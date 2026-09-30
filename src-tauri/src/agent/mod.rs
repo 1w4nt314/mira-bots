@@ -4,19 +4,30 @@ pub mod claude_path;
 pub mod manager;
 pub mod pty;
 pub mod ring_buffer;
+pub mod workdir;
 
 pub use manager::{
-    AgentId, AgentInfo, AgentManager, EventSink, SinkEvent, SpawnContext, SpawnRequest,
+    AgentId, AgentInfo, AgentManager, AgentRole, EventSink, FrameMatch, MatchVia, SeatKind,
+    SinkEvent, SpawnContext, SpawnRequest,
 };
 
-use crate::config::MAX_WORK_AGENTS;
+use crate::config::{MAX_STAFF_AGENTS, MAX_WORK_AGENTS};
+
+/// Text of [`AgentError::LimitReached`].
+fn limit_text(seat: &SeatKind) -> String {
+    match seat {
+        SeatKind::Work => format!("Loft på {MAX_WORK_AGENTS} arbejdspladser nået"),
+        SeatKind::Staff => format!("Loft på {MAX_STAFF_AGENTS} stabspladser nået"),
+    }
+}
 
 /// Errors from agent operations. The messages are user-facing (Danish) because commands pass
 /// them straight to the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    #[error("Loft på {} agenter nået", MAX_WORK_AGENTS)]
-    LimitReached,
+    /// All seats of that kind are taken by non-exited agents.
+    #[error("{}", limit_text(.0))]
+    LimitReached(SeatKind),
     #[error("Mappen findes ikke eller er ikke en mappe")]
     InvalidCwd,
     #[error("Fandt ikke claude — installer Claude Code eller sæt MIRA_CLAUDE_PATH")]

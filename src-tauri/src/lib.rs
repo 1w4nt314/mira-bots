@@ -1,11 +1,13 @@
 pub mod agent;
 pub mod commands;
 pub mod config;
+pub mod diagnostics;
 pub mod events;
 pub mod hooks;
 pub mod island;
 pub mod permissions;
 pub mod pipe;
+pub mod workplace;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -15,11 +17,17 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+use tauri_plugin_log::{FileOpenStrategy, RotationStrategy, Target, TargetKind, TimezoneStrategy};
 
 use agent::claude_path::find_claude;
+use agent::workdir::agents_root;
 use agent::{AgentManager, EventSink, SinkEvent};
 use commands::{AppPaths, AppState};
-use config::{HOOK_EXE_ENV, MAX_WORK_AGENTS};
+use config::{
+    CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
+    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS,
+};
+use diagnostics::{log_level_from_env, probe_claude_version, HookStats, VersionProbe};
 use events::{AgentOutputPayload, AGENTS_CHANGED, AGENT_OUTPUT};
 use hooks::settings::write_hooks_json;
 use island::IslandState;
@@ -77,9 +85,9 @@ pub fn find_hook_exe(app: &AppHandle) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Binds the manager's PTY thread events to Tauri: output becomes `agent-output` (base64) and an
-/// exit marks the agent exited, releases its pending permission requests and emits
-/// `agents-changed`.
+/// Binds the manager's PTY thread events to Tauri: output becomes `agent-output` (base64, only to
+/// the workplace window; the island never shows terminal output) and an exit marks the agent
+/// exited, releases its pending permission requests and emits `agents-changed`.
 pub fn tauri_sink(
     app: AppHandle,
     manager: Arc<Mutex<AgentManager>>,
@@ -96,7 +104,9 @@ pub fn tauri_sink(
                 seq,
                 data_base64: BASE64.encode(bytes),
             };
-            if let Err(e) = app.emit(AGENT_OUTPUT, payload) {
+            // TODO(windows-verify): emit_to a missing workplace window neither spams the log nor
+            // loses data (the ring buffer covers it) (plan D.21).
+            if let Err(e) = app.emit_to(workplace::LABEL, AGENT_OUTPUT, payload) {
                 log::debug!("emit {AGENT_OUTPUT}: {e}");
             }
         }
@@ -108,6 +118,7 @@ pub fn tauri_sink(
             // Handlers waiting on these answer `none` and emit permission-resolved themselves.
             lock(&pending).remove_for_agent(&agent_id);
             if known {
+                log::info!("agent {agent_id} exited (code {code:?})");
                 let list = lock(&manager).list();
                 if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
                     log::error!("emit {AGENTS_CHANGED}: {e}");
@@ -117,9 +128,90 @@ pub fn tauri_sink(
     })
 }
 
+/// The file logger (plus stdout in debug builds). Level from `MIRA_LOG` (default info); the
+/// chatty windowing/HTTP crates are capped at warn.
+// TODO(windows-verify): the log file is %LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log, a new one
+// per start (at most 3 old ones kept), and a panic ends up in it; MIRA_LOG=debug gives one line per
+// hook frame (plan D.18).
+fn log_plugin(level: log::LevelFilter) -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    let mut targets = vec![Target::new(TargetKind::LogDir {
+        file_name: Some(LOG_FILE_STEM.into()),
+    })];
+    if cfg!(debug_assertions) {
+        targets.push(Target::new(TargetKind::Stdout));
+    }
+    tauri_plugin_log::Builder::new()
+        .clear_targets()
+        .targets(targets)
+        .level(level)
+        .level_for("tao", log::LevelFilter::Warn)
+        .level_for("wry", log::LevelFilter::Warn)
+        .level_for("hyper", log::LevelFilter::Warn)
+        .max_file_size(LOG_MAX_FILE_SIZE)
+        .rotation_strategy(RotationStrategy::KeepSome(LOG_KEEP_FILES))
+        .file_open_strategy(FileOpenStrategy::Rotate)
+        .timezone_strategy(TimezoneStrategy::UseLocal)
+        .build()
+}
+
+/// Panics go to the log file (a Windows GUI app has no stderr). Runs before the release
+/// profile's abort.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panic: {info}");
+        log::logger().flush();
+    }));
+}
+
+/// `<home>/mira-bots/agents`, with home from Tauri, else `USERPROFILE`/`HOME`, else `fallback`.
+fn resolve_agents_root(app: &AppHandle, fallback: &Path) -> PathBuf {
+    let home = app
+        .path()
+        .home_dir()
+        .ok()
+        .or_else(|| {
+            ["USERPROFILE", "HOME"]
+                .iter()
+                .filter_map(std::env::var_os)
+                .find(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| fallback.to_path_buf());
+    agents_root(&home)
+}
+
+/// Runs `claude --version` once on its own thread and stores the result in `slot`.
+fn start_version_probe(slot: Arc<Mutex<VersionProbe>>) {
+    let Some(claude) = find_claude() else {
+        *lock(&slot) = VersionProbe::NotFound;
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("claude-version".into())
+        .spawn(move || {
+            let result = probe_claude_version(&claude, CLAUDE_VERSION_TIMEOUT);
+            match &result {
+                Ok(v) => log::info!("claude --version: {v}"),
+                Err(e) => log::warn!("claude --version failed: {e}"),
+            }
+            *lock(&slot) = match result {
+                Ok(v) => VersionProbe::Ok(v),
+                Err(e) => VersionProbe::Failed(e),
+            };
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start the claude version probe: {e}");
+    }
+}
+
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    // Logging is controlled by RUST_LOG only.
-    let _ = env_logger::try_init();
+    // The log plugin is already initialised (plugins run before setup).
+    install_panic_hook();
+    log::info!(
+        "mira-bots {} starting; log level {}",
+        env!("CARGO_PKG_VERSION"),
+        log::max_level()
+    );
     let handle = app.handle().clone();
 
     let data_dir = app.path().app_data_dir().unwrap_or_else(|e| {
@@ -137,9 +229,25 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         None => log::warn!("mira-hook not found; agents cannot be started (set MIRA_HOOK_EXE)"),
     }
     // Only logged: the lookup is repeated on every get_app_info/spawn_agent.
-    if find_claude().is_none() {
-        log::warn!("claude not found (set MIRA_CLAUDE_PATH)");
+    match find_claude() {
+        Some(p) => log::info!("claude: {}", p.display()),
+        None => log::warn!("claude not found (set MIRA_CLAUDE_PATH)"),
     }
+    let claude_version = Arc::new(Mutex::new(VersionProbe::Pending));
+    start_version_probe(Arc::clone(&claude_version));
+
+    let log_file = match app.path().app_log_dir() {
+        Ok(d) => Some(d.join(format!("{LOG_FILE_STEM}.log"))),
+        Err(e) => {
+            log::warn!("app_log_dir unavailable: {e}");
+            None
+        }
+    };
+    if let Some(f) = &log_file {
+        log::info!("log file: {}", f.display());
+    }
+    let agents_root = resolve_agents_root(&handle, &data_dir);
+    log::info!("default agent folders under {}", agents_root.display());
 
     // hooks.json is rewritten before each spawn too; writing it now makes the path exist early.
     // Without a hook exe a placeholder path is written; spawn_agent refuses to start agents.
@@ -147,7 +255,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("mira-hook-not-found"));
     let hooks_json = match write_hooks_json(&data_dir, &hook_for_file) {
-        Ok(p) => p,
+        Ok(p) => {
+            log::info!("hooks.json written: {}", p.display());
+            p
+        }
         Err(e) => {
             log::error!("could not write hooks.json in {}: {e}", data_dir.display());
             data_dir.join("hooks.json")
@@ -159,6 +270,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let sink = tauri_sink(handle.clone(), Arc::clone(&manager), Arc::clone(&pending));
 
     let pipe_ready = Arc::new(AtomicBool::new(false));
+    let hook_stats = Arc::new(HookStats::default());
     let emit_handle = handle.clone();
     pipe::server::start(
         pipe_name.clone(),
@@ -170,6 +282,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("emit {name}: {e}");
                 }
             }),
+            stats: Arc::clone(&hook_stats),
         },
         Arc::clone(&pipe_ready),
     );
@@ -182,10 +295,15 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             hooks_json,
             pipe_name,
             data_dir,
+            log_file,
+            agents_root,
         },
         island: IslandState::default(),
         pipe_ready,
         sink,
+        hook_stats,
+        claude_version,
+        workplace_select: Mutex::new(None),
     });
 
     if let Some(window) = app.get_webview_window(island::LABEL) {
@@ -200,9 +318,15 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run() {
+    let level = log_level_from_env(std::env::var(LOG_LEVEL_ENV).ok().as_deref());
     let app = tauri::Builder::default()
+        // Sets the global logger; nothing else may (env_logger was removed for this reason).
+        .plugin(log_plugin(level))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(setup)
+        // Only the island reacts here. Closing the workplace window just destroys it: Tauri
+        // raises ExitRequested only when the last window is gone, and the island cannot be closed.
         .on_window_event(|window, event| {
             if window.label() != island::LABEL {
                 return;
@@ -235,6 +359,11 @@ pub fn run() {
             commands::respond_permission,
             commands::resize_island,
             commands::quit_app,
+            commands::get_diagnostics,
+            commands::open_workplace,
+            commands::take_workplace_selection,
+            commands::open_agent_folder,
+            commands::open_log_dir,
         ])
         .build(tauri::generate_context!())
         .expect("error while building mira-bots");

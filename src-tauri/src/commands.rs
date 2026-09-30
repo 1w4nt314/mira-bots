@@ -1,7 +1,8 @@
-//! Tauri commands (contract C.1) and the managed [`AppState`].
+//! Tauri commands (contracts C.1 + C2.1) and the managed [`AppState`].
 //!
-//! All commands are synchronous and return `Result<T, String>`; errors are Danish, user-facing
-//! text. Locks are held briefly and never while emitting.
+//! All commands except `open_workplace` (async: window creation) are synchronous and return
+//! `Result<T, String>`; errors are Danish, user-facing text. Locks are held briefly and never
+//! while emitting.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,14 +12,21 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::agent::claude_path::find_claude;
-use crate::agent::{AgentError, AgentInfo, AgentManager, EventSink, SpawnContext, SpawnRequest};
-use crate::config::MAX_WORK_AGENTS;
-use crate::events::{AgentOutputPayload, AGENTS_CHANGED};
+use crate::agent::workdir::{ensure_dir, next_agent_dir};
+use crate::agent::{
+    now_ms, AgentError, AgentInfo, AgentManager, AgentRole, EventSink, SeatKind, SpawnContext,
+    SpawnRequest,
+};
+use crate::config::{MAX_STAFF_AGENTS, MAX_WORK_AGENTS, STARTING_HINT_AFTER};
+use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
+use crate::events::{AgentOutputPayload, AGENTS_CHANGED, WORKPLACE_SELECT};
 use crate::hooks::settings::write_hooks_json;
 use crate::island::{self, IslandState};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
+use crate::workplace;
 
 /// Locations resolved once in `setup`. The `claude` binary is not cached: it is looked up again
 /// on every `get_app_info` and `spawn_agent` (cheap), so installing it while the app runs works.
@@ -32,6 +40,11 @@ pub struct AppPaths {
     pub pipe_name: String,
     /// App data directory (`%APPDATA%\dk.mira.bots` on Windows).
     pub data_dir: PathBuf,
+    /// `<app_log_dir>/mira-bots.log` (`%LOCALAPPDATA%\dk.mira.bots\logs` on Windows); `None` if
+    /// the log dir could not be resolved.
+    pub log_file: Option<PathBuf>,
+    /// `<home>/mira-bots/agents`: parent of the default agent folders (created on first use).
+    pub agents_root: PathBuf,
 }
 
 /// Managed state shared by commands, the pipe handler and the PTY threads.
@@ -45,6 +58,12 @@ pub struct AppState {
     pub pipe_ready: Arc<AtomicBool>,
     /// Receives PTY output/exit from the manager's threads (see `lib.rs::tauri_sink`).
     pub sink: EventSink,
+    /// Hook frame counters, shared with the pipe handler.
+    pub hook_stats: Arc<HookStats>,
+    /// Result of the one-shot background `claude --version` probe.
+    pub claude_version: Arc<Mutex<VersionProbe>>,
+    /// Agent to select when a newly created workplace window asks (`take_workplace_selection`).
+    pub workplace_select: Mutex<Option<String>>,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -59,6 +78,8 @@ pub struct AppInfo {
     pub version: String,
     /// Whether the pipe server is listening (see [`AppState::pipe_ready`]).
     pub pipe_ready: bool,
+    pub max_staff_agents: usize,
+    pub agents_root: String,
 }
 
 /// `get_agent_output` result: same shape as the `agent-output` event payload.
@@ -83,16 +104,71 @@ impl AppState {
             max_agents: MAX_WORK_AGENTS,
             version: env!("CARGO_PKG_VERSION").to_string(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
+            max_staff_agents: MAX_STAFF_AGENTS,
+            agents_root: self.paths.agents_root.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Everything the Diagnostics panel shows (C2.3). Recomputes the `claude` lookup.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let (claude_version, claude_version_note, claude_code_args_supported) =
+            version_fields(&lock(&self.claude_version));
+        Diagnostics {
+            claude_path: path_string(&find_claude()),
+            claude_version,
+            claude_version_note,
+            claude_code_args_supported,
+            hook_exe: path_string(&self.paths.hook_exe),
+            hooks_json_path: self.paths.hooks_json.to_string_lossy().into_owned(),
+            hooks_json_exists: self.paths.hooks_json.is_file(),
+            pipe_name: self.paths.pipe_name.clone(),
+            pipe_ready: self.pipe_ready.load(Ordering::Acquire),
+            frames_received: self.hook_stats.received(),
+            frames_unknown_session: self.hook_stats.unknown(),
+            last_hook_event: self.hook_stats.last_event(),
+            log_path: path_string(&self.paths.log_file),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            agents_root: self.paths.agents_root.to_string_lossy().into_owned(),
+            running_agents: lock(&self.manager).running_count(),
         }
     }
 
     /// Emits the full agent list as `agents-changed`.
     pub fn emit_agents(&self, app: &AppHandle) {
-        let list = lock(&self.manager).list();
-        if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
-            log::error!("emit {AGENTS_CHANGED}: {e}");
+        emit_agent_list(app, &self.manager);
+    }
+}
+
+/// Emits the full agent list as `agents-changed` (lock released before emitting).
+pub fn emit_agent_list(app: &AppHandle, manager: &Mutex<AgentManager>) {
+    let list = lock(manager).list();
+    if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
+        log::error!("emit {AGENTS_CHANGED}: {e}");
+    }
+}
+
+/// Explicit folder if given and non-blank, otherwise the next free default folder
+/// (`<agents_root>/<prefix>-<nn>`), created on disk.
+pub fn resolve_cwd(
+    cwd: Option<String>,
+    agents_root: &std::path::Path,
+    role: AgentRole,
+    manager: &Mutex<AgentManager>,
+) -> Result<PathBuf, AgentError> {
+    match cwd {
+        Some(s) if !s.trim().is_empty() => Ok(PathBuf::from(s)),
+        _ => {
+            let taken = lock(manager).cwds();
+            let dir = next_agent_dir(agents_root, role, &taken);
+            ensure_dir(&dir)?;
+            Ok(dir)
         }
     }
+}
+
+/// Takes (and clears) the pending workplace selection.
+pub fn take_selection(slot: &Mutex<Option<String>>) -> Option<String> {
+    lock(slot).take()
 }
 
 /// Refuses to start agents while the pipe server is not listening.
@@ -158,12 +234,23 @@ pub fn list_agents(state: State<'_, AppState>) -> Result<Vec<AgentInfo>, String>
 }
 
 #[tauri::command]
+pub fn get_diagnostics(state: State<'_, AppState>) -> Result<Diagnostics, String> {
+    Ok(state.diagnostics())
+}
+
+/// `cwd` null/blank → default folder; `role` defaults to `none`, `seat_kind` to `work`.
+/// After [`STARTING_HINT_AFTER`] without a hook event, the agent gets the Starting hint.
+#[tauri::command]
 pub fn spawn_agent(
     app: AppHandle,
     state: State<'_, AppState>,
-    cwd: String,
+    cwd: Option<String>,
     prompt: Option<String>,
+    role: Option<AgentRole>,
+    seat_kind: Option<SeatKind>,
 ) -> Result<AgentInfo, String> {
+    let role = role.unwrap_or_default();
+    let seat_kind = seat_kind.unwrap_or_default();
     let hook_exe = state
         .paths
         .hook_exe
@@ -178,13 +265,42 @@ pub fn spawn_agent(
         hooks_json,
         pipe_name: state.paths.pipe_name.clone(),
     };
+    let cwd = resolve_cwd(cwd, &state.paths.agents_root, role, &state.manager)?;
     let req = SpawnRequest {
-        cwd: PathBuf::from(cwd),
+        cwd,
         prompt,
+        role,
+        seat_kind,
     };
     let info = lock(&state.manager).spawn(req, &ctx, Arc::clone(&state.sink))?;
+    log::info!(
+        "spawned agent {} ({}) in {} role={:?} seat={:?} session={} pid={:?}",
+        info.id,
+        info.name,
+        info.cwd,
+        info.role,
+        info.seat_kind,
+        info.session_id,
+        info.pid
+    );
     state.emit_agents(&app);
+    schedule_starting_hint(app, Arc::clone(&state.manager), info.id.clone());
     Ok(info)
+}
+
+/// After [`STARTING_HINT_AFTER`], sets the Starting hint if the agent is still waiting for its
+/// first hook event, and emits `agents-changed`.
+// TODO(windows-verify): the trust dialog is what holds the first hook back; after "Yes" in the
+// terminal, SessionStart arrives and the agent turns Idle (the hint disappears) (plan D.16).
+fn schedule_starting_hint(app: AppHandle, manager: Arc<Mutex<AgentManager>>, id: String) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(STARTING_HINT_AFTER).await;
+        let hinted = lock(&manager).apply_starting_hint(&id, now_ms()).is_some();
+        if hinted {
+            log::info!("agent {id}: no hook event after {STARTING_HINT_AFTER:?}; showing hint");
+            emit_agent_list(&app, &manager);
+        }
+    });
 }
 
 #[tauri::command]
@@ -194,6 +310,7 @@ pub fn stop_agent(
     agent_id: String,
 ) -> Result<(), String> {
     stop(&state.manager, &state.pending, &agent_id)?;
+    log::info!("stopped agent {agent_id}");
     state.emit_agents(&app);
     Ok(())
 }
@@ -280,6 +397,78 @@ pub fn resize_island(
         .ok_or_else(|| "Island-vinduet findes ikke".to_string())?;
     *lock(&state.island.last) = (w, h);
     island::place(&window, w, h).map_err(|e| format!("Kunne ikke placere islanden: {e}"))
+}
+
+/// Opens (or focuses) the workplace window and selects `agent_id` in it. Async on purpose:
+/// creating a window from a synchronous command deadlocks on Windows (research2 §5).
+#[tauri::command]
+pub async fn open_workplace(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_id: Option<String>,
+) -> Result<(), String> {
+    *lock(&state.workplace_select) = agent_id.clone();
+    let created =
+        workplace::open_or_focus(&app).map_err(|e| format!("Kunne ikke åbne Workplace: {e}"))?;
+    log::info!(
+        "workplace {} (select {agent_id:?})",
+        if created { "created" } else { "focused" }
+    );
+    if !created {
+        // A new window fetches the selection itself via take_workplace_selection. The slot is
+        // kept here too, in case the existing window is still loading and misses the event.
+        if let Some(id) = agent_id {
+            if let Err(e) = app.emit_to(workplace::LABEL, WORKPLACE_SELECT, id) {
+                log::debug!("emit {WORKPLACE_SELECT}: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn take_workplace_selection(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(take_selection(&state.workplace_select))
+}
+
+/// Opens the agent's working folder in the file manager (opener plugin, called from Rust: no JS
+/// capability needed).
+// TODO(windows-verify): opens Explorer on the right folder (plan D.22).
+#[tauri::command]
+pub fn open_agent_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<(), String> {
+    let cwd = lock(&state.manager)
+        .get(&agent_id)
+        .map(|a| a.cwd)
+        .ok_or_else(|| AgentError::NotFound.to_string())?;
+    app.opener()
+        .open_path(cwd, None::<&str>)
+        .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
+}
+
+/// Opens the log folder (created first if needed).
+// TODO(windows-verify): opens Explorer on %LOCALAPPDATA%\dk.mira.bots\logs (plan D.18/D.22).
+#[tauri::command]
+pub fn open_log_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = match state
+        .paths
+        .log_file
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        Some(d) => d.to_path_buf(),
+        None => app
+            .path()
+            .app_log_dir()
+            .map_err(|e| format!("Kunne ikke finde logmappen: {e}"))?,
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Kunne ikke oprette logmappen: {e}"))?;
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
 }
 
 #[tauri::command]
@@ -380,12 +569,108 @@ mod tests {
             max_agents: 5,
             version: "0.1.0".into(),
             pipe_ready: false,
+            max_staff_agents: 2,
+            agents_root: "/h/mira-bots/agents".into(),
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
             json!({"claudePath":null,"hookExe":"/h","hooksJson":"/d/hooks.json",
-                   "pipeName":"pipe","maxAgents":5,"version":"0.1.0","pipeReady":false})
+                   "pipeName":"pipe","maxAgents":5,"version":"0.1.0","pipeReady":false,
+                   "maxStaffAgents":2,"agentsRoot":"/h/mira-bots/agents"})
         );
+    }
+
+    fn app_state(dir: &std::path::Path) -> AppState {
+        let mut m = AgentManager::new(5);
+        m.insert_fake("sess", "/w/demo");
+        let stopped = m.insert_fake("sess-2", "/w/demo2");
+        m.stop(&stopped).unwrap();
+        AppState {
+            manager: Arc::new(Mutex::new(m)),
+            pending: Arc::new(Mutex::new(PendingPermissions::new())),
+            paths: AppPaths {
+                hook_exe: None,
+                hooks_json: dir.join("hooks.json"),
+                pipe_name: "pipe".into(),
+                data_dir: dir.to_path_buf(),
+                log_file: Some(dir.join("logs").join("mira-bots.log")),
+                agents_root: dir.join("agents"),
+            },
+            island: IslandState::default(),
+            pipe_ready: Arc::new(AtomicBool::new(true)),
+            sink: Arc::new(|_| {}),
+            hook_stats: Arc::new(HookStats::default()),
+            claude_version: Arc::new(Mutex::new(VersionProbe::Ok("2.1.286 (Claude Code)".into()))),
+            workplace_select: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_built_from_the_state() {
+        let dir = std::env::temp_dir().join(format!("mira-diag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = app_state(&dir);
+        state.hook_stats.record(
+            crate::diagnostics::LastHookEvent {
+                name: "Stop".into(),
+                session_id: "sess".into(),
+                agent_id: None,
+                at: 5,
+            },
+            false,
+        );
+        let d = state.diagnostics();
+        assert_eq!(d.claude_version.as_deref(), Some("2.1.286 (Claude Code)"));
+        assert_eq!(d.claude_version_note, None);
+        assert_eq!(d.claude_code_args_supported, Some(true));
+        assert!(!d.hooks_json_exists);
+        assert!(d.pipe_ready);
+        assert_eq!((d.frames_received, d.frames_unknown_session), (1, 1));
+        assert_eq!(d.last_hook_event.unwrap().name, "Stop");
+        assert!(d.log_path.unwrap().ends_with("mira-bots.log"));
+        assert_eq!(d.running_agents, 1, "the stopped agent does not count");
+        assert!(d.agents_root.ends_with("agents"));
+        std::fs::write(dir.join("hooks.json"), "{}").unwrap();
+        *lock(&state.claude_version) = VersionProbe::Pending;
+        let d = state.diagnostics();
+        assert!(d.hooks_json_exists);
+        assert_eq!(d.claude_version_note.as_deref(), Some("kører stadig"));
+        assert_eq!(d.claude_code_args_supported, None);
+        let info = state.app_info();
+        assert_eq!(info.max_staff_agents, 2);
+        assert_eq!(info.agents_root, d.agents_root);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn workplace_selection_is_taken_once() {
+        let slot = Mutex::new(Some("a1".to_string()));
+        assert_eq!(take_selection(&slot), Some("a1".into()));
+        assert_eq!(take_selection(&slot), None);
+    }
+
+    #[test]
+    fn resolve_cwd_uses_explicit_or_next_default_folder() {
+        let base = std::env::temp_dir().join(format!("mira-cwd-{}", uuid::Uuid::new_v4()));
+        let root = base.join("agents");
+        let m = Mutex::new(AgentManager::new(5));
+        assert_eq!(
+            resolve_cwd(Some("/w/x".into()), &root, AgentRole::None, &m).unwrap(),
+            PathBuf::from("/w/x")
+        );
+        let first = resolve_cwd(Some("  ".into()), &root, AgentRole::None, &m).unwrap();
+        assert_eq!(first, root.join("bot-01"));
+        assert!(first.is_dir());
+        lock(&m).insert_fake("s", &first.to_string_lossy());
+        assert_eq!(
+            resolve_cwd(None, &root, AgentRole::None, &m).unwrap(),
+            root.join("bot-02")
+        );
+        assert_eq!(
+            resolve_cwd(None, &root, AgentRole::Researcher, &m).unwrap(),
+            root.join("researcher-01")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

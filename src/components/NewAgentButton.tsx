@@ -1,18 +1,14 @@
 import { useEffect, useState } from "react";
-import { errorMessage, getAppInfo, pickFolder, spawnAgent } from "../lib/ipc";
+import { errorMessage, getAppInfo, spawnAgent } from "../lib/ipc";
 import { isExited } from "../lib/status";
 import { useStore } from "../state/store";
 
 export default function NewAgentButton() {
   const { state, dispatch } = useStore();
   const [busy, setBusy] = useState(false);
-  // Fallback when the native dialog fails: type the folder path.
-  // TODO(windows-verify): the island is not focusable, so this field may not take keyboard
-  // input; it is only a fallback for a failing folder dialog (plan D.11).
-  const [manual, setManual] = useState<string | null>(null);
 
-  // Keep the island open while the folder dialog or the fallback field is in use.
-  const pinned = busy || manual !== null;
+  // Keep the island open while a spawn is in flight.
+  const pinned = busy;
   useEffect(() => {
     dispatch({ type: "ui/pin", pinned });
     return () => dispatch({ type: "ui/pin", pinned: false });
@@ -52,71 +48,17 @@ export default function NewAgentButton() {
       ? "Fandt ikke claude endnu — installer Claude Code eller sæt MIRA_CLAUDE_PATH"
       : null;
 
-  const start = async (path: string) => {
-    try {
-      await spawnAgent(path, null);
-    } catch (e) {
-      dispatch({ type: "error/set", error: errorMessage(e) });
-    }
-  };
-
-  const choose = async () => {
+  // One click: default folder, role "none", work seat (role/folder are chosen in Workplace).
+  const start = async () => {
     setBusy(true);
     try {
-      let path: string | null = null;
-      try {
-        path = await pickFolder();
-      } catch (e) {
-        dispatch({ type: "error/set", error: `Mappevælgeren fejlede: ${errorMessage(e)}` });
-        setManual("");
-        return;
-      }
-      if (path) await start(path);
+      await spawnAgent(null, null, null, null);
+    } catch (e) {
+      dispatch({ type: "error/set", error: errorMessage(e) });
     } finally {
       setBusy(false);
     }
   };
-
-  const submitManual = async () => {
-    const path = (manual ?? "").trim();
-    setManual(null);
-    if (path) {
-      setBusy(true);
-      await start(path);
-      setBusy(false);
-    }
-  };
-
-  if (manual !== null) {
-    return (
-      <form
-        className="flex items-center gap-1"
-        onSubmit={(e) => {
-          e.preventDefault();
-          void submitManual();
-        }}
-      >
-        <input
-          autoFocus
-          value={manual}
-          onChange={(e) => setManual(e.target.value)}
-          placeholder="Sti til mappe"
-          className="w-40 rounded bg-black/40 px-1.5 py-1 text-[11px] outline-none"
-        />
-        <button type="submit" className="rounded bg-white/10 px-2 py-1 text-[11px]">
-          Start
-        </button>
-        <button
-          type="button"
-          onClick={() => setManual(null)}
-          className="rounded px-1 text-[11px] text-neutral-400 hover:text-white"
-          aria-label="Annuller"
-        >
-          {"×"}
-        </button>
-      </form>
-    );
-  }
 
   return (
     <>
@@ -127,12 +69,12 @@ export default function NewAgentButton() {
       )}
       <button
         type="button"
-        onClick={() => void choose()}
+        onClick={() => void start()}
         disabled={busy || disabledReason !== null}
         title={
           disabledReason ??
           claudeHint ??
-          "Start en ny agent (kører Claude Code i den valgte mappe)"
+          "Start en ny agent i standardmappen (vælg rolle/mappe i Workplace)"
         }
         className="shrink-0 rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"
       >

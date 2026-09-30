@@ -10,7 +10,8 @@ fn run_bin(input: &str, pipe: Option<&str>) -> (Option<i32>, Vec<u8>, Duration) 
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     cmd.env_remove("MIRA_BOTS_PIPE")
-        .env_remove("MIRA_HOOK_DEBUG");
+        .env_remove("MIRA_HOOK_DEBUG")
+        .env_remove("MIRA_AGENT_ID");
     if let Some(p) = pipe {
         cmd.env("MIRA_BOTS_PIPE", p);
     }

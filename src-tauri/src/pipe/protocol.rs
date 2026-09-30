@@ -7,12 +7,23 @@ use crate::permissions::Decision;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Hook → app: `{"v":1,"kind":"hook","event":{...}}`.
+/// Hook → app: `{"v":1,"kind":"hook","agent_id":"<id>","event":{...}}` (`agent_id` optional,
+/// C2.4; hook exes from step 1 never send it).
 #[derive(Deserialize, Debug)]
 struct Frame {
     v: u32,
     kind: String,
+    #[serde(default)]
+    agent_id: Option<String>,
     event: Value,
+}
+
+/// A parsed hook frame: the app's agent id from `MIRA_AGENT_ID` (if the hook sent one) and the
+/// hook event JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookFrame {
+    pub agent_id: Option<String>,
+    pub event: Value,
 }
 
 /// App → hook (PermissionRequest only): `{"v":1,"kind":"decision","decision":"allow|deny|none","message":...}`.
@@ -34,8 +45,8 @@ pub enum FrameError {
     Kind(String),
 }
 
-/// Parses one received line and returns the hook event JSON.
-pub fn parse_frame(line: &str) -> Result<Value, FrameError> {
+/// Parses one received line. An empty `agent_id` counts as absent.
+pub fn parse_frame(line: &str) -> Result<HookFrame, FrameError> {
     let f: Frame =
         serde_json::from_str(line.trim_end()).map_err(|e| FrameError::Json(e.to_string()))?;
     if f.v != PROTOCOL_VERSION {
@@ -44,7 +55,10 @@ pub fn parse_frame(line: &str) -> Result<Value, FrameError> {
     if f.kind != "hook" {
         return Err(FrameError::Kind(f.kind));
     }
-    Ok(f.event)
+    Ok(HookFrame {
+        agent_id: f.agent_id.filter(|s| !s.is_empty()),
+        event: f.event,
+    })
 }
 
 /// Renders the newline-terminated reply line.
@@ -82,10 +96,23 @@ mod tests {
 
     #[test]
     fn parses_hook_frame() {
-        let ev =
+        let f =
             parse_frame("{\"v\":1,\"kind\":\"hook\",\"event\":{\"hook_event_name\":\"Stop\"}}\n")
                 .unwrap();
-        assert_eq!(ev, json!({"hook_event_name":"Stop"}));
+        assert_eq!(f.event, json!({"hook_event_name":"Stop"}));
+        assert_eq!(f.agent_id, None);
+    }
+
+    #[test]
+    fn parses_frame_level_agent_id() {
+        let f = parse_frame(
+            r#"{"v":1,"kind":"hook","agent_id":"a1","event":{"hook_event_name":"SubagentStop","agent_id":"sub"}}"#,
+        )
+        .unwrap();
+        assert_eq!(f.agent_id.as_deref(), Some("a1"));
+        assert_eq!(f.event["agent_id"], "sub");
+        let f = parse_frame(r#"{"v":1,"kind":"hook","agent_id":"","event":{}}"#).unwrap();
+        assert_eq!(f.agent_id, None, "empty agent_id counts as absent");
     }
 
     #[test]
@@ -148,8 +175,12 @@ mod tests {
     fn hook_exe_frame_is_understood_by_the_app() {
         let p =
             mira_hook::payload::parse(r#"{"hook_event_name":"Stop","session_id":"s"}"#).unwrap();
-        let ev = parse_frame(&mira_hook::payload::to_frame(&p)).unwrap();
-        assert_eq!(ev["session_id"], "s");
+        let f = parse_frame(&mira_hook::payload::to_frame(&p, None)).unwrap();
+        assert_eq!(f.event["session_id"], "s");
+        assert_eq!(f.agent_id, None);
+        let f = parse_frame(&mira_hook::payload::to_frame(&p, Some("a1"))).unwrap();
+        assert_eq!(f.event["session_id"], "s");
+        assert_eq!(f.agent_id.as_deref(), Some("a1"));
     }
 
     #[test]

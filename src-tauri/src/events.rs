@@ -13,6 +13,9 @@ pub const PERMISSION_REQUEST: &str = "permission-request";
 pub const PERMISSION_RESOLVED: &str = "permission-resolved";
 /// Debug/step-2 feed of hook events (`HookEventPayload`).
 pub const HOOK_EVENT: &str = "hook-event";
+/// Select an agent in an already open workplace window (payload: agent id string). Only sent to
+/// the `workplace` window.
+pub const WORKPLACE_SELECT: &str = "workplace-select";
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +57,7 @@ mod tests {
         assert_eq!(PERMISSION_REQUEST, "permission-request");
         assert_eq!(PERMISSION_RESOLVED, "permission-resolved");
         assert_eq!(HOOK_EVENT, "hook-event");
+        assert_eq!(WORKPLACE_SELECT, "workplace-select");
     }
 
     #[test]

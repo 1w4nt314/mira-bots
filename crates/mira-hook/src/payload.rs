@@ -106,20 +106,29 @@ pub fn expects_reply(event_name: &str) -> bool {
 /// by `{"_truncated": true}`. Leaves headroom below the app's 1 MiB line limit.
 pub const MAX_FRAME_BYTES: usize = 900 * 1024;
 
-fn render_frame(event: &Value) -> String {
-    let mut s = json!({"v": 1, "kind": "hook", "event": event}).to_string();
+fn render_frame(event: &Value, agent_id: Option<&str>) -> String {
+    let mut frame = json!({"v": 1, "kind": "hook"});
+    if let Some(id) = agent_id {
+        frame["agent_id"] = Value::String(id.to_string());
+    }
+    frame["event"] = event.clone();
+    let mut s = frame.to_string();
     s.push('\n');
     s
 }
 
-/// Renders the newline-terminated pipe frame `{"v":1,"kind":"hook","event":{...}}`.
+/// Renders the newline-terminated pipe frame
+/// `{"v":1,"kind":"hook","agent_id":"<id>","event":{...}}`.
+///
+/// `agent_id` (from `MIRA_AGENT_ID`) sits at frame level, not inside `event` (where `agent_id`
+/// already means a subagent id); it is omitted entirely when `None`.
 ///
 /// Strings are already capped by [`trim`], but a `tool_input` with very many elements can still
-/// exceed the app's line limit; if the frame is over [`MAX_FRAME_BYTES`], `tool_input` is replaced
-/// by `{"_truncated": true}` (all other fields, e.g. `tool_name`, are kept) so the status update
-/// and permission card still arrive.
-pub fn to_frame(payload: &HookPayload) -> String {
-    let frame = render_frame(&payload.json);
+/// exceed the app's line limit; if the full frame (agent id included) is over
+/// [`MAX_FRAME_BYTES`], `tool_input` is replaced by `{"_truncated": true}` (all other fields, e.g.
+/// `tool_name`, are kept) so the status update and permission card still arrive.
+pub fn to_frame(payload: &HookPayload, agent_id: Option<&str>) -> String {
+    let frame = render_frame(&payload.json, agent_id);
     if frame.len() <= MAX_FRAME_BYTES {
         return frame;
     }
@@ -128,7 +137,7 @@ pub fn to_frame(payload: &HookPayload) -> String {
         Some(input) => *input = json!({"_truncated": true}),
         None => return frame,
     }
-    render_frame(&event)
+    render_frame(&event, agent_id)
 }
 
 #[cfg(test)]
@@ -223,7 +232,7 @@ mod tests {
         trim(&mut p.json);
         assert!(p.json.get("tool_response").is_none());
         assert_eq!(p.json["tool_input"]["command"], "ls");
-        assert!(to_frame(&p).len() < 1000);
+        assert!(to_frame(&p, None).len() < 1000);
     }
 
     #[test]
@@ -304,14 +313,15 @@ mod tests {
         .to_string();
         let mut p = parse(&raw).unwrap();
         trim(&mut p.json);
-        assert!(render_frame(&p.json).len() > MAX_FRAME_BYTES);
+        assert!(render_frame(&p.json, None).len() > MAX_FRAME_BYTES);
 
-        let f = to_frame(&p);
+        let f = to_frame(&p, Some("agent-1"));
         assert!(f.len() <= MAX_FRAME_BYTES, "{}", f.len());
         assert!(f.ends_with('\n'));
         assert_eq!(f.matches('\n').count(), 1);
         let v: Value = serde_json::from_str(f.trim_end()).unwrap();
         assert_eq!(v["event"]["tool_input"], json!({"_truncated": true}));
+        assert_eq!(v["agent_id"], "agent-1");
         assert_eq!(v["event"]["tool_name"], "MultiEdit");
         assert_eq!(v["event"]["hook_event_name"], "PermissionRequest");
         assert_eq!(v["event"]["session_id"], "sess-1");
@@ -329,14 +339,14 @@ mod tests {
             r#"{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
         )
         .unwrap();
-        let v: Value = serde_json::from_str(to_frame(&p).trim_end()).unwrap();
+        let v: Value = serde_json::from_str(to_frame(&p, None).trim_end()).unwrap();
         assert_eq!(v["event"]["tool_input"]["command"], "ls");
     }
 
     #[test]
     fn frame_is_one_json_line() {
         let p = parse(r#"{"hook_event_name":"Stop","session_id":"s","x":"a\nb"}"#).unwrap();
-        let f = to_frame(&p);
+        let f = to_frame(&p, None);
         assert!(f.ends_with('\n'));
         assert_eq!(
             f.matches('\n').count(),
@@ -348,5 +358,27 @@ mod tests {
         assert_eq!(v["kind"], "hook");
         assert_eq!(v["event"]["hook_event_name"], "Stop");
         assert_eq!(v["event"]["x"], "a\nb");
+    }
+
+    #[test]
+    fn frame_without_agent_id_has_no_key() {
+        let p = parse(r#"{"hook_event_name":"Stop","session_id":"s"}"#).unwrap();
+        let v: Value = serde_json::from_str(to_frame(&p, None).trim_end()).unwrap();
+        assert!(v.as_object().unwrap().get("agent_id").is_none());
+        assert!(!to_frame(&p, None).contains("agent_id"));
+    }
+
+    #[test]
+    fn frame_with_agent_id_carries_it_at_top_level() {
+        // A SubagentStop event has its own `agent_id` inside `event`; the two must not collide.
+        let p = parse(r#"{"hook_event_name":"SubagentStop","session_id":"s","agent_id":"sub-7"}"#)
+            .unwrap();
+        let f = to_frame(&p, Some("abc"));
+        assert!(f.contains(r#""agent_id":"abc""#), "{f}");
+        let v: Value = serde_json::from_str(f.trim_end()).unwrap();
+        assert_eq!(v["agent_id"], "abc");
+        assert_eq!(v["event"]["agent_id"], "sub-7");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["kind"], "hook");
     }
 }
