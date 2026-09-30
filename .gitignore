@@ -15,3 +15,6 @@ src-tauri/gen/schemas/
 .DS_Store
 *.log
 .env
+
+# hook exe copied into the bundle resources by beforeBuildCommand
+src-tauri/resources/*.exe

@@ -1,0 +1,16 @@
+[package]
+name = "mira-hook"
+version = "0.1.0"
+edition = "2021"
+description = "Hook relay for mira-bots: forwards Claude Code hook events to the app over a named pipe"
+license = "MIT"
+
+[lib]
+name = "mira_hook"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mira-hook"
+path = "src/main.rs"
+
+[dependencies]
