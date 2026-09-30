@@ -1,0 +1,1 @@
+{"session_id":"sess-1","cwd":"C:\\work\\demo","permission_mode":"default","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"npm test","description":"run tests"},"tool_use_id":"toolu_2"}

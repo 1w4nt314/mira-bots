@@ -1,0 +1,20 @@
+[package]
+name = "mira-hook"
+version = "0.1.0"
+edition = "2021"
+description = "Hook relay for mira-bots: forwards Claude Code hook events to the app over a named pipe"
+license = "MIT"
+
+# The size-optimised release profile (opt-level "s", lto, panic = "abort", strip) lives in the
+# workspace root Cargo.toml: cargo ignores [profile] sections in workspace members.
+
+[lib]
+name = "mira_hook"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mira-hook"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
