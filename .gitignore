@@ -1,0 +1,17 @@
+# orchestration scratch
+.orch/
+
+# node
+node_modules/
+dist/
+
+# rust
+target/
+
+# tauri
+src-tauri/gen/schemas/
+
+# misc
+.DS_Store
+*.log
+.env
