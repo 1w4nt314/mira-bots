@@ -8,6 +8,7 @@ pub mod permissions;
 pub mod pipe;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -100,7 +101,10 @@ pub fn tauri_sink(
             }
         }
         SinkEvent::Exited { agent_id, code } => {
-            let known = lock(&manager).mark_exited(&agent_id, code).is_some();
+            let exited = lock(&manager).mark_exited(&agent_id, code);
+            let known = exited.is_some();
+            // Drop the PTY (ConPTY ClosePseudoConsole may block) only after the lock is released.
+            drop(exited);
             // Handlers waiting on these answer `none` and emit permission-resolved themselves.
             lock(&pending).remove_for_agent(&agent_id);
             if known {
@@ -128,12 +132,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     let pipe_name = pipe::protocol::pipe_name(std::process::id());
     let hook_exe = find_hook_exe(&handle);
-    let claude = find_claude();
     match &hook_exe {
         Some(p) => log::info!("hook exe: {}", p.display()),
         None => log::warn!("mira-hook not found; agents cannot be started (set MIRA_HOOK_EXE)"),
     }
-    if claude.is_none() {
+    // Only logged: the lookup is repeated on every get_app_info/spawn_agent.
+    if find_claude().is_none() {
         log::warn!("claude not found (set MIRA_CLAUDE_PATH)");
     }
 
@@ -154,6 +158,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let pending = Arc::new(Mutex::new(PendingPermissions::new()));
     let sink = tauri_sink(handle.clone(), Arc::clone(&manager), Arc::clone(&pending));
 
+    let pipe_ready = Arc::new(AtomicBool::new(false));
     let emit_handle = handle.clone();
     pipe::server::start(
         pipe_name.clone(),
@@ -166,19 +171,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }),
         },
+        Arc::clone(&pipe_ready),
     );
 
     app.manage(AppState {
         manager,
         pending,
         paths: AppPaths {
-            claude,
             hook_exe,
             hooks_json,
             pipe_name,
             data_dir,
         },
         island: IslandState::default(),
+        pipe_ready,
         sink,
     });
 

@@ -46,6 +46,8 @@ export interface AppInfo {
   pipeName: string;
   maxAgents: number;
   version: string;
+  /** False while the hook pipe is not listening; `spawn_agent` then refuses to start agents. */
+  pipeReady: boolean;
 }
 
 export interface AgentOutputPayload {

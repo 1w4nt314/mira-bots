@@ -4,6 +4,7 @@
 //! text. Locks are held briefly and never while emitting.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -19,11 +20,10 @@ use crate::hooks::settings::write_hooks_json;
 use crate::island::{self, IslandState};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 
-/// Locations resolved once in `setup`.
+/// Locations resolved once in `setup`. The `claude` binary is not cached: it is looked up again
+/// on every `get_app_info` and `spawn_agent` (cheap), so installing it while the app runs works.
 #[derive(Clone, Debug)]
 pub struct AppPaths {
-    /// `claude` binary, if found at startup (looked up again at spawn time when `None`).
-    pub claude: Option<PathBuf>,
     /// `mira-hook` binary; `None` disables spawning (`AgentError::HookExeNotFound`).
     pub hook_exe: Option<PathBuf>,
     /// `<data_dir>/hooks.json`, passed to `claude --settings`.
@@ -40,6 +40,9 @@ pub struct AppState {
     pub pending: Arc<Mutex<PendingPermissions>>,
     pub paths: AppPaths,
     pub island: IslandState,
+    /// Set by the pipe server once the pipe/socket exists; cleared if the server stops for good.
+    /// While false, `spawn_agent` refuses to start agents (their hooks would reach nothing).
+    pub pipe_ready: Arc<AtomicBool>,
     /// Receives PTY output/exit from the manager's threads (see `lib.rs::tauri_sink`).
     pub sink: EventSink,
 }
@@ -54,6 +57,8 @@ pub struct AppInfo {
     pub pipe_name: String,
     pub max_agents: usize,
     pub version: String,
+    /// Whether the pipe server is listening (see [`AppState::pipe_ready`]).
+    pub pipe_ready: bool,
 }
 
 /// `get_agent_output` result: same shape as the `agent-output` event payload.
@@ -68,14 +73,16 @@ fn path_string(p: &Option<PathBuf>) -> Option<String> {
 }
 
 impl AppState {
+    /// Recomputes the `claude` lookup on every call.
     pub fn app_info(&self) -> AppInfo {
         AppInfo {
-            claude_path: path_string(&self.paths.claude),
+            claude_path: path_string(&find_claude()),
             hook_exe: path_string(&self.paths.hook_exe),
             hooks_json: self.paths.hooks_json.to_string_lossy().into_owned(),
             pipe_name: self.paths.pipe_name.clone(),
             max_agents: MAX_WORK_AGENTS,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            pipe_ready: self.pipe_ready.load(Ordering::Acquire),
         }
     }
 
@@ -85,6 +92,15 @@ impl AppState {
         if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
             log::error!("emit {AGENTS_CHANGED}: {e}");
         }
+    }
+}
+
+/// Refuses to start agents while the pipe server is not listening.
+pub fn check_pipe_ready(ready: &AtomicBool) -> Result<(), AgentError> {
+    if ready.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(AgentError::PipeNotReady)
     }
 }
 
@@ -153,12 +169,8 @@ pub fn spawn_agent(
         .hook_exe
         .as_ref()
         .ok_or(AgentError::HookExeNotFound)?;
-    let claude = state
-        .paths
-        .claude
-        .clone()
-        .or_else(find_claude)
-        .ok_or(AgentError::ClaudeNotFound)?;
+    check_pipe_ready(&state.pipe_ready)?;
+    let claude = find_claude().ok_or(AgentError::ClaudeNotFound)?;
     // Rewrite hooks.json before every spawn (idempotent) so a moved hook exe is picked up.
     let hooks_json = write_hooks_json(&state.paths.data_dir, hook_exe).map_err(AgentError::Io)?;
     let ctx = SpawnContext {
@@ -192,7 +204,9 @@ pub fn remove_agent(
     state: State<'_, AppState>,
     agent_id: String,
 ) -> Result<(), String> {
-    lock(&state.manager).remove(&agent_id)?;
+    let pty = lock(&state.manager).remove(&agent_id)?;
+    // Close the pseudo terminal only after the manager lock is released (it may block).
+    drop(pty);
     state.emit_agents(&app);
     Ok(())
 }
@@ -365,11 +379,22 @@ mod tests {
             pipe_name: "pipe".into(),
             max_agents: 5,
             version: "0.1.0".into(),
+            pipe_ready: false,
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
             json!({"claudePath":null,"hookExe":"/h","hooksJson":"/d/hooks.json",
-                   "pipeName":"pipe","maxAgents":5,"version":"0.1.0"})
+                   "pipeName":"pipe","maxAgents":5,"version":"0.1.0","pipeReady":false})
         );
+    }
+
+    #[test]
+    fn spawn_is_refused_until_the_pipe_is_ready() {
+        let ready = AtomicBool::new(false);
+        let err = check_pipe_ready(&ready).unwrap_err();
+        assert!(matches!(err, AgentError::PipeNotReady));
+        assert!(String::from(err).starts_with("Hook-forbindelsen"));
+        ready.store(true, Ordering::Release);
+        assert!(check_pipe_ready(&ready).is_ok());
     }
 }

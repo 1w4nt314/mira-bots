@@ -102,11 +102,33 @@ pub fn expects_reply(event_name: &str) -> bool {
     event_name == "PermissionRequest"
 }
 
-/// Renders the newline-terminated pipe frame `{"v":1,"kind":"hook","event":{...}}`.
-pub fn to_frame(payload: &HookPayload) -> String {
-    let mut s = json!({"v": 1, "kind": "hook", "event": payload.json}).to_string();
+/// Frames larger than this (bytes, newline included) are re-rendered with `tool_input` replaced
+/// by `{"_truncated": true}`. Leaves headroom below the app's 1 MiB line limit.
+pub const MAX_FRAME_BYTES: usize = 900 * 1024;
+
+fn render_frame(event: &Value) -> String {
+    let mut s = json!({"v": 1, "kind": "hook", "event": event}).to_string();
     s.push('\n');
     s
+}
+
+/// Renders the newline-terminated pipe frame `{"v":1,"kind":"hook","event":{...}}`.
+///
+/// Strings are already capped by [`trim`], but a `tool_input` with very many elements can still
+/// exceed the app's line limit; if the frame is over [`MAX_FRAME_BYTES`], `tool_input` is replaced
+/// by `{"_truncated": true}` (all other fields, e.g. `tool_name`, are kept) so the status update
+/// and permission card still arrive.
+pub fn to_frame(payload: &HookPayload) -> String {
+    let frame = render_frame(&payload.json);
+    if frame.len() <= MAX_FRAME_BYTES {
+        return frame;
+    }
+    let mut event = payload.json.clone();
+    match event.get_mut("tool_input") {
+        Some(input) => *input = json!({"_truncated": true}),
+        None => return frame,
+    }
+    render_frame(&event)
 }
 
 #[cfg(test)]
@@ -264,6 +286,51 @@ mod tests {
         }
         assert!(expects_reply("PermissionRequest"));
         assert!(!expects_reply("PreToolUse"));
+    }
+
+    #[test]
+    fn oversized_tool_input_is_replaced_but_tool_name_kept() {
+        // 50 000 small edits: every string is short, but the frame is about 2 MiB.
+        let edits: Vec<Value> = (0..50_000)
+            .map(|i| json!({"old_string": format!("a{i}"), "new_string": "b"}))
+            .collect();
+        let raw = json!({
+            "hook_event_name": "PermissionRequest",
+            "session_id": "sess-1",
+            "cwd": "C:\\work",
+            "tool_name": "MultiEdit",
+            "tool_input": {"file_path": "src/x.rs", "edits": edits},
+        })
+        .to_string();
+        let mut p = parse(&raw).unwrap();
+        trim(&mut p.json);
+        assert!(render_frame(&p.json).len() > MAX_FRAME_BYTES);
+
+        let f = to_frame(&p);
+        assert!(f.len() <= MAX_FRAME_BYTES, "{}", f.len());
+        assert!(f.ends_with('\n'));
+        assert_eq!(f.matches('\n').count(), 1);
+        let v: Value = serde_json::from_str(f.trim_end()).unwrap();
+        assert_eq!(v["event"]["tool_input"], json!({"_truncated": true}));
+        assert_eq!(v["event"]["tool_name"], "MultiEdit");
+        assert_eq!(v["event"]["hook_event_name"], "PermissionRequest");
+        assert_eq!(v["event"]["session_id"], "sess-1");
+        assert_eq!(v["event"]["cwd"], "C:\\work");
+        // The payload itself is untouched.
+        assert_eq!(
+            p.json["tool_input"]["edits"].as_array().unwrap().len(),
+            50_000
+        );
+    }
+
+    #[test]
+    fn small_frames_keep_tool_input() {
+        let p = parse(
+            r#"{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(to_frame(&p).trim_end()).unwrap();
+        assert_eq!(v["event"]["tool_input"]["command"], "ls");
     }
 
     #[test]

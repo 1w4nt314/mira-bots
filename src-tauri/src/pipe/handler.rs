@@ -2,6 +2,7 @@
 //! for PermissionRequest, answer with one decision line.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -55,18 +56,46 @@ impl HandlerCtx {
     }
 }
 
+/// After the reply is written, how long to wait for the hook exe to close its end (it does so
+/// right after reading the line). Proves delivery before the server end is dropped.
+const REPLY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Reads one `\n`-terminated line of at most `MAX_PIPE_LINE` bytes (newline included).
+/// Logs (debug) why a line is rejected.
 async fn read_frame_line<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> Option<String> {
     let mut buf = Vec::new();
-    let n = r
+    let n = match r
         .take(MAX_PIPE_LINE as u64 + 1)
         .read_until(b'\n', &mut buf)
         .await
-        .ok()?;
-    if n == 0 || buf.len() > MAX_PIPE_LINE {
+    {
+        Ok(n) => n,
+        Err(e) => {
+            log::debug!("pipe: read failed after {} bytes: {e}; closing", buf.len());
+            return None;
+        }
+    };
+    if n == 0 {
+        log::debug!("pipe: client closed without sending a frame");
         return None;
     }
-    String::from_utf8(buf).ok()
+    if buf.len() > MAX_PIPE_LINE {
+        log::debug!(
+            "pipe: frame rejected: read {} bytes without a newline (limit {MAX_PIPE_LINE}); closing",
+            buf.len()
+        );
+        return None;
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log::debug!(
+                "pipe: frame of {} bytes is not UTF-8; closing",
+                e.as_bytes().len()
+            );
+            None
+        }
+    }
 }
 
 async fn write_reply<W: AsyncWrite + Unpin>(w: &mut W, decision: Decision) {
@@ -82,6 +111,25 @@ async fn write_reply<W: AsyncWrite + Unpin>(w: &mut W, decision: Decision) {
     }
 }
 
+/// Reads (and discards) until the client closes its end, for at most [`REPLY_DRAIN_TIMEOUT`].
+/// The hook exe closes right after reading the reply line, so EOF here means it got the line;
+/// only then is the server end dropped (Windows may discard unread bytes on `CloseHandle`).
+async fn drain_until_closed<R: AsyncRead + Unpin>(r: &mut R) {
+    let mut scratch = [0u8; 256];
+    let drained = tokio::time::timeout(REPLY_DRAIN_TIMEOUT, async {
+        loop {
+            match r.read(&mut scratch).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        log::debug!("pipe: client did not close within {REPLY_DRAIN_TIMEOUT:?} after the reply");
+    }
+}
+
 /// Handles one connection end to end. Never panics on bad input; just closes.
 ///
 /// Emits: `hook-event` for every valid frame; `agents-changed` on status changes;
@@ -94,7 +142,6 @@ where
 {
     let mut reader = BufReader::new(stream);
     let Some(line) = read_frame_line(&mut reader).await else {
-        log::debug!("pipe: empty, oversized or non-UTF-8 line; closing");
         return;
     };
     let ev = match protocol::parse_frame(&line)
@@ -138,19 +185,34 @@ where
         return;
     }
     let decision = match agent_id {
-        Some(id) => decide_permission(&ev, &id, &ctx).await,
-        None => Decision::None,
+        Some(id) => decide_permission(&ev, &id, &ctx, &mut stream).await,
+        None => Some(Decision::None),
     };
-    // TODO(windows-verify): the reply line reaches the hook exe before the server end of the
-    // named pipe is dropped (tokio's flush does not call FlushFileBuffers) (plan D.7/D.8).
+    let Some(decision) = decision else {
+        // The hook exe went away while we waited; nobody to answer.
+        return;
+    };
     write_reply(&mut stream, decision).await;
+    // TODO(windows-verify): the reply line reaches the hook exe before the server end of the
+    // named pipe is dropped (tokio's flush does not call FlushFileBuffers; we wait for the
+    // client's EOF instead) (plan D.7/D.8).
+    drain_until_closed(&mut stream).await;
 }
 
 /// Whitelist → allow now; UI not ready → none now; otherwise wait for the UI up to
 /// `PERMISSION_APP_DEADLINE` (108 s), then none.
+///
+/// While waiting, `client` is read so a hook exe that goes away (EOF or error) is noticed: the
+/// request is then resolved as `none`, `permission-resolved{none}` is emitted and `None` is
+/// returned (nothing is written back).
 // TODO(windows-verify): while this waits, Claude Code's own terminal dialog is NOT shown, and it
 // does appear after a `none` answer (research §1f, plan D.8).
-async fn decide_permission(ev: &HookEvent, agent_id: &str, ctx: &HandlerCtx) -> Decision {
+async fn decide_permission<C: AsyncRead + Unpin>(
+    ev: &HookEvent,
+    agent_id: &str,
+    ctx: &HandlerCtx,
+    client: &mut C,
+) -> Option<Decision> {
     let tool_name = ev.tool_name.clone().unwrap_or_default();
     let summary = summarize_tool_input(&tool_name, ev.tool_input.as_ref());
 
@@ -163,11 +225,11 @@ async fn decide_permission(ev: &HookEvent, agent_id: &str, ctx: &HandlerCtx) -> 
     };
     if whitelisted {
         apply_decision_status(ctx, agent_id, &tool_name, &summary, Decision::Allow);
-        return Decision::Allow;
+        return Some(Decision::Allow);
     }
     if !lock(&ctx.pending).is_ui_ready() {
         // The terminal takes over; status stays WaitingPermission.
-        return Decision::None;
+        return Some(Decision::None);
     }
 
     let created_at = now_ms();
@@ -185,14 +247,31 @@ async fn decide_permission(ev: &HookEvent, agent_id: &str, ctx: &HandlerCtx) -> 
     let mut rx = lock(&ctx.pending).insert(info.clone());
     ctx.emit(PERMISSION_REQUEST, &info);
 
-    let decision = tokio::select! {
-        d = &mut rx => d.unwrap_or(Decision::None),
-        _ = tokio::time::sleep(PERMISSION_APP_DEADLINE) => {
-            // Expire it. If the UI resolved it in the same instant, its answer is already in rx.
-            lock(&ctx.pending).resolve(&request_id, Decision::None);
-            rx.try_recv().unwrap_or(Decision::None)
+    let deadline = tokio::time::sleep(PERMISSION_APP_DEADLINE);
+    tokio::pin!(deadline);
+    let mut scratch = [0u8; 256];
+    // `Some(d)`: answer `d`; `None`: the client is gone.
+    let outcome = loop {
+        tokio::select! {
+            d = &mut rx => break Some(d.unwrap_or(Decision::None)),
+            _ = &mut deadline => {
+                // Expire it. If the UI resolved it in the same instant, its answer is already in rx.
+                lock(&ctx.pending).resolve(&request_id, Decision::None);
+                break Some(rx.try_recv().unwrap_or(Decision::None));
+            }
+            r = client.read(&mut scratch) => match r {
+                // The hook exe sends nothing after its frame; EOF or an error means it is gone
+                // (killed by Claude Code, agent stopped, dialog answered in the terminal).
+                Ok(0) | Err(_) => {
+                    lock(&ctx.pending).resolve(&request_id, Decision::None);
+                    break None;
+                }
+                // Unexpected bytes: ignore and keep waiting.
+                Ok(_) => {}
+            },
         }
     };
+    let decision = outcome.unwrap_or(Decision::None);
     ctx.emit(
         PERMISSION_RESOLVED,
         &PermissionResolvedPayload {
@@ -201,7 +280,7 @@ async fn decide_permission(ev: &HookEvent, agent_id: &str, ctx: &HandlerCtx) -> 
         },
     );
     apply_decision_status(ctx, agent_id, &tool_name, &summary, decision);
-    decision
+    outcome
 }
 
 /// allow → status of the tool, deny → Thinking, none → unchanged (WaitingPermission).
@@ -296,6 +375,8 @@ mod tests {
         client.write_all(line.as_bytes()).await.unwrap();
         let mut out = String::new();
         client.read_to_string(&mut out).await.unwrap();
+        // Like the hook exe: close right after reading the reply.
+        drop(client);
         task.await.unwrap();
         out
     }
@@ -388,6 +469,7 @@ mod tests {
 
         let mut out = String::new();
         client.read_to_string(&mut out).await.unwrap();
+        drop(client);
         task.await.unwrap();
         assert_eq!(reply_decision(&out), "allow");
         assert_eq!(h.status(), AgentStatus::Running);
@@ -417,6 +499,7 @@ mod tests {
             .unwrap();
         let mut out = String::new();
         client.read_to_string(&mut out).await.unwrap();
+        drop(client);
         task.await.unwrap();
         assert_eq!(reply_decision(&out), "deny");
         assert_eq!(h.status(), AgentStatus::Thinking);
@@ -528,7 +611,69 @@ mod tests {
         assert_eq!(gone.len(), 1);
         let mut out = String::new();
         client.read_to_string(&mut out).await.unwrap();
+        drop(client);
         task.await.unwrap();
         assert_eq!(reply_decision(&out), "none");
+    }
+
+    #[tokio::test]
+    async fn client_gone_while_waiting_resolves_none_without_reply() {
+        let h = harness(true);
+        let (mut client, task) = h.start();
+        client
+            .write_all(frame(fx::PERMISSION_REQUEST).as_bytes())
+            .await
+            .unwrap();
+        let id = wait_for_request(&h).await["requestId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(h.ctx.pending.lock().unwrap().list().len(), 1);
+        // The hook exe is killed while the card is shown.
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("handler must notice the client is gone")
+            .unwrap();
+        assert!(h.ctx.pending.lock().unwrap().list().is_empty());
+        assert_eq!(
+            h.emitted(PERMISSION_RESOLVED),
+            vec![json!({"requestId": id, "decision": "none"})]
+        );
+        assert_eq!(h.status(), AgentStatus::WaitingPermission);
+        // A late click from the UI now finds nothing.
+        assert!(h
+            .ctx
+            .pending
+            .lock()
+            .unwrap()
+            .resolve(&id, Decision::Allow)
+            .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_waits_for_client_close_at_most_2_s() {
+        let h = harness(false);
+        let (mut client, task) = h.start();
+        client
+            .write_all(frame(fx::PERMISSION_REQUEST).as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(reply_decision(&line), "none");
+        // The client keeps its end open: the handler gives up after REPLY_DRAIN_TIMEOUT.
+        let t0 = tokio::time::Instant::now();
+        task.await.unwrap();
+        let waited = t0.elapsed();
+        assert!(waited >= REPLY_DRAIN_TIMEOUT, "{waited:?}");
+        assert!(
+            waited <= REPLY_DRAIN_TIMEOUT + Duration::from_millis(100),
+            "{waited:?}"
+        );
+        drop(client);
     }
 }

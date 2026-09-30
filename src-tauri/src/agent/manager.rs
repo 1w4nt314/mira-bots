@@ -57,7 +57,16 @@ pub type EventSink = Arc<dyn Fn(SinkEvent) + Send + Sync>;
 #[derive(Clone, Debug)]
 pub struct SpawnRequest {
     pub cwd: PathBuf,
+    /// Optional first prompt, passed as claude's positional argument after the flags. A prompt
+    /// that starts with `-` (after leading whitespace) is refused with
+    /// [`AgentError::InvalidPrompt`] instead of being rewritten, since claude would parse it as a
+    /// flag. Empty/whitespace-only prompts are omitted.
     pub prompt: Option<String>,
+}
+
+/// Whether `prompt` would be parsed as a flag by claude (see [`SpawnRequest::prompt`]).
+fn prompt_looks_like_flag(prompt: Option<&str>) -> bool {
+    prompt.is_some_and(|p| p.trim_start().starts_with('-'))
 }
 
 #[derive(Clone, Debug)]
@@ -138,8 +147,8 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Starts `claude` in `req.cwd`. Checks, in order: agent limit, cwd is a directory,
-    /// claude binary exists.
+    /// Starts `claude` in `req.cwd`. Checks, in order: agent limit, prompt does not start with
+    /// `-`, cwd is a directory, claude binary exists.
     pub fn spawn(
         &mut self,
         req: SpawnRequest,
@@ -147,6 +156,9 @@ impl AgentManager {
         sink: EventSink,
     ) -> Result<AgentInfo, AgentError> {
         self.check_limit()?;
+        if prompt_looks_like_flag(req.prompt.as_deref()) {
+            return Err(AgentError::InvalidPrompt);
+        }
         if !req.cwd.is_dir() {
             return Err(AgentError::InvalidCwd);
         }
@@ -247,9 +259,15 @@ impl AgentManager {
         Ok(agent.info.clone())
     }
 
-    /// Records the exit reported by the waiter thread and drops the PTY (closing the pseudo
-    /// terminal, which also lets a ConPTY reader thread finish). Returns the updated info.
-    pub fn mark_exited(&mut self, id: &str, code: Option<i32>) -> Option<AgentInfo> {
+    /// Records the exit reported by the waiter thread and takes the PTY out of the agent.
+    /// Returns the updated info and the PTY handle, which the caller must drop **after** releasing
+    /// the manager lock: dropping it closes the pseudo terminal (ConPTY `ClosePseudoConsole` can
+    /// block until output is drained), which also lets a ConPTY reader thread finish.
+    pub fn mark_exited(
+        &mut self,
+        id: &str,
+        code: Option<i32>,
+    ) -> Option<(AgentInfo, Option<PtyHandle>)> {
         let agent = self.agents.get_mut(id)?;
         // Keep a known code if stop() raced ahead with None; otherwise take the reported one.
         let keep =
@@ -259,8 +277,8 @@ impl AgentManager {
         }
         agent.info.detail = None;
         agent.info.last_event_at = now_ms();
-        agent.pty = None;
-        Some(agent.info.clone())
+        let pty = agent.pty.take();
+        Some((agent.info.clone(), pty))
     }
 
     /// Kills every child (app exit / `quit_app`). Idempotent; errors are only logged.
@@ -274,16 +292,17 @@ impl AgentManager {
         }
     }
 
-    /// Removes an exited agent.
-    pub fn remove(&mut self, id: &str) -> Result<(), AgentError> {
+    /// Removes an exited agent. Returns its PTY handle if it still had one (stopped, waiter not
+    /// yet reported); like with [`Self::mark_exited`], drop it after releasing the manager lock.
+    pub fn remove(&mut self, id: &str) -> Result<Option<PtyHandle>, AgentError> {
         let agent = self.agents.get(id).ok_or(AgentError::NotFound)?;
         if !is_exited(&agent.info.status) {
             return Err(AgentError::StillRunning);
         }
         let session_id = agent.info.session_id.clone();
-        self.agents.remove(id);
+        let removed = self.agents.remove(id);
         self.by_session.remove(&session_id);
-        Ok(())
+        Ok(removed.and_then(|mut a| a.pty.take()))
     }
 
     pub fn write_input(&mut self, id: &str, bytes: &[u8]) -> Result<(), AgentError> {
@@ -471,6 +490,48 @@ mod tests {
     }
 
     #[test]
+    fn spawn_rejects_prompt_that_looks_like_a_flag() {
+        let mut m = AgentManager::new(5);
+        let c = ctx(PathBuf::from("/nope/claude"));
+        for prompt in [
+            "-p hi",
+            "--dangerously-skip-permissions",
+            "  -x",
+            "\t--print",
+        ] {
+            let req = SpawnRequest {
+                cwd: std::env::temp_dir(),
+                prompt: Some(prompt.into()),
+            };
+            assert!(
+                matches!(
+                    m.spawn(req, &c, null_sink()),
+                    Err(AgentError::InvalidPrompt)
+                ),
+                "{prompt:?}"
+            );
+        }
+        // A dash later in the prompt is fine (fails on the next check instead).
+        for prompt in [Some("fix -x flag"), Some("  "), None] {
+            let req = SpawnRequest {
+                cwd: std::env::temp_dir(),
+                prompt: prompt.map(str::to_string),
+            };
+            assert!(
+                matches!(
+                    m.spawn(req, &c, null_sink()),
+                    Err(AgentError::ClaudeNotFound)
+                ),
+                "{prompt:?}"
+            );
+        }
+        assert!(AgentError::InvalidPrompt
+            .to_string()
+            .starts_with("Prompten"));
+        assert!(m.list().is_empty());
+    }
+
+    #[test]
     fn spawn_rejects_missing_claude() {
         let mut m = AgentManager::new(5);
         let req = SpawnRequest {
@@ -516,15 +577,16 @@ mod tests {
         assert_eq!(info.status, AgentStatus::Exited { code: None });
         assert!(m.set_status(&id, AgentStatus::Thinking, None).is_none());
         assert_eq!(
-            m.mark_exited(&id, Some(3)).unwrap().status,
+            m.mark_exited(&id, Some(3)).unwrap().0.status,
             AgentStatus::Exited { code: Some(3) }
         );
         // A later None does not erase a known code.
         assert_eq!(
-            m.mark_exited(&id, None).unwrap().status,
+            m.mark_exited(&id, None).unwrap().0.status,
             AgentStatus::Exited { code: Some(3) }
         );
-        m.remove(&id).unwrap();
+        assert!(m.mark_exited("nope", None).is_none());
+        assert!(m.remove(&id).unwrap().is_none(), "fake agent has no PTY");
         assert!(m.list().is_empty());
         assert_eq!(m.agent_id_for_session("s"), None);
         assert!(matches!(m.remove(&id), Err(AgentError::NotFound)));
@@ -638,8 +700,18 @@ mod tests {
                 })
                 .collect();
             assert!(seqs.windows(2).all(|w| w[0] < w[1]));
-            let exited = m.mark_exited(&info.id, Some(3)).unwrap();
+            let (exited, pty) = m.mark_exited(&info.id, Some(3)).unwrap();
             assert_eq!(exited.status, AgentStatus::Exited { code: Some(3) });
+            assert!(pty.is_some(), "the PTY handle is handed to the caller");
+            assert_eq!(
+                m.get(&info.id).unwrap().status,
+                AgentStatus::Exited { code: Some(3) }
+            );
+            // Dropped here, outside any manager lock; a second report has nothing left to hand.
+            drop(pty);
+            let (_, again) = m.mark_exited(&info.id, None).unwrap();
+            assert!(again.is_none());
+            assert!(m.remove(&info.id).unwrap().is_none());
         }
 
         #[test]
@@ -674,7 +746,10 @@ mod tests {
             let stopped = m.stop(&info.id).unwrap();
             assert_eq!(stopped.status, AgentStatus::Exited { code: None });
             wait_for_exit(&events);
-            m.remove(&info.id).unwrap();
+            // mark_exited was not called (no Tauri sink here), so remove hands back the PTY.
+            let pty = m.remove(&info.id).unwrap();
+            assert!(pty.is_some());
+            assert!(m.get(&info.id).is_none());
         }
 
         #[test]

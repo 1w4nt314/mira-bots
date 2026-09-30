@@ -23,6 +23,12 @@ pub enum AgentError {
     ClaudeNotFound,
     #[error("Fandt ikke mira-hook — appen kan ikke lytte efter hook-events (sæt MIRA_HOOK_EXE)")]
     HookExeNotFound,
+    /// The pipe server is not listening, so hooks would reach nothing (F2).
+    #[error("Hook-forbindelsen er ikke klar — genstart mira-bots (se loggen)")]
+    PipeNotReady,
+    /// The initial prompt starts with `-` and would be parsed as a flag by claude.
+    #[error("Prompten må ikke starte med '-' (den ville blive læst som et flag)")]
+    InvalidPrompt,
     #[error("Agenten findes ikke")]
     NotFound,
     /// `remove` on an agent that has not exited (C.1 `remove_agent`).
