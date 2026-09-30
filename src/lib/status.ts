@@ -59,3 +59,8 @@ export function worstStatus(agents: AgentInfo[]): AgentStatusKind | null {
 export function isExited(a: AgentInfo): boolean {
   return a.status.kind === "exited";
 }
+
+/** Starting for a while without hook events: the backend set a hint in `detail` (plan item 7). */
+export function isStartingHint(a: AgentInfo): boolean {
+  return a.status.kind === "starting" && a.detail !== null;
+}

@@ -7,13 +7,6 @@ export default function NewAgentButton() {
   const { state, dispatch } = useStore();
   const [busy, setBusy] = useState(false);
 
-  // Keep the island open while a spawn is in flight.
-  const pinned = busy;
-  useEffect(() => {
-    dispatch({ type: "ui/pin", pinned });
-    return () => dispatch({ type: "ui/pin", pinned: false });
-  }, [pinned, dispatch]);
-
   // This button is only mounted while the island is open: refresh the app info each time it
   // opens, so a claude installed (or a pipe that became ready) while the app runs is picked up.
   useEffect(() => {
@@ -31,7 +24,8 @@ export default function NewAgentButton() {
   }, [dispatch]);
 
   const info = state.appInfo;
-  const running = state.agents.filter((a) => !isExited(a)).length;
+  // The island always spawns into a work seat, so only live work agents count against the limit.
+  const running = state.agents.filter((a) => a.seatKind === "work" && !isExited(a)).length;
   // A missing claude does not disable the button: the backend looks it up again on spawn and
   // its (Danish) error is shown if it is still missing.
   let disabledReason: string | null = null;
@@ -40,7 +34,7 @@ export default function NewAgentButton() {
   } else if (info !== null && !info.pipeReady) {
     disabledReason = "Hook-forbindelsen er ikke klar — genstart mira-bots";
   } else if (info !== null && running >= info.maxAgents) {
-    disabledReason = `Loft på ${info.maxAgents} agenter nået`;
+    disabledReason = `Loft på ${info.maxAgents} arbejdspladser nået`;
   }
   const pipeDown = info !== null && info.hookExe !== null && !info.pipeReady;
   const claudeHint =

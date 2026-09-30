@@ -24,8 +24,6 @@ export interface State {
   pending: PermissionRequestInfo[];
   /** Expanded by hovering the island. */
   expanded: boolean;
-  /** Keeps the island open (e.g. while the folder picker is showing). */
-  pinned: boolean;
   error: string | null;
   appInfo: AppInfo | null;
 }
@@ -36,7 +34,6 @@ export type Action =
   | { type: "permission/remove"; requestId: string }
   | { type: "ui/expand" }
   | { type: "ui/collapse" }
-  | { type: "ui/pin"; pinned: boolean }
   | { type: "error/set"; error: string | null }
   | { type: "appInfo/set"; appInfo: AppInfo };
 
@@ -44,7 +41,6 @@ export const initialState: State = {
   agents: [],
   pending: [],
   expanded: false,
-  pinned: false,
   error: null,
   appInfo: null,
 };
@@ -62,8 +58,6 @@ export function reducer(state: State, action: Action): State {
       return state.expanded ? state : { ...state, expanded: true };
     case "ui/collapse":
       return state.expanded ? { ...state, expanded: false } : state;
-    case "ui/pin":
-      return state.pinned === action.pinned ? state : { ...state, pinned: action.pinned };
     case "error/set":
       return { ...state, error: action.error };
     case "appInfo/set":
@@ -89,7 +83,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
     (async () => {
       try {
-        // Step 1 ignores `agent-output` (step 2 adds the xterm view).
+        // `agent-output` is consumed by AgentTerminal itself (workplace only).
         const subs = await Promise.all([
           onAgentsChanged((agents) => dispatch({ type: "agents/set", agents })),
           onPermissionRequest((request) => dispatch({ type: "permission/add", request })),
