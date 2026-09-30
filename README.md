@@ -46,7 +46,7 @@ Kendt risiko: installeren er ikke kodesigneret. Windows SmartScreen og Defender 
 
 ## Udvikling
 
-Kræver Rust (stable), Node 22 og, på Linux, Tauris systembiblioteker (`libwebkit2gtk-4.1-dev` m.fl.). `npm run tauri dev` kræver Windows.
+Kræver Rust (stable), Node 22 og, på Linux, Tauris systembiblioteker (`libwebkit2gtk-4.1-dev` m.fl.) samt `llvm` (giver `llvm-rc`, som krydstjekket mod Windows-target skal bruge). `npm run tauri dev` kræver Windows.
 
 ```
 npm ci
