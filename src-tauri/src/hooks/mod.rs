@@ -13,15 +13,13 @@ pub(crate) mod fixtures {
     pub const PRE_TOOL_USE: &str = include_str!("../../tests/fixtures/pre_tool_use.json");
     pub const PERMISSION_REQUEST: &str =
         include_str!("../../tests/fixtures/permission_request.json");
-    pub const PERMISSION_DENIED: &str =
-        include_str!("../../tests/fixtures/permission_denied.json");
+    pub const PERMISSION_DENIED: &str = include_str!("../../tests/fixtures/permission_denied.json");
     pub const POST_TOOL_USE: &str = include_str!("../../tests/fixtures/post_tool_use.json");
     pub const POST_TOOL_USE_FAILURE: &str =
         include_str!("../../tests/fixtures/post_tool_use_failure.json");
     pub const NOTIFICATION_PERMISSION: &str =
         include_str!("../../tests/fixtures/notification_permission.json");
-    pub const NOTIFICATION_IDLE: &str =
-        include_str!("../../tests/fixtures/notification_idle.json");
+    pub const NOTIFICATION_IDLE: &str = include_str!("../../tests/fixtures/notification_idle.json");
     pub const NOTIFICATION_OTHER: &str =
         include_str!("../../tests/fixtures/notification_other.json");
     pub const STOP: &str = include_str!("../../tests/fixtures/stop.json");

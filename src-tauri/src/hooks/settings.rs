@@ -124,8 +124,12 @@ mod tests {
 
     #[test]
     fn windows_path_uses_forward_slashes_without_quotes() {
-        let v = render_hooks_json(Path::new(r"C:\Program Files\mira-bots\resources\mira-hook.exe"));
-        let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        let v = render_hooks_json(Path::new(
+            r"C:\Program Files\mira-bots\resources\mira-hook.exe",
+        ));
+        let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
         assert_eq!(cmd, "C:/Program Files/mira-bots/resources/mira-hook.exe");
         assert!(!cmd.contains('"') && !cmd.contains('\\'));
     }
@@ -142,7 +146,10 @@ mod tests {
         // Second write overwrites and leaves no temp file behind.
         write_hooks_json(&dir, Path::new("/other/mira-hook")).unwrap();
         let read: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(read["hooks"]["Stop"][0]["hooks"][0]["command"], "/other/mira-hook");
+        assert_eq!(
+            read["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/other/mira-hook"
+        );
         let leftovers: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

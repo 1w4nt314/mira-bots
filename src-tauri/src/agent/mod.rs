@@ -21,6 +21,8 @@ pub enum AgentError {
     InvalidCwd,
     #[error("Fandt ikke claude — installer Claude Code eller sæt MIRA_CLAUDE_PATH")]
     ClaudeNotFound,
+    #[error("Fandt ikke mira-hook — appen kan ikke lytte efter hook-events (sæt MIRA_HOOK_EXE)")]
+    HookExeNotFound,
     #[error("Agenten findes ikke")]
     NotFound,
     /// `remove` on an agent that has not exited (C.1 `remove_agent`).

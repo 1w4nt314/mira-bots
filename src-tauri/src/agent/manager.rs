@@ -263,6 +263,17 @@ impl AgentManager {
         Some(agent.info.clone())
     }
 
+    /// Kills every child (app exit / `quit_app`). Idempotent; errors are only logged.
+    pub fn kill_all(&mut self) {
+        for (id, agent) in &mut self.agents {
+            if let Some(pty) = agent.pty.as_mut() {
+                if let Err(e) = pty.kill() {
+                    log::debug!("kill_all: agent {id}: {e}");
+                }
+            }
+        }
+    }
+
     /// Removes an exited agent.
     pub fn remove(&mut self, id: &str) -> Result<(), AgentError> {
         let agent = self.agents.get(id).ok_or(AgentError::NotFound)?;

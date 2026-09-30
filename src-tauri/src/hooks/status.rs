@@ -28,9 +28,7 @@ pub fn status_for_tool(tool_name: &str) -> AgentStatus {
         "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch"
         | "ToolSearch" => AgentStatus::Reading,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => AgentStatus::Editing,
-        "TodoWrite" | "AskUserQuestion" | "ExitPlanMode" | "EnterPlanMode" => {
-            AgentStatus::Thinking
-        }
+        "TodoWrite" | "AskUserQuestion" | "ExitPlanMode" | "EnterPlanMode" => AgentStatus::Thinking,
         // Bash, PowerShell, Task, Agent, Skill, mcp__* and everything unknown.
         _ => AgentStatus::Running,
     }
@@ -113,7 +111,10 @@ mod tests {
 
     #[test]
     fn apply_session_start_is_idle() {
-        assert_eq!(apply(&ev(fx::SESSION_START)), t(Some(AgentStatus::Idle), None));
+        assert_eq!(
+            apply(&ev(fx::SESSION_START)),
+            t(Some(AgentStatus::Idle), None)
+        );
     }
 
     #[test]
@@ -142,7 +143,11 @@ mod tests {
 
     #[test]
     fn apply_permission_denied_and_post_tool_are_thinking() {
-        for f in [fx::PERMISSION_DENIED, fx::POST_TOOL_USE, fx::POST_TOOL_USE_FAILURE] {
+        for f in [
+            fx::PERMISSION_DENIED,
+            fx::POST_TOOL_USE,
+            fx::POST_TOOL_USE_FAILURE,
+        ] {
             assert_eq!(apply(&ev(f)), t(Some(AgentStatus::Thinking), None));
         }
     }
@@ -166,7 +171,10 @@ mod tests {
     #[test]
     fn apply_stop_and_stop_failure_are_idle() {
         assert_eq!(apply(&ev(fx::STOP)), t(Some(AgentStatus::Idle), None));
-        assert_eq!(apply(&ev(fx::STOP_FAILURE)), t(Some(AgentStatus::Idle), None));
+        assert_eq!(
+            apply(&ev(fx::STOP_FAILURE)),
+            t(Some(AgentStatus::Idle), None)
+        );
     }
 
     #[test]
