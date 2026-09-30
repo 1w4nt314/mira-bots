@@ -104,6 +104,10 @@ pub fn tauri_sink(
                 seq,
                 data_base64: BASE64.encode(bytes),
             };
+            // emit_to only scopes by window label: a JS listener registered with listen() (target
+            // Any, the @tauri-apps/api default) in another window would receive this too. It works
+            // because the island never listens on `agent-output`; a future island listener must
+            // filter on its own (or be given a window-scoped listen), or the IPC load doubles.
             // TODO(windows-verify): emit_to a missing workplace window neither spams the log nor
             // loses data (the ring buffer covers it) (plan D.21).
             if let Err(e) = app.emit_to(workplace::LABEL, AGENT_OUTPUT, payload) {
@@ -154,12 +158,52 @@ fn log_plugin(level: log::LevelFilter) -> tauri::plugin::TauriPlugin<tauri::Wry>
         .build()
 }
 
-/// Panics go to the log file (a Windows GUI app has no stderr). Runs before the release
-/// profile's abort.
+/// File name of the emergency log in the system temp dir.
+const EMERGENCY_LOG_FILE: &str = "mira-bots-panic.log";
+
+/// Emergency file for failures that may happen before (or because of) the log plugin: a Windows
+/// GUI app has no stderr, so without this an early failure is a silent exit.
+fn emergency_log_path() -> PathBuf {
+    std::env::temp_dir().join(EMERGENCY_LOG_FILE)
+}
+
+/// One emergency line: `[<unix seconds>.<millis>] <message>` (no chrono dependency; the log file
+/// has the local time once it exists).
+fn format_emergency_line(since_epoch: std::time::Duration, message: &str) -> String {
+    format!(
+        "[{}.{:03}] {}\n",
+        since_epoch.as_secs(),
+        since_epoch.subsec_millis(),
+        message
+    )
+}
+
+/// Appends one timestamped line to `path`, creating the file if needed.
+fn write_emergency_line(path: &Path, message: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(format_emergency_line(now, message).as_bytes())
+}
+
+/// Best effort: a failure to write the emergency file has nowhere left to be reported.
+fn emergency_log(message: &str) {
+    let _ = write_emergency_line(&emergency_log_path(), message);
+}
+
+/// Panics go to the log (once the logger is up; `log` is a no-op before that) and always to the
+/// emergency file. Installed before the Tauri builder so it also covers plugin initialisation.
+/// Runs before the release profile's abort.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         log::error!("panic: {info}");
         log::logger().flush();
+        emergency_log(&format!("panic: {info}"));
     }));
 }
 
@@ -205,8 +249,8 @@ fn start_version_probe(slot: Arc<Mutex<VersionProbe>>) {
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    // The log plugin is already initialised (plugins run before setup).
-    install_panic_hook();
+    // The log plugin is already initialised (plugins run before setup); the panic hook was
+    // installed in run().
     log::info!(
         "mira-bots {} starting; log level {}",
         env!("CARGO_PKG_VERSION"),
@@ -318,8 +362,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run() {
+    // Before anything that can fail or panic, so even plugin initialisation leaves a trace.
+    install_panic_hook();
     let level = log_level_from_env(std::env::var(LOG_LEVEL_ENV).ok().as_deref());
-    let app = tauri::Builder::default()
+    let built = tauri::Builder::default()
         // Sets the global logger; nothing else may (env_logger was removed for this reason).
         .plugin(log_plugin(level))
         .plugin(tauri_plugin_dialog::init())
@@ -365,8 +411,19 @@ pub fn run() {
             commands::open_agent_folder,
             commands::open_log_dir,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building mira-bots");
+        .build(tauri::generate_context!());
+    // Plugin setup (the log plugin creates its directory and installs the global logger) runs
+    // inside build(). The Builder is consumed on failure and cannot be retried without the log
+    // plugin, so report to the emergency file and exit with a non-zero code: never silently.
+    let app = match built {
+        Ok(app) => app,
+        Err(e) => {
+            let message = format!("error while building mira-bots: {e}");
+            log::error!("{message}");
+            emergency_log(&message);
+            std::process::exit(1);
+        }
+    };
 
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
@@ -380,6 +437,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emergency_line_has_timestamp_and_message() {
+        let line = format_emergency_line(std::time::Duration::from_millis(1_234_567), "boom");
+        assert_eq!(line, "[1234.567] boom\n");
+    }
+
+    #[test]
+    fn emergency_file_is_created_and_appended_to() {
+        let dir = std::env::temp_dir().join(format!("mira-bots-emergency-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mira-bots-panic.log");
+        let _ = std::fs::remove_file(&path);
+        write_emergency_line(&path, "first").unwrap();
+        write_emergency_line(&path, "second").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with('[') && lines[0].ends_with("] first"));
+        assert!(lines[1].ends_with("] second"));
+        // A path that cannot be opened reports an error instead of panicking.
+        assert!(write_emergency_line(&dir.join("no/such/dir/x.log"), "x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emergency_log_lives_in_the_temp_dir() {
+        assert_eq!(
+            emergency_log_path(),
+            std::env::temp_dir().join(EMERGENCY_LOG_FILE)
+        );
+    }
 
     #[test]
     fn hook_exe_candidates_follow_the_lookup_order() {
