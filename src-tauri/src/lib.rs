@@ -7,6 +7,7 @@ pub mod hooks;
 pub mod island;
 pub mod permissions;
 pub mod pipe;
+pub mod tickets;
 pub mod workplace;
 
 use std::path::{Path, PathBuf};

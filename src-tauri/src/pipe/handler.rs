@@ -19,8 +19,7 @@ use crate::hooks::event::{self, summarize_tool_input, HookEvent};
 use crate::hooks::status::{self, status_for_tool, AgentStatus};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 
-/// Emits a Tauri event (`name`, JSON payload). In the app this wraps `app.emit`.
-pub type EmitFn = Arc<dyn Fn(&str, Value) + Send + Sync>;
+pub use crate::events::EmitFn;
 
 #[derive(Clone)]
 pub struct HandlerCtx {

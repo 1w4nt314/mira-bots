@@ -61,6 +61,41 @@ pub const STARTING_HINT_AFTER: Duration = Duration::from_secs(15);
 /// Detail shown while an agent is presumably waiting for an answer in its terminal (trust dialog).
 pub const STARTING_HINT_TEXT: &str = "Venter på svar i terminalen (fx godkendelse af mappen)";
 
+// --- Tickets (step 3) ---
+
+/// File name of the ticket store in the app data dir.
+pub const TICKETS_FILE: &str = "tickets.json";
+/// Current `schemaVersion` of `tickets.json`.
+pub const TICKETS_SCHEMA_VERSION: u32 = 1;
+/// Directory of the ticket files, relative to the agent's cwd. Always `/`-separated; join it
+/// component by component (see `tickets::prompt::ticket_dir`).
+pub const TICKET_DIR: &str = ".mira-bots/tickets";
+/// Length of a ticket's short id (first hex chars of the uuid without dashes).
+pub const TICKET_SHORT_ID_LEN: usize = 8;
+/// Maximum title length (chars) accepted when a ticket is created or updated.
+pub const TICKET_TITLE_MAX_CHARS: usize = 200;
+/// Maximum title length (chars) in the line typed into the agent's terminal.
+pub const TICKET_LINE_TITLE_MAX_CHARS: usize = 120;
+/// Maximum body length (chars).
+pub const TICKET_BODY_MAX_CHARS: usize = 20_000;
+/// Pause between an agent becoming idle and typing the next ticket line.
+pub const DISPATCH_DELAY_MS: u64 = 750;
+/// Pause between the typed line and the separate Enter (`\r`).
+pub const ENTER_DELAY_MS: u64 = 150;
+/// How long to wait for a delivery confirmation before Enter is sent once more.
+pub const CONFIRM_TIMEOUT_MS: u64 = 3_000;
+/// How long to wait after the extra Enter before the delivery counts as failed.
+pub const RETRY_TIMEOUT_MS: u64 = 5_000;
+/// Spawn with a ticket: how long after the first idle to wait for confirmation of the positional
+/// prompt before falling back to an ordinary PTY dispatch.
+pub const SPAWN_CONFIRM_TIMEOUT_MS: u64 = 8_000;
+/// Agent detail after an unconfirmed delivery.
+pub const DELIVERY_FAILED_TEXT: &str = "Kunne ikke aflevere ticket, se terminalen";
+/// Agent detail after a `StopFailure` while a ticket was in progress.
+pub const TURN_FAILED_TEXT: &str = "Turn fejlede, prøv igen eller skriv i terminalen";
+/// History note when queued/in-progress tickets go back to the backlog at startup.
+pub const RESTART_NOTE: &str = "app genstartet";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +116,31 @@ mod tests {
         assert_eq!(OUTPUT_RING_CAPACITY, 1_048_576);
         assert_eq!((PTY_COLS, PTY_ROWS), (120, 30));
         assert!(DEFAULT_TOOL_WHITELIST.is_empty());
+    }
+
+    #[test]
+    fn ticket_limits_match_the_plan() {
+        assert_eq!(TICKETS_FILE, "tickets.json");
+        assert_eq!(TICKETS_SCHEMA_VERSION, 1);
+        assert_eq!(TICKET_DIR, ".mira-bots/tickets");
+        assert_eq!(TICKET_SHORT_ID_LEN, 8);
+        assert_eq!(TICKET_TITLE_MAX_CHARS, 200);
+        assert_eq!(TICKET_LINE_TITLE_MAX_CHARS, 120);
+        assert_eq!(TICKET_BODY_MAX_CHARS, 20_000);
+        assert_eq!(DISPATCH_DELAY_MS, 750);
+        assert_eq!(ENTER_DELAY_MS, 150);
+        assert_eq!(CONFIRM_TIMEOUT_MS, 3_000);
+        assert_eq!(RETRY_TIMEOUT_MS, 5_000);
+        assert_eq!(SPAWN_CONFIRM_TIMEOUT_MS, 8_000);
+        assert_eq!(
+            DELIVERY_FAILED_TEXT,
+            "Kunne ikke aflevere ticket, se terminalen"
+        );
+        assert_eq!(
+            TURN_FAILED_TEXT,
+            "Turn fejlede, prøv igen eller skriv i terminalen"
+        );
+        assert_eq!(RESTART_NOTE, "app genstartet");
     }
 
     #[test]
