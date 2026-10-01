@@ -11,8 +11,12 @@ fn main() {
         .read_to_end(&mut input)
         .is_ok();
     if read_ok {
-        if let Some(out) = mira_hook::run(&input, mira_hook::transport::pipe_name_from_env(), debug)
-        {
+        if let Some(out) = mira_hook::run(
+            &input,
+            mira_hook::transport::pipe_name_from_env(),
+            mira_hook::agent_id_from_env(),
+            debug,
+        ) {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout.write_all(out.as_bytes());
             let _ = stdout.flush();

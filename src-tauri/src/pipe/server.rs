@@ -238,6 +238,8 @@ mod tests {
             manager: Arc::clone(&manager),
             pending: Arc::new(Mutex::new(PendingPermissions::new())),
             emit: Arc::new(|_: &str, _| {}),
+            stats: Arc::new(crate::diagnostics::HookStats::default()),
+            observer: None,
         };
         let name = std::env::temp_dir()
             .join(format!("mira-bots-test-{}.sock", uuid::Uuid::new_v4()))
@@ -257,7 +259,7 @@ mod tests {
         let pipe = name.clone();
         let stdout = tokio::task::spawn_blocking(move || {
             let input = br#"{"hook_event_name":"PermissionRequest","session_id":"sess-e2e","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
-            mira_hook::run(input, Some(pipe), false)
+            mira_hook::run(input, Some(pipe), None, false)
         })
         .await
         .unwrap();
@@ -273,10 +275,12 @@ mod tests {
         );
 
         let pipe = name.clone();
+        let agent_for_hook = agent.clone();
         let stdout = tokio::task::spawn_blocking(move || {
             mira_hook::run(
                 br#"{"hook_event_name":"Stop","session_id":"sess-e2e"}"#,
                 Some(pipe),
+                Some(agent_for_hook),
                 false,
             )
         })
@@ -305,6 +309,8 @@ mod tests {
             manager: Arc::new(Mutex::new(AgentManager::new(5))),
             pending: Arc::new(Mutex::new(PendingPermissions::new())),
             emit: Arc::new(|_: &str, _| {}),
+            stats: Arc::new(crate::diagnostics::HookStats::default()),
+            observer: None,
         };
         let name = std::env::temp_dir()
             .join(format!("mira-bots-no-such-dir-{}", uuid::Uuid::new_v4()))

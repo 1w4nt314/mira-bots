@@ -10,22 +10,31 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use super::protocol;
 use crate::agent::{now_ms, AgentManager};
 use crate::config::{MAX_PIPE_LINE, PERMISSION_APP_DEADLINE};
+use crate::diagnostics::{HookStats, LastHookEvent};
 use crate::events::{
-    HookEventPayload, PermissionResolvedPayload, AGENTS_CHANGED, HOOK_EVENT, PERMISSION_REQUEST,
-    PERMISSION_RESOLVED,
+    HookEventPayload, PermissionResolvedPayload, StatusEvent, AGENTS_CHANGED, HOOK_EVENT,
+    PERMISSION_REQUEST, PERMISSION_RESOLVED,
 };
 use crate::hooks::event::{self, summarize_tool_input, HookEvent};
 use crate::hooks::status::{self, status_for_tool, AgentStatus};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 
-/// Emits a Tauri event (`name`, JSON payload). In the app this wraps `app.emit`.
-pub type EmitFn = Arc<dyn Fn(&str, Value) + Send + Sync>;
+pub use crate::events::EmitFn;
+
+/// Told about every hook frame that matched an agent, after its status was applied (the app
+/// glue forwards it to the ticket dispatcher; the handler knows nothing about tickets). Called
+/// without any lock held; must not block.
+pub type StatusObserver = Arc<dyn Fn(StatusEvent) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct HandlerCtx {
     pub manager: Arc<Mutex<AgentManager>>,
     pub pending: Arc<Mutex<PendingPermissions>>,
     pub emit: EmitFn,
+    /// Frame counters for `get_diagnostics` (same `Arc` as `AppState::hook_stats`).
+    pub stats: Arc<HookStats>,
+    /// See [`StatusObserver`]; `None` in tests that do not care.
+    pub observer: Option<StatusObserver>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -46,13 +55,15 @@ impl HandlerCtx {
     }
 
     /// Sets status (lock released before emitting) and emits `agents-changed` if it changed.
-    fn set_status(&self, agent_id: &str, status: AgentStatus, detail: Option<String>) {
+    /// Returns whether it changed (i.e. whether `agents-changed` was emitted).
+    fn set_status(&self, agent_id: &str, status: AgentStatus, detail: Option<String>) -> bool {
         let changed = lock(&self.manager)
             .set_status(agent_id, status, detail)
             .is_some();
         if changed {
             self.emit_agents();
         }
+        changed
     }
 }
 
@@ -132,7 +143,11 @@ async fn drain_until_closed<R: AsyncRead + Unpin>(r: &mut R) {
 
 /// Handles one connection end to end. Never panics on bad input; just closes.
 ///
-/// Emits: `hook-event` for every valid frame; `agents-changed` on status changes;
+/// The frame is matched to an agent by its frame-level `agent_id` first, then by `session_id`
+/// ([`AgentManager::match_frame`]); a rebound session id is reported with `agents-changed`.
+///
+/// Emits: `hook-event` for every valid frame; `agents-changed` on status changes, session rebinds
+/// and when the Starting hint is cleared;
 /// for PermissionRequests that go to the UI, `permission-request` and later exactly one
 /// `permission-resolved` (so `respond_permission` must NOT emit `permission-resolved` itself;
 /// it only calls `PendingPermissions::resolve`).
@@ -144,11 +159,14 @@ where
     let Some(line) = read_frame_line(&mut reader).await else {
         return;
     };
-    let ev = match protocol::parse_frame(&line)
+    let (hint, ev) = match protocol::parse_frame(&line)
         .map_err(|e| e.to_string())
-        .and_then(|v| event::parse(&v).map_err(|e| format!("invalid hook event: {e}")))
-    {
-        Ok(ev) => ev,
+        .and_then(|f| {
+            event::parse(&f.event)
+                .map(|ev| (f.agent_id, ev))
+                .map_err(|e| format!("invalid hook event: {e}"))
+        }) {
+        Ok(v) => v,
         Err(e) => {
             log::warn!("pipe: {e}");
             return;
@@ -157,18 +175,57 @@ where
     let mut stream = reader.into_inner();
     let is_permission = ev.hook_event_name == "PermissionRequest";
 
-    let agent_id = lock(&ctx.manager).agent_id_for_session(&ev.session_id);
-    if let Some(id) = &agent_id {
-        let t = status::apply(&ev);
-        if let Some(status) = t.status {
-            ctx.set_status(id, status, t.detail);
+    // One lock: match (and possibly rebind) plus clearing the Starting hint. No emit under it.
+    let (found, hint_cleared) = {
+        let mut m = lock(&ctx.manager);
+        let found = m.match_frame(hint.as_deref(), &ev.session_id);
+        let cleared = found
+            .as_ref()
+            .is_some_and(|f| m.clear_starting_hint(&f.agent_id));
+        (found, cleared)
+    };
+    ctx.stats.record(
+        LastHookEvent {
+            name: ev.hook_event_name.clone(),
+            session_id: ev.session_id.clone(),
+            agent_id: hint.clone(),
+            at: now_ms(),
+        },
+        found.is_some(),
+    );
+    log::debug!(
+        "hook {} session={} agent_hint={hint:?} -> {found:?}",
+        ev.hook_event_name,
+        ev.session_id
+    );
+    let agent_id = found.as_ref().map(|f| f.agent_id.clone());
+    if let Some(f) = &found {
+        if f.rebound {
+            log::info!("agent {} rebound to session {}", f.agent_id, ev.session_id);
         }
-    } else {
-        log::debug!(
-            "pipe: {} for unknown session {}",
-            ev.hook_event_name,
-            ev.session_id
-        );
+        let t = status::apply(&ev);
+        let implied = t.status.clone();
+        let emitted = match t.status {
+            Some(status) => ctx.set_status(&f.agent_id, status, t.detail),
+            None => false,
+        };
+        // The UI must see the new sessionId / the cleared hint even without a status change.
+        if (f.rebound || hint_cleared) && !emitted {
+            ctx.emit_agents();
+        }
+        // Also when the status did not change: Stop/StopFailure/UserPromptSubmit matter to the
+        // dispatcher on their own (turn ended, delivery confirmed).
+        if let Some(observe) = &ctx.observer {
+            observe(StatusEvent {
+                agent_id: f.agent_id.clone(),
+                hook_event_name: ev.hook_event_name.clone(),
+                prompt: ev
+                    .prompt
+                    .clone()
+                    .filter(|_| ev.hook_event_name == "UserPromptSubmit"),
+                status: implied,
+            });
+        }
     }
     ctx.emit(
         HOOK_EVENT,
@@ -293,8 +350,12 @@ fn apply_decision_status(
 ) {
     let detail = (!summary.is_empty()).then(|| summary.to_string());
     match decision {
-        Decision::Allow => ctx.set_status(agent_id, status_for_tool(tool_name), detail),
-        Decision::Deny => ctx.set_status(agent_id, AgentStatus::Thinking, None),
+        Decision::Allow => {
+            ctx.set_status(agent_id, status_for_tool(tool_name), detail);
+        }
+        Decision::Deny => {
+            ctx.set_status(agent_id, AgentStatus::Thinking, None);
+        }
         Decision::None => {}
     }
 }
@@ -332,6 +393,8 @@ mod tests {
                 emit: Arc::new(move |name: &str, v: Value| {
                     sink.lock().unwrap().push((name.to_string(), v))
                 }),
+                stats: Arc::new(HookStats::default()),
+                observer: None,
             },
             events,
             agent,
@@ -367,6 +430,14 @@ mod tests {
     fn frame(event_json: &str) -> String {
         let ev: Value = serde_json::from_str(event_json).unwrap();
         format!("{}\n", json!({"v":1,"kind":"hook","event":ev}))
+    }
+
+    fn frame_with_agent(event_json: &str, agent_id: &str) -> String {
+        let ev: Value = serde_json::from_str(event_json).unwrap();
+        format!(
+            "{}\n",
+            json!({"v":1,"kind":"hook","agent_id":agent_id,"event":ev})
+        )
     }
 
     /// Sends one line and returns everything the handler wrote before closing.
@@ -573,7 +644,7 @@ mod tests {
             .unwrap();
         let mut p = mira_hook::payload::parse(fx::PERMISSION_REQUEST).unwrap();
         mira_hook::payload::trim(&mut p.json);
-        let out = round_trip(&h, &mira_hook::payload::to_frame(&p)).await;
+        let out = round_trip(&h, &mira_hook::payload::to_frame(&p, None)).await;
         let d = mira_hook::decision::parse_reply(&out);
         assert_eq!(d, mira_hook::decision::Decision::Allow);
         assert_eq!(
@@ -675,5 +746,141 @@ mod tests {
             "{waited:?}"
         );
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn agent_id_hint_maps_despite_unknown_session() {
+        let h = harness(true);
+        let ev = fx::PRE_TOOL_USE.replace("sess-1", "new-sess");
+        assert_eq!(round_trip(&h, &frame_with_agent(&ev, &h.agent)).await, "");
+        assert_eq!(h.status(), AgentStatus::Editing);
+        let info = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(info.session_id, "new-sess");
+        let lists = h.emitted(AGENTS_CHANGED);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0][0]["sessionId"], "new-sess");
+        assert_eq!(h.emitted(HOOK_EVENT)[0]["agentId"], json!(h.agent));
+        assert_eq!(h.ctx.stats.received(), 1);
+        assert_eq!(h.ctx.stats.unknown(), 0);
+        let last = h.ctx.stats.last_event().unwrap();
+        assert_eq!(last.agent_id.as_deref(), Some(h.agent.as_str()));
+        assert_eq!(last.session_id, "new-sess");
+
+        // Without a hint, the new session id now matches…
+        let ev = fx::STOP.replace("sess-1", "new-sess");
+        round_trip(&h, &frame(&ev)).await;
+        assert_eq!(h.status(), AgentStatus::Idle);
+        // …and the old one no longer does.
+        let before = h.emitted(AGENTS_CHANGED).len();
+        round_trip(&h, &frame(fx::PRE_TOOL_USE)).await;
+        assert_eq!(h.status(), AgentStatus::Idle);
+        assert_eq!(h.emitted(AGENTS_CHANGED).len(), before);
+        assert_eq!(h.ctx.stats.received(), 3);
+        assert_eq!(h.ctx.stats.unknown(), 1);
+    }
+
+    #[tokio::test]
+    async fn rebind_without_status_change_still_emits_agents() {
+        let h = harness(true);
+        h.ctx.manager.lock().unwrap().stop(&h.agent).unwrap();
+        let ev = fx::PRE_TOOL_USE.replace("sess-1", "after-clear");
+        round_trip(&h, &frame_with_agent(&ev, &h.agent)).await;
+        let lists = h.emitted(AGENTS_CHANGED);
+        assert_eq!(
+            lists.len(),
+            1,
+            "exited: no status change, but the rebind is shown"
+        );
+        assert_eq!(lists[0][0]["sessionId"], "after-clear");
+    }
+
+    #[tokio::test]
+    async fn unknown_hint_falls_back_to_session() {
+        let h = harness(true);
+        round_trip(&h, &frame_with_agent(fx::PRE_TOOL_USE, "nope")).await;
+        assert_eq!(h.status(), AgentStatus::Editing);
+        let info = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(info.session_id, "sess-1", "no rebind via session");
+        assert_eq!(h.emitted(HOOK_EVENT)[0]["agentId"], json!(h.agent));
+        assert_eq!((h.ctx.stats.received(), h.ctx.stats.unknown()), (1, 0));
+        assert_eq!(
+            h.ctx.stats.last_event().unwrap().agent_id.as_deref(),
+            Some("nope")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hint_no_session_counts_unknown() {
+        let h = harness(true);
+        let ev = fx::PERMISSION_REQUEST.replace("sess-1", "someone-else");
+        assert_eq!(reply_decision(&round_trip(&h, &frame(&ev)).await), "none");
+        assert_eq!(h.ctx.stats.received(), 1);
+        assert_eq!(h.ctx.stats.unknown(), 1);
+        let last = h.ctx.stats.last_event().unwrap();
+        assert_eq!(last.name, "PermissionRequest");
+        assert_eq!(last.session_id, "someone-else");
+        assert_eq!(last.agent_id, None);
+        assert!(h.ctx.pending.lock().unwrap().list().is_empty());
+        // Invalid frames are not counted.
+        round_trip(&h, "garbage\n").await;
+        assert_eq!(h.ctx.stats.received(), 1);
+    }
+
+    #[tokio::test]
+    async fn first_hook_event_clears_the_starting_hint() {
+        let h = harness(true);
+        {
+            let mut m = h.ctx.manager.lock().unwrap();
+            m.backdate(&h.agent, 20_000);
+            assert!(m.apply_starting_hint(&h.agent, now_ms()).is_some());
+        }
+        // An event that leaves the status unchanged still removes the hint.
+        let ev = r#"{"session_id":"sess-1","hook_event_name":"Notification","message":"x"}"#;
+        round_trip(&h, &frame(ev)).await;
+        let info = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(info.status, AgentStatus::Starting);
+        assert_eq!(info.detail, None);
+        assert_eq!(h.emitted(AGENTS_CHANGED).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn matched_frames_reach_the_status_observer() {
+        let mut h = harness(true);
+        let seen: Arc<Mutex<Vec<StatusEvent>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        h.ctx.observer = Some(Arc::new(move |ev| sink.lock().unwrap().push(ev)));
+        let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+        round_trip(&h, &frame(fx::STOP)).await;
+        assert_eq!(
+            take(),
+            vec![StatusEvent {
+                agent_id: h.agent.clone(),
+                hook_event_name: "Stop".into(),
+                prompt: None,
+                status: Some(AgentStatus::Idle),
+            }]
+        );
+        // A second Stop leaves the status unchanged but still reaches the observer.
+        round_trip(&h, &frame(fx::STOP)).await;
+        assert_eq!(take().len(), 1);
+
+        round_trip(&h, &frame(fx::USER_PROMPT_SUBMIT)).await;
+        let evs = take();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].hook_event_name, "UserPromptSubmit");
+        assert_eq!(evs[0].prompt.as_deref(), Some("fix the bug"));
+        assert_eq!(evs[0].status, Some(AgentStatus::Thinking));
+
+        // A notification without a status change is reported with `status: None`.
+        round_trip(&h, &frame(fx::NOTIFICATION_OTHER)).await;
+        let evs = take();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].status, None);
+
+        // Unknown session: no agent, no observer call.
+        let ev = fx::STOP.replace("sess-1", "someone-else");
+        round_trip(&h, &frame(&ev)).await;
+        assert!(take().is_empty());
     }
 }

@@ -1,7 +1,16 @@
 //! Names and payloads of the Tauri events emitted from Rust to the frontend.
 //! All payloads are camelCase on the wire.
 
-use serde::Serialize;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::hooks::status::AgentStatus;
+
+/// Emits a Tauri event (`name`, JSON payload). In the app this wraps `app.emit`.
+/// (Moved here from `pipe::handler`, which re-exports it, so `tickets` can use it too.)
+pub type EmitFn = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
 /// Full agent list (`AgentInfo[]`) after any change.
 pub const AGENTS_CHANGED: &str = "agents-changed";
@@ -13,6 +22,34 @@ pub const PERMISSION_REQUEST: &str = "permission-request";
 pub const PERMISSION_RESOLVED: &str = "permission-resolved";
 /// Debug/step-2 feed of hook events (`HookEventPayload`).
 pub const HOOK_EVENT: &str = "hook-event";
+/// Select an agent in an already open workplace window (payload: agent id string). Only sent to
+/// the `workplace` window.
+pub const WORKPLACE_SELECT: &str = "workplace-select";
+/// Full ticket list (`TicketSummary[]`, without history) after any ticket mutation.
+pub const TICKETS_CHANGED: &str = "tickets-changed";
+
+/// Payload of `workplace-select` and the result of `take_workplace_selection`: which agent and/or
+/// sidebar tab the workplace window should show (`tab`: "permissions" | "diagnostics" |
+/// "tickets").
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkplaceSelection {
+    pub agent_id: Option<String>,
+    pub tab: Option<String>,
+}
+
+/// In-process notification (not a Tauri event) from the pipe handler after a hook frame was
+/// matched to an agent and applied: what happened and the status it implied. Lives here, in a
+/// module both `pipe` and `tickets` may import, so `pipe` never depends on `tickets`.
+/// `prompt` is only set for `UserPromptSubmit` and must never be logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusEvent {
+    pub agent_id: String,
+    pub hook_event_name: String,
+    pub prompt: Option<String>,
+    /// `None`: the event left the status unchanged.
+    pub status: Option<AgentStatus>,
+}
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +91,26 @@ mod tests {
         assert_eq!(PERMISSION_REQUEST, "permission-request");
         assert_eq!(PERMISSION_RESOLVED, "permission-resolved");
         assert_eq!(HOOK_EVENT, "hook-event");
+        assert_eq!(WORKPLACE_SELECT, "workplace-select");
+        assert_eq!(TICKETS_CHANGED, "tickets-changed");
+    }
+
+    #[test]
+    fn workplace_selection_is_camel_case() {
+        let sel = WorkplaceSelection {
+            agent_id: Some("a".into()),
+            tab: Some("tickets".into()),
+        };
+        let v = serde_json::to_value(&sel).unwrap();
+        assert_eq!(v, json!({"agentId":"a","tab":"tickets"}));
+        assert_eq!(
+            serde_json::from_value::<WorkplaceSelection>(v).unwrap(),
+            sel
+        );
+        assert_eq!(
+            serde_json::to_value(WorkplaceSelection::default()).unwrap(),
+            json!({"agentId":null,"tab":null})
+        );
     }
 
     #[test]

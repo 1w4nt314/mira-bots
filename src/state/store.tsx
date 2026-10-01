@@ -12,22 +12,24 @@ import {
   getAppInfo,
   listAgents,
   listPendingPermissions,
+  listTickets,
   onAgentsChanged,
   onPermissionRequest,
   onPermissionResolved,
+  onTicketsChanged,
   uiReady,
 } from "../lib/ipc";
-import type { AgentInfo, AppInfo, PermissionRequestInfo } from "../lib/types";
+import type { AgentInfo, AppInfo, PermissionRequestInfo, TicketSummary } from "../lib/types";
 
 export interface State {
   agents: AgentInfo[];
   pending: PermissionRequestInfo[];
   /** Expanded by hovering the island. */
   expanded: boolean;
-  /** Keeps the island open (e.g. while the folder picker is showing). */
-  pinned: boolean;
   error: string | null;
   appInfo: AppInfo | null;
+  /** All tickets without history (`tickets-changed` replaces the whole list). */
+  tickets: TicketSummary[];
 }
 
 export type Action =
@@ -36,17 +38,17 @@ export type Action =
   | { type: "permission/remove"; requestId: string }
   | { type: "ui/expand" }
   | { type: "ui/collapse" }
-  | { type: "ui/pin"; pinned: boolean }
   | { type: "error/set"; error: string | null }
-  | { type: "appInfo/set"; appInfo: AppInfo };
+  | { type: "appInfo/set"; appInfo: AppInfo }
+  | { type: "tickets/set"; tickets: TicketSummary[] };
 
 export const initialState: State = {
   agents: [],
   pending: [],
   expanded: false,
-  pinned: false,
   error: null,
   appInfo: null,
+  tickets: [],
 };
 
 export function reducer(state: State, action: Action): State {
@@ -62,12 +64,12 @@ export function reducer(state: State, action: Action): State {
       return state.expanded ? state : { ...state, expanded: true };
     case "ui/collapse":
       return state.expanded ? { ...state, expanded: false } : state;
-    case "ui/pin":
-      return state.pinned === action.pinned ? state : { ...state, pinned: action.pinned };
     case "error/set":
       return { ...state, error: action.error };
     case "appInfo/set":
       return { ...state, appInfo: action.appInfo };
+    case "tickets/set":
+      return { ...state, tickets: action.tickets };
   }
 }
 
@@ -86,16 +88,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     const unlisteners: UnlistenFn[] = [];
+    // A `tickets-changed` that arrives before the initial `listTickets()` answer is newer.
+    let ticketsFromEvent = false;
 
     (async () => {
       try {
-        // Step 1 ignores `agent-output` (step 2 adds the xterm view).
+        // `agent-output` is consumed by AgentTerminal itself (workplace only).
         const subs = await Promise.all([
           onAgentsChanged((agents) => dispatch({ type: "agents/set", agents })),
           onPermissionRequest((request) => dispatch({ type: "permission/add", request })),
           onPermissionResolved((p) =>
             dispatch({ type: "permission/remove", requestId: p.requestId }),
           ),
+          onTicketsChanged((tickets) => {
+            ticketsFromEvent = true;
+            dispatch({ type: "tickets/set", tickets });
+          }),
         ]);
         if (cancelled) {
           for (const u of subs) u();
@@ -104,13 +112,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         unlisteners.push(...subs);
         // Only after the listeners exist: from now on permission requests go to this UI.
         await uiReady();
-        const [agents, pending, appInfo] = await Promise.all([
+        // Both windows load the tickets; the island only uses the review count.
+        const [agents, pending, appInfo, tickets] = await Promise.all([
           listAgents(),
           listPendingPermissions(),
           getAppInfo(),
+          listTickets(),
         ]);
         if (cancelled) return;
         dispatch({ type: "agents/set", agents });
+        if (!ticketsFromEvent) dispatch({ type: "tickets/set", tickets });
         for (const request of pending) dispatch({ type: "permission/add", request });
         dispatch({ type: "appInfo/set", appInfo });
       } catch (e) {
