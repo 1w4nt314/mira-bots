@@ -1,38 +1,73 @@
-//! The app side of the agents' MCP tools (plan4 punkt 7): every tool frame from `mira-mcp`
-//! ends here. This is the security boundary for what an agent can do to the tickets:
+//! The app side of the agents' MCP tools (plan4 punkt 7, plan5 punkt 13): every tool frame from
+//! `mira-mcp` ends here. This is the security boundary for what an agent can do:
 //!
 //! 1. the frame's `agent_id` must be a live agent (unknown or exited → "Ukendt agent");
-//! 2. the tool must be one of the five;
-//! 3. the arguments are read again with the same limits (mira-mcp validated them, but the app
+//! 2. the tool must be one of the fifteen ([`mira_mcp::tools::TOOL_NAMES`]);
+//! 3. the agent's roles (fixed at spawn, from the manager) must allow it
+//!    ([`mira_mcp::tools::is_allowed`], the one role matrix) → "Din rolle tillader ikke dette
+//!    værktøj", whatever mira-mcp showed;
+//! 4. the arguments are read again with the same limits (mira-mcp validated them, but the app
 //!    does not rely on that), titles/notes made one-line, bodies cleaned;
-//! 4. ownership: an agent can only submit its own ticket in progress;
-//! 5. `mira_create_ticket` is rate-limited per agent (in memory; reset at app restart).
+//! 5. ownership: an agent submits and reports only on its own ticket (or, as reviewer, on the
+//!    review it was given); a reviewer approves/rejects only tickets in review it was assigned,
+//!    never its own submission;
+//! 6. `mira_create_ticket` is rate-limited per agent (in memory; reset at app restart);
+//! 7. `mira_spawn_agent` goes through the same spawn path and seat limits as the UI
+//!    ([`SpawnPort`]).
 //!
 //! All ticket changes go through [`TicketsCtx::mutate`]/`read`, so saving, agent links and
-//! `tickets-changed`/`agents-changed` emits work exactly as for the UI. Locks: the manager lock
-//! and the service lock are taken one after the other, never together; the rate-limit lock is
-//! taken alone. Titles, bodies, summaries and notes are never logged.
+//! `tickets-changed`/`agents-changed` emits work exactly as for the UI. Locks: the manager lock,
+//! the service lock and the profile lock are taken one after the other, never together; the
+//! rate-limit lock is taken alone. Titles, bodies, summaries, notes and report texts are never
+//! logged.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use mira_mcp::tools as mcp_tools;
 use serde_json::{json, Map, Value};
 
-use super::model::{Ticket, TicketError};
+use super::model::{ReportAuthor, Ticket, TicketError, TicketReport, TicketState, WorkspaceRules};
 use super::prompt::{clean_body, one_line};
 use super::service::TicketService;
-use super::TicketsCtx;
-use crate::config::{AGENT_NOTE_MAX_CHARS, CREATE_TICKET_RATE_LIMIT, CREATE_TICKET_RATE_WINDOW_MS};
+use super::{validate_report, TicketsCtx};
+use crate::agent::roles::{wire_names, Role};
+use crate::agent::{AgentInfo, SeatKind};
+use crate::config::{
+    AGENT_NOTE_MAX_CHARS, CREATE_TICKET_RATE_LIMIT, CREATE_TICKET_RATE_WINDOW_MS,
+    REPORT_ON_SUBMIT_TITLE, REVIEW_NOTE_MAX_CHARS,
+};
 use crate::hooks::status::AgentStatus;
 use crate::pipe::protocol::{ToolFrame, ToolResult};
+use crate::profiles::ProfilesCtx;
 
 pub const UNKNOWN_AGENT: &str = "Ukendt agent";
 pub const NOTE_ERROR: &str = "note skal være en tekst på 1–120 tegn";
 pub const UNKNOWN_FILTER: &str = "Ukendt filter";
+/// The agent's roles do not allow the tool (plan5 C5.5; same text as mira-mcp's).
+pub const ROLE_DENIED: &str = mcp_tools::ROLE_DENIED;
+/// `assignTo` on `mira_create_ticket` without the coordinator role.
+pub const ONLY_COORDINATOR_ASSIGNS: &str = "Kun koordinator-rollen må tildele";
+/// No [`SpawnPort`] (tests, or the app is still starting).
+pub const SPAWN_UNAVAILABLE: &str = "Start af agenter er ikke tilgængelig";
 /// `mira_list_tickets` shows at most this many characters of each ticket's summary (then "…");
 /// `mira_get_ticket` has the full text. Keeps a list of any realistic length far below
 /// mira-mcp's `MAX_REPLY` (N1); the UI's `tickets-changed` still carries the full summary.
 pub const LIST_SUMMARY_MAX_CHARS: usize = 160;
+
+/// `mira_spawn_agent`'s request to the app's spawn path (`commands::spawn_for_tool`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnByProfile {
+    pub profile_id: String,
+    /// `None`: the profile's `defaultSeat`.
+    pub seat_kind: Option<SeatKind>,
+    /// A backlog ticket (full or short id) the new agent starts with.
+    pub first_ticket_id: Option<String>,
+}
+
+/// Starts an agent like the UI does (same checks and seat limits); set in `setup` as a closure
+/// over the `AppHandle`. Errors are the UI's Danish texts.
+pub type SpawnPort = Arc<dyn Fn(SpawnByProfile) -> Result<AgentInfo, String> + Send + Sync>;
 
 /// `s` cut to `max` characters with a trailing "…" (unchanged when it fits).
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -51,6 +86,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Shared by every pipe connection (one `Arc` in the tool handler closure).
 pub struct ToolsCtx {
     tickets: Arc<TicketsCtx>,
+    profiles: Arc<ProfilesCtx>,
+    spawn: Mutex<Option<SpawnPort>>,
     /// Per agent: Unix ms of its successful creates inside the rate-limit window.
     created: Mutex<HashMap<String, VecDeque<u64>>>,
 }
@@ -68,6 +105,20 @@ fn opt_str<'a>(
     }
 }
 
+/// An optional id argument, trimmed; blank counts as absent.
+fn opt_id<'a>(args: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>, String> {
+    Ok(
+        opt_str(args, key, &format!("{key} skal være en tekst på 1–64 tegn"))?
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )
+}
+
+/// A required id argument, trimmed.
+fn req_id<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
+    opt_id(args, key)?.ok_or_else(|| format!("{key} skal være en tekst på 1–64 tegn"))
+}
+
 /// `{"id","shortId","title","state","skipReview"}` (C4.4).
 fn created_json(t: &Ticket) -> Value {
     json!({
@@ -79,12 +130,36 @@ fn created_json(t: &Ticket) -> Value {
     })
 }
 
+/// The status kind as a plain string (`"idle"`, `"exited"`, …).
+fn status_kind(s: &AgentStatus) -> Value {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.get("kind").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// A review note: one line, at most [`REVIEW_NOTE_MAX_CHARS`].
+fn review_note(args: &Map<String, Value>) -> Result<String, String> {
+    let note = one_line(opt_str(args, "note", "note skal være en tekst")?.unwrap_or_default());
+    if note.chars().count() > REVIEW_NOTE_MAX_CHARS {
+        return Err(format!("note må højst være {REVIEW_NOTE_MAX_CHARS} tegn"));
+    }
+    Ok(note)
+}
+
 impl ToolsCtx {
-    pub fn new(tickets: Arc<TicketsCtx>) -> Self {
+    pub fn new(tickets: Arc<TicketsCtx>, profiles: Arc<ProfilesCtx>) -> Self {
         ToolsCtx {
             tickets,
+            profiles,
+            spawn: Mutex::new(None),
             created: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Installs the spawn path used by `mira_spawn_agent`.
+    pub fn set_spawn_port(&self, port: SpawnPort) {
+        *lock(&self.spawn) = Some(port);
     }
 
     /// Answers one tool frame. Never panics; every error is Danish text for the model.
@@ -104,34 +179,68 @@ impl ToolsCtx {
     }
 
     fn run(&self, frame: &ToolFrame, now: u64) -> Result<Value, String> {
-        let agent_id = self.live_agent(frame.agent_id.as_deref())?;
+        let agent = self.live_agent(frame.agent_id.as_deref())?;
         let empty = Map::new();
         let args = match &frame.args {
             Value::Object(m) => m,
             Value::Null => &empty,
             _ => return Err("Argumenterne skal være et objekt".into()),
         };
-        match frame.tool.as_str() {
-            "mira_create_ticket" => self.create(&agent_id, args, now),
-            "mira_list_tickets" => self.list(&agent_id, args),
-            "mira_get_ticket" => self.get(args),
-            "mira_submit_for_review" => self.submit(&agent_id, args, now),
-            "mira_update_status" => self.update_status(&agent_id, args, now),
+        let tool = frame.tool.as_str();
+        if !mcp_tools::is_known(tool) {
+            return Err(format!("Ukendt værktøj: {tool}"));
+        }
+        // The security boundary for role-bound tools (plan5 A.2): the roles the agent was
+        // spawned with, whatever mira-mcp listed.
+        if !mcp_tools::is_allowed(tool, &wire_names(&agent.roles)) {
+            log::info!(
+                "agent {} refused {tool}: not allowed for its roles",
+                agent.id
+            );
+            return Err(ROLE_DENIED.into());
+        }
+        let id = agent.id.as_str();
+        match tool {
+            mcp_tools::CREATE_TICKET => self.create(&agent, args, now),
+            mcp_tools::LIST_TICKETS => self.list(id, args),
+            mcp_tools::GET_TICKET => self.get(args),
+            mcp_tools::SUBMIT_FOR_REVIEW => self.submit(id, args, now),
+            mcp_tools::UPDATE_STATUS => self.update_status(id, args, now),
+            mcp_tools::GET_WORKSPACE_RULES => {
+                serde_json::to_value(WorkspaceRules::current()).map_err(|e| e.to_string())
+            }
+            mcp_tools::ADD_REPORT => self.add_report(id, args),
+            mcp_tools::GET_REPORT => self.get_report(args),
+            mcp_tools::APPROVE_TICKET => self.approve(&agent, args, now),
+            mcp_tools::REJECT_TICKET => self.reject(&agent, args, now),
+            mcp_tools::ASSIGN_TICKET => self.assign(&agent, args, now),
+            mcp_tools::UNASSIGN_TICKET => self.unassign(id, args, now),
+            mcp_tools::SPAWN_AGENT => self.spawn_agent(id, args),
+            mcp_tools::LIST_AGENTS => Ok(self.list_agents()),
+            mcp_tools::LIST_PROFILES => Ok(self.list_profiles()),
             other => Err(format!("Ukendt værktøj: {other}")),
         }
     }
 
-    /// The agent id if it names an agent that has not exited (manager lock, briefly).
-    fn live_agent(&self, agent_id: Option<&str>) -> Result<String, String> {
+    /// The agent if `agent_id` names one that has not exited (manager lock, briefly).
+    fn live_agent(&self, agent_id: Option<&str>) -> Result<AgentInfo, String> {
         let id = agent_id.filter(|s| !s.is_empty()).ok_or(UNKNOWN_AGENT)?;
-        let live = lock(&self.tickets.manager)
+        lock(&self.tickets.manager)
             .get(id)
-            .is_some_and(|a| !matches!(a.status, AgentStatus::Exited { .. }));
-        if live {
-            Ok(id.to_string())
-        } else {
-            Err(UNKNOWN_AGENT.into())
-        }
+            .filter(|a| !matches!(a.status, AgentStatus::Exited { .. }))
+            .ok_or_else(|| UNKNOWN_AGENT.into())
+    }
+
+    /// Another agent by id, live (manager lock, briefly); "Agenten kører ikke" otherwise.
+    fn target_agent(&self, agent_id: &str) -> Result<AgentInfo, String> {
+        lock(&self.tickets.manager)
+            .get(agent_id)
+            .filter(|a| !matches!(a.status, AgentStatus::Exited { .. }))
+            .ok_or_else(|| TicketError::AgentNotLive.into())
+    }
+
+    fn is_live(&self, agent_id: &str) -> bool {
+        self.target_agent(agent_id).is_ok()
     }
 
     /// See [`TicketsCtx::set_agent_detail`].
@@ -157,7 +266,13 @@ impl ToolsCtx {
         q.len()
     }
 
-    fn create(&self, agent_id: &str, args: &Map<String, Value>, now: u64) -> Result<Value, String> {
+    fn create(
+        &self,
+        agent: &AgentInfo,
+        args: &Map<String, Value>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let agent_id = agent.id.as_str();
         let title = one_line(opt_str(args, "title", "Titel må ikke være tom")?.unwrap_or_default());
         let body =
             clean_body(opt_str(args, "body", "body skal være en tekst")?.unwrap_or_default());
@@ -166,23 +281,48 @@ impl ToolsCtx {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("skipReview skal være true eller false".into()),
         };
+        // assignTo: only the coordinator role, only to a live agent (plan5 C5.5).
+        let assign_to = match opt_id(args, "assignTo")? {
+            Some(target) => {
+                if !agent.roles.contains(&Role::Coordinator) {
+                    return Err(ONLY_COORDINATOR_ASSIGNS.into());
+                }
+                Some(self.target_agent(target)?.id)
+            }
+            None => None,
+        };
         if self.recent_creates(agent_id, now) >= CREATE_TICKET_RATE_LIMIT {
             return Err(TicketError::RateLimited.into());
         }
-        let t = self
-            .tickets
-            .mutate(|s| s.create_by_agent(&title, body.trim(), skip_review, now))?;
+        let t = self.tickets.mutate(|s| {
+            s.create_by_agent(
+                &title,
+                body.trim(),
+                skip_review,
+                assign_to.as_deref().map(|a| (a, agent.name.as_str())),
+                now,
+            )
+        })?;
         lock(&self.created)
             .entry(agent_id.to_string())
             .or_default()
             .push_back(now);
         log::info!(
-            "agent {agent_id} created ticket {} (title {} chars, body {} chars)",
+            "agent {agent_id} created ticket {} (title {} chars, body {} chars){}",
             t.short_id(),
             t.title.chars().count(),
-            t.body.chars().count()
+            t.body.chars().count(),
+            assign_to
+                .as_deref()
+                .map(|a| format!(" for agent {a}"))
+                .unwrap_or_default()
         );
-        Ok(created_json(&t))
+        let mut v = created_json(&t);
+        if let (Some(target), Value::Object(m)) = (&assign_to, &mut v) {
+            m.insert("assigneeAgentId".into(), Value::String(target.clone()));
+            self.tickets.notify([target.as_str()]);
+        }
+        Ok(v)
     }
 
     fn list(&self, agent_id: &str, args: &Map<String, Value>) -> Result<Value, String> {
@@ -217,30 +357,83 @@ impl ToolsCtx {
         Ok(v)
     }
 
+    /// `mira_submit_for_review`, with an optional `report` written first (plan5 C5.5: nothing
+    /// is submitted when the report fails).
+    // TODO(windows-verify): `mira_submit_for_review` with `report` in one call puts the ticket in
+    // Review with the report visible (plan5 D.61).
     fn submit(&self, agent_id: &str, args: &Map<String, Value>, now: u64) -> Result<Value, String> {
         let summary_error = "summary skal være en tekst på 1–2000 tegn";
         let summary = opt_str(args, "summary", summary_error)?.unwrap_or_default();
-        let ticket_id = opt_str(args, "ticketId", "ticketId skal være en tekst på 1–64 tegn")?
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let ticket_id = opt_id(args, "ticketId")?;
+        let report = opt_str(args, "report", "report skal være en tekst på 1–20000 tegn")?;
+        let mut report_id = None;
+        if let Some(body) = report {
+            // The same checks as the submit, read-only, so a refused submit writes no report.
+            let summary_ok = summary.trim().chars().count();
+            if summary_ok == 0 || summary_ok > crate::config::TICKET_SUMMARY_MAX_CHARS {
+                return Err(summary_error.into());
+            }
+            let target = self.own_submittable(agent_id, ticket_id)?;
+            validate_report(REPORT_ON_SUBMIT_TITLE, body)?;
+            let r = self.tickets.add_report(
+                &target.id,
+                ReportAuthor::agent(agent_id),
+                REPORT_ON_SUBMIT_TITLE,
+                body,
+            )?;
+            report_id = Some(r.id);
+        }
         let t = self
             .tickets
             .mutate(|s| s.submit_by_agent(agent_id, ticket_id, summary, now))?;
-        // The queue may move on at the next idle.
+        // The queue may move on at the next idle; a review needs a reviewer.
         self.tickets.notify([agent_id]);
         self.tickets.clear_stale_detail(agent_id);
+        if t.state == TicketState::Review {
+            self.tickets.route_reviews();
+        }
         log::info!(
-            "agent {agent_id} submitted ticket {} -> {} (summary {} chars)",
+            "agent {agent_id} submitted ticket {} -> {} (summary {} chars, report {})",
             t.short_id(),
             t.state.as_str(),
-            t.summary.as_deref().map_or(0, |s| s.chars().count())
+            t.summary.as_deref().map_or(0, |s| s.chars().count()),
+            report_id.is_some()
         );
-        Ok(json!({
+        let mut v = json!({
             "id": t.id,
             "shortId": t.short_id(),
             "state": t.state,
             "summary": t.summary,
-        }))
+        });
+        if let (Some(r), Value::Object(m)) = (report_id, &mut v) {
+            m.insert("reportId".into(), Value::String(r));
+        }
+        Ok(v)
+    }
+
+    /// The ticket `mira_submit_for_review` would submit (same rules as
+    /// `TicketService::submit_by_agent`), read-only.
+    fn own_submittable(&self, agent_id: &str, ticket_id: Option<&str>) -> Result<Ticket, String> {
+        let t = match ticket_id {
+            Some(id) => {
+                let t = self
+                    .tickets
+                    .read(|s| s.get_by_any_id(id))
+                    .ok_or(TicketError::NotFound)?;
+                if t.assignee_agent_id.as_deref() != Some(agent_id) {
+                    return Err(TicketError::NotYours.into());
+                }
+                if t.state != TicketState::InProgress {
+                    return Err(TicketError::NotInProgress.into());
+                }
+                t
+            }
+            None => self
+                .tickets
+                .read(|s| s.current_for_agent(agent_id))
+                .ok_or(TicketError::NoTicketInProgress)?,
+        };
+        Ok(t)
     }
 
     fn update_status(
@@ -261,6 +454,254 @@ impl ToolsCtx {
             .mutate_if(|s| s.note_by_agent(agent_id, &note, now), Option::is_some)?;
         Ok(json!({"ok": true, "ticketId": t.map(|t| t.id)}))
     }
+
+    // ---- reports ----
+
+    /// `mira_add_report`: on the agent's own ticket (default: its ticket in progress), or as
+    /// reviewer on the ticket in review it was assigned.
+    fn add_report(&self, agent_id: &str, args: &Map<String, Value>) -> Result<Value, String> {
+        let title = opt_str(args, "title", "Titel må ikke være tom")?.unwrap_or_default();
+        let body = opt_str(args, "body", "Rapporten må ikke være tom")?.unwrap_or_default();
+        let t = match opt_id(args, "ticketId")? {
+            Some(id) => self
+                .tickets
+                .read(|s| s.get_by_any_id(id))
+                .ok_or(TicketError::NotFound)?,
+            None => self
+                .tickets
+                .read(|s| s.current_for_agent(agent_id))
+                .ok_or(TicketError::NoTicketInProgress)?,
+        };
+        let own = t.assignee_agent_id.as_deref() == Some(agent_id);
+        let reviewing = t.reviewer_agent_id.as_deref() == Some(agent_id);
+        if !own {
+            if reviewing && t.state != TicketState::Review {
+                return Err(TicketError::NotYourReview.into());
+            }
+            if !reviewing {
+                return Err(TicketError::NotYours.into());
+            }
+        }
+        let r: TicketReport =
+            self.tickets
+                .add_report(&t.id, ReportAuthor::agent(agent_id), title, body)?;
+        let mut v = serde_json::to_value(&r).map_err(|e| e.to_string())?;
+        if let Value::Object(m) = &mut v {
+            m.insert("ticketId".into(), Value::String(t.id.clone()));
+        }
+        Ok(v)
+    }
+
+    /// `mira_get_report`: any agent may read any report.
+    fn get_report(&self, args: &Map<String, Value>) -> Result<Value, String> {
+        let ticket_id = req_id(args, "ticketId")?;
+        let report_id = opt_str(args, "reportId", "reportId skal være en tekst på 1–8 tegn")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("reportId skal være en tekst på 1–8 tegn")?;
+        let c = self.tickets.get_report(ticket_id, report_id)?;
+        serde_json::to_value(&c).map_err(|e| e.to_string())
+    }
+
+    // ---- reviewer ----
+
+    // TODO(windows-verify): mira_approve_ticket sets Done, mira_reject_ticket puts the ticket
+    // first in the coder's queue with round 1/3 (plan5 D.54).
+    fn approve(
+        &self,
+        agent: &AgentInfo,
+        args: &Map<String, Value>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let id = req_id(args, "id")?;
+        let note = review_note(args)?;
+        let t = self
+            .tickets
+            .mutate(|s| s.approve_by_agent(&agent.id, &agent.name, id, Some(&note), now))?;
+        self.tickets
+            .notify(t.assignee_agent_id.iter().map(String::as_str));
+        log::info!("agent {} approved ticket {}", agent.id, t.short_id());
+        Ok(json!({"id": t.id, "shortId": t.short_id(), "state": "done"}))
+    }
+
+    fn reject(
+        &self,
+        agent: &AgentInfo,
+        args: &Map<String, Value>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let id = req_id(args, "id")?;
+        let note = review_note(args)?;
+        if note.is_empty() {
+            return Err(TicketError::NeedsNote.into());
+        }
+        let sender = self
+            .tickets
+            .read(|s| s.get_by_any_id(id))
+            .and_then(|t| t.assignee_agent_id);
+        let sender_live = sender.as_deref().is_some_and(|a| self.is_live(a));
+        let t = self
+            .tickets
+            .mutate(|s| s.reject_by_agent(&agent.id, &agent.name, id, &note, sender_live, now))?;
+        self.tickets.notify(sender.iter().map(String::as_str));
+        self.tickets.route_reviews();
+        log::info!(
+            "agent {} rejected ticket {} (round {})",
+            agent.id,
+            t.short_id(),
+            t.review_round
+        );
+        // C5.5: "rejected" while it waits (first in the sender's queue), else "backlog".
+        let state = if t.state == TicketState::Backlog {
+            "backlog"
+        } else {
+            "rejected"
+        };
+        Ok(json!({
+            "id": t.id,
+            "shortId": t.short_id(),
+            "state": state,
+            "reviewRound": t.review_round,
+            "escalated": t.escalated,
+        }))
+    }
+
+    // ---- coordinator ----
+
+    fn assign(
+        &self,
+        agent: &AgentInfo,
+        args: &Map<String, Value>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let id = req_id(args, "id")?;
+        let target = self.target_agent(req_id(args, "agentId")?)?;
+        let t = self
+            .tickets
+            .mutate(|s| s.assign_by_agent(id, &target.id, &agent.name, now))?;
+        self.tickets.notify([target.id.as_str()]);
+        log::info!(
+            "agent {} assigned ticket {} to agent {}",
+            agent.id,
+            t.short_id(),
+            target.id
+        );
+        Ok(json!({
+            "id": t.id,
+            "shortId": t.short_id(),
+            "state": t.state,
+            "assigneeAgentId": t.assignee_agent_id,
+            "queuePosition": t.queue_position,
+        }))
+    }
+
+    fn unassign(
+        &self,
+        agent_id: &str,
+        args: &Map<String, Value>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let id = req_id(args, "id")?;
+        let old = self
+            .tickets
+            .read(|s| s.get_by_any_id(id))
+            .and_then(|t| t.assignee_agent_id);
+        let t = self.tickets.mutate(|s| s.unassign_by_agent(id, now))?;
+        self.tickets.notify(old);
+        log::info!("agent {agent_id} unassigned ticket {}", t.short_id());
+        Ok(json!({"id": t.id, "shortId": t.short_id(), "state": t.state}))
+    }
+
+    // TODO(windows-verify): mira_spawn_agent respects the limits (a 6th work agent is refused
+    // with the Danish limit text) and mira_create_ticket with assignTo queues the ticket
+    // (plan5 D.57).
+    fn spawn_agent(&self, agent_id: &str, args: &Map<String, Value>) -> Result<Value, String> {
+        let profile_id = opt_str(
+            args,
+            "profileId",
+            "profileId skal være en tekst på 1–40 tegn",
+        )?
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("profileId skal være en tekst på 1–40 tegn")?;
+        let seat_kind = match opt_str(
+            args,
+            "seatKind",
+            "seatKind skal være \"work\" eller \"staff\"",
+        )?
+        .map(str::trim)
+        {
+            None => None,
+            Some("work") => Some(SeatKind::Work),
+            Some("staff") => Some(SeatKind::Staff),
+            Some(_) => return Err("seatKind skal være \"work\" eller \"staff\"".into()),
+        };
+        let first_ticket_id = opt_id(args, "firstTicketId")?.map(str::to_string);
+        if self.profiles.get(profile_id).is_none() {
+            return Err(crate::profiles::ProfileError::NotFound.into());
+        }
+        let port = lock(&self.spawn).clone().ok_or(SPAWN_UNAVAILABLE)?;
+        let info = port(SpawnByProfile {
+            profile_id: profile_id.to_string(),
+            seat_kind,
+            first_ticket_id,
+        })?;
+        log::info!(
+            "agent {agent_id} spawned agent {} from profile {}",
+            info.id,
+            info.profile_id
+        );
+        Ok(json!({
+            "agentId": info.id,
+            "name": info.name,
+            "cwd": info.cwd,
+            "profileId": info.profile_id,
+            "seatKind": info.seat_kind,
+        }))
+    }
+
+    fn list_agents(&self) -> Value {
+        let agents: Vec<Value> = lock(&self.tickets.manager)
+            .list()
+            .into_iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "name": a.name,
+                    "cwd": a.cwd,
+                    "profileId": a.profile_id,
+                    "profileName": a.profile_name,
+                    "roles": a.roles,
+                    "seatKind": a.seat_kind,
+                    "status": status_kind(&a.status),
+                    "currentTicketId": a.current_ticket_id,
+                    "queueLength": a.queue_length,
+                    "openReviews": a.open_reviews,
+                })
+            })
+            .collect();
+        json!({ "agents": agents })
+    }
+
+    fn list_profiles(&self) -> Value {
+        let profiles: Vec<Value> = self
+            .profiles
+            .list()
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "roles": p.roles,
+                    "specialist": p.is_specialist(),
+                    "defaultSeat": p.default_seat,
+                    "model": p.model,
+                    "effort": p.effort,
+                })
+            })
+            .collect();
+        json!({ "profiles": profiles })
+    }
 }
 
 #[cfg(test)]
@@ -272,21 +713,51 @@ mod tests {
     use crate::tickets::dispatcher::DispatchMsg;
     use crate::tickets::model::{TicketActor, TicketIssue, TicketSource, TicketState};
     use crate::tickets::test_support::{test_ctx, TestCtx};
+    use mira_mcp::tools::ALL_TOOL_NAMES;
 
     struct T {
         tc: TestCtx,
         tools: ToolsCtx,
         a: String,
         b: String,
+        /// Reviewer (staff).
+        r: String,
+        /// Coordinator (staff).
+        k: String,
+        profiles_dir: std::path::PathBuf,
+    }
+
+    impl Drop for T {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.profiles_dir);
+            let _ = std::fs::remove_dir_all(self.tc.ctx.reports.root());
+        }
     }
 
     fn setup() -> T {
         let mut m = AgentManager::new(5);
         let a = m.insert_fake("s-a", "/w/a");
         let b = m.insert_fake("s-b", "/w/b");
+        let r = m.insert_fake_with("s-r", "/w/r", &[Role::Reviewer], SeatKind::Staff);
+        let k = m.insert_fake_with("s-k", "/w/k", &[Role::Coordinator], SeatKind::Staff);
         let tc = test_ctx(Arc::new(Mutex::new(m)));
-        let tools = ToolsCtx::new(Arc::clone(&tc.ctx));
-        T { tc, tools, a, b }
+        let profiles_dir =
+            std::env::temp_dir().join(format!("mira-tools-profiles-{}", uuid::Uuid::new_v4()));
+        let emit: crate::events::EmitFn = Arc::new(|_: &str, _: Value| {});
+        let profiles = Arc::new(ProfilesCtx::new(
+            crate::profiles::ProfileStore::load(profiles_dir.clone(), 1),
+            emit,
+        ));
+        let tools = ToolsCtx::new(Arc::clone(&tc.ctx), profiles);
+        T {
+            tc,
+            tools,
+            a,
+            b,
+            r,
+            k,
+            profiles_dir,
+        }
     }
 
     impl T {
@@ -553,15 +1024,27 @@ mod tests {
         assert_eq!(now.state, TicketState::Review);
         assert_eq!(now.summary.as_deref(), Some("Rettet login"));
         assert_eq!(now.issue, None);
-        assert_eq!(now.history.last().unwrap().by, TicketActor::Agent);
+        let submit = &now.history[now.history.len() - 2];
+        assert_eq!(
+            (submit.by, submit.to),
+            (TicketActor::Agent, TicketState::Review)
+        );
+        // Then routed to the reviewer (plan5 A.6).
+        assert_eq!(now.reviewer_agent_id.as_deref(), Some(t.r.as_str()));
+        assert_eq!(now.history.last().unwrap().by, TicketActor::System);
         assert_eq!(
             t.tc.sent(),
-            vec![DispatchMsg::QueueChanged {
-                agent_id: t.a.clone()
-            }]
+            vec![
+                DispatchMsg::QueueChanged {
+                    agent_id: t.a.clone()
+                },
+                DispatchMsg::ReviewAssigned {
+                    reviewer_agent_id: t.r.clone()
+                }
+            ]
         );
         assert_eq!(t.detail(&t.a), None);
-        assert_eq!(t.tc.emitted(TICKETS_CHANGED).len(), 1);
+        assert_eq!(t.tc.emitted(TICKETS_CHANGED).len(), 2);
         assert!(!t.tc.emitted(AGENTS_CHANGED).is_empty());
     }
 
@@ -801,5 +1284,637 @@ mod tests {
         let tk = t.in_progress(&t.a, "x", false);
         t.tc.ctx.mutate(|s| s.mark_not_submitted(&t.a, 4)).unwrap();
         assert_eq!(t.ticket(&tk.id).issue, Some(TicketIssue::NotSubmitted));
+    }
+
+    // ---- step 5 (plan5 punkt 13) ----
+
+    impl T {
+        fn agent_with(&self, roles: &[Role], seat: SeatKind) -> String {
+            self.tc.ctx.manager.lock().unwrap().insert_fake_with(
+                &uuid::Uuid::new_v4().to_string(),
+                "/w/x",
+                roles,
+                seat,
+            )
+        }
+
+        /// A ticket submitted by `sender` and routed to `self.r`.
+        fn review_for_r(&self, sender: &str, title: &str) -> Ticket {
+            let t = self.in_progress(sender, title, false);
+            self.call(
+                Some(sender),
+                "mira_submit_for_review",
+                json!({"summary":"klar"}),
+                5,
+            )
+            .unwrap();
+            let t = self.ticket(&t.id);
+            assert_eq!(
+                t.reviewer_agent_id.as_deref(),
+                Some(self.r.as_str()),
+                "routed"
+            );
+            t
+        }
+    }
+
+    #[test]
+    fn role_tool_matrix_is_enforced() {
+        let t = setup();
+        const COMMON: [&str; 8] = [
+            "mira_create_ticket",
+            "mira_list_tickets",
+            "mira_get_ticket",
+            "mira_submit_for_review",
+            "mira_update_status",
+            "mira_get_workspace_rules",
+            "mira_add_report",
+            "mira_get_report",
+        ];
+        let table: [(&[Role], &[&str]); 8] = [
+            (&[], &[]),
+            (&[Role::Coder], &[]),
+            (&[Role::Researcher], &[]),
+            (&[Role::Planner], &[]),
+            (&[Role::Debugger], &[]),
+            (
+                &[Role::Reviewer],
+                &["mira_approve_ticket", "mira_reject_ticket"],
+            ),
+            (
+                &[Role::Coordinator],
+                &[
+                    "mira_assign_ticket",
+                    "mira_unassign_ticket",
+                    "mira_spawn_agent",
+                    "mira_list_agents",
+                    "mira_list_profiles",
+                ],
+            ),
+            (
+                &[Role::Reviewer, Role::Coordinator],
+                &[
+                    "mira_approve_ticket",
+                    "mira_reject_ticket",
+                    "mira_assign_ticket",
+                    "mira_unassign_ticket",
+                    "mira_spawn_agent",
+                    "mira_list_agents",
+                    "mira_list_profiles",
+                ],
+            ),
+        ];
+        assert_eq!(ALL_TOOL_NAMES.len(), 15);
+        for (roles, extra) in table {
+            let agent = t.agent_with(roles, SeatKind::Work);
+            for tool in ALL_TOOL_NAMES {
+                let allowed = COMMON.contains(&tool) || extra.contains(&tool);
+                let r = t.call(Some(&agent), tool, json!({}), 1);
+                if allowed {
+                    assert_ne!(r, Err(ROLE_DENIED.into()), "{roles:?} {tool}");
+                } else {
+                    assert_eq!(r, Err(ROLE_DENIED.into()), "{roles:?} {tool}");
+                }
+            }
+        }
+        // An unknown tool is still "Ukendt værktøj", before the role gate.
+        assert_eq!(
+            t.call(Some(&t.a), "mira_nope", json!({}), 1),
+            Err("Ukendt værktøj: mira_nope".into())
+        );
+    }
+
+    #[test]
+    fn approve_via_tool_rules() {
+        let t = setup();
+        let tk = t.review_for_r(&t.a, "Ret login");
+        // Not a reviewer at all.
+        assert_eq!(
+            t.call(Some(&t.a), "mira_approve_ticket", json!({"id": tk.id}), 6),
+            Err(ROLE_DENIED.into())
+        );
+        // A second reviewer that is not this ticket's reviewer.
+        let r2 = t.agent_with(&[Role::Reviewer], SeatKind::Staff);
+        assert_eq!(
+            t.call(
+                Some(&r2),
+                "mira_approve_ticket",
+                json!({"id": tk.short_id()}),
+                6
+            ),
+            Err("Du er ikke reviewer på denne ticket".into())
+        );
+        // Not in review.
+        let backlog = t.tc.ctx.mutate(|s| s.create("b", "", false, 1)).unwrap();
+        assert_eq!(
+            t.call(
+                Some(&t.r),
+                "mira_approve_ticket",
+                json!({"id": backlog.id}),
+                6
+            ),
+            Err("Ticketen er ikke i review".into())
+        );
+        // Its own submission (a reviewer that also submits work).
+        let own = t.in_progress(&t.r, "Eget", false);
+        t.call(
+            Some(&t.r),
+            "mira_submit_for_review",
+            json!({"summary":"x"}),
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            t.call(Some(&t.r), "mira_approve_ticket", json!({"id": own.id}), 6),
+            Err("Du kan ikke reviewe din egen aflevering".into())
+        );
+        assert_eq!(
+            t.call(Some(&t.r), "mira_approve_ticket", json!({"id": "nope"}), 6),
+            Err("Ticketen findes ikke".into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.r),
+                "mira_approve_ticket",
+                json!({"id": tk.id, "note": "n".repeat(2001)}),
+                6
+            ),
+            Err("note må højst være 2000 tegn".into())
+        );
+        let r = t
+            .call(
+                Some(&t.r),
+                "mira_approve_ticket",
+                json!({"id": tk.short_id(), "note": "Tests\nok"}),
+                7,
+            )
+            .unwrap();
+        assert_eq!(
+            r,
+            json!({"id": tk.id, "shortId": tk.short_id(), "state": "done"})
+        );
+        let done = t.ticket(&tk.id);
+        assert_eq!(done.state, TicketState::Done);
+        assert_eq!(done.history.last().unwrap().by, TicketActor::Agent);
+        assert!(done
+            .history
+            .last()
+            .unwrap()
+            .note
+            .as_deref()
+            .unwrap()
+            .ends_with(": Tests ok"));
+    }
+
+    #[test]
+    fn reject_via_tool_requires_note_and_requeues() {
+        let mut t = setup();
+        let first =
+            t.tc.ctx
+                .mutate(|s| s.create("først", "", false, 1))
+                .unwrap();
+        let tk = t.review_for_r(&t.a, "Ret login");
+        t.tc.ctx.mutate(|s| s.assign(&first.id, &t.a, 6)).unwrap();
+        t.tc.sent();
+        assert_eq!(
+            t.call(Some(&t.r), "mira_reject_ticket", json!({"id": tk.id}), 7),
+            Err("Afvisning kræver en note".into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.r),
+                "mira_reject_ticket",
+                json!({"id": tk.id, "note": " \n "}),
+                7
+            ),
+            Err("Afvisning kræver en note".into())
+        );
+        let r = t
+            .call(
+                Some(&t.r),
+                "mira_reject_ticket",
+                json!({"id": tk.id, "note": "Mangler test"}),
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            r,
+            json!({"id": tk.id, "shortId": tk.short_id(), "state": "rejected", "reviewRound": 1, "escalated": false})
+        );
+        let now = t.ticket(&tk.id);
+        assert_eq!(
+            (now.state, now.queue_position),
+            (TicketState::Assigned, Some(0))
+        );
+        assert_eq!(now.rejection_note.as_deref(), Some("Mangler test"));
+        assert!(t.tc.sent().contains(&DispatchMsg::QueueChanged {
+            agent_id: t.a.clone()
+        }));
+        assert!(t.tc.ctx.read(|s| s.review_assignments()).is_empty());
+    }
+
+    #[test]
+    fn assign_to_only_for_coordinator() {
+        let mut t = setup();
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_create_ticket",
+                json!({"title":"x","assignTo": t.b}),
+                1
+            ),
+            Err(ONLY_COORDINATOR_ASSIGNS.into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_create_ticket",
+                json!({"title":"x","assignTo":"nope"}),
+                1
+            ),
+            Err("Agenten kører ikke".into())
+        );
+        assert!(t.tc.ctx.read(TicketService::is_empty));
+        t.tc.sent();
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_create_ticket",
+                json!({"title":"Del 1","assignTo": t.b}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "assigned");
+        assert_eq!(r["assigneeAgentId"], json!(t.b));
+        let tk = t.ticket(r["id"].as_str().unwrap());
+        assert_eq!(
+            (tk.assignee_agent_id.as_deref(), tk.queue_position),
+            (Some(t.b.as_str()), Some(0))
+        );
+        assert_eq!(
+            t.tc.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: t.b.clone()
+            }]
+        );
+
+        // mira_assign_ticket / mira_unassign_ticket.
+        let b2 = t
+            .call(
+                Some(&t.k),
+                "mira_create_ticket",
+                json!({"title":"Del 2"}),
+                3,
+            )
+            .unwrap();
+        let id = b2["id"].as_str().unwrap();
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": id, "agentId": "nope"}),
+                4
+            ),
+            Err("Agenten kører ikke".into())
+        );
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": b2["shortId"], "agentId": t.b}),
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            r,
+            json!({"id": id, "shortId": b2["shortId"], "state": "assigned", "assigneeAgentId": t.b, "queuePosition": 1})
+        );
+        let r = t
+            .call(Some(&t.k), "mira_unassign_ticket", json!({"id": id}), 5)
+            .unwrap();
+        assert_eq!(
+            r,
+            json!({"id": id, "shortId": b2["shortId"], "state": "backlog"})
+        );
+        let busy = t.in_progress(&t.b, "i gang", false);
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_unassign_ticket",
+                json!({"id": busy.id}),
+                6
+            ),
+            Err("Kan ikke flytte en ticket fra I gang til Backlog".into())
+        );
+    }
+
+    #[test]
+    fn spawn_tool_uses_port_and_limits() {
+        let t = setup();
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_spawn_agent",
+                json!({"profileId":"coder"}),
+                1
+            ),
+            Err(SPAWN_UNAVAILABLE.into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_spawn_agent",
+                json!({"profileId":"nope"}),
+                1
+            ),
+            Err("Profilen findes ikke".into())
+        );
+        let seen: Arc<Mutex<Vec<SpawnByProfile>>> = Arc::default();
+        let (rec, manager) = (Arc::clone(&seen), Arc::clone(&t.tc.ctx.manager));
+        t.tools.set_spawn_port(Arc::new(move |req: SpawnByProfile| {
+            rec.lock().unwrap().push(req.clone());
+            if req.seat_kind == Some(SeatKind::Staff) {
+                return Err(crate::agent::AgentError::LimitReached(SeatKind::Staff).to_string());
+            }
+            let mut m = manager.lock().unwrap();
+            let id = m.insert_fake("s-new", "/w/coder-01");
+            Ok(m.get(&id).unwrap())
+        }));
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_spawn_agent",
+                json!({"profileId":"coder","firstTicketId":"abc"}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(r["name"], "coder-01");
+        assert_eq!(r["cwd"], "/w/coder-01");
+        assert_eq!(r["seatKind"], "work");
+        assert!(r["agentId"].is_string() && r.get("profileId").is_some());
+        let err = t
+            .call(
+                Some(&t.k),
+                "mira_spawn_agent",
+                json!({"profileId":"reviewer","seatKind":"staff"}),
+                3,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            crate::agent::AgentError::LimitReached(SeatKind::Staff).to_string()
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                SpawnByProfile {
+                    profile_id: "coder".into(),
+                    seat_kind: None,
+                    first_ticket_id: Some("abc".into()),
+                },
+                SpawnByProfile {
+                    profile_id: "reviewer".into(),
+                    seat_kind: Some(SeatKind::Staff),
+                    first_ticket_id: None,
+                },
+            ]
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_spawn_agent",
+                json!({"profileId":"coder"}),
+                4
+            ),
+            Err(ROLE_DENIED.into())
+        );
+    }
+
+    #[test]
+    fn list_agents_and_profiles_shape() {
+        let t = setup();
+        t.in_progress(&t.a, "x", false);
+        let r = t
+            .call(Some(&t.k), "mira_list_agents", json!({}), 1)
+            .unwrap();
+        let agents = r["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 4);
+        let a = agents.iter().find(|x| x["id"] == json!(t.a)).unwrap();
+        let keys: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut want = vec![
+            "id",
+            "name",
+            "cwd",
+            "profileId",
+            "profileName",
+            "roles",
+            "seatKind",
+            "status",
+            "currentTicketId",
+            "queueLength",
+            "openReviews",
+        ];
+        let mut got = keys.clone();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert_eq!(a["status"], "starting");
+        assert!(a["currentTicketId"].is_string());
+        let k = agents.iter().find(|x| x["id"] == json!(t.k)).unwrap();
+        assert_eq!(
+            (k["roles"].clone(), k["seatKind"].clone()),
+            (json!(["coordinator"]), json!("staff"))
+        );
+
+        let r = t
+            .call(Some(&t.k), "mira_list_profiles", json!({}), 1)
+            .unwrap();
+        let p = r["profiles"].as_array().unwrap();
+        assert_eq!(p.len(), 7);
+        assert_eq!(
+            p[0],
+            json!({"id":"coder","name":"Koder","roles":["coder"],"specialist":false,"defaultSeat":"work","model":null,"effort":null})
+        );
+        let spec = p.iter().find(|x| x["id"] == "specialist").unwrap();
+        assert_eq!(spec["specialist"], true);
+        assert_eq!(spec["roles"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn workspace_rules_values() {
+        let t = setup();
+        let r = t
+            .call(Some(&t.a), "mira_get_workspace_rules", json!({}), 1)
+            .unwrap();
+        assert_eq!(
+            r,
+            json!({"maxWorkAgents":5,"maxStaffAgents":2,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20})
+        );
+    }
+
+    #[test]
+    fn add_report_ownership() {
+        let t = setup();
+        // Own ticket in progress (default ticket).
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_add_report",
+                json!({"title":"T","body":"b"}),
+                1
+            ),
+            Err("Du har ingen ticket i gang".into())
+        );
+        let mine = t.in_progress(&t.a, "x", false);
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_add_report",
+                json!({"title":"Ændringer","body":"# Hej"}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(r["ticketId"], json!(mine.id));
+        assert_eq!(r["id"], "01");
+        assert_eq!(r["author"], json!({"kind":"agent","agentId": t.a}));
+        assert_eq!(r["path"], "reports/01-aendringer.md");
+        // Someone else's ticket.
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_add_report",
+                json!({"ticketId": mine.id, "title":"T","body":"b"}),
+                3
+            ),
+            Err("Ticketen er tildelt en anden agent".into())
+        );
+        // The reviewer on the review ticket.
+        t.call(
+            Some(&t.a),
+            "mira_submit_for_review",
+            json!({"summary":"klar"}),
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            t.ticket(&mine.id).reviewer_agent_id.as_deref(),
+            Some(t.r.as_str())
+        );
+        let r = t
+            .call(
+                Some(&t.r),
+                "mira_add_report",
+                json!({"ticketId": mine.short_id(), "title":"Review","body":"ok"}),
+                5,
+            )
+            .unwrap();
+        assert_eq!(r["id"], "02");
+        // The reviewer once the ticket is back in progress: refused.
+        t.tc.ctx
+            .mutate(|s| s.set_state(&mine.id, TicketState::InProgress, None, true, 6))
+            .unwrap();
+        assert_eq!(
+            t.call(
+                Some(&t.r),
+                "mira_add_report",
+                json!({"ticketId": mine.id, "title":"T","body":"b"}),
+                7
+            ),
+            Err("Ticketen er tildelt en anden agent".into())
+        );
+        assert_eq!(t.ticket(&mine.id).reports.len(), 2);
+    }
+
+    #[test]
+    fn submit_with_report_stores_both() {
+        let t = setup();
+        let tk = t.in_progress(&t.a, "x", false);
+        // A bad report: nothing is submitted.
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_submit_for_review",
+                json!({"summary":"s","report":"  "}),
+                2
+            ),
+            Err("Rapporten må ikke være tom".into())
+        );
+        assert_eq!(t.ticket(&tk.id).state, TicketState::InProgress);
+        assert!(t.ticket(&tk.id).reports.is_empty());
+        // A refused submit writes no report.
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_submit_for_review",
+                json!({"summary":"s","report":"r","ticketId": tk.id}),
+                2
+            ),
+            Err("Ticketen er tildelt en anden agent".into())
+        );
+        assert!(t.ticket(&tk.id).reports.is_empty());
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_submit_for_review",
+                json!({"summary":"Færdig","report":"# Rapport\nalt ok"}),
+                3,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "review");
+        assert_eq!(r["reportId"], "01");
+        let now = t.ticket(&tk.id);
+        assert_eq!(now.state, TicketState::Review);
+        assert_eq!(now.reports.len(), 1);
+        assert_eq!(now.reports[0].title, crate::config::REPORT_ON_SUBMIT_TITLE);
+        let c = t.tc.ctx.get_report(&tk.id, "01").unwrap();
+        assert_eq!(c.body, "# Rapport\nalt ok");
+    }
+
+    #[test]
+    fn get_report_by_any_agent() {
+        let t = setup();
+        let tk = t.in_progress(&t.a, "x", false);
+        t.call(
+            Some(&t.a),
+            "mira_add_report",
+            json!({"title":"T","body":"æøå"}),
+            1,
+        )
+        .unwrap();
+        for agent in [&t.a, &t.b, &t.r, &t.k] {
+            let r = t
+                .call(
+                    Some(agent),
+                    "mira_get_report",
+                    json!({"ticketId": tk.short_id(), "reportId":"01"}),
+                    2,
+                )
+                .unwrap();
+            assert_eq!(r["body"], "æøå");
+            assert_eq!(r["report"]["title"], "T");
+        }
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_get_report",
+                json!({"ticketId": tk.id, "reportId":"02"}),
+                2
+            ),
+            Err("Rapporten findes ikke".into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_get_report",
+                json!({"ticketId": "nope", "reportId":"01"}),
+                2
+            ),
+            Err("Ticketen findes ikke".into())
+        );
+        // get_ticket carries the report list.
+        let g = t
+            .call(Some(&t.b), "mira_get_ticket", json!({"id": tk.id}), 3)
+            .unwrap();
+        assert_eq!(g["reports"][0]["id"], "01");
     }
 }

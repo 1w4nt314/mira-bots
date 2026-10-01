@@ -310,6 +310,12 @@ pub struct Diagnostics {
     /// Set when profile files were broken (renamed to `.broken-<ts>`) or the folder could not
     /// be used.
     pub profiles_warning: Option<String>,
+    /// Open review assignments (plan5 A.6).
+    pub review_assignments_open: usize,
+    /// Tickets escalated after [`crate::config::MAX_REVIEW_ROUNDS`] rejections.
+    pub tickets_escalated: usize,
+    /// Reports on all tickets.
+    pub reports_total: usize,
 }
 
 #[cfg(test)]
@@ -518,6 +524,9 @@ mod tests {
             profiles_path: "/h/mira-bots/agents/.mira-bots/profiles".into(),
             profiles_loaded: 7,
             profiles_warning: Some("1 profilfil(er) kunne ikke læses".into()),
+            review_assignments_open: 2,
+            tickets_escalated: 1,
+            reports_total: 5,
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -553,7 +562,10 @@ mod tests {
                 "ticketsTotal": 4,
                 "profilesPath": "/h/mira-bots/agents/.mira-bots/profiles",
                 "profilesLoaded": 7,
-                "profilesWarning": "1 profilfil(er) kunne ikke læses"
+                "profilesWarning": "1 profilfil(er) kunne ikke læses",
+                "reviewAssignmentsOpen": 2,
+                "ticketsEscalated": 1,
+                "reportsTotal": 5
             })
         );
     }

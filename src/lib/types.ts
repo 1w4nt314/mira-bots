@@ -181,6 +181,11 @@ export interface Diagnostics {
   profilesLoaded: number;
   /** Set when profile files were broken (renamed to `.broken-<ts>`) or the folder was unusable. */
   profilesWarning: string | null;
+  /** Open review assignments. */
+  reviewAssignmentsOpen: number;
+  /** Tickets escalated after `MAX_REVIEW_ROUNDS` rejections. */
+  ticketsEscalated: number;
+  reportsTotal: number;
 }
 
 export interface AgentOutputPayload {
@@ -249,15 +254,61 @@ export interface TicketSummary {
   /** Milliseconds since the Unix epoch. */
   updatedAt: number;
   historyLen: number;
+  /** Review rejections so far; reset when the ticket goes back to the backlog. */
+  reviewRound: number;
+  /** Reached the maximum review rounds: no automatic routing, the user decides. */
+  escalated: boolean;
+  /** The reviewer agent while in review (kept after approval). */
+  reviewerAgentId: string | null;
+  reportCount: number;
+}
+
+/** Who wrote a report: an agent (`agentId`) or the user. */
+export interface ReportAuthor {
+  kind: "agent" | "user";
+  agentId: string | null;
+}
+
+/** A report on a ticket; its text comes from `getReport`. */
+export interface TicketReport {
+  /** Two-digit sequence number ("01"). */
+  id: string;
+  title: string;
+  author: ReportAuthor;
+  /** Milliseconds since the Unix epoch. */
+  createdAt: number;
+  /** Relative to the ticket's folder: `reports/01-slug.md`. */
+  path: string;
+  /** Bytes. */
+  size: number;
+}
+
+/** `get_report` result. */
+export interface ReportContent {
+  report: TicketReport;
+  body: string;
+}
+
+/** An open review of a ticket by a reviewer agent. */
+export interface ReviewAssignment {
+  ticketId: string;
+  reviewerAgentId: string;
+  round: number;
+  /** Milliseconds since the Unix epoch. */
+  assignedAt: number;
+  /** null until the review line was confirmed in the reviewer's terminal. */
+  deliveredAt: number | null;
+  attempts: number;
 }
 
 /**
  * `get_ticket` result: with history. The Rust `Ticket` has no `shortId` (only the summary does),
  * so it is omitted here; use `shortId(id)` from `lib/tickets` if it is needed.
  */
-export interface Ticket extends Omit<TicketSummary, "historyLen" | "shortId"> {
+export interface Ticket extends Omit<TicketSummary, "historyLen" | "shortId" | "reportCount"> {
   body: string;
   history: TicketHistoryEntry[];
+  reports: TicketReport[];
 }
 
 /** `update_ticket` patch; absent fields stay unchanged. */

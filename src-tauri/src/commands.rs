@@ -40,9 +40,11 @@ use crate::profiles::prompt::{profile_files_dir, write_profile_prompt};
 use crate::profiles::ProfilesCtx;
 use crate::tickets::dispatcher::DispatchMsg;
 use crate::tickets::model::{
-    Ticket, TicketError, TicketPatch, TicketState, TicketSummary, WorkspaceRules,
+    ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
+    TicketSummary, WorkspaceRules,
 };
-use crate::tickets::{prompt, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
+use crate::tickets::tools::{SpawnByProfile, SPAWN_UNAVAILABLE};
+use crate::tickets::{prompt, ReportContent, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
 use crate::workplace;
 
 /// Locations resolved once in `setup`. The `claude` binary is not cached: it is looked up again
@@ -192,6 +194,9 @@ impl AppState {
             profiles_path: self.paths.profiles_dir.to_string_lossy().into_owned(),
             profiles_loaded: self.profiles.read(|s| s.len()),
             profiles_warning: self.profiles.read(|s| s.warning().map(str::to_string)),
+            review_assignments_open: self.tickets.read(|s| s.review_assignments().len()),
+            tickets_escalated: self.tickets.read(|s| s.escalated_count()),
+            reports_total: self.tickets.read(|s| s.report_count()),
         }
     }
 
@@ -327,8 +332,9 @@ pub fn ticket_update(
         .map(|tk| TicketSummary::from(&tk))
 }
 
+/// Deletes the ticket and its report folder.
 pub fn ticket_delete(t: &TicketsCtx, id: &str) -> Result<(), String> {
-    t.mutate(|s| s.delete(id))
+    t.delete_ticket(id)
 }
 
 /// backlog/rejected → the agent's queue (at the end). The agent must exist and not have exited.
@@ -379,6 +385,10 @@ pub fn ticket_set_state(
         }
     }
     t.notify(old.into_iter().chain(tk.assignee_agent_id.clone()));
+    // "Send til review" by hand: find a reviewer (plan5 A.6).
+    if tk.state == TicketState::Review {
+        t.route_reviews();
+    }
     Ok(TicketSummary::from(&tk))
 }
 
@@ -398,6 +408,7 @@ pub fn ticket_reject(t: &TicketsCtx, id: &str, note: &str) -> Result<TicketSumma
     let now = now_ms();
     let tk = t.mutate(|s| s.reject(id, note.trim(), live, now))?;
     t.notify(old);
+    t.route_reviews();
     Ok(TicketSummary::from(&tk))
 }
 
@@ -625,6 +636,8 @@ fn spawn_prepared(
     );
     state.emit_agents(app);
     schedule_starting_hint(app.clone(), Arc::clone(&state.manager), info.id.clone());
+    // A new reviewer may take reviews that were waiting (plan5 A.6).
+    state.tickets.route_reviews();
     Ok(info)
 }
 
@@ -682,10 +695,25 @@ pub fn spawn_agent_with_ticket(
     cwd: Option<String>,
     seat_kind: Option<SeatKind>,
 ) -> Result<AgentInfo, String> {
-    let ticket = ticket_for_spawn(&state.tickets, &ticket_id)?;
+    spawn_with_ticket_core(
+        &app, &state, &ticket_id, profile_id, overrides, cwd, seat_kind,
+    )
+}
+
+/// The shared core of `spawn_agent_with_ticket` and `mira_spawn_agent` with `firstTicketId`.
+pub fn spawn_with_ticket_core(
+    app: &AppHandle,
+    state: &AppState,
+    ticket_id: &str,
+    profile_id: Option<String>,
+    overrides: Option<SpawnOverrides>,
+    cwd: Option<String>,
+    seat_kind: Option<SeatKind>,
+) -> Result<AgentInfo, String> {
+    let ticket = ticket_for_spawn(&state.tickets, ticket_id)?;
     let profile = resolve_profile(&state.profiles, profile_id.as_deref())?;
     validate_overrides(overrides.clone().unwrap_or_default())?;
-    let (ctx, cwd) = prepare_spawn(&state, &profile, cwd)?;
+    let (ctx, cwd) = prepare_spawn(state, &profile, cwd)?;
     let file = prompt::write_ticket_file(&cwd, &ticket, now_ms())
         .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
     let req = spawn_request(
@@ -695,7 +723,7 @@ pub fn spawn_agent_with_ticket(
         Some(prompt::line_for(&ticket)),
         seat_kind,
     )?;
-    let info = match spawn_prepared(&app, &state, &ctx, req) {
+    let info = match spawn_prepared(app, state, &ctx, req) {
         Ok(info) => info,
         Err(e) => {
             if let Err(rm) = std::fs::remove_file(&file) {
@@ -711,6 +739,41 @@ pub fn spawn_agent_with_ticket(
         ticket.short_id()
     );
     Ok(lock(&state.manager).get(&info.id).unwrap_or(info))
+}
+
+/// `mira_spawn_agent` (the tool's [`crate::tickets::tools::SpawnPort`]): the same path and seat
+/// limits as the UI. With `first_ticket_id` (full or short id of a backlog ticket) it is
+/// `spawn_agent_with_ticket`. Default folder, no overrides.
+pub fn spawn_for_tool(app: &AppHandle, req: SpawnByProfile) -> Result<AgentInfo, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| SPAWN_UNAVAILABLE.to_string())?;
+    match req.first_ticket_id {
+        Some(id) => {
+            let ticket = state
+                .tickets
+                .read(|s| s.get_by_any_id(&id))
+                .ok_or(TicketError::NotFound)?;
+            spawn_with_ticket_core(
+                app,
+                &state,
+                &ticket.id,
+                Some(req.profile_id),
+                None,
+                None,
+                req.seat_kind,
+            )
+        }
+        None => spawn_core(
+            app,
+            &state,
+            Some(req.profile_id),
+            None,
+            None,
+            None,
+            req.seat_kind,
+        ),
+    }
 }
 
 // ---- model/effort change = restart with --resume (plan5 A.5) ----
@@ -1235,6 +1298,75 @@ pub fn redispatch_ticket(state: State<'_, AppState>, id: String) -> Result<(), S
 #[tauri::command]
 pub fn request_submission(state: State<'_, AppState>, ticket_id: String) -> Result<(), String> {
     ticket_request_submission(&state.tickets, &ticket_id)
+}
+
+// ---- reports and review assignment (plan5 C5.4) ----
+
+/// The user adds a report (author "user").
+#[tauri::command]
+pub fn add_report(
+    state: State<'_, AppState>,
+    ticket_id: String,
+    title: String,
+    body: String,
+) -> Result<TicketReport, String> {
+    state
+        .tickets
+        .add_report(&ticket_id, ReportAuthor::user(), &title, &body)
+}
+
+#[tauri::command]
+pub fn get_report(
+    state: State<'_, AppState>,
+    ticket_id: String,
+    report_id: String,
+) -> Result<ReportContent, String> {
+    state.tickets.get_report(&ticket_id, &report_id)
+}
+
+/// Opens the ticket's report folder (created first if needed).
+// TODO(windows-verify): "Åbn mappe" opens Explorer on
+// %APPDATA%\dk.mira.bots\tickets\<id>\reports; deleting the ticket removes it (plan5 D.58).
+#[tauri::command]
+pub fn open_report_dir(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ticket_id: String,
+) -> Result<(), String> {
+    state
+        .tickets
+        .read(|s| s.get(&ticket_id))
+        .ok_or(TicketError::NotFound)?;
+    let dir = state
+        .tickets
+        .reports
+        .dir_for(&ticket_id)
+        .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Kunne ikke oprette mappen: {e}"))?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
+}
+
+/// Picks (`agentId`) or removes (`null`, then routed again) the reviewer of a ticket in review.
+// TODO(windows-verify): an escalated ticket can get a reviewer by hand; "Fjern reviewer" routes
+// it again (plan5 D.55).
+#[tauri::command]
+pub fn assign_reviewer(
+    state: State<'_, AppState>,
+    ticket_id: String,
+    agent_id: Option<String>,
+) -> Result<TicketSummary, String> {
+    state
+        .tickets
+        .assign_reviewer(&ticket_id, agent_id.as_deref().filter(|a| !a.is_empty()))
+}
+
+#[tauri::command]
+pub fn list_review_assignments(
+    state: State<'_, AppState>,
+) -> Result<Vec<ReviewAssignment>, String> {
+    Ok(state.tickets.read(|s| s.review_assignments()))
 }
 
 #[tauri::command]
@@ -2070,5 +2202,38 @@ mod tests {
         assert!(String::from(err).starts_with("Hook-forbindelsen"));
         ready.store(true, Ordering::Release);
         assert!(check_pipe_ready(&ready).is_ok());
+    }
+
+    // ---- step 5: review routing from the commands, report folder on delete ----
+
+    #[test]
+    fn manual_review_routes_and_delete_removes_reports() {
+        let mut m = AgentManager::new(5);
+        let live = m.insert_fake("s1", "/w/live");
+        m.set_status(&live, AgentStatus::Idle, None).unwrap();
+        let rev = m.insert_fake_with("s2", "/w/rev", &[Role::Reviewer], SeatKind::Staff);
+        let mut t = test_ctx(Arc::new(Mutex::new(m)));
+        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        ticket_assign(&t.ctx, &tk.id, &live).unwrap();
+        ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
+        t.sent();
+        // "Send til review" by hand: routed to the reviewer.
+        let s = ticket_set_state(&t.ctx, &tk.id, TicketState::Review, None).unwrap();
+        assert_eq!(s.state, TicketState::Review);
+        let now = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(now.reviewer_agent_id.as_deref(), Some(rev.as_str()));
+        assert!(t.sent().contains(&DispatchMsg::ReviewAssigned {
+            reviewer_agent_id: rev.clone()
+        }));
+        // The user approves; the ticket (with a report) is deleted with its folder.
+        t.ctx
+            .add_report(&tk.id, ReportAuthor::user(), "Noter", "tekst")
+            .unwrap();
+        ticket_approve(&t.ctx, &tk.id).unwrap();
+        let dir = t.ctx.reports.root().join(&tk.id);
+        assert!(dir.is_dir());
+        ticket_delete(&t.ctx, &tk.id).unwrap();
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(t.ctx.reports.root());
     }
 }

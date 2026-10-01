@@ -20,9 +20,11 @@ fn main() {
             }
         ),
     );
+    let roles = mira_mcp::roles_from_env();
+    mira_mcp::log(debug, &format!("roles: {roles:?}"));
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    mira_mcp::run_loop(stdin.lock(), stdout.lock(), &backend, debug);
+    mira_mcp::run_loop(stdin.lock(), stdout.lock(), &backend, &roles, debug);
     // Exit right away; a worker thread still blocked on the pipe is simply torn down.
     std::process::exit(0);
 }

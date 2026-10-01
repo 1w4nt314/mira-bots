@@ -758,6 +758,18 @@ impl AgentManager {
         }
     }
 
+    /// Sets the agent's open review count (`openReviews`, from the tickets glue). Returns whether
+    /// it changed (unknown agent: `false`).
+    pub fn set_review_link(&mut self, id: &str, open_reviews: usize) -> bool {
+        match self.agents.get_mut(id) {
+            Some(a) if a.info.open_reviews != open_reviews => {
+                a.info.open_reviews = open_reviews;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Ids of every known agent (exited included).
     pub fn ids(&self) -> Vec<AgentId> {
         self.agents.keys().cloned().collect()

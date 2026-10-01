@@ -1,5 +1,5 @@
 //! mira-mcp: a minimal MCP server (JSON-RPC 2.0 over stdio, one JSON message per line) that
-//! gives a Claude Code agent five tools for the mira-bots tickets. Each `tools/call` is relayed
+//! gives a Claude Code agent the mira-bots tools its roles allow (`MIRA_AGENT_ROLES`). Each `tools/call` is relayed
 //! to the app over the same pipe the hooks use (one connection per call) and answered with the
 //! app's result.
 //!
@@ -172,11 +172,13 @@ fn probe_id(head: &[u8], tail: &[u8]) -> Option<serde_json::Value> {
 
 /// The server loop: one stdin line → [`rpc::handle_line`] → at most one stdout line (flushed).
 /// Returns at stdin EOF (or a read error) and when stdout is gone (Claude Code closed it).
-/// Serial: a `tools/call` blocks the loop for at most the backend's timeout.
+/// Serial: a `tools/call` blocks the loop for at most the backend's timeout. `roles` (fixed for
+/// the session, research5 Q7) decide which tools are listed and callable.
 pub fn run_loop<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     backend: &dyn ToolBackend,
+    roles: &[String],
     debug: bool,
 ) {
     while let Some(line) = read_line(&mut reader) {
@@ -185,7 +187,7 @@ pub fn run_loop<R: BufRead, W: Write>(
                 if text.trim().is_empty() {
                     continue;
                 }
-                rpc::handle_line(&text, backend)
+                rpc::handle_line(&text, backend, roles)
             }
             Line::TooLong { head, tail } => {
                 log(debug, "stdin line longer than MAX_LINE");
@@ -223,7 +225,7 @@ mod tests {
 
     fn run(input: &[u8]) -> Vec<Value> {
         let mut out = Vec::new();
-        run_loop(input, &mut out, &Echo, false);
+        run_loop(input, &mut out, &Echo, &[], false);
         let text = String::from_utf8(out).unwrap();
         assert!(text.is_empty() || text.ends_with('\n'));
         text.lines()
@@ -338,6 +340,7 @@ mod tests {
             &b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n"[..],
             Closed,
             &Echo,
+            &[],
             false,
         );
     }

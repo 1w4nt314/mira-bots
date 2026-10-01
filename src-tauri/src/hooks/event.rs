@@ -129,6 +129,17 @@ pub fn mira_tool_label(tool_name: &str) -> Option<&'static str> {
         "mira_get_ticket" => Some("Læser ticket"),
         "mira_submit_for_review" => Some("Afleverer til review"),
         "mira_update_status" => Some("Opdaterer status"),
+        // Step 5 (plan5 C5.13).
+        "mira_approve_ticket" => Some("Godkender ticket"),
+        "mira_reject_ticket" => Some("Afviser ticket"),
+        "mira_assign_ticket" => Some("Tildeler ticket"),
+        "mira_unassign_ticket" => Some("Fjerner tildeling"),
+        "mira_spawn_agent" => Some("Starter agent"),
+        "mira_list_agents" => Some("Læser agenter"),
+        "mira_list_profiles" => Some("Læser profiler"),
+        "mira_get_workspace_rules" => Some("Læser regler"),
+        "mira_add_report" => Some("Skriver rapport"),
+        "mira_get_report" => Some("Læser rapport"),
         _ => None,
     }
 }
@@ -358,8 +369,25 @@ mod tests {
             ("mira_get_ticket", "Læser ticket"),
             ("mira_submit_for_review", "Afleverer til review"),
             ("mira_update_status", "Opdaterer status"),
+            ("mira_approve_ticket", "Godkender ticket"),
+            ("mira_reject_ticket", "Afviser ticket"),
+            ("mira_assign_ticket", "Tildeler ticket"),
+            ("mira_unassign_ticket", "Fjerner tildeling"),
+            ("mira_spawn_agent", "Starter agent"),
+            ("mira_list_agents", "Læser agenter"),
+            ("mira_list_profiles", "Læser profiler"),
+            ("mira_get_workspace_rules", "Læser regler"),
+            ("mira_add_report", "Skriver rapport"),
+            ("mira_get_report", "Læser rapport"),
         ];
-        let input = json!({"summary":"hemmelig opsummering","title":"x","note":"y"});
+        // Every tool of the MCP server has a label (and only those).
+        let mut names: Vec<&str> = table.iter().map(|(t, _)| *t).collect();
+        let mut want = mira_mcp::tools::TOOL_NAMES.to_vec();
+        names.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(names, want);
+        let input =
+            json!({"summary":"hemmelig opsummering","title":"x","note":"y","body":"rapport"});
         for (tool, label) in table {
             let name = format!("mcp__mira-bots__{tool}");
             assert_eq!(mira_tool_label(&name), Some(label));

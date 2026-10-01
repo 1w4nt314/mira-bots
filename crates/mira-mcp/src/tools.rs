@@ -1,6 +1,7 @@
-//! The five tools (plan4 C4.3): `tools/list` definitions and argument validation before
-//! anything is sent to the app. The app validates again (C4.12); this layer gives the model a
-//! quick, precise error without a pipe round trip.
+//! The fifteen tools (plan4 C4.3 + plan5 C5.3): `tools/list` definitions, the role matrix and
+//! argument validation before anything is sent to the app. The app validates again (C4.12) and
+//! enforces the role matrix itself (the security boundary); this layer gives the model a quick,
+//! precise error without a pipe round trip and only lists the tools its roles allow.
 
 use serde_json::{json, Map, Value};
 
@@ -10,16 +11,7 @@ pub const GET_TICKET: &str = "mira_get_ticket";
 pub const SUBMIT_FOR_REVIEW: &str = "mira_submit_for_review";
 pub const UPDATE_STATUS: &str = "mira_update_status";
 
-pub const TOOL_NAMES: [&str; 5] = [
-    CREATE_TICKET,
-    LIST_TICKETS,
-    GET_TICKET,
-    SUBMIT_FOR_REVIEW,
-    UPDATE_STATUS,
-];
-
-// Step 5 tools (plan5 C5.3). Their definitions and argument validation arrive with batch 2; the
-// names are needed now for the role matrix below, which the app also uses for its deny rules.
+// Step 5 tools (plan5 C5.3).
 pub const APPROVE_TICKET: &str = "mira_approve_ticket";
 pub const REJECT_TICKET: &str = "mira_reject_ticket";
 pub const ASSIGN_TICKET: &str = "mira_assign_ticket";
@@ -53,6 +45,9 @@ pub const ROLE_BOUND_TOOLS: [&str; 7] = [
     LIST_AGENTS,
     LIST_PROFILES,
 ];
+
+/// Every tool name (plan5 C5.8), common ones first; the order of [`definitions`].
+pub const TOOL_NAMES: [&str; 15] = ALL_TOOL_NAMES;
 
 /// Every tool name of plan5 C5.3, common ones first.
 pub const ALL_TOOL_NAMES: [&str; 15] = [
@@ -120,6 +115,13 @@ pub const SUMMARY_MAX: usize = 2_000;
 pub const NOTE_MAX: usize = 120;
 pub const ID_MAX: usize = 64;
 pub const FILTERS: [&str; 3] = ["mine", "backlog", "all"];
+/// Step 5 limits (plan5 C5.3).
+pub const REVIEW_NOTE_MAX: usize = 2_000;
+pub const PROFILE_ID_MAX: usize = 40;
+pub const REPORT_TITLE_MAX: usize = 120;
+pub const REPORT_BODY_MAX: usize = 20_000;
+pub const REPORT_ID_MAX: usize = 8;
+pub const SEAT_KINDS: [&str; 2] = ["work", "staff"];
 
 fn annotations(read_only: bool, idempotent: bool) -> Value {
     json!({
@@ -141,7 +143,8 @@ pub fn definitions() -> Vec<Value> {
                 "properties": {
                     "title": {"type": "string", "minLength": 1, "maxLength": TITLE_MAX, "description": "Kort titel (én linje)"},
                     "body": {"type": "string", "maxLength": BODY_MAX, "description": "Beskrivelse (markdown)"},
-                    "skipReview": {"type": "boolean", "description": "true: ticketen går direkte til Done når den afleveres"}
+                    "skipReview": {"type": "boolean", "description": "true: ticketen går direkte til Done når den afleveres"},
+                    "assignTo": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agent-id (kun koordinator): ticketen sættes bagest i agentens kø"}
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -176,7 +179,8 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "minLength": 1, "maxLength": SUMMARY_MAX, "description": "Hvad er gjort, hvad bør brugeren kigge på"},
-                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX}
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "report": {"type": "string", "minLength": 1, "maxLength": REPORT_BODY_MAX, "description": "Valgfri rapport (markdown) der gemmes på ticketen sammen med afleveringen"}
                 },
                 "required": ["summary"],
                 "additionalProperties": false
@@ -194,12 +198,144 @@ pub fn definitions() -> Vec<Value> {
             },
             "annotations": annotations(false, true)
         }),
+        json!({
+            "name": GET_WORKSPACE_RULES,
+            "description": "Reglerne i dette workspace: lofter for agenter, maks review-runder, om Stop automatisk sender til review, grænser for tickets og rapporter.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": annotations(true, true)
+        }),
+        json!({
+            "name": ADD_REPORT,
+            "description": "Lægger en rapport (markdown, maks 20000 tegn) på en ticket, så brugeren og revieweren kan se hvad der er lavet. Uden ticketId bruges din igangværende ticket. Reviewere kan lægge en review-rapport på tickets de reviewer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "title": {"type": "string", "minLength": 1, "maxLength": REPORT_TITLE_MAX},
+                    "body": {"type": "string", "minLength": 1, "maxLength": REPORT_BODY_MAX}
+                },
+                "required": ["title", "body"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
+            "name": GET_REPORT,
+            "description": "Henter teksten i en rapport på en ticket (rapport-id'erne står i mira_get_ticket).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "reportId": {"type": "string", "minLength": 1, "maxLength": REPORT_ID_MAX}
+                },
+                "required": ["ticketId", "reportId"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(true, true)
+        }),
+        json!({
+            "name": APPROVE_TICKET,
+            "description": "Godkender en ticket du er reviewer på: den går til Done. Kun tickets i Review, aldrig dine egne afleveringer. Skriv kort hvad du har tjekket i note.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "note": {"type": "string", "maxLength": REVIEW_NOTE_MAX}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
+            "name": REJECT_TICKET,
+            "description": "Afviser en ticket du er reviewer på med en begrundelse: den går tilbage forrest i afsenderens kø (runde +1; efter 3 runder afgør brugeren). Kun tickets i Review, aldrig dine egne.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "note": {"type": "string", "minLength": 1, "maxLength": REVIEW_NOTE_MAX}
+                },
+                "required": ["id", "note"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
+            "name": ASSIGN_TICKET,
+            "description": "Sætter en ticket fra backlog eller afvist bagest i en kørende agents kø (koordinator). Agent-id'er fås med mira_list_agents.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX}
+                },
+                "required": ["id", "agentId"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
+            "name": UNASSIGN_TICKET,
+            "description": "Tager en ticket i kø ud af agentens kø og tilbage til backlog (koordinator). Tickets i gang kan ikke tages.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string", "minLength": 1, "maxLength": ID_MAX}},
+                "required": ["id"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, true)
+        }),
+        json!({
+            "name": SPAWN_AGENT,
+            "description": "Starter en ny agent fra en profil (koordinator). Samme lofter som i appen (5 arbejdspladser, 2 stabspladser). Med firstTicketId får agenten den ticket som første opgave.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "profileId": {"type": "string", "minLength": 1, "maxLength": PROFILE_ID_MAX},
+                    "seatKind": {"type": "string", "enum": SEAT_KINDS},
+                    "firstTicketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX}
+                },
+                "required": ["profileId"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
+            "name": LIST_AGENTS,
+            "description": "Lister agenterne i appen: id, navn, profil, roller, plads, status, ticket i gang, kølængde og åbne reviews.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": annotations(true, true)
+        }),
+        json!({
+            "name": LIST_PROFILES,
+            "description": "Lister agentprofilerne (id, navn, roller, standardplads, model, effort) til brug for mira_spawn_agent.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": annotations(true, true)
+        }),
     ]
+}
+
+/// The `tools/list` entries for an agent with `roles` (see [`tools_for_roles`]), in
+/// [`TOOL_NAMES`] order.
+pub fn definitions_for<S: AsRef<str>>(roles: &[S]) -> Vec<Value> {
+    let allowed = tools_for_roles(roles);
+    definitions()
+        .into_iter()
+        .filter(|d| {
+            d.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| allowed.contains(&n))
+        })
+        .collect()
 }
 
 pub fn is_known(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
+
+/// Error text when an agent calls a tool its roles do not allow (same as the app's).
+pub const ROLE_DENIED: &str = "Din rolle tillader ikke dette værktøj";
 
 /// What a string argument must look like; `None` max = no upper bound check here.
 struct StrRule {
@@ -237,6 +373,27 @@ fn take_str(
     Ok(())
 }
 
+/// An id-like string of 1–`max` chars; the error names the key and the range.
+fn id_rule(key: &'static str, required: bool, max: usize) -> StrRule {
+    let error: &'static str = match key {
+        "profileId" => "profileId skal være en tekst på 1–40 tegn",
+        "reportId" => "reportId skal være en tekst på 1–8 tegn",
+        "ticketId" => "ticketId skal være en tekst på 1–64 tegn",
+        "agentId" => "agentId skal være en tekst på 1–64 tegn",
+        "assignTo" => "assignTo skal være en tekst på 1–64 tegn",
+        "firstTicketId" => "firstTicketId skal være en tekst på 1–64 tegn",
+        _ => "id skal være en tekst på 1–64 tegn",
+    };
+    StrRule {
+        key,
+        required,
+        min: 1,
+        max,
+        error,
+        too_long: None,
+    }
+}
+
 /// Checks `args` for tool `name` (which must be known) and returns the cleaned object: only the
 /// tool's keys, strings trimmed. Errors are Danish, for the model (`isError: true`).
 pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
@@ -244,11 +401,18 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         .as_object()
         .ok_or_else(|| "Argumenterne skal være et objekt".to_string())?;
     let allowed: &[&str] = match name {
-        CREATE_TICKET => &["title", "body", "skipReview"],
+        CREATE_TICKET => &["title", "body", "skipReview", "assignTo"],
         LIST_TICKETS => &["filter"],
         GET_TICKET => &["id"],
-        SUBMIT_FOR_REVIEW => &["summary", "ticketId"],
+        SUBMIT_FOR_REVIEW => &["summary", "ticketId", "report"],
         UPDATE_STATUS => &["note"],
+        APPROVE_TICKET | REJECT_TICKET => &["id", "note"],
+        ASSIGN_TICKET => &["id", "agentId"],
+        UNASSIGN_TICKET => &["id"],
+        SPAWN_AGENT => &["profileId", "seatKind", "firstTicketId"],
+        LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES => &[],
+        ADD_REPORT => &["ticketId", "title", "body"],
+        GET_REPORT => &["ticketId", "reportId"],
         other => return Err(format!("Ukendt værktøj: {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -287,6 +451,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
                     .ok_or_else(|| "skipReview skal være true eller false".to_string())?;
                 out.insert("skipReview".into(), Value::Bool(b));
             }
+            take_str(obj, &mut out, &id_rule("assignTo", false, ID_MAX))?;
         }
         LIST_TICKETS => {
             if let Some(v) = obj.get("filter") {
@@ -322,18 +487,87 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
                     too_long: None,
                 },
             )?;
+            take_str(obj, &mut out, &id_rule("ticketId", false, ID_MAX))?;
             take_str(
                 obj,
                 &mut out,
                 &StrRule {
-                    key: "ticketId",
+                    key: "report",
                     required: false,
                     min: 1,
-                    max: ID_MAX,
-                    error: "ticketId skal være en tekst på 1–64 tegn",
-                    too_long: None,
+                    max: REPORT_BODY_MAX,
+                    error: "report skal være en tekst på 1–20000 tegn",
+                    too_long: Some("Rapporten er for lang (maks 20000 tegn)"),
                 },
             )?;
+        }
+        APPROVE_TICKET | REJECT_TICKET => {
+            take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?;
+            let reject = name == REJECT_TICKET;
+            take_str(
+                obj,
+                &mut out,
+                &StrRule {
+                    key: "note",
+                    required: reject,
+                    min: usize::from(reject),
+                    max: REVIEW_NOTE_MAX,
+                    error: if reject {
+                        "Afvisning kræver en note"
+                    } else {
+                        "note skal være en tekst på højst 2000 tegn"
+                    },
+                    too_long: Some("note må højst være 2000 tegn"),
+                },
+            )?;
+        }
+        ASSIGN_TICKET => {
+            take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?;
+            take_str(obj, &mut out, &id_rule("agentId", true, ID_MAX))?;
+        }
+        UNASSIGN_TICKET => take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?,
+        SPAWN_AGENT => {
+            take_str(obj, &mut out, &id_rule("profileId", true, PROFILE_ID_MAX))?;
+            if let Some(v) = obj.get("seatKind") {
+                let k = v.as_str().map(str::trim).unwrap_or_default();
+                if !SEAT_KINDS.contains(&k) {
+                    return Err("seatKind skal være \"work\" eller \"staff\"".into());
+                }
+                out.insert("seatKind".into(), Value::String(k.to_string()));
+            }
+            take_str(obj, &mut out, &id_rule("firstTicketId", false, ID_MAX))?;
+        }
+        LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES => {}
+        ADD_REPORT => {
+            take_str(obj, &mut out, &id_rule("ticketId", false, ID_MAX))?;
+            take_str(
+                obj,
+                &mut out,
+                &StrRule {
+                    key: "title",
+                    required: true,
+                    min: 1,
+                    max: REPORT_TITLE_MAX,
+                    error: "Titel må ikke være tom",
+                    too_long: Some("Titlen er for lang (maks 120 tegn)"),
+                },
+            )?;
+            take_str(
+                obj,
+                &mut out,
+                &StrRule {
+                    key: "body",
+                    required: true,
+                    min: 1,
+                    max: REPORT_BODY_MAX,
+                    error: "Rapporten må ikke være tom",
+                    too_long: Some("Rapporten er for lang (maks 20000 tegn)"),
+                },
+            )?;
+        }
+        GET_REPORT => {
+            take_str(obj, &mut out, &id_rule("ticketId", true, ID_MAX))?;
+            take_str(obj, &mut out, &id_rule("reportId", true, REPORT_ID_MAX))?;
         }
         _ => take_str(
             obj,
@@ -397,7 +631,8 @@ mod tests {
             ALL_TOOL_NAMES.len()
         );
         // Every step-4 tool is a common tool.
-        assert!(TOOL_NAMES.iter().all(|t| COMMON_TOOLS.contains(t)));
+        assert!(TOOL_NAMES[..5].iter().all(|t| COMMON_TOOLS.contains(t)));
+        assert_eq!(TOOL_NAMES, ALL_TOOL_NAMES);
         let roles: Vec<&str> = ROLE_TOOLS.iter().map(|(r, _)| *r).collect();
         assert_eq!(roles, all);
     }
@@ -411,7 +646,7 @@ mod tests {
     #[test]
     fn definitions_are_well_formed() {
         let defs = definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 15);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert_eq!(names, TOOL_NAMES);
         for d in &defs {
@@ -437,7 +672,7 @@ mod tests {
             }
         }
         let all = serde_json::to_string(&defs).unwrap();
-        assert!(all.len() < 8 * 1024, "{} bytes", all.len());
+        assert!(all.len() < 16 * 1024, "{} bytes", all.len());
         assert!(!all.contains('\n'));
     }
 
@@ -593,6 +828,204 @@ mod tests {
         assert_eq!(
             validate_args("mira_assign", &json!({})).unwrap_err(),
             "Ukendt værktøj: mira_assign"
+        );
+    }
+
+    fn def<'a>(defs: &'a [Value], name: &str) -> &'a Value {
+        defs.iter().find(|d| d["name"] == name).unwrap()
+    }
+
+    #[test]
+    fn definitions_for_each_role() {
+        let names = |roles: &[&str]| -> Vec<String> {
+            definitions_for(roles)
+                .iter()
+                .map(|d| d["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for (roles, n) in [
+            (&[][..], 8),
+            (&["coder"][..], 8),
+            (&["researcher"][..], 8),
+            (&["planner"][..], 8),
+            (&["debugger"][..], 8),
+            (&["reviewer"][..], 10),
+            (&["coordinator"][..], 13),
+            (&["coder", "reviewer", "coordinator"][..], 15),
+            (&["nobody"][..], 8),
+        ] {
+            assert_eq!(names(roles).len(), n, "{roles:?}");
+            let want: Vec<String> = tools_for_roles(roles)
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert_eq!(names(roles), want, "{roles:?}");
+        }
+        assert!(!names(&["coder"]).contains(&APPROVE_TICKET.to_string()));
+        assert!(!names(&["reviewer"]).contains(&ASSIGN_TICKET.to_string()));
+    }
+
+    #[test]
+    fn step5_definitions_match_c5_3() {
+        let defs = definitions();
+        let create = def(&defs, CREATE_TICKET);
+        assert_eq!(
+            create["inputSchema"]["properties"]["assignTo"],
+            json!({"type":"string","minLength":1,"maxLength":64,"description":"Agent-id (kun koordinator): ticketen sættes bagest i agentens kø"})
+        );
+        assert_eq!(
+            def(&defs, SUBMIT_FOR_REVIEW)["inputSchema"]["properties"]["report"]["maxLength"],
+            20000
+        );
+        assert_eq!(
+            def(&defs, APPROVE_TICKET)["inputSchema"],
+            json!({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64},"note":{"type":"string","maxLength":2000}},"required":["id"],"additionalProperties":false})
+        );
+        assert_eq!(
+            def(&defs, REJECT_TICKET)["inputSchema"]["required"],
+            json!(["id", "note"])
+        );
+        assert_eq!(
+            def(&defs, ASSIGN_TICKET)["inputSchema"]["required"],
+            json!(["id", "agentId"])
+        );
+        assert_eq!(
+            def(&defs, UNASSIGN_TICKET)["annotations"]["idempotentHint"],
+            true
+        );
+        let spawn = &def(&defs, SPAWN_AGENT)["inputSchema"];
+        assert_eq!(spawn["properties"]["profileId"]["maxLength"], 40);
+        assert_eq!(
+            spawn["properties"]["seatKind"]["enum"],
+            json!(["work", "staff"])
+        );
+        assert_eq!(spawn["required"], json!(["profileId"]));
+        for t in [LIST_AGENTS, LIST_PROFILES, GET_WORKSPACE_RULES, GET_REPORT] {
+            assert_eq!(def(&defs, t)["annotations"]["readOnlyHint"], true, "{t}");
+        }
+        assert_eq!(
+            def(&defs, LIST_AGENTS)["inputSchema"],
+            json!({"type":"object","properties":{},"additionalProperties":false})
+        );
+        let add = &def(&defs, ADD_REPORT)["inputSchema"];
+        assert_eq!(add["required"], json!(["title", "body"]));
+        assert_eq!(add["properties"]["title"]["maxLength"], 120);
+        assert_eq!(add["properties"]["body"]["maxLength"], 20000);
+        assert_eq!(
+            def(&defs, GET_REPORT)["inputSchema"]["properties"]["reportId"]["maxLength"],
+            8
+        );
+        assert!(def(&defs, REJECT_TICKET)["description"]
+            .as_str()
+            .unwrap()
+            .contains("efter 3 runder afgør brugeren"));
+    }
+
+    #[test]
+    fn validate_new_tools() {
+        let ok = |name: &str, args: Value| validate_args(name, &args).unwrap();
+        let err = |name: &str, args: Value| validate_args(name, &args).unwrap_err();
+        assert_eq!(
+            ok(APPROVE_TICKET, json!({"id":" abcdef01 "})),
+            json!({"id":"abcdef01"})
+        );
+        assert_eq!(
+            ok(APPROVE_TICKET, json!({"id":"x","note":""})),
+            json!({"id":"x","note":""})
+        );
+        assert_eq!(
+            err(APPROVE_TICKET, json!({"id":"x","note":"n".repeat(2001)})),
+            "note må højst være 2000 tegn"
+        );
+        assert_eq!(
+            err(REJECT_TICKET, json!({"id":"x"})),
+            "Afvisning kræver en note"
+        );
+        assert_eq!(
+            err(REJECT_TICKET, json!({"id":"x","note":"  "})),
+            "Afvisning kræver en note"
+        );
+        assert_eq!(
+            err(APPROVE_TICKET, json!({})),
+            "id skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(
+            err(ASSIGN_TICKET, json!({"id":"x"})),
+            "agentId skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(
+            ok(ASSIGN_TICKET, json!({"id":"x","agentId":"a"})),
+            json!({"id":"x","agentId":"a"})
+        );
+        assert_eq!(
+            err(UNASSIGN_TICKET, json!({"id":""})),
+            "id skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(
+            ok(
+                SPAWN_AGENT,
+                json!({"profileId":"coder","seatKind":"staff","firstTicketId":"t"})
+            ),
+            json!({"profileId":"coder","seatKind":"staff","firstTicketId":"t"})
+        );
+        assert_eq!(
+            err(SPAWN_AGENT, json!({"profileId":"x".repeat(41)})),
+            "profileId skal være en tekst på 1–40 tegn"
+        );
+        assert_eq!(
+            err(SPAWN_AGENT, json!({"profileId":"coder","seatKind":"desk"})),
+            "seatKind skal være \"work\" eller \"staff\""
+        );
+        for t in [LIST_AGENTS, LIST_PROFILES, GET_WORKSPACE_RULES] {
+            assert_eq!(ok(t, json!({})), json!({}));
+            assert_eq!(err(t, json!({"x":1})), "Ukendt argument: x");
+        }
+        assert_eq!(
+            ok(ADD_REPORT, json!({"title":" T ","body":"b"})),
+            json!({"title":"T","body":"b"})
+        );
+        assert_eq!(
+            err(ADD_REPORT, json!({"body":"b"})),
+            "Titel må ikke være tom"
+        );
+        assert_eq!(
+            err(ADD_REPORT, json!({"title":"t".repeat(121),"body":"b"})),
+            "Titlen er for lang (maks 120 tegn)"
+        );
+        assert_eq!(
+            err(ADD_REPORT, json!({"title":"t"})),
+            "Rapporten må ikke være tom"
+        );
+        assert_eq!(
+            err(ADD_REPORT, json!({"title":"t","body":"b".repeat(20_001)})),
+            "Rapporten er for lang (maks 20000 tegn)"
+        );
+        assert_eq!(
+            err(GET_REPORT, json!({"ticketId":"t","reportId":"123456789"})),
+            "reportId skal være en tekst på 1–8 tegn"
+        );
+        assert_eq!(
+            ok(GET_REPORT, json!({"ticketId":"t","reportId":"01"})),
+            json!({"ticketId":"t","reportId":"01"})
+        );
+        assert_eq!(
+            ok(CREATE_TICKET, json!({"title":"t","assignTo":"a1"})),
+            json!({"title":"t","assignTo":"a1"})
+        );
+        assert_eq!(
+            err(CREATE_TICKET, json!({"title":"t","assignTo":""})),
+            "assignTo skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(
+            ok(SUBMIT_FOR_REVIEW, json!({"summary":"s","report":"# R"})),
+            json!({"summary":"s","report":"# R"})
+        );
+        assert_eq!(
+            err(
+                SUBMIT_FOR_REVIEW,
+                json!({"summary":"s","report":"r".repeat(20_001)})
+            ),
+            "Rapporten er for lang (maks 20000 tegn)"
         );
     }
 }

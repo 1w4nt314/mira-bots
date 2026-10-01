@@ -266,6 +266,16 @@ mod tests {
             ("mira_get_ticket", "Læser ticket"),
             ("mira_submit_for_review", "Afleverer til review"),
             ("mira_update_status", "Opdaterer status"),
+            ("mira_approve_ticket", "Godkender ticket"),
+            ("mira_reject_ticket", "Afviser ticket"),
+            ("mira_assign_ticket", "Tildeler ticket"),
+            ("mira_unassign_ticket", "Fjerner tildeling"),
+            ("mira_spawn_agent", "Starter agent"),
+            ("mira_list_agents", "Læser agenter"),
+            ("mira_list_profiles", "Læser profiler"),
+            ("mira_get_workspace_rules", "Læser regler"),
+            ("mira_add_report", "Skriver rapport"),
+            ("mira_get_report", "Læser rapport"),
         ];
         for (tool, label) in table {
             let name = format!("mcp__mira-bots__{tool}");

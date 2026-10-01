@@ -22,6 +22,7 @@ fn run_bin(input: &str, env: &[(&str, &str)]) -> Run {
         "MIRA_AGENT_ID",
         "MIRA_MCP_DEBUG",
         "MIRA_MCP_TIMEOUT_MS",
+        "MIRA_AGENT_ROLES",
     ] {
         cmd.env_remove(k);
     }
@@ -74,10 +75,74 @@ fn handshake_list_unknown_and_notification_give_three_lines() {
     assert_eq!(r.lines[0]["id"], 0);
     assert_eq!(r.lines[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(r.lines[1]["id"], 1);
-    assert_eq!(r.lines[1]["result"]["tools"].as_array().unwrap().len(), 5);
+    // Without MIRA_AGENT_ROLES: the common tools only.
+    assert_eq!(r.lines[1]["result"]["tools"].as_array().unwrap().len(), 8);
     assert_eq!(r.lines[2]["id"], 2);
     assert_eq!(r.lines[2]["error"]["code"], -32601);
     assert!(r.took < Duration::from_secs(5));
+}
+
+fn listed_names(roles: Option<&str>) -> Vec<String> {
+    let input = format!(
+        "{INIT}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+    );
+    let env: Vec<(&str, &str)> = roles.map(|r| ("MIRA_AGENT_ROLES", r)).into_iter().collect();
+    let r = run_bin(&input, &env);
+    assert_eq!(r.code, Some(0));
+    r.lines[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn tools_list_filtered_by_env() {
+    let common = [
+        "mira_create_ticket",
+        "mira_list_tickets",
+        "mira_get_ticket",
+        "mira_submit_for_review",
+        "mira_update_status",
+        "mira_get_workspace_rules",
+        "mira_add_report",
+        "mira_get_report",
+    ];
+    let with = |extra: &[&str]| -> Vec<String> {
+        common.iter().chain(extra).map(|s| s.to_string()).collect()
+    };
+    assert_eq!(listed_names(None), with(&[]));
+    assert_eq!(listed_names(Some("")), with(&[]));
+    assert_eq!(listed_names(Some("${MIRA_AGENT_ROLES}")), with(&[]));
+    assert_eq!(listed_names(Some("coder")), with(&[]));
+    assert_eq!(
+        listed_names(Some("reviewer")),
+        with(&["mira_approve_ticket", "mira_reject_ticket"])
+    );
+    assert_eq!(
+        listed_names(Some(" coordinator ")),
+        with(&[
+            "mira_assign_ticket",
+            "mira_unassign_ticket",
+            "mira_spawn_agent",
+            "mira_list_agents",
+            "mira_list_profiles"
+        ])
+    );
+    assert_eq!(listed_names(Some("coder,reviewer,coordinator")).len(), 15);
+    // A hidden tool is refused without contacting the app (no pipe needed).
+    let input = format!(
+        "{INIT}\n{}\n",
+        call(2, "mira_approve_ticket", json!({"id": "abcdef01"}))
+    );
+    let r = run_bin(&input, &[("MIRA_AGENT_ROLES", "coder")]);
+    assert_eq!(r.lines[1]["result"]["isError"], true);
+    assert_eq!(
+        r.lines[1]["result"]["content"][0]["text"],
+        "Din rolle tillader ikke dette værktøj"
+    );
 }
 
 #[test]

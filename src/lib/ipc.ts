@@ -13,10 +13,13 @@ import type {
   HookEventPayload,
   PermissionRequestInfo,
   PermissionResolvedPayload,
+  ReportContent,
+  ReviewAssignment,
   SeatKind,
   SpawnOverrides,
   Ticket,
   TicketPatch,
+  TicketReport,
   TicketState,
   TicketSummary,
   WorkplaceSelection,
@@ -63,6 +66,11 @@ export const COMMANDS = {
   resetBuiltinProfile: "reset_builtin_profile",
   setAgentModel: "set_agent_model",
   setAgentEffort: "set_agent_effort",
+  addReport: "add_report",
+  getReport: "get_report",
+  openReportDir: "open_report_dir",
+  assignReviewer: "assign_reviewer",
+  listReviewAssignments: "list_review_assignments",
 } as const;
 
 export const EVENTS = {
@@ -194,6 +202,19 @@ export const setAgentModel = (agentId: string, model: string | null) =>
 /** Like `setAgentModel`, for the effort level. */
 export const setAgentEffort = (agentId: string, effort: Effort) =>
   invoke<AgentInfo>(COMMANDS.setAgentEffort, { agentId, effort });
+/** The user adds a report to a ticket (author "user"). */
+export const addReport = (ticketId: string, title: string, body: string) =>
+  invoke<TicketReport>(COMMANDS.addReport, { ticketId, title, body });
+export const getReport = (ticketId: string, reportId: string) =>
+  invoke<ReportContent>(COMMANDS.getReport, { ticketId, reportId });
+/** Opens the ticket's report folder in Explorer (created first if needed). */
+export const openReportDir = (ticketId: string) =>
+  invoke<void>(COMMANDS.openReportDir, { ticketId });
+/** Picks the reviewer of a ticket in review; `null` removes it and routes the ticket again. */
+export const assignReviewer = (ticketId: string, agentId: string | null) =>
+  invoke<TicketSummary>(COMMANDS.assignReviewer, { ticketId, agentId });
+export const listReviewAssignments = () =>
+  invoke<ReviewAssignment[]>(COMMANDS.listReviewAssignments);
 
 // --- events (each returns the unlisten function) ----------------------------------------------
 

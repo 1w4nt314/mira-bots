@@ -15,8 +15,8 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const KNOWN_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 pub const LATEST: &str = "2025-11-25";
 
-/// `initialize.instructions` (plan4 C4.6).
-pub const INSTRUCTIONS: &str = "Værktøjer fra mira-bots til tickets. Kald mira_submit_for_review med en kort opsummering når din ticket er færdig.";
+/// `initialize.instructions` (plan4 C4.6, plan5: reports).
+pub const INSTRUCTIONS: &str = "Værktøjer fra mira-bots til tickets. Kald mira_submit_for_review med en kort opsummering når din ticket er færdig, og læg gerne en rapport på ticketen (report i mira_submit_for_review eller mira_add_report).";
 
 pub fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
@@ -31,8 +31,13 @@ pub fn tool_result(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
-/// Handles one parsed message. `None` = nothing to send (notification, i.e. no `id`).
-pub fn handle(msg: &Value, backend: &dyn ToolBackend) -> Option<Value> {
+/// Handles one parsed message for an agent with `roles` (role wire names, from
+/// `MIRA_AGENT_ROLES`). `None` = nothing to send (notification, i.e. no `id`).
+///
+/// `tools/list` shows only the tools `roles` allow; `tools/call` of a known tool the roles do
+/// not allow is an `isError` result ([`tools::ROLE_DENIED`]) without asking the app (which
+/// refuses it too); an unknown tool is `-32602`.
+pub fn handle(msg: &Value, backend: &dyn ToolBackend, roles: &[String]) -> Option<Value> {
     let Some(obj) = msg.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -71,7 +76,7 @@ pub fn handle(msg: &Value, backend: &dyn ToolBackend) -> Option<Value> {
             )
         }
         "ping" => result_response(id, json!({})),
-        "tools/list" => result_response(id, json!({"tools": tools::definitions()})),
+        "tools/list" => result_response(id, json!({"tools": tools::definitions_for(roles)})),
         "tools/call" => {
             let name = params
                 .and_then(|p| p.get("name"))
@@ -82,6 +87,12 @@ pub fn handle(msg: &Value, backend: &dyn ToolBackend) -> Option<Value> {
                     id,
                     INVALID_PARAMS,
                     &format!("Unknown tool: {name}"),
+                ));
+            }
+            if !tools::is_allowed(name, roles) {
+                return Some(result_response(
+                    id,
+                    tool_result(tools::ROLE_DENIED.to_string(), true),
                 ));
             }
             let args = params
@@ -105,9 +116,9 @@ pub fn handle(msg: &Value, backend: &dyn ToolBackend) -> Option<Value> {
 }
 
 /// Parses one stdin line and returns the response line (without newline, never pretty).
-pub fn handle_line(line: &str, backend: &dyn ToolBackend) -> Option<String> {
+pub fn handle_line(line: &str, backend: &dyn ToolBackend, roles: &[String]) -> Option<String> {
     let reply = match serde_json::from_str::<Value>(line) {
-        Ok(msg) => handle(&msg, backend)?,
+        Ok(msg) => handle(&msg, backend, roles)?,
         Err(_) => error_response(Value::Null, PARSE_ERROR, "Parse error"),
     };
     Some(reply.to_string())
@@ -146,8 +157,14 @@ mod tests {
         }
     }
 
+    /// An agent without roles (the common tools only).
     fn line(b: &FakeBackend, s: &str) -> Option<Value> {
-        handle_line(s, b).map(|out| {
+        line_as(b, s, &[])
+    }
+
+    fn line_as(b: &FakeBackend, s: &str, roles: &[&str]) -> Option<Value> {
+        let roles: Vec<String> = roles.iter().map(|r| r.to_string()).collect();
+        handle_line(s, b, &roles).map(|out| {
             assert!(!out.contains('\n'), "one line: {out}");
             serde_json::from_str(&out).unwrap()
         })
@@ -184,8 +201,11 @@ mod tests {
         );
 
         let r = line(&b, r#"{"method":"tools/list","jsonrpc":"2.0","id":1}"#).unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
-        assert_eq!(r["result"]["tools"], json!(tools::definitions()));
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(
+            r["result"]["tools"],
+            json!(tools::definitions_for(&[] as &[&str]))
+        );
 
         let r = line(&b, r#"{"method":"tools/call","params":{"name":"mira_create_ticket","arguments":{"title":" Ny "},"_meta":{"claudecode/toolUseId":"toolu_1","progressToken":2}},"jsonrpc":"2.0","id":2}"#).unwrap();
         assert_eq!(r["id"], 2);
@@ -332,7 +352,62 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"x"}}"#,
         )
         .unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 8);
         assert!(r["result"].get("nextCursor").is_none());
+    }
+
+    fn listed(b: &FakeBackend, roles: &[&str]) -> Vec<String> {
+        let r = line_as(
+            b,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            roles,
+        )
+        .unwrap();
+        r["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tools_list_is_filtered_by_roles() {
+        let b = FakeBackend::ok(json!({}));
+        let common: Vec<String> = tools::COMMON_TOOLS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(listed(&b, &[]), common);
+        assert_eq!(listed(&b, &["coder"]), common);
+        let rev = listed(&b, &["reviewer"]);
+        assert_eq!(rev.len(), 10);
+        assert!(rev.contains(&"mira_approve_ticket".into()));
+        assert!(rev.contains(&"mira_reject_ticket".into()));
+        let co = listed(&b, &["coordinator"]);
+        assert_eq!(co.len(), 13);
+        assert!(!co.contains(&"mira_approve_ticket".into()));
+        assert_eq!(listed(&b, &["reviewer", "coordinator"]).len(), 15);
+    }
+
+    #[test]
+    fn hidden_tool_call_is_refused_without_the_backend() {
+        let b = FakeBackend::ok(json!({"id":"x"}));
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mira_approve_ticket","arguments":{"id":"abcdef01"}}}"#;
+        let r = line_as(&b, call, &["coder"]).unwrap();
+        assert!(r.get("error").is_none());
+        assert_eq!(
+            r["result"],
+            json!({"content":[{"type":"text","text":"Din rolle tillader ikke dette værktøj"}],"isError":true})
+        );
+        assert!(b.calls.borrow().is_empty());
+        let r = line_as(&b, call, &["reviewer"]).unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        assert_eq!(b.calls.borrow().len(), 1);
+        // Unknown names stay a protocol error, whatever the roles.
+        let r = line_as(
+            &b,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"mira_nope"}}"#,
+            &["coordinator"],
+        )
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32602);
     }
 }

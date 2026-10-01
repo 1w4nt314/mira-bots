@@ -108,9 +108,19 @@ pub fn migrate(value: Value) -> Result<TicketDoc, String> {
         .filter(|t| t.is_array())
         .ok_or_else(|| "tickets is not a list".to_string())?;
     let tickets = serde_json::from_value(tickets.clone()).map_err(|e| e.to_string())?;
+    // Review assignments (step 5) are derived state: missing or unreadable ones are dropped
+    // (the tickets' reviewers are cleared at startup anyway, their agents are gone).
+    let review_assignments = match obj.get("reviewAssignments") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+            log::warn!("tickets: ignoring unreadable reviewAssignments: {e}");
+            Vec::new()
+        }),
+    };
     Ok(TicketDoc {
         schema_version: TICKETS_SCHEMA_VERSION,
         tickets,
+        review_assignments,
     })
 }
 
@@ -282,6 +292,7 @@ mod tests {
                 ticket("11111111-0000-4000-8000-000000000000", TicketState::Backlog),
                 ticket("22222222-0000-4000-8000-000000000000", TicketState::Done),
             ],
+            review_assignments: Vec::new(),
         }
     }
 

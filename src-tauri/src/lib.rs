@@ -29,7 +29,7 @@ use commands::{AppPaths, AppState};
 use config::{
     CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
     LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR,
-    SETTINGS_FILE, SYSTEM_PROMPT_FILE, TICKETS_FILE,
+    REPORTS_DIR, SETTINGS_FILE, SYSTEM_PROMPT_FILE, TICKETS_FILE,
 };
 use diagnostics::{log_level_from_env, probe_claude_version, HookStats, VersionProbe};
 use events::{AgentOutputPayload, EmitFn, StatusEvent, AGENTS_CHANGED, AGENT_OUTPUT};
@@ -425,6 +425,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&manager),
         dispatch_tx.clone(),
         Arc::clone(&emit),
+        data_dir.join(REPORTS_DIR),
     ));
     let sink = tauri_sink(
         handle.clone(),
@@ -453,8 +454,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Tool frames from mira-mcp → the agents' ticket tools (the pipe knows nothing about tickets).
+    // mira_spawn_agent goes through the UI's spawn path and limits (plan5 punkt 13); the
+    // closure looks the state up per call, so frames before `manage` get "not available".
     let tool_handler: ToolHandler = {
-        let tools = Arc::new(ToolsCtx::new(Arc::clone(&tickets)));
+        let tools = Arc::new(ToolsCtx::new(Arc::clone(&tickets), Arc::clone(&profiles)));
+        let spawn_handle = handle.clone();
+        tools.set_spawn_port(Arc::new(move |req| {
+            commands::spawn_for_tool(&spawn_handle, req)
+        }));
         Arc::new(move |frame| tools.handle_tool(frame, now_ms()))
     };
 
@@ -583,6 +590,11 @@ pub fn run() {
             commands::reset_builtin_profile,
             commands::set_agent_model,
             commands::set_agent_effort,
+            commands::add_report,
+            commands::get_report,
+            commands::open_report_dir,
+            commands::assign_reviewer,
+            commands::list_review_assignments,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
