@@ -12,6 +12,7 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "claudeVersion", label: "Claude Code-version" },
   { key: "claudeVersionNote", label: "Versionsnote" },
   { key: "claudeCodeArgsSupported", label: "Hooks med args understøttet" },
+  { key: "claudeCodeMcpSupported", label: "Agentværktøjer understøttet (≥ 2.1.274)" },
   { key: "hookExe", label: "Hook-program" },
   { key: "settingsPath", label: "settings.json" },
   { key: "settingsExists", label: "settings.json findes" },
@@ -63,6 +64,11 @@ function warningsFor(d: Diagnostics): string[] {
   if (d.claudeCodeArgsSupported === false) {
     out.push(
       `Claude Code ${d.claudeVersion ?? ""} er ældre end 2.1.139: hooks med \`args\` understøttes ikke — opdater Claude Code`,
+    );
+  }
+  if (d.claudeCodeMcpSupported === false && d.claudeCodeArgsSupported !== false) {
+    out.push(
+      `Claude Code ${d.claudeVersion ?? ""} er ældre end 2.1.274: agentværktøjerne (mira_*) er ikke verificeret — opdater Claude Code`,
     );
   }
   if (!d.pipeReady) out.push("Hook-forbindelsen lytter ikke");

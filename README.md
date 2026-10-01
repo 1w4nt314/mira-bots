@@ -34,7 +34,7 @@ Island → Workplace → pladser → terminal:
 
 - Windows 10 version 1809 eller nyere.
 - Nyeste Claude Code installeret og logget ind. `claude` skal kunne findes som `%USERPROFILE%\.local\bin\claude.exe` eller i `PATH`. Ellers sæt miljøvariablen `MIRA_CLAUDE_PATH` til den fulde sti.
-- Claude Code version 2.1.139 eller nyere. Appens hooks bruger exec-form (`command` + `args`), som ældre versioner ikke understøtter. Fanen Diagnostik viser den fundne version og om `args` understøttes.
+- Claude Code version 2.1.274 eller nyere for agentens værktøjer (trin 4: `mira-mcp` og tilladelser via `mcp_server.source`). Trin 1–3 (hooks med exec-form `command` + `args`, tickets) virker fra 2.1.139, men uden værktøjerne. Alt er verificeret mod 2.1.286. Fanen Diagnostik viser den fundne version, om `args` understøttes (≥ 2.1.139) og om agentværktøjerne er understøttet (≥ 2.1.274).
 - `mira-mcp.exe` (agentens værktøjer) skal ligge ved siden af `mira-hook.exe`; installeren lægger dem begge i `resources`. Findes den ikke, kører agenterne uden værktøjer, og Diagnostik viser en advarsel.
 - WebView2 (følger med Windows 11; installeren henter den på Windows 10).
 
@@ -81,8 +81,8 @@ Fra trin 4 har hver agent en lille lokal MCP-server, `mira-mcp.exe`, som Claude 
 
 - `mira_submit_for_review`: afleverer agentens igangværende ticket med en opsummering (1-2000 tegn). Ticketen går til Review, eller til Done ved "Spring review over". Det er den måde, en agent siger "færdig" på.
 - `mira_create_ticket`: opretter en ny ticket i Backlog (titel, valgfri beskrivelse, evt. "spring review over"). Tickets oprettet af en agent bliver aldrig tildelt automatisk, og en agent kan højst oprette 20 pr. time.
-- `mira_list_tickets`: lister tickets uden beskrivelse og historik (`mine`, `backlog` eller `all`).
-- `mira_get_ticket`: henter én ticket med beskrivelse og historik (fuldt id eller kort-id).
+- `mira_list_tickets`: lister tickets uden beskrivelse og historik og med opsummeringen afkortet til 160 tegn (`mine`, `backlog` eller `all`).
+- `mira_get_ticket`: henter én ticket med beskrivelse, fuld opsummering og historik (fuldt id eller kort-id).
 - `mira_update_status`: sætter en kort statuslinje (højst 120 tegn), der vises ved agenten og noteres på ticketen. Ændrer ingen tilstand.
 
 Der findes ingen værktøjer til at godkende, afvise, tildele eller starte agenter; det er stadig dig, der gør det.
@@ -206,7 +206,7 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 37. Stop/Fjern af en agent med kø: alle dens tickets står i Backlog med note, en igangværende aflevering skriver ikke mere i terminalen, og `queueLength` er 0.
 38. xterms automatiske svar (Device Attributes, cursor- og fokusrapporter) tæller ikke som brugerinput under ConPTY og udsætter ikke ticket-levering, mens tastetryk, piletaster og indsat tekst (også bracketed paste via Shift+Insert eller højreklik) gør.
 
-39. Claude Code starter `mira-mcp.exe` fra `--mcp-config` med en sti med mellemrum og `/` uden `cmd /c`; `/mcp` viser `mira-bots` som connected, og de fem værktøjer er synlige uden `ToolSearch`.
+39. Claude Code (≥ 2.1.274; researchet mod 2.1.286) starter `mira-mcp.exe` fra `--mcp-config` med en sti med mellemrum og `/` uden `cmd /c`; nøglerne `alwaysLoad` og `timeout` i `mcp.json` accepteres af den installerede version; `/mcp` viser `mira-bots` som connected, og de fem værktøjer er synlige uden `ToolSearch`.
 40. `MIRA_BOTS_PIPE` og `MIRA_AGENT_ID` når `mira-mcp.exe` (arv og/eller `${VAR}`-udvidelse); et værktøjskald rammer den rigtige agent, også efter `/clear`.
 41. Ingen tilladelsesprompt for `mcp__mira-bots__*` via appens `settings.json` (`permissions.allow`); dine egne MCP-servere og allow-regler virker stadig.
 42. `mira_submit_for_review` flytter ticketen til Review med opsummeringen synlig på kortet; Stop uden kald giver "Ikke afleveret"; "Bed om aflevering" taster linjen og Enter, og agenten svarer med et kald; "Send til review" virker som fallback.

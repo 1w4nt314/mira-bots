@@ -27,6 +27,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{now_ms, AgentManager};
+use crate::config::{NOT_SUBMITTED_TEXT, TURN_FAILED_TEXT};
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
 use model::TicketError;
@@ -154,6 +155,39 @@ impl TicketsCtx {
     fn emit_agents(&self) {
         let list = lock(&self.manager).list();
         emit_json(&self.emit, AGENTS_CHANGED, &list);
+    }
+
+    /// Sets the agent's detail (no-op for the same text) and emits `agents-changed` after the
+    /// manager lock is released. `only_if`: change only while the current detail passes.
+    pub fn set_agent_detail(
+        &self,
+        agent_id: &str,
+        detail: Option<String>,
+        only_if: impl FnOnce(Option<&str>) -> bool,
+    ) {
+        let list = {
+            let mut m = lock(&self.manager);
+            let current = m.get(agent_id).and_then(|a| a.detail);
+            if current == detail || !only_if(current.as_deref()) {
+                return;
+            }
+            if !m.set_detail(agent_id, detail) {
+                return;
+            }
+            m.list()
+        };
+        emit_json(&self.emit, AGENTS_CHANGED, &list);
+    }
+
+    /// Clears the agent's detail when it is the "turn ended without submitting" or "turn failed"
+    /// hint ([`NOT_SUBMITTED_TEXT`]/[`TURN_FAILED_TEXT`]): used when its ticket leaves in-progress
+    /// (submit, manual move), so the hint does not outlive the ticket. Other texts stay.
+    pub fn clear_stale_detail(&self, agent_id: &str) {
+        self.set_agent_detail(
+            agent_id,
+            None,
+            |d| matches!(d, Some(d) if d == NOT_SUBMITTED_TEXT || d == TURN_FAILED_TEXT),
+        );
     }
 
     /// Tells the dispatcher that these agents' queues changed (each id once).

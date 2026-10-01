@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use log::LevelFilter;
 use serde::Serialize;
 
-use crate::config::HOOK_ARGS_MIN_VERSION;
+use crate::config::{HOOK_ARGS_MIN_VERSION, MCP_MIN_VERSION};
 
 /// `MIRA_LOG` value → level. `trace|debug|info|warn|error` (any case); anything else → `Info`.
 pub fn log_level_from_env(value: Option<&str>) -> LevelFilter {
@@ -61,17 +61,32 @@ pub fn supports_hook_args(v: (u32, u32, u32)) -> bool {
     v >= HOOK_ARGS_MIN_VERSION
 }
 
-/// `(claudeVersion, claudeVersionNote, claudeCodeArgsSupported)` for the diagnostics payload.
-pub fn version_fields(probe: &VersionProbe) -> (Option<String>, Option<String>, Option<bool>) {
+/// Whether the agent tools (step 4: `mcp_server.source` in permission requests) are understood by
+/// this Claude Code version.
+pub fn supports_mcp_tools(v: (u32, u32, u32)) -> bool {
+    v >= MCP_MIN_VERSION
+}
+
+/// `(claudeVersion, claudeVersionNote, claudeCodeArgsSupported, claudeCodeMcpSupported)` for the
+/// diagnostics payload.
+pub fn version_fields(
+    probe: &VersionProbe,
+) -> (Option<String>, Option<String>, Option<bool>, Option<bool>) {
     match probe {
-        VersionProbe::Pending => (None, Some("kører stadig".into()), None),
-        VersionProbe::NotFound => (None, Some("ikke fundet".into()), None),
-        VersionProbe::Failed(e) => (None, Some(e.clone()), None),
+        VersionProbe::Pending => (None, Some("kører stadig".into()), None, None),
+        VersionProbe::NotFound => (None, Some("ikke fundet".into()), None, None),
+        VersionProbe::Failed(e) => (None, Some(e.clone()), None, None),
         VersionProbe::Ok(v) => match parse_claude_version(v) {
-            Some(parsed) => (Some(v.clone()), None, Some(supports_hook_args(parsed))),
+            Some(parsed) => (
+                Some(v.clone()),
+                None,
+                Some(supports_hook_args(parsed)),
+                Some(supports_mcp_tools(parsed)),
+            ),
             None => (
                 Some(v.clone()),
                 Some("kunne ikke læse versionsnummeret".into()),
+                None,
                 None,
             ),
         },
@@ -241,6 +256,8 @@ pub struct Diagnostics {
     pub claude_version: Option<String>,
     pub claude_version_note: Option<String>,
     pub claude_code_args_supported: Option<bool>,
+    /// Claude Code >= 2.1.274 (the agent tools, step 4); `None` when the version is unknown.
+    pub claude_code_mcp_supported: Option<bool>,
     pub hook_exe: Option<String>,
     /// `<app_data_dir>/settings.json` (hooks + permissions; `hooks.json` up to step 3).
     pub settings_path: String,
@@ -324,25 +341,40 @@ mod tests {
     fn version_fields_per_probe_state() {
         assert_eq!(
             version_fields(&VersionProbe::Pending),
-            (None, Some("kører stadig".into()), None)
+            (None, Some("kører stadig".into()), None, None)
         );
         assert_eq!(
             version_fields(&VersionProbe::NotFound),
-            (None, Some("ikke fundet".into()), None)
+            (None, Some("ikke fundet".into()), None, None)
         );
         assert_eq!(
             version_fields(&VersionProbe::Failed("exit 1: x".into())),
-            (None, Some("exit 1: x".into()), None)
+            (None, Some("exit 1: x".into()), None, None)
         );
         assert_eq!(
             version_fields(&VersionProbe::Ok("2.1.100 (Claude Code)".into())),
-            (Some("2.1.100 (Claude Code)".into()), None, Some(false))
+            (
+                Some("2.1.100 (Claude Code)".into()),
+                None,
+                Some(false),
+                Some(false)
+            )
         );
-        assert_eq!(
-            version_fields(&VersionProbe::Ok("2.1.286 (Claude Code)".into())).2,
-            Some(true)
-        );
-        assert_eq!(version_fields(&VersionProbe::Ok("??".into())).2, None);
+        // 2.1.139 has hook args but not the step 4 tools; 2.1.274 has both.
+        let v = |s: &str| version_fields(&VersionProbe::Ok(s.into()));
+        assert_eq!((v("2.1.139").2, v("2.1.139").3), (Some(true), Some(false)));
+        assert_eq!((v("2.1.273").2, v("2.1.273").3), (Some(true), Some(false)));
+        assert_eq!((v("2.1.274").2, v("2.1.274").3), (Some(true), Some(true)));
+        assert_eq!(v("2.1.286 (Claude Code)").3, Some(true));
+        assert_eq!((v("??").2, v("??").3), (None, None));
+    }
+
+    #[test]
+    fn mcp_tools_need_2_1_274() {
+        assert!(!supports_mcp_tools((2, 1, 273)));
+        assert!(supports_mcp_tools((2, 1, 274)));
+        assert!(supports_mcp_tools((2, 2, 0)));
+        assert!(!supports_mcp_tools((1, 9, 999)));
     }
 
     #[cfg(unix)]
@@ -432,6 +464,7 @@ mod tests {
             claude_version: Some("2.1.200 (Claude Code)".into()),
             claude_version_note: None,
             claude_code_args_supported: Some(true),
+            claude_code_mcp_supported: Some(false),
             hook_exe: None,
             settings_path: "/d/settings.json".into(),
             settings_exists: true,
@@ -474,6 +507,7 @@ mod tests {
                 "claudeVersion": "2.1.200 (Claude Code)",
                 "claudeVersionNote": null,
                 "claudeCodeArgsSupported": true,
+                "claudeCodeMcpSupported": false,
                 "hookExe": null,
                 "settingsPath": "/d/settings.json",
                 "settingsExists": true,

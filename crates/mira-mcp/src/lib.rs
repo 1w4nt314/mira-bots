@@ -33,8 +33,9 @@ pub const MCP_CALL_TIMEOUT_MS: u64 = 10_000;
 /// Maximum stdin line (bytes, newline excluded). Longer lines are answered with `-32600` when an
 /// id can be found, otherwise ignored.
 pub const MAX_LINE: usize = 1 << 20;
-/// Maximum reply line read from the app (bytes).
-pub const MAX_REPLY: u64 = 256 << 10;
+/// Maximum reply line read from the app (bytes). A longer reply is reported as
+/// "Svar fra mira-bots for stort" (`list_tickets` truncates summaries, so this is a safety net).
+pub const MAX_REPLY: u64 = 1 << 20;
 
 /// Whether an env value counts as missing: empty, or an unexpanded `${VAR}` placeholder (Claude
 /// Code leaves `${VAR}` in mcp.json's `env` as literal text when VAR is not set; research4 Q2).
@@ -233,7 +234,7 @@ mod tests {
         assert_eq!(SERVER_NAME, "mira-bots");
         assert_eq!(MCP_CALL_TIMEOUT_MS, 10_000);
         assert_eq!(MAX_LINE, 1_048_576);
-        assert_eq!(MAX_REPLY, 262_144);
+        assert_eq!(MAX_REPLY, 1_048_576);
     }
 
     #[test]

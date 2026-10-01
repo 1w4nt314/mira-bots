@@ -132,13 +132,18 @@ impl AppState {
 
     /// Everything the Diagnostics panel shows (C2.3). Recomputes the `claude` lookup.
     pub fn diagnostics(&self) -> Diagnostics {
-        let (claude_version, claude_version_note, claude_code_args_supported) =
-            version_fields(&lock(&self.claude_version));
+        let (
+            claude_version,
+            claude_version_note,
+            claude_code_args_supported,
+            claude_code_mcp_supported,
+        ) = version_fields(&lock(&self.claude_version));
         Diagnostics {
             claude_path: path_string(&find_claude()),
             claude_version,
             claude_version_note,
             claude_code_args_supported,
+            claude_code_mcp_supported,
             hook_exe: path_string(&self.paths.hook_exe),
             settings_path: self.paths.settings_json.to_string_lossy().into_owned(),
             settings_exists: self.paths.settings_json.is_file(),
@@ -338,10 +343,17 @@ pub fn ticket_set_state(
     target: TicketState,
     note: Option<String>,
 ) -> Result<TicketSummary, String> {
-    let old = assignee_of(t, id)?;
+    let before = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    let old = before.assignee_agent_id;
     let live = old.as_deref().is_some_and(|a| agent_live(&t.manager, a));
     let now = now_ms();
     let tk = t.mutate(|s| s.set_state(id, target, note, live, now))?;
+    // The ticket left in-progress: the agent's "no submission"/"turn failed" hint is stale (N3).
+    if before.state == TicketState::InProgress && tk.state != TicketState::InProgress {
+        if let Some(agent) = old.as_deref() {
+            t.clear_stale_detail(agent);
+        }
+    }
     t.notify(old.into_iter().chain(tk.assignee_agent_id.clone()));
     Ok(TicketSummary::from(&tk))
 }
@@ -1078,6 +1090,7 @@ mod tests {
         assert_eq!(d.claude_version.as_deref(), Some("2.1.286 (Claude Code)"));
         assert_eq!(d.claude_version_note, None);
         assert_eq!(d.claude_code_args_supported, Some(true));
+        assert_eq!(d.claude_code_mcp_supported, Some(true));
         assert!(!d.settings_exists);
         assert!(d.settings_path.ends_with("settings.json"));
         assert_eq!(d.mcp_exe, None);
@@ -1120,6 +1133,7 @@ mod tests {
         assert_eq!(d.last_tool_call.unwrap().tool, "mira_list_tickets");
         assert_eq!(d.claude_version_note.as_deref(), Some("kører stadig"));
         assert_eq!(d.claude_code_args_supported, None);
+        assert_eq!(d.claude_code_mcp_supported, None);
         let info = state.app_info();
         assert_eq!(info.max_staff_agents, 2);
         assert_eq!(info.agents_root, d.agents_root);
@@ -1202,6 +1216,50 @@ mod tests {
             ticket_unassign(&t.ctx, &tk.id).unwrap_err(),
             "Ticketen findes ikke"
         );
+    }
+
+    #[test]
+    fn leaving_in_progress_clears_the_stale_agent_hint() {
+        use crate::config::{NOT_SUBMITTED_TEXT, TURN_FAILED_TEXT};
+        let (t, live, _) = tickets_setup();
+        let detail = |t: &TestCtx| lock(&t.ctx.manager).get(&live).unwrap().detail;
+        let in_progress = |t: &TestCtx| {
+            let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+            ticket_assign(&t.ctx, &tk.id, &live).unwrap();
+            ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
+            tk.id
+        };
+        for hint in [NOT_SUBMITTED_TEXT, TURN_FAILED_TEXT] {
+            let id = in_progress(&t);
+            lock(&t.ctx.manager).set_detail(&live, Some(hint.into()));
+            t.clear();
+            ticket_set_state(&t.ctx, &id, TicketState::Review, None).unwrap();
+            assert_eq!(detail(&t), None, "{hint}");
+            // The last `agents-changed` already carries the cleared detail.
+            let last = t.emitted(AGENTS_CHANGED).pop().unwrap();
+            let me = last
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"] == json!(live))
+                .unwrap();
+            assert!(me["detail"].is_null(), "{hint}");
+            ticket_set_state(&t.ctx, &id, TicketState::Done, None).unwrap();
+        }
+        // Another detail stays; so does the hint when a different ticket is moved.
+        let id = in_progress(&t);
+        lock(&t.ctx.manager).set_detail(&live, Some("Kører tests".into()));
+        ticket_set_state(&t.ctx, &id, TicketState::Review, None).unwrap();
+        assert_eq!(detail(&t).as_deref(), Some("Kører tests"));
+        let id = in_progress(&t);
+        let other = ticket_create(&t.ctx, "y", "", false).unwrap();
+        ticket_assign(&t.ctx, &other.id, &live).unwrap();
+        lock(&t.ctx.manager).set_detail(&live, Some(NOT_SUBMITTED_TEXT.into()));
+        ticket_set_state(&t.ctx, &other.id, TicketState::Backlog, None).unwrap();
+        assert_eq!(detail(&t).as_deref(), Some(NOT_SUBMITTED_TEXT));
+        // Back to the backlog from in-progress clears it too.
+        ticket_set_state(&t.ctx, &id, TicketState::Backlog, None).unwrap();
+        assert_eq!(detail(&t), None);
     }
 
     #[test]

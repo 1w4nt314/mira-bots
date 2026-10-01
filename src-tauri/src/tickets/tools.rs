@@ -21,18 +21,28 @@ use serde_json::{json, Map, Value};
 use super::model::{Ticket, TicketError};
 use super::prompt::{clean_body, one_line};
 use super::service::TicketService;
-use super::{emit_json, TicketsCtx};
-use crate::config::{
-    AGENT_NOTE_MAX_CHARS, CREATE_TICKET_RATE_LIMIT, CREATE_TICKET_RATE_WINDOW_MS,
-    NOT_SUBMITTED_TEXT, TURN_FAILED_TEXT,
-};
-use crate::events::AGENTS_CHANGED;
+use super::TicketsCtx;
+use crate::config::{AGENT_NOTE_MAX_CHARS, CREATE_TICKET_RATE_LIMIT, CREATE_TICKET_RATE_WINDOW_MS};
 use crate::hooks::status::AgentStatus;
 use crate::pipe::protocol::{ToolFrame, ToolResult};
 
 pub const UNKNOWN_AGENT: &str = "Ukendt agent";
 pub const NOTE_ERROR: &str = "note skal være en tekst på 1–120 tegn";
 pub const UNKNOWN_FILTER: &str = "Ukendt filter";
+/// `mira_list_tickets` shows at most this many characters of each ticket's summary (then "…");
+/// `mira_get_ticket` has the full text. Keeps a list of any realistic length far below
+/// mira-mcp's `MAX_REPLY` (N1); the UI's `tickets-changed` still carries the full summary.
+pub const LIST_SUMMARY_MAX_CHARS: usize = 160;
+
+/// `s` cut to `max` characters with a trailing "…" (unchanged when it fits).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -124,26 +134,14 @@ impl ToolsCtx {
         }
     }
 
-    /// Sets the agent's detail (no-op for the same text) and emits `agents-changed` after the
-    /// manager lock is released. `only_if`: change only while the current detail passes.
+    /// See [`TicketsCtx::set_agent_detail`].
     fn set_detail(
         &self,
         agent_id: &str,
         detail: Option<String>,
         only_if: impl FnOnce(Option<&str>) -> bool,
     ) {
-        let list = {
-            let mut m = lock(&self.tickets.manager);
-            let current = m.get(agent_id).and_then(|a| a.detail);
-            if current == detail || !only_if(current.as_deref()) {
-                return;
-            }
-            if !m.set_detail(agent_id, detail) {
-                return;
-            }
-            m.list()
-        };
-        emit_json(&self.tickets.emit, AGENTS_CHANGED, &list);
+        self.tickets.set_agent_detail(agent_id, detail, only_if);
     }
 
     /// Creates within the window, after dropping expired entries.
@@ -191,12 +189,18 @@ impl ToolsCtx {
         let filter = opt_str(args, "filter", UNKNOWN_FILTER)?
             .map(str::trim)
             .unwrap_or("mine");
-        let tickets = match filter {
+        let mut tickets = match filter {
             "mine" => self.tickets.read(|s| s.list_for_agent(agent_id)),
             "backlog" => self.tickets.read(TicketService::backlog),
             "all" => self.tickets.read(TicketService::list),
             _ => return Err(UNKNOWN_FILTER.into()),
         };
+        for t in &mut tickets {
+            t.summary = t
+                .summary
+                .as_deref()
+                .map(|s| truncate_chars(s, LIST_SUMMARY_MAX_CHARS));
+        }
         Ok(json!({"filter": filter, "tickets": tickets}))
     }
 
@@ -224,11 +228,7 @@ impl ToolsCtx {
             .mutate(|s| s.submit_by_agent(agent_id, ticket_id, summary, now))?;
         // The queue may move on at the next idle.
         self.tickets.notify([agent_id]);
-        self.set_detail(
-            agent_id,
-            None,
-            |d| matches!(d, Some(d) if d == NOT_SUBMITTED_TEXT || d == TURN_FAILED_TEXT),
-        );
+        self.tickets.clear_stale_detail(agent_id);
         log::info!(
             "agent {agent_id} submitted ticket {} -> {} (summary {} chars)",
             t.short_id(),
@@ -267,7 +267,8 @@ impl ToolsCtx {
 mod tests {
     use super::*;
     use crate::agent::AgentManager;
-    use crate::events::TICKETS_CHANGED;
+    use crate::config::NOT_SUBMITTED_TEXT;
+    use crate::events::{AGENTS_CHANGED, TICKETS_CHANGED};
     use crate::tickets::dispatcher::DispatchMsg;
     use crate::tickets::model::{TicketActor, TicketIssue, TicketSource, TicketState};
     use crate::tickets::test_support::{test_ctx, TestCtx};
@@ -660,6 +661,58 @@ mod tests {
             ),
             Err(UNKNOWN_FILTER.into())
         );
+    }
+
+    /// N1: a list of 150 finished tickets with 2000-character summaries stays far below
+    /// mira-mcp's `MAX_REPLY` (1 MiB); summaries are cut to 160 characters + "…" and the full
+    /// text is still there through `mira_get_ticket`.
+    #[test]
+    fn list_truncates_summaries_and_stays_below_the_reply_limit() {
+        const MCP_MAX_REPLY: usize = 1 << 20; // crates/mira-mcp: MAX_REPLY
+        let t = setup();
+        let long = "æ".repeat(2_000);
+        let mut first = String::new();
+        for i in 0..150 {
+            let tk = t.in_progress(&t.a, &format!("t{i}"), false);
+            if i == 0 {
+                first = tk.id.clone();
+            }
+            t.call(
+                Some(&t.a),
+                "mira_submit_for_review",
+                json!({"summary": long}),
+                10,
+            )
+            .unwrap();
+        }
+        let r = t
+            .call(Some(&t.a), "mira_list_tickets", json!({"filter":"all"}), 11)
+            .unwrap();
+        assert_eq!(r["tickets"].as_array().unwrap().len(), 150);
+        let reply =
+            json!({"v":1,"kind":"tool_result","request_id":"1-1","ok":true,"result":r}).to_string();
+        assert!(
+            reply.len() < MCP_MAX_REPLY / 2,
+            "list reply is {} bytes",
+            reply.len()
+        );
+        let shown = r["tickets"][0]["summary"].as_str().unwrap();
+        assert_eq!(shown.chars().count(), LIST_SUMMARY_MAX_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        // The full text is unchanged in the service and in get_ticket.
+        let full = t
+            .call(Some(&t.a), "mira_get_ticket", json!({"id": first}), 12)
+            .unwrap();
+        assert_eq!(full["summary"].as_str(), Some(long.as_str()));
+        assert_eq!(t.ticket(&first).summary.as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn truncate_chars_cuts_on_characters() {
+        assert_eq!(truncate_chars("kort", 160), "kort");
+        assert_eq!(truncate_chars("æøå", 3), "æøå");
+        assert_eq!(truncate_chars("æøåx", 3), "æøå…");
+        assert_eq!(truncate_chars("", 3), "");
     }
 
     #[test]

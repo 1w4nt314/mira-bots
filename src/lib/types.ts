@@ -97,6 +97,8 @@ export interface Diagnostics {
   claudeVersionNote: string | null;
   /** Whether settings.json's exec-form `args` is supported (>= 2.1.139); null when unknown. */
   claudeCodeArgsSupported: boolean | null;
+  /** Claude Code >= 2.1.274 (the agent tools); null when the version is unknown. */
+  claudeCodeMcpSupported: boolean | null;
   hookExe: string | null;
   /** `<app_data_dir>/settings.json` (hooks + permissions). */
   settingsPath: string;

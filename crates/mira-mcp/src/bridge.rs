@@ -23,6 +23,7 @@ pub const ERR_NO_PIPE: &str = "mira-bots kører ikke (MIRA_BOTS_PIPE mangler)";
 pub const ERR_NOT_RUNNING: &str = "mira-bots kører ikke";
 pub const ERR_NO_AGENT: &str = "Agent-id mangler (MIRA_AGENT_ID)";
 pub const ERR_BAD_REPLY: &str = "Ugyldigt svar fra mira-bots";
+pub const ERR_TOO_LARGE: &str = "Svar fra mira-bots for stort";
 
 /// "mira-bots svarede ikke inden for 10 s" (ms when not whole seconds, e.g. in tests).
 pub fn timeout_text(timeout: Duration) -> String {
@@ -48,6 +49,8 @@ pub struct PipeBackend {
 enum WorkerError {
     Connect(std::io::Error),
     Io(std::io::Error),
+    /// The reply line was longer than `MAX_REPLY` (no newline within the limit).
+    TooLarge,
 }
 
 /// Connect, send the frame, read one line (at most `MAX_REPLY` bytes), close.
@@ -57,12 +60,26 @@ fn exchange(pipe: &str, frame: &str, deadline: Instant) -> Result<String, Worker
         .write_all(frame.as_bytes())
         .and_then(|()| stream.flush())
         .map_err(WorkerError::Io)?;
-    let mut line = String::new();
     let mut reader = BufReader::new(stream.take(MAX_REPLY));
-    reader.read_line(&mut line).map_err(WorkerError::Io)?;
+    let line = read_reply_line(&mut reader);
     // Close our handle right away: the app's side waits for this EOF (drain_until_closed).
     drop(reader);
-    Ok(line)
+    line
+}
+
+/// Reads one line from `reader`, which is limited to `MAX_REPLY` bytes (`Read::take`). A line
+/// that fills the whole limit without ending in `\n` is cut off: [`WorkerError::TooLarge`]
+/// (checked on the bytes, since the cut may fall inside a multi-byte character).
+fn read_reply_line(reader: &mut impl BufRead) -> Result<String, WorkerError> {
+    let mut buf = Vec::new();
+    reader
+        .read_until(b'\n', &mut buf)
+        .map_err(WorkerError::Io)?;
+    if buf.last() != Some(&b'\n') && buf.len() as u64 >= MAX_REPLY {
+        return Err(WorkerError::TooLarge);
+    }
+    String::from_utf8(buf)
+        .map_err(|e| WorkerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
 impl PipeBackend {
@@ -166,6 +183,10 @@ impl ToolBackend for PipeBackend {
                 log(debug, &format!("pipe I/O failed: {e}"));
                 return Err(ERR_BAD_REPLY.into());
             }
+            Ok(Err(WorkerError::TooLarge)) => {
+                log(debug, "reply longer than MAX_REPLY");
+                return Err(ERR_TOO_LARGE.into());
+            }
             Err(e) => {
                 log(debug, &format!("no reply: {e}"));
                 return Err(timeout_text(self.timeout));
@@ -213,6 +234,38 @@ mod tests {
         ] {
             assert_eq!(parse_reply(bad, "1-1"), Err(ERR_BAD_REPLY.into()), "{bad}");
         }
+    }
+
+    #[test]
+    fn reply_line_limit() {
+        use std::io::Cursor;
+        // Over-long line without a newline (cut inside a two-byte character): too large.
+        let mut big = vec![b'a'];
+        big.extend("æ".repeat(MAX_REPLY as usize).into_bytes());
+        let mut r = BufReader::new(Cursor::new(big).take(MAX_REPLY));
+        assert!(matches!(
+            read_reply_line(&mut r),
+            Err(WorkerError::TooLarge)
+        ));
+        // A line that fits (also when it ends exactly at the limit) is returned whole.
+        let mut fits = vec![b'a'; MAX_REPLY as usize - 1];
+        fits.push(b'\n');
+        let mut r = BufReader::new(Cursor::new(fits).take(MAX_REPLY));
+        assert_eq!(
+            read_reply_line(&mut r).ok().map(|l| l.len() as u64),
+            Some(MAX_REPLY)
+        );
+        // Short line, EOF without newline, and invalid UTF-8.
+        let mut r = BufReader::new(Cursor::new(b"hej".to_vec()).take(MAX_REPLY));
+        assert_eq!(read_reply_line(&mut r).ok().as_deref(), Some("hej"));
+        let mut r = BufReader::new(Cursor::new(vec![0xff, b'\n']).take(MAX_REPLY));
+        assert!(matches!(read_reply_line(&mut r), Err(WorkerError::Io(_))));
+    }
+
+    #[test]
+    fn too_large_text_is_clear_danish() {
+        assert_eq!(ERR_TOO_LARGE, "Svar fra mira-bots for stort");
+        assert_ne!(ERR_TOO_LARGE, ERR_BAD_REPLY);
     }
 
     #[test]
@@ -314,7 +367,10 @@ mod tests {
                     }
                     // Empty: hang up without answering.
                     Reply::Raw(l) if l.is_empty() => return (frame, false),
-                    Reply::Raw(l) => w.write_all(l.as_bytes()).unwrap(),
+                    // The client may hang up before the end (e.g. an over-long reply).
+                    Reply::Raw(l) => {
+                        let _ = w.write_all(l.as_bytes());
+                    }
                     Reply::Silent(hold) => {
                         std::thread::sleep(hold);
                         return (frame, false);
@@ -377,6 +433,19 @@ mod tests {
             );
             let r = backend(&path, Duration::from_secs(5)).call("mira_list_tickets", json!({}));
             assert_eq!(r, Err(ERR_BAD_REPLY.into()));
+            server.join().unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn oversized_reply_is_reported_as_too_large() {
+            let path = sock_path("big");
+            let server = serve_once(
+                &path,
+                Reply::Raw(format!("{}{}", "x".repeat(MAX_REPLY as usize + 10), "\n")),
+            );
+            let r = backend(&path, Duration::from_secs(5)).call("mira_list_tickets", json!({}));
+            assert_eq!(r, Err(ERR_TOO_LARGE.into()));
             server.join().unwrap();
             let _ = std::fs::remove_file(&path);
         }

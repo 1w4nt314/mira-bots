@@ -55,6 +55,9 @@ pub const LOG_KEEP_FILES: usize = 3;
 pub const CLAUDE_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// First Claude Code version that supports exec-form hooks (`args`).
 pub const HOOK_ARGS_MIN_VERSION: (u32, u32, u32) = (2, 1, 139);
+/// First Claude Code version whose permission requests name the MCP server (`mcp_server.source`,
+/// step 4 tools); step 4 is verified against 2.1.286.
+pub const MCP_MIN_VERSION: (u32, u32, u32) = (2, 1, 274);
 
 /// A `Starting` agent without any hook event for this long gets [`STARTING_HINT_TEXT`] as detail.
 pub const STARTING_HINT_AFTER: Duration = Duration::from_secs(15);
