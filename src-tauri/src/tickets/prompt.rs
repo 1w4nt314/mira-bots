@@ -193,13 +193,18 @@ pub fn handed_over_line(short: &str, to_name: Option<&str>) -> String {
 }
 
 /// Detail text of an agent whose ticket in progress left it (review 5c W4).
-pub fn handed_over_detail(short: &str) -> String {
-    format!("Ticket {short} givet videre")
+pub fn handed_over_detail(short: &str, to_agent: bool) -> String {
+    if to_agent {
+        format!("Ticket {short} givet videre")
+    } else {
+        format!("Ticket {short} lagt tilbage")
+    }
 }
 
 /// Whether `detail` is a [`handed_over_detail`] text (cleared like the other dispatcher hints).
 pub fn is_handed_over_detail(detail: &str) -> bool {
-    detail.starts_with("Ticket ") && detail.ends_with(" givet videre")
+    detail.starts_with("Ticket ")
+        && (detail.ends_with(" givet videre") || detail.ends_with(" lagt tilbage"))
 }
 
 /// The line for a ticket (sanitises the title): [`render_line`], or
@@ -824,10 +829,17 @@ mod tests {
             "{l}"
         );
         assert_eq!(
-            handed_over_detail("abcdef01"),
+            handed_over_detail("abcdef01", true),
             "Ticket abcdef01 givet videre"
         );
-        assert!(is_handed_over_detail(&handed_over_detail("abcdef01")));
+        assert_eq!(
+            handed_over_detail("abcdef01", false),
+            "Ticket abcdef01 lagt tilbage"
+        );
+        assert!(is_handed_over_detail(&handed_over_detail("abcdef01", true)));
+        assert!(is_handed_over_detail(&handed_over_detail(
+            "abcdef01", false
+        )));
         assert!(!is_handed_over_detail("Kører tests"));
     }
 

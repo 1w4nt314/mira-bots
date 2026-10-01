@@ -2156,7 +2156,7 @@ mod tests {
         assert_eq!(
             lock(&t.ctx.manager).get(&other).unwrap().detail,
             Some(format!(
-                "Ticket {} givet videre",
+                "Ticket {} lagt tilbage",
                 crate::tickets::model::short_id(&tk.id)
             ))
         );

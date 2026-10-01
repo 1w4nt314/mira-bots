@@ -2811,7 +2811,7 @@ mod tests {
             .unwrap();
         // TicketsCtx::handed_over sets the detail; the dispatcher clears it like its own hints.
         h.port
-            .set_detail("a1", Some(prompt::handed_over_detail(&a.short_id())));
+            .set_detail("a1", Some(prompt::handed_over_detail(&a.short_id(), true)));
         handed_over(&mut h, "a1", &a, Some("bot-w"));
         h.advance(10_000);
         assert_eq!(h.writes().len(), 2, "busy: nothing typed");

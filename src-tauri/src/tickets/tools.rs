@@ -2058,12 +2058,12 @@ mod tests {
             .starts_with("overdraget fra "));
         // The coordinator has nothing in progress any more; both queues are woken.
         assert_eq!(t.tc.ctx.read(|s| s.current_for_agent(&t.k)), None);
-        // Review 5c W4: the detail says so; it handed it on itself, so no stop line (below:
-        // only the two QueueChanged).
-        assert_eq!(
-            t.detail(&t.k).as_deref(),
-            Some(format!("Ticket {} givet videre", tk.short_id()).as_str())
-        );
+        // Review 5c W4/N8: it handed the ticket on itself, so its own status text stays and no
+        // stop line is typed (below: only the two QueueChanged).
+        assert!(t
+            .detail(&t.k)
+            .as_deref()
+            .is_none_or(|d| !d.contains("givet videre")));
         let mut sent = t.tc.sent();
         sent.sort_by_key(|m| format!("{m:?}"));
         let mut want = vec![

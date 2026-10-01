@@ -81,10 +81,14 @@ pub fn render_profile_prompt(profile: &AgentProfile, rules: &WorkspaceRules) -> 
             out.push_str(role_text(*role));
             out.push('\n');
         }
-        if !roles::has_work_role(&roles) {
-            out.push_str(NO_WORK_ROLE_TEXT);
+    }
+    // Review 5c W5: also for a profile without any role (its file tools are denied too).
+    if !roles::has_work_role(&roles) {
+        if roles.is_empty() {
             out.push('\n');
         }
+        out.push_str(NO_WORK_ROLE_TEXT);
+        out.push('\n');
     }
     let append = profile.prompt_append.replace("\r\n", "\n");
     let append = append.trim();
@@ -167,6 +171,15 @@ mod tests {
             assert!(!text.contains(NO_WORK_ROLE_TEXT), "{id}");
             assert!(!text.contains("ændrer ikke"), "{id}");
         }
+        // A custom profile without any role has no role section but still gets the paragraph.
+        let none = AgentProfile {
+            roles: vec![],
+            ..builtin_profile("coder").unwrap()
+        };
+        let text = render_profile_prompt(&none, &rules());
+        assert!(!text.contains(ROLE_HEADING));
+        assert_eq!(text.matches(NO_WORK_ROLE_TEXT).count(), 1);
+        assert!(text.find(NO_WORK_ROLE_TEXT).unwrap() < text.find(RULES_HEADING).unwrap());
         for role in Role::ALL {
             assert!(!role_text(role).contains("Bash til at skrive"), "{role:?}");
         }

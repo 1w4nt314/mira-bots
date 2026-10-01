@@ -257,10 +257,14 @@ impl TicketsCtx {
             return;
         }
         let short = ticket.short_id();
-        self.set_agent_detail(from_agent, Some(prompt::handed_over_detail(&short)), |_| {
-            true
-        });
+        // Review 5c N8: an agent that handed the ticket on itself keeps its own status text; only a
+        // hand-over by someone else replaces it (the agent has not been told yet).
         if by_someone_else {
+            self.set_agent_detail(
+                from_agent,
+                Some(prompt::handed_over_detail(&short, to_name.is_some())),
+                |_| true,
+            );
             self.send(DispatchMsg::HandedOver {
                 agent_id: from_agent.to_string(),
                 ticket_id: ticket.id.clone(),
