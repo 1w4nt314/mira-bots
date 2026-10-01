@@ -87,7 +87,7 @@ pub enum ProfileKind {
     Custom,
 }
 
-/// One profile; file `<agents_root>/.mira-bots/profiles/<id>.json` (C5.2), camelCase.
+/// One profile; file `<projects root>/.mira-bots/profiles/<id>.json` (C5.2), camelCase.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProfile {

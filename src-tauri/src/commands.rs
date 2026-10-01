@@ -17,14 +17,11 @@ use tauri_plugin_opener::OpenerExt;
 use crate::agent::claude_path::find_claude;
 use crate::agent::manager::{build_restart_spec, RestartSession};
 use crate::agent::roles::prefix_for;
-use crate::agent::workdir::{ensure_dir, next_agent_dir};
+use crate::agent::workdir::{ensure_dir, next_agent_name};
 use crate::agent::{
     now_ms, AgentError, AgentInfo, AgentManager, EventSink, SeatKind, SpawnContext, SpawnRequest,
 };
-use crate::config::{
-    AUTO_REVIEW_ON_STOP, DEFAULT_PROFILE_ID, MAX_STAFF_AGENTS, MAX_WORK_AGENTS, SETTINGS_FILE,
-    STARTING_HINT_AFTER, SYSTEM_PROMPT_FILE,
-};
+use crate::config::{DEFAULT_PROFILE_ID, SETTINGS_FILE, STARTING_HINT_AFTER, SYSTEM_PROMPT_FILE};
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
 use crate::hooks::settings::write_profile_settings;
@@ -46,6 +43,7 @@ use crate::tickets::model::{
 use crate::tickets::tools::{SpawnByProfile, SPAWN_UNAVAILABLE};
 use crate::tickets::{prompt, ReportContent, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
 use crate::workplace;
+use crate::workspace::WorkspaceReader;
 
 /// Locations resolved once in `setup`. The `claude` binary is not cached: it is looked up again
 /// on every `get_app_info` and `spawn_agent` (cheap), so installing it while the app runs works.
@@ -71,11 +69,14 @@ pub struct AppPaths {
     /// `<app_log_dir>/mira-bots.log` (`%LOCALAPPDATA%\dk.mira.bots\logs` on Windows); `None` if
     /// the log dir could not be resolved.
     pub log_file: Option<PathBuf>,
-    /// `<home>/mira-bots/agents`: parent of the default agent folders (created on first use).
-    pub agents_root: PathBuf,
+    /// The projects root (`<home>/mira-bots/projects` or the app setting, plan4b A.1): project
+    /// folders, the profile store and the workspace file. Fixed while the app runs.
+    pub projects_root: PathBuf,
+    /// `<data_dir>/app-settings.json` (the projects root setting; applies after a restart).
+    pub app_settings: PathBuf,
     /// `<data_dir>/tickets.json`.
     pub tickets_file: PathBuf,
-    /// `<agents_root>/.mira-bots/profiles`: the profile store (one JSON file per profile).
+    /// `<projects_root>/.mira-bots/profiles`: the profile store (one JSON file per profile).
     pub profiles_dir: PathBuf,
     /// `<data_dir>/profiles`: the rendered per-profile files (`<id>/settings.json`,
     /// `<id>/system-prompt.md`), passed to claude with `--settings` and
@@ -107,6 +108,10 @@ pub struct AppState {
     pub tickets_warning: Option<String>,
     /// Agent profiles (store + `profiles-changed`).
     pub profiles: Arc<ProfilesCtx>,
+    /// `<projects_root>/mira-bots.workspace.json`, read on demand (shared with `TicketsCtx`).
+    pub workspace: Arc<WorkspaceReader>,
+    /// Profiles copied from the step 1–5 agents root at this start (Diagnostik).
+    pub profiles_migrated: usize,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -118,12 +123,16 @@ pub struct AppInfo {
     /// The app's settings.json (`hooksJson` up to step 3).
     pub settings_json: String,
     pub pipe_name: String,
+    /// `rules.max_work_agents`.
     pub max_agents: usize,
     pub version: String,
     /// Whether the pipe server is listening (see [`AppState::pipe_ready`]).
     pub pipe_ready: bool,
+    /// `rules.max_staff_agents`.
     pub max_staff_agents: usize,
-    pub agents_root: String,
+    pub projects_root: String,
+    /// The effective workspace rules (plan4b A.4).
+    pub rules: WorkspaceRules,
 }
 
 /// `get_agent_output` result: same shape as the `agent-output` event payload.
@@ -140,16 +149,18 @@ fn path_string(p: &Option<PathBuf>) -> Option<String> {
 impl AppState {
     /// Recomputes the `claude` lookup on every call.
     pub fn app_info(&self) -> AppInfo {
+        let rules = self.workspace.snapshot().rules;
         AppInfo {
             claude_path: path_string(&find_claude()),
             hook_exe: path_string(&self.paths.hook_exe),
             settings_json: self.paths.settings_json.to_string_lossy().into_owned(),
             pipe_name: self.paths.pipe_name.clone(),
-            max_agents: MAX_WORK_AGENTS,
+            max_agents: rules.max_work_agents,
             version: env!("CARGO_PKG_VERSION").to_string(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
-            max_staff_agents: MAX_STAFF_AGENTS,
-            agents_root: self.paths.agents_root.to_string_lossy().into_owned(),
+            max_staff_agents: rules.max_staff_agents,
+            projects_root: self.paths.projects_root.to_string_lossy().into_owned(),
+            rules,
         }
     }
 
@@ -161,6 +172,7 @@ impl AppState {
             claude_code_args_supported,
             claude_code_mcp_supported,
         ) = version_fields(&lock(&self.claude_version));
+        let ws = self.workspace.snapshot();
         Diagnostics {
             claude_path: path_string(&find_claude()),
             claude_version,
@@ -177,7 +189,7 @@ impl AppState {
             tool_calls: self.hook_stats.tool_calls(),
             tool_errors: self.hook_stats.tool_errors(),
             last_tool_call: self.hook_stats.last_tool_call(),
-            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
+            auto_review_on_stop: ws.rules.auto_review_on_stop,
             pipe_name: self.paths.pipe_name.clone(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
             frames_received: self.hook_stats.received(),
@@ -185,7 +197,7 @@ impl AppState {
             last_hook_event: self.hook_stats.last_event(),
             log_path: path_string(&self.paths.log_file),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            agents_root: self.paths.agents_root.to_string_lossy().into_owned(),
+            projects_root: self.paths.projects_root.to_string_lossy().into_owned(),
             running_agents: lock(&self.manager).running_count(),
             tickets_path: self.paths.tickets_file.to_string_lossy().into_owned(),
             tickets_warning: self.tickets_warning.clone(),
@@ -197,6 +209,11 @@ impl AppState {
             review_assignments_open: self.tickets.read(|s| s.review_assignments().len()),
             tickets_escalated: self.tickets.read(|s| s.escalated_count()),
             reports_total: self.tickets.read(|s| s.report_count()),
+            workspace_file_path: self.workspace.path().to_string_lossy().into_owned(),
+            workspace_file_exists: ws.file_exists,
+            workspace_warning: ws.warning,
+            projects_total: crate::projects::list_projects(&self.paths.projects_root).len(),
+            profiles_migrated: self.profiles_migrated,
         }
     }
 
@@ -214,19 +231,20 @@ pub fn emit_agent_list(app: &AppHandle, manager: &Mutex<AgentManager>) {
     }
 }
 
-/// Explicit folder if given and non-blank, otherwise the next free default folder
-/// (`<agents_root>/<prefix>-<nn>`, prefix from the profile's roles), created on disk.
+/// Explicit folder if given and non-blank, otherwise a default folder named after the next free
+/// agent name (`<projects_root>/<prefix>-<nn>`, prefix from the profile's roles), created on
+/// disk. Step 4b batch 1 keeps this until the project placement replaces it (batch 2).
 pub fn resolve_cwd(
     cwd: Option<String>,
-    agents_root: &std::path::Path,
+    projects_root: &std::path::Path,
     prefix: &str,
     manager: &Mutex<AgentManager>,
 ) -> Result<PathBuf, AgentError> {
     match cwd {
         Some(s) if !s.trim().is_empty() => Ok(PathBuf::from(s)),
         _ => {
-            let taken = lock(manager).cwds();
-            let dir = next_agent_dir(agents_root, prefix, &taken);
+            let taken = lock(manager).names();
+            let dir = projects_root.join(next_agent_name(prefix, &taken));
             ensure_dir(&dir)?;
             Ok(dir)
         }
@@ -554,6 +572,8 @@ pub fn spawn_request(
     profile.check_seat(seat_kind)?;
     Ok(SpawnRequest {
         cwd,
+        name: None,
+        project: None,
         prompt,
         seat_kind,
         profile: profile.snapshot(&overrides),
@@ -571,7 +591,7 @@ pub fn write_profile_files(
         .clone()
         .unwrap_or_else(|| PathBuf::from("mira-hook-not-found"));
     let settings = write_profile_settings(&paths.data_dir, &hook, profile)?;
-    let prompt = write_profile_prompt(&paths.data_dir, profile, &WorkspaceRules::current())?;
+    let prompt = write_profile_prompt(&paths.data_dir, profile, &WorkspaceRules::defaults())?;
     Ok((settings, prompt))
 }
 
@@ -596,8 +616,9 @@ pub fn spawn_context(
         Some(p) => {
             let settings =
                 write_profile_settings(&state.paths.data_dir, hook_exe, p).map_err(io)?;
-            let prompt = write_profile_prompt(&state.paths.data_dir, p, &WorkspaceRules::current())
-                .map_err(io)?;
+            let prompt =
+                write_profile_prompt(&state.paths.data_dir, p, &WorkspaceRules::defaults())
+                    .map_err(io)?;
             (settings, prompt)
         }
         None => {
@@ -635,7 +656,7 @@ pub fn prepare_spawn(
 ) -> Result<(SpawnContext, PathBuf), String> {
     let ctx = spawn_context(state, &profile.id, Some(profile))?;
     let prefix = prefix_for(&profile.roles, profile.is_specialist());
-    let cwd = resolve_cwd(cwd, &state.paths.agents_root, prefix, &state.manager)?;
+    let cwd = resolve_cwd(cwd, &state.paths.projects_root, prefix, &state.manager)?;
     Ok((ctx, cwd))
 }
 
@@ -847,6 +868,8 @@ pub fn restart_request(
 ) -> SpawnRequest {
     SpawnRequest {
         cwd: PathBuf::from(&info.cwd),
+        name: Some(info.name.clone()),
+        project: info.project.clone(),
         prompt: None,
         seat_kind: info.seat_kind,
         profile: ProfileSnapshot {
@@ -1522,13 +1545,20 @@ mod tests {
             version: "0.1.0".into(),
             pipe_ready: false,
             max_staff_agents: 3,
-            agents_root: "/h/mira-bots/agents".into(),
+            projects_root: "/h/mira-bots/projects".into(),
+            rules: WorkspaceRules::defaults(),
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
             json!({"claudePath":null,"hookExe":"/h","settingsJson":"/d/settings.json",
                    "pipeName":"pipe","maxAgents":5,"version":"0.1.0","pipeReady":false,
-                   "maxStaffAgents":3,"agentsRoot":"/h/mira-bots/agents"})
+                   "maxStaffAgents":3,"projectsRoot":"/h/mira-bots/projects",
+                   "rules":{"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,
+                            "autoReviewOnStop":false,"createTicketRateLimit":20,
+                            "ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,
+                            "reportsPerTicketMax":20,"reviewByDefault":true,
+                            "userInputGraceMs":5000,"agentsMayCreateProjects":false,
+                            "maxAgentsPerProject":0}})
         );
     }
 
@@ -1553,9 +1583,10 @@ mod tests {
                 pipe_name: "pipe".into(),
                 data_dir: dir.to_path_buf(),
                 log_file: Some(dir.join("logs").join("mira-bots.log")),
-                agents_root: dir.join("agents"),
+                projects_root: dir.join("projects"),
+                app_settings: dir.join("app-settings.json"),
                 tickets_file: dir.join("tickets.json"),
-                profiles_dir: profiles_dir(&dir.join("agents")),
+                profiles_dir: profiles_dir(&dir.join("projects")),
                 profile_files_dir: dir.join("profiles"),
             },
             island: IslandState::default(),
@@ -1567,9 +1598,13 @@ mod tests {
             tickets: t.ctx,
             tickets_warning: Some("tickets.json kunne ikke læses".into()),
             profiles: Arc::new(ProfilesCtx::new(
-                ProfileStore::load(profiles_dir(&dir.join("agents")), 1),
+                ProfileStore::load(profiles_dir(&dir.join("projects")), 1),
                 Arc::new(|_, _| {}),
             )),
+            workspace: Arc::new(WorkspaceReader::new(
+                dir.join("projects").join(crate::config::WORKSPACE_FILE),
+            )),
+            profiles_migrated: 0,
         }
     }
 
@@ -1608,7 +1643,12 @@ mod tests {
         assert_eq!(d.last_hook_event.unwrap().name, "Stop");
         assert!(d.log_path.unwrap().ends_with("mira-bots.log"));
         assert_eq!(d.running_agents, 1, "the stopped agent does not count");
-        assert!(d.agents_root.ends_with("agents"));
+        assert!(d.projects_root.ends_with("projects"));
+        assert!(d.workspace_file_path.ends_with("mira-bots.workspace.json"));
+        assert!(!d.workspace_file_exists);
+        assert_eq!(d.workspace_warning, None);
+        assert_eq!(d.projects_total, 0);
+        assert_eq!(d.profiles_migrated, 0);
         assert!(d.tickets_path.ends_with("tickets.json"));
         assert_eq!(d.tickets_total, 2);
         assert!(!d.tickets_read_only);
@@ -1637,7 +1677,30 @@ mod tests {
         assert_eq!(d.claude_code_mcp_supported, None);
         let info = state.app_info();
         assert_eq!(info.max_staff_agents, 3);
-        assert_eq!(info.agents_root, d.agents_root);
+        assert_eq!(info.projects_root, d.projects_root);
+        assert_eq!(info.rules, WorkspaceRules::defaults());
+
+        // The workspace file decides the limits and the auto review; projects are counted.
+        std::fs::write(
+            dir.join("projects").join(crate::config::WORKSPACE_FILE),
+            r#"{"maxWorkAgents": 2, "maxStaffAgents": 1, "autoReviewOnStop": true}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("projects").join("demo")).unwrap();
+        let info = state.app_info();
+        assert_eq!((info.max_agents, info.max_staff_agents), (2, 1));
+        assert_eq!(info.rules.max_work_agents, 2);
+        let d = state.diagnostics();
+        assert!(d.workspace_file_exists && d.auto_review_on_stop);
+        assert_eq!(d.projects_total, 1);
+        std::fs::write(
+            dir.join("projects").join(crate::config::WORKSPACE_FILE),
+            "{ broken",
+        )
+        .unwrap();
+        let d = state.diagnostics();
+        assert!(d.workspace_warning.is_some());
+        assert!(!d.auto_review_on_stop);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2358,7 +2421,7 @@ mod tests {
     #[test]
     fn resolve_cwd_uses_explicit_or_next_default_folder() {
         let base = std::env::temp_dir().join(format!("mira-cwd-{}", uuid::Uuid::new_v4()));
-        let root = base.join("agents");
+        let root = base.join("projects");
         let m = Mutex::new(AgentManager::new(5));
         assert_eq!(
             resolve_cwd(Some("/w/x".into()), &root, "bot", &m).unwrap(),

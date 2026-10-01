@@ -18,14 +18,15 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::model::{ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState};
+use super::model::{
+    ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState, WorkspaceRules,
+};
 use super::prompt::{self, ReviewSender, TicketDelivery};
 use super::service::TicketService;
 use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
-    AUTO_REVIEW_ON_STOP, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
-    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
-    TURN_FAILED_TEXT,
+    CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS, ENTER_DELAY_MS,
+    NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -42,8 +43,9 @@ pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
 pub const SUBMISSION_REQUESTED_NOTE: &str = "bedt om aflevering";
 
 /// No ticket is typed into a terminal the user typed into less than this long ago (their
-/// half-written prompt would be merged with the ticket line); the dispatch waits instead.
-pub const USER_INPUT_GRACE_MS: u64 = 5000;
+/// half-written prompt would be merged with the ticket line); the dispatch waits instead. The
+/// effective value is the workspace rule `userInputGraceMs` ([`TicketsHost::rules`]).
+pub use crate::config::USER_INPUT_GRACE_MS;
 
 /// What the dispatcher needs to know about an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +63,8 @@ pub struct AgentSnapshot {
     /// coordination task (5c C.1, [`TicketDelivery::for_agent`]).
     pub seat_kind: SeatKind,
     pub roles: Vec<Role>,
+    /// The agent's project (plan4b A.1); `None` on a staff seat.
+    pub project: Option<String>,
 }
 
 /// Access to the agents (implemented by `ManagerPort` over `Arc<Mutex<AgentManager>>`; each call
@@ -71,6 +75,11 @@ pub trait AgentPort: Send {
     fn write_input(&self, id: &str, bytes: &[u8]) -> Result<(), String>;
     /// Sets the agent's detail text; `false` when unknown or exited.
     fn set_detail(&self, id: &str, detail: Option<String>) -> bool;
+    /// Names of the other live work agents in `id`'s project (plan4b A.5). Empty by default
+    /// (test ports without projects).
+    fn peers_in_project(&self, _id: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Access to the shared ticket service (implemented for the app's `TicketsCtx`).
@@ -87,6 +96,15 @@ pub trait TicketsHost: Send {
     /// Called when an agent becomes idle and after an automatic move to review. No-op by
     /// default (tests that do not route).
     fn reroute_reviews(&self) {}
+    /// The effective workspace rules (plan4b A.4; `TicketsCtx` reads the workspace file).
+    /// The defaults from `config.rs` unless overridden.
+    fn rules(&self) -> WorkspaceRules {
+        WorkspaceRules::defaults()
+    }
+    /// The project ids under the projects root (plan4b A.6). Empty by default.
+    fn project_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Schedules `msg` to be fed back into the dispatcher after `delay_ms`, and tells the time the
@@ -276,8 +294,8 @@ pub struct Dispatcher<H, P, T> {
     /// they are idle, before their next delivery.
     stop_notices: HashMap<String, StopNotice>,
     next_token: u64,
-    /// See [`AUTO_REVIEW_ON_STOP`].
-    auto_review_on_stop: bool,
+    /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
+    auto_review_on_stop: Option<bool>,
 }
 
 impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
@@ -289,14 +307,22 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             deliveries: HashMap::new(),
             stop_notices: HashMap::new(),
             next_token: 0,
-            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
+            auto_review_on_stop: None,
         }
     }
 
-    /// Overrides [`AUTO_REVIEW_ON_STOP`] (tests).
+    /// Overrides the workspace rule `autoReviewOnStop` (default
+    /// [`crate::config::AUTO_REVIEW_ON_STOP`]; tests).
     pub fn with_auto_review(mut self, on: bool) -> Self {
-        self.auto_review_on_stop = on;
+        self.auto_review_on_stop = Some(on);
         self
+    }
+
+    /// Whether a Stop moves the in-progress ticket to review: the override, else the workspace
+    /// rule (read when needed, plan4b A.4).
+    fn auto_review(&self) -> bool {
+        self.auto_review_on_stop
+            .unwrap_or_else(|| self.host.rules().auto_review_on_stop)
     }
 
     fn token(&mut self) -> u64 {
@@ -396,11 +422,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         self.set(agent_id, Delivery::Delaying { token });
     }
 
-    /// Milliseconds left of [`USER_INPUT_GRACE_MS`] since the user last typed, if any.
+    /// Milliseconds left of the grace period (workspace rule `userInputGraceMs`, default
+    /// [`USER_INPUT_GRACE_MS`]) since the user last typed, if any.
     fn user_grace_left(&self, snap: &AgentSnapshot) -> Option<u64> {
         let at = snap.last_user_input_at?;
+        let grace = self.host.rules().user_input_grace_ms;
         let elapsed = self.timers.now_ms().saturating_sub(at);
-        (elapsed < USER_INPUT_GRACE_MS).then(|| USER_INPUT_GRACE_MS - elapsed)
+        (elapsed < grace).then(|| grace - elapsed)
     }
 
     /// The agent (idle, not exited) and what it gets next, if a delivery may start now: its
@@ -543,7 +571,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
-    /// Stop: with [`AUTO_REVIEW_ON_STOP`] the in-progress ticket goes to review (step 3).
+    /// Stop: with `autoReviewOnStop` ([`Self::auto_review`]) the in-progress ticket goes to
+    /// review (step 3).
     /// Otherwise (step 4) a ticket still in progress was not submitted with
     /// `mira_submit_for_review`: it keeps its state with `issue: notSubmitted` and the agent gets
     /// [`NOT_SUBMITTED_TEXT`]; no next ticket is considered. Without a ticket in progress (e.g.
@@ -571,7 +600,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             self.port
                 .set_detail(agent_id, Some(TURN_FAILED_TEXT.to_string()));
-        } else if self.auto_review_on_stop {
+        } else if self.auto_review() {
             match self.host.mutate(|s| s.complete_turn(agent_id, now)) {
                 Ok(Some(_)) => self.host.reroute_reviews(),
                 Ok(None) => {}
@@ -1216,6 +1245,7 @@ impl Timers for FakeTimers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AUTO_REVIEW_ON_STOP;
     use crate::hooks::event::parse;
     use crate::hooks::fixtures as fx;
     use crate::hooks::status::apply;
@@ -1234,6 +1264,7 @@ mod tests {
     struct TestHost {
         svc: Arc<Mutex<TicketService>>,
         mutations: Arc<AtomicUsize>,
+        rules: WorkspaceRules,
     }
 
     impl TicketsHost for TestHost {
@@ -1250,6 +1281,10 @@ mod tests {
 
         fn read<R>(&self, f: impl FnOnce(&TicketService) -> R) -> R {
             f(&lock(&self.svc))
+        }
+
+        fn rules(&self) -> WorkspaceRules {
+            self.rules
         }
     }
 
@@ -1311,6 +1346,7 @@ mod tests {
             let host = TestHost {
                 svc: svc.clone(),
                 mutations: Arc::default(),
+                rules: WorkspaceRules::defaults(),
             };
             let port = FakePort::default();
             let timers = FakeTimers::new();
@@ -1344,6 +1380,7 @@ mod tests {
                     last_user_input_at: None,
                     seat_kind,
                     roles: roles.to_vec(),
+                    project: None,
                 },
             );
         }
@@ -1707,7 +1744,7 @@ mod tests {
     #[test]
     fn turn_end_moves_the_ticket_to_review_or_done() {
         let mut h = Harness::new();
-        h.d.auto_review_on_stop = true;
+        h.d.auto_review_on_stop = Some(true);
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1820,7 +1857,7 @@ mod tests {
     #[test]
     fn rejected_ticket_goes_first_and_its_file_has_the_note() {
         let mut h = Harness::new();
-        h.d.auto_review_on_stop = true;
+        h.d.auto_review_on_stop = Some(true);
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -2173,10 +2210,40 @@ mod tests {
     #[test]
     fn auto_review_follows_the_constant() {
         let h = Harness::new();
-        assert_eq!(h.d.auto_review_on_stop, AUTO_REVIEW_ON_STOP);
-        assert!(!h.d.auto_review_on_stop);
+        assert_eq!(h.d.auto_review(), AUTO_REVIEW_ON_STOP);
+        assert!(!h.d.auto_review());
         let d = Dispatcher::new(h.d.host.clone(), h.port.clone(), h.timers.clone());
-        assert!(d.with_auto_review(true).auto_review_on_stop);
+        assert!(d.with_auto_review(true).auto_review());
+        // Without an override the host's (workspace) rules decide (plan4b A.4).
+        let mut host = h.d.host.clone();
+        host.rules.auto_review_on_stop = true;
+        let d = Dispatcher::new(host.clone(), h.port.clone(), h.timers.clone());
+        assert!(d.auto_review());
+        assert!(!d.with_auto_review(false).auto_review());
+    }
+
+    #[test]
+    fn user_input_grace_follows_the_rules() {
+        let h = Harness::new();
+        let now = h.timers.now();
+        let snap = AgentSnapshot {
+            name: "a".into(),
+            cwd: PathBuf::from("/w"),
+            status: AgentStatus::Idle,
+            detail: None,
+            last_user_input_at: Some(now),
+            seat_kind: SeatKind::Work,
+            roles: vec![],
+            project: None,
+        };
+        assert_eq!(h.d.user_grace_left(&snap), Some(USER_INPUT_GRACE_MS));
+        let mut host = h.d.host.clone();
+        host.rules.user_input_grace_ms = 1000;
+        let d = Dispatcher::new(host.clone(), h.port.clone(), h.timers.clone());
+        assert_eq!(d.user_grace_left(&snap), Some(1000));
+        host.rules.user_input_grace_ms = 0;
+        let d = Dispatcher::new(host, h.port.clone(), h.timers.clone());
+        assert_eq!(d.user_grace_left(&snap), None);
     }
 
     #[test]
@@ -2206,7 +2273,7 @@ mod tests {
     #[test]
     fn stop_with_auto_review_moves_on_to_the_next_ticket() {
         let mut h = Harness::new();
-        h.d.auto_review_on_stop = true;
+        h.d.auto_review_on_stop = Some(true);
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
         assert_eq!(h.ticket(&a.id).state, S::Review);
@@ -2553,6 +2620,7 @@ mod tests {
         let host = TestHost {
             svc: h.svc.clone(),
             mutations: Arc::default(),
+            rules: WorkspaceRules::defaults(),
         };
         let d = Dispatcher::new(host, h.port.clone(), h.timers.clone());
         tx2.send(DispatchMsg::QueueChanged {

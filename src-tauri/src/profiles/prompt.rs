@@ -127,7 +127,7 @@ mod tests {
     use crate::profiles::model::{builtin_profile, builtin_profiles};
 
     fn rules() -> WorkspaceRules {
-        WorkspaceRules::current()
+        WorkspaceRules::defaults()
     }
 
     #[test]

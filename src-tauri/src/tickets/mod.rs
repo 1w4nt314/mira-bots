@@ -35,9 +35,11 @@ use crate::config::{
 };
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::hooks::status::AgentStatus;
+use crate::workspace::WorkspaceReader;
 use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
 use model::{
     ReportAuthor, Ticket, TicketActor, TicketError, TicketReport, TicketState, TicketSummary,
+    WorkspaceRules,
 };
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
@@ -120,6 +122,8 @@ pub struct TicketsCtx {
     /// Serialises report writes (sequence number → file → metadata). Taken before, never
     /// inside, the service lock.
     report_lock: Mutex<()>,
+    /// The workspace file reader (plan4b A.4), shared with `AppState`.
+    pub workspace: Arc<WorkspaceReader>,
 }
 
 impl TicketsCtx {
@@ -129,6 +133,7 @@ impl TicketsCtx {
         dispatch_tx: UnboundedSender<DispatchMsg>,
         emit: EmitFn,
         reports_root: PathBuf,
+        workspace: Arc<WorkspaceReader>,
     ) -> Self {
         TicketsCtx {
             service: Mutex::new(service),
@@ -137,6 +142,7 @@ impl TicketsCtx {
             emit,
             reports: ReportStore::new(reports_root),
             report_lock: Mutex::new(()),
+            workspace,
         }
     }
 
@@ -536,6 +542,17 @@ impl TicketsHost for Arc<TicketsCtx> {
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T {
         TicketsCtx::read(self, f)
     }
+
+    fn rules(&self) -> WorkspaceRules {
+        self.workspace.rules()
+    }
+
+    fn project_ids(&self) -> Vec<String> {
+        crate::projects::list_projects(self.workspace.root())
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
 }
 
 /// The dispatcher's [`AgentPort`] over the real manager. Each call takes the manager lock
@@ -566,6 +583,7 @@ impl AgentPort for ManagerPort {
             last_user_input_at,
             seat_kind: a.seat_kind,
             roles: a.roles,
+            project: a.project,
         })
     }
 
@@ -573,6 +591,21 @@ impl AgentPort for ManagerPort {
         lock(&self.manager)
             .write_input(id, bytes)
             .map_err(|e| e.to_string())
+    }
+
+    fn peers_in_project(&self, id: &str) -> Vec<String> {
+        let m = lock(&self.manager);
+        let Some(me) = m.get(id) else {
+            return Vec::new();
+        };
+        let Some(project) = me.project.as_deref() else {
+            return Vec::new();
+        };
+        m.live_work_in_project(project)
+            .into_iter()
+            .filter(|a| a.id != id)
+            .map(|a| a.name)
+            .collect()
     }
 
     fn set_detail(&self, id: &str, detail: Option<String>) -> bool {
@@ -618,8 +651,21 @@ pub(crate) mod test_support {
         });
         let reports_root =
             std::env::temp_dir().join(format!("mira-tickets-{}", uuid::Uuid::new_v4()));
+        // A workspace file that does not exist: the defaults.
+        let workspace = Arc::new(WorkspaceReader::new(
+            std::env::temp_dir()
+                .join(format!("mira-ws-{}", uuid::Uuid::new_v4()))
+                .join(crate::config::WORKSPACE_FILE),
+        ));
         TestCtx {
-            ctx: Arc::new(TicketsCtx::new(svc, manager, tx, emit, reports_root)),
+            ctx: Arc::new(TicketsCtx::new(
+                svc,
+                manager,
+                tx,
+                emit,
+                reports_root,
+                workspace,
+            )),
             rx,
             events,
             store,
@@ -749,6 +795,11 @@ mod tests {
             tx,
             Arc::clone(&emit),
             std::env::temp_dir().join("mira-unused-reports"),
+            Arc::new(WorkspaceReader::new(
+                std::env::temp_dir()
+                    .join(format!("mira-ws-{}", uuid::Uuid::new_v4()))
+                    .join(crate::config::WORKSPACE_FILE),
+            )),
         ));
         assert!(slot.set(Arc::clone(&ctx)).is_ok());
         let tk = ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
@@ -987,6 +1038,8 @@ mod tests {
                         ..ProfileSnapshot::default()
                     },
                     seat_kind: SeatKind::Work,
+                    name: "bot-01".into(),
+                    project: None,
                 },
                 sink,
             )
@@ -1429,5 +1482,41 @@ mod tests {
         let tk2 = t.ctx.mutate(|s| s.create("y", "", false, 1)).unwrap();
         t.ctx.delete_ticket(&tk2.id).unwrap();
         let _ = std::fs::remove_dir_all(t.ctx.reports.root());
+    }
+
+    #[test]
+    fn manager_port_and_host_see_projects_and_rules() {
+        use crate::agent::SeatKind;
+        let m = Arc::new(Mutex::new(AgentManager::new(5)));
+        let (a, b, c) = {
+            let mut g = lock(&m);
+            let a = g.insert_fake_in("a", "/r/p", &[Role::Coder], SeatKind::Work, Some("p"));
+            let b = g.insert_fake_in("b", "/r/P", &[Role::Coder], SeatKind::Work, Some("P"));
+            let c = g.insert_fake_with("c", "/r", &[Role::Coordinator], SeatKind::Staff);
+            (a, b, c)
+        };
+        let port = ManagerPort::new(Arc::clone(&m), Arc::new(|_, _| {}));
+        assert_eq!(port.peers_in_project(&a), ["P"]);
+        assert_eq!(port.peers_in_project(&b), ["p"]);
+        assert!(port.peers_in_project(&c).is_empty(), "staff: no project");
+        assert!(port.peers_in_project("nope").is_empty());
+        assert_eq!(port.snapshot(&a).unwrap().project.as_deref(), Some("p"));
+
+        // The host reads the (missing) workspace file: defaults, no projects.
+        let t = test_ctx(Arc::clone(&m));
+        assert_eq!(t.ctx.rules(), WorkspaceRules::defaults());
+        assert!(t.ctx.project_ids().is_empty());
+        let root = t.ctx.workspace.root().to_path_buf();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join("Alpha")).unwrap();
+        std::fs::write(
+            t.ctx.workspace.path(),
+            r#"{"userInputGraceMs": 0, "autoReviewOnStop": true}"#,
+        )
+        .unwrap();
+        assert_eq!(t.ctx.project_ids(), ["Alpha", "beta"]);
+        let r = t.ctx.rules();
+        assert!(r.auto_review_on_stop && r.user_input_grace_ms == 0);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

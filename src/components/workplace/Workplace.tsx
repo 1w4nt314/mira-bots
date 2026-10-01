@@ -423,7 +423,7 @@ export default function Workplace() {
             seatKind={spawnFor.seatKind}
             ticket={spawnFor.ticket}
             theme={theme}
-            agentsRoot={appInfo?.agentsRoot ?? null}
+            projectsRoot={appInfo?.projectsRoot ?? null}
             onClose={() => setSpawnFor(null)}
             onSpawned={(id) => {
               setSpawnFor(null);

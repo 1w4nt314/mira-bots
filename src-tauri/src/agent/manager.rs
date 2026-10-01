@@ -58,6 +58,10 @@ pub(crate) struct AgentMeta {
     pub session_id: String,
     pub profile: ProfileSnapshot,
     pub seat_kind: SeatKind,
+    /// `AgentInfo.name` (plan4b A.1: `<prefix>-<nn>`, independent of the folder).
+    pub name: String,
+    /// `AgentInfo.project`.
+    pub project: Option<String>,
 }
 
 /// Key of the session map: session ids are compared case-insensitively (research2 §2).
@@ -71,7 +75,8 @@ fn session_key(session_id: &str) -> String {
 pub struct AgentInfo {
     pub id: AgentId,
     pub session_id: String,
-    /// Last component of `cwd`.
+    /// `<prefix>-<nn>` from the profile's roles (plan4b A.1); falls back to the last component
+    /// of `cwd` when the spawn named none.
     pub name: String,
     pub cwd: String,
     pub status: AgentStatus,
@@ -101,6 +106,9 @@ pub struct AgentInfo {
     pub current_ticket_id: Option<String>,
     /// Number of queued (`assigned`) tickets; see `current_ticket_id`.
     pub queue_length: usize,
+    /// The project folder the agent works in (work seat, plan4b A.1); `None` for staff agents
+    /// (cwd = the projects root) and agents started outside a project.
+    pub project: Option<String>,
 }
 
 /// What the manager reports from its PTY threads. `gen` is the agent's PTY generation the
@@ -137,6 +145,10 @@ pub struct SpawnRequest {
     pub seat_kind: SeatKind,
     /// Profile id/name, roles, specialist and the requested model/effort.
     pub profile: ProfileSnapshot,
+    /// The agent's name; `None` → the last component of `cwd`.
+    pub name: Option<String>,
+    /// The agent's project (`AgentInfo.project`).
+    pub project: Option<String>,
 }
 
 /// Whether `prompt` would be parsed as a flag by claude (see [`SpawnRequest::prompt`]).
@@ -423,18 +435,64 @@ impl AgentManager {
             SeatKind::Staff => self.max_staff,
         };
         if self.running_in(seat) >= max {
-            return Err(AgentError::LimitReached(seat));
+            return Err(AgentError::LimitReached { seat, max });
         }
         Ok(())
     }
 
-    /// Working folders of every known agent (exited included), for
-    /// [`super::workdir::next_agent_dir`].
+    /// Changes the seat limits (from the workspace rules, plan4b A.4); running agents are never
+    /// stopped, a lower limit only blocks new spawns.
+    pub fn set_limits(&mut self, work: usize, staff: usize) {
+        self.max_work = work;
+        self.max_staff = staff;
+    }
+
+    /// Working folders of every known agent (exited included).
     pub fn cwds(&self) -> Vec<PathBuf> {
         self.agents
             .values()
             .map(|a| PathBuf::from(&a.info.cwd))
             .collect()
+    }
+
+    /// Names of every known agent (exited included), for
+    /// [`super::workdir::next_agent_name`].
+    pub fn names(&self) -> Vec<String> {
+        self.agents.values().map(|a| a.info.name.clone()).collect()
+    }
+
+    /// Sets the agent's project (after a move, plan4b A.3). `false` for unknown or exited
+    /// agents.
+    pub fn set_project(&mut self, id: &str, project: Option<String>) -> bool {
+        match self.agents.get_mut(id) {
+            Some(a) if !is_exited(&a.info.status) => {
+                a.info.project = project;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Live (not exited) agents on a work seat in `project` (ASCII-case-insensitive), oldest
+    /// first.
+    pub fn live_work_in_project(&self, project: &str) -> Vec<AgentInfo> {
+        self.list()
+            .into_iter()
+            .filter(|a| {
+                !is_exited(&a.status)
+                    && a.seat_kind == SeatKind::Work
+                    && a.project
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(project))
+            })
+            .collect()
+    }
+
+    /// Whether a live agent with the coordinator role runs (any seat; plan4b A.5).
+    pub fn has_live_coordinator(&self) -> bool {
+        self.agents
+            .values()
+            .any(|a| !is_exited(&a.info.status) && a.info.roles.contains(&Role::Coordinator))
     }
 
     /// Starts `claude` in `req.cwd`. Checks, in order: seat limit, prompt does not start with
@@ -460,6 +518,8 @@ impl AgentManager {
             session_id: uuid::Uuid::new_v4().to_string(),
             profile: req.profile.clone(),
             seat_kind: req.seat_kind,
+            name: req.name.clone().unwrap_or_else(|| name_for(&req.cwd)),
+            project: req.project.clone(),
         };
         let spec = build_spawn_spec(&req, ctx, &meta.session_id, &meta.id);
         self.spawn_spec(spec, meta, sink)
@@ -478,6 +538,8 @@ impl AgentManager {
             session_id,
             profile,
             seat_kind,
+            name,
+            project,
         } = meta;
         let output = Arc::new(Mutex::new(RingBuffer::new(OUTPUT_RING_CAPACITY)));
         let gen_cell = Arc::new(AtomicU64::new(0));
@@ -487,7 +549,7 @@ impl AgentManager {
         let info = AgentInfo {
             id: id.clone(),
             session_id: session_id.clone(),
-            name: name_for(&spec.cwd),
+            name,
             cwd: spec.cwd.to_string_lossy().into_owned(),
             status: AgentStatus::Starting,
             detail: None,
@@ -505,13 +567,15 @@ impl AgentManager {
             seat_kind,
             current_ticket_id: None,
             queue_length: 0,
+            project,
         };
         self.insert(info.clone(), Some(handle), output, gen_cell);
         Ok(info)
     }
 
     /// Restarts a live agent with a new command line (`--resume`, model/effort change; plan5
-    /// A.5): same id, seat, cwd, session id and ring buffer. The PTY generation is bumped first,
+    /// A.5): same id, seat, name, session id and ring buffer. The cwd becomes `spec.cwd` (the same
+    /// folder for a model/effort change, another project's folder for a move, plan4b A.3). The PTY generation is bumped first,
     /// so the old child's exit and output are ignored; then the old child is killed and the new
     /// one started. The agent shows `Starting` with [`RESTARTING_TEXT`] until its SessionStart;
     /// `model`/`effort` become the requested values (`model_observed = false`).
@@ -546,6 +610,7 @@ impl AgentManager {
         let now = now_ms();
         match start_child(&spec, id, gen, &agent.pty_gen, &agent.output, sink) {
             Ok(handle) => {
+                agent.info.cwd = spec.cwd.to_string_lossy().into_owned();
                 agent.info.pid = handle.pid();
                 agent.pty = Some(handle);
                 agent.info.status = AgentStatus::Starting;
@@ -991,6 +1056,19 @@ impl AgentManager {
         roles: &[Role],
         seat_kind: SeatKind,
     ) -> AgentId {
+        self.insert_fake_in(session_id, cwd, roles, seat_kind, None)
+    }
+
+    /// Test helper: an agent without a PTY in `project`.
+    #[cfg(test)]
+    pub fn insert_fake_in(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        roles: &[Role],
+        seat_kind: SeatKind,
+        project: Option<&str>,
+    ) -> AgentId {
         let now = now_ms();
         let id = uuid::Uuid::new_v4().to_string();
         let info = AgentInfo {
@@ -1014,6 +1092,7 @@ impl AgentManager {
             seat_kind,
             current_ticket_id: None,
             queue_length: 0,
+            project: project.map(str::to_string),
         };
         self.insert(
             info,
@@ -1060,6 +1139,8 @@ mod tests {
     fn work_req(prompt: Option<&str>) -> SpawnRequest {
         SpawnRequest {
             cwd: PathBuf::from("/w/demo"),
+            name: None,
+            project: None,
             prompt: prompt.map(str::to_string),
             profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
@@ -1143,6 +1224,8 @@ mod tests {
     fn spawn_spec_command_line() {
         let req = SpawnRequest {
             cwd: PathBuf::from("/w/demo"),
+            name: None,
+            project: None,
             prompt: Some("fix it".into()),
             profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
@@ -1184,6 +1267,8 @@ mod tests {
         for prompt in [None, Some(String::new()), Some("   ".into())] {
             let req = SpawnRequest {
                 cwd: PathBuf::from("/w"),
+                name: None,
+                project: None,
                 prompt,
                 profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
@@ -1196,6 +1281,8 @@ mod tests {
     fn profile_req(model: Option<&str>, effort: Option<Effort>, roles: &[Role]) -> SpawnRequest {
         SpawnRequest {
             cwd: PathBuf::from("/w/demo"),
+            name: None,
+            project: None,
             prompt: Some("fix it".into()),
             seat_kind: SeatKind::Work,
             profile: ProfileSnapshot {
@@ -1414,6 +1501,8 @@ mod tests {
             .collect();
         let req = || SpawnRequest {
             cwd: PathBuf::from("/definitely/not/a/dir"),
+            name: None,
+            project: None,
             prompt: None,
             profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
@@ -1421,7 +1510,10 @@ mod tests {
         let c = ctx(PathBuf::from("/nope/claude"));
         assert!(matches!(
             m.spawn(req(), &c, null_sink()),
-            Err(AgentError::LimitReached(SeatKind::Work))
+            Err(AgentError::LimitReached {
+                seat: SeatKind::Work,
+                max: 5
+            })
         ));
         m.mark_exited(&ids[0], 0, Some(0));
         // Past the limit now; fails on the next check instead.
@@ -1430,11 +1522,19 @@ mod tests {
             Err(AgentError::InvalidCwd)
         ));
         assert_eq!(
-            AgentError::LimitReached(SeatKind::Work).to_string(),
+            AgentError::LimitReached {
+                seat: SeatKind::Work,
+                max: 5
+            }
+            .to_string(),
             "Loft på 5 arbejdspladser nået"
         );
         assert_eq!(
-            AgentError::LimitReached(SeatKind::Staff).to_string(),
+            AgentError::LimitReached {
+                seat: SeatKind::Staff,
+                max: 3
+            }
+            .to_string(),
             "Loft på 3 stabspladser nået"
         );
     }
@@ -1443,6 +1543,8 @@ mod tests {
         // Passes the limit check, then fails on the cwd check (nothing is started).
         SpawnRequest {
             cwd: PathBuf::from("/definitely/not/a/dir"),
+            name: None,
+            project: None,
             prompt: None,
             profile: ProfileSnapshot::default(),
             seat_kind,
@@ -1458,7 +1560,10 @@ mod tests {
         }
         assert!(matches!(
             m.spawn(doomed(SeatKind::Work), &c, null_sink()),
-            Err(AgentError::LimitReached(SeatKind::Work))
+            Err(AgentError::LimitReached {
+                seat: SeatKind::Work,
+                max: 5
+            })
         ));
         // Five work agents do not block staff.
         assert!(matches!(
@@ -1470,7 +1575,10 @@ mod tests {
         m.insert_fake_with("s2", "/w/s", &[Role::Planner], SeatKind::Staff);
         assert!(matches!(
             m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
-            Err(AgentError::LimitReached(SeatKind::Staff))
+            Err(AgentError::LimitReached {
+                seat: SeatKind::Staff,
+                max: 3
+            })
         ));
         m.mark_exited(&s0, 0, Some(0));
         assert!(matches!(
@@ -1486,6 +1594,111 @@ mod tests {
             Err(AgentError::InvalidCwd)
         ));
         assert_eq!(m.running_count(), 2);
+    }
+
+    #[test]
+    fn step4b_agent_errors_are_danish() {
+        let table = [
+            (
+                AgentError::LimitReached {
+                    seat: SeatKind::Work,
+                    max: 2,
+                },
+                "Loft på 2 arbejdspladser nået",
+            ),
+            (
+                AgentError::LimitReached {
+                    seat: SeatKind::Staff,
+                    max: 1,
+                },
+                "Loft på 1 stabspladser nået",
+            ),
+            (
+                AgentError::QueueNotEmpty(2),
+                "Agenten har 2 tickets i kø — flyt dem først, eller bekræft at de lægges i Backlog",
+            ),
+            (
+                AgentError::ProjectLimit {
+                    project: "p".into(),
+                    max: 1,
+                },
+                "Loft på 1 agenter i projektet «p» nået",
+            ),
+            (
+                AgentError::SameProject("p".into()),
+                "Agenten står allerede i projekt «p»",
+            ),
+            (
+                AgentError::StaffHasNoProject,
+                "Stabsagenter står i projektroden og kan ikke flyttes",
+            ),
+        ];
+        for (e, text) in table {
+            assert_eq!(e.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn set_limits_changes_the_check() {
+        let mut m = AgentManager::with_limits(1, 3);
+        let c = ctx(PathBuf::from("/nope/claude"));
+        m.insert_fake("w0", "/w/a");
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Work), &c, null_sink()),
+            Err(AgentError::LimitReached {
+                seat: SeatKind::Work,
+                max: 1
+            })
+        ));
+        m.set_limits(2, 3);
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Work), &c, null_sink()),
+            Err(AgentError::InvalidCwd)
+        ));
+        m.set_limits(2, 1);
+        m.insert_fake_with("s0", "/w", &[Role::Coordinator], SeatKind::Staff);
+        assert_eq!(
+            m.spawn(doomed(SeatKind::Staff), &c, null_sink())
+                .unwrap_err()
+                .to_string(),
+            "Loft på 1 stabspladser nået"
+        );
+    }
+
+    #[test]
+    fn names_projects_and_coordinator() {
+        let mut m = AgentManager::new(5);
+        let a = m.insert_fake_in("a", "/r/p", &[Role::Coder], SeatKind::Work, Some("p"));
+        let b = m.insert_fake_in("b", "/r/P", &[Role::Coder], SeatKind::Work, Some("P"));
+        m.insert_fake_in("c", "/r/q", &[Role::Coder], SeatKind::Work, Some("q"));
+        m.insert_fake_with("d", "/r", &[Role::Reviewer], SeatKind::Staff);
+        let mut names = m.names();
+        names.sort();
+        assert_eq!(names, ["P", "p", "q", "r"]);
+        assert_eq!(m.get(&a).unwrap().project.as_deref(), Some("p"));
+        let in_p: Vec<_> = m
+            .live_work_in_project("p")
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(in_p.len(), 2);
+        assert!(in_p.contains(&a) && in_p.contains(&b));
+        assert!(m.live_work_in_project("none").is_empty());
+        assert!(!m.has_live_coordinator());
+
+        // set_project: live agents only.
+        assert!(m.set_project(&b, Some("q".into())));
+        assert_eq!(m.live_work_in_project("Q").len(), 2);
+        assert!(!m.set_project("nope", None));
+        m.mark_exited(&a, 0, Some(0));
+        assert!(!m.set_project(&a, None));
+        assert!(m.live_work_in_project("p").is_empty());
+        assert_eq!(m.names().len(), 4, "exited agents keep their names");
+
+        let k = m.insert_fake_with("k", "/r", &[Role::Coordinator], SeatKind::Staff);
+        assert!(m.has_live_coordinator());
+        m.mark_exited(&k, 0, Some(0));
+        assert!(!m.has_live_coordinator());
     }
 
     #[test]
@@ -1606,6 +1819,8 @@ mod tests {
         ] {
             let req = SpawnRequest {
                 cwd: std::env::temp_dir(),
+                name: None,
+                project: None,
                 prompt: Some(prompt.into()),
                 profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
@@ -1622,6 +1837,8 @@ mod tests {
         for prompt in [Some("fix -x flag"), Some("  "), None] {
             let req = SpawnRequest {
                 cwd: std::env::temp_dir(),
+                name: None,
+                project: None,
                 prompt: prompt.map(str::to_string),
                 profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
@@ -1645,6 +1862,8 @@ mod tests {
         let mut m = AgentManager::new(5);
         let req = SpawnRequest {
             cwd: std::env::temp_dir(),
+            name: None,
+            project: None,
             prompt: None,
             profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
@@ -1729,9 +1948,11 @@ mod tests {
             "seatKind",
             "currentTicketId",
             "queueLength",
+            "project",
         ] {
             assert!(v.get(key).is_some(), "{key}");
         }
+        assert_eq!(v["project"], Value::Null);
         assert_eq!(v["currentTicketId"], Value::Null);
         assert_eq!(v["queueLength"], 0);
         m.set_ticket_link(&id, Some("t1".into()), 2);
@@ -1915,6 +2136,8 @@ mod tests {
                 session_id: session.to_string(),
                 profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
+                name: "bot-01".into(),
+                project: None,
             }
         }
 
@@ -2018,6 +2241,8 @@ mod tests {
             let (sink, events) = collecting_sink();
             let req = SpawnRequest {
                 cwd: std::env::temp_dir(),
+                name: None,
+                project: None,
                 prompt: None,
                 profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
@@ -2068,7 +2293,10 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 m.spawn_spec(sh("true", vec![]), meta("c"), sink.clone()),
-                Err(AgentError::LimitReached(SeatKind::Work))
+                Err(AgentError::LimitReached {
+                    seat: SeatKind::Work,
+                    max: 2
+                })
             ));
             m.stop(&a.id).unwrap();
             let c = m.spawn_spec(sh("true", vec![]), meta("c"), sink).unwrap();
@@ -2094,9 +2322,13 @@ mod tests {
                 .unwrap();
             assert!(wait_for_output(&events, "first").contains("first"));
             m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            let moved = std::env::temp_dir().join(format!("mira-restart-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&moved).unwrap();
+            let mut second = sh("echo second; sleep 30", vec![]);
+            second.cwd = moved.clone();
             let (res, old) = m.restart(
                 &info.id,
-                sh("echo second; sleep 30", vec![]),
+                second,
                 &RestartSession::Resume("sess-r".into()),
                 Some("opus".into()),
                 Some("high".into()),
@@ -2107,6 +2339,9 @@ mod tests {
             assert_eq!(after.id, info.id);
             assert_eq!(after.session_id, "sess-r");
             assert_eq!(after.created_at, info.created_at);
+            assert_eq!(after.name, info.name);
+            assert_eq!(after.cwd, moved.to_string_lossy());
+            assert_ne!(after.cwd, info.cwd);
             assert_eq!(after.status, AgentStatus::Starting);
             assert_eq!(after.detail.as_deref(), Some(RESTARTING_TEXT));
             assert_ne!(after.pid, info.pid);
@@ -2158,6 +2393,7 @@ mod tests {
             let (res, _) = m.restart("nope", sh("true", vec![]), &resume, None, None, sink);
             assert!(matches!(res, Err(AgentError::NotFound)));
             assert_eq!(m.list().len(), 1);
+            let _ = std::fs::remove_dir_all(&moved);
         }
 
         /// The exit code of generation `gen` (waits up to 10 s).

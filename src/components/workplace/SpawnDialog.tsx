@@ -59,7 +59,7 @@ function defaultProfileId(profiles: readonly AgentProfile[], seatKind: SeatKind)
 interface Props {
   seatKind: SeatKind;
   theme: Theme;
-  agentsRoot: string | null;
+  projectsRoot: string | null;
   /** Start the agent with this ticket (its line becomes the first prompt) instead of a prompt. */
   ticket?: TicketSummary | null;
   onClose: () => void;
@@ -67,7 +67,7 @@ interface Props {
 }
 
 export default function SpawnDialog(props: Props) {
-  const { seatKind, theme, agentsRoot, ticket = null, onClose, onSpawned } = props;
+  const { seatKind, theme, projectsRoot, ticket = null, onClose, onSpawned } = props;
   const { state, dispatch } = useStore();
   const profiles = state.profiles;
   // `null` until the user picks one: the default then follows the loaded profiles.
@@ -97,10 +97,10 @@ export default function SpawnDialog(props: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, onClose]);
 
-  const sep = agentsRoot !== null && agentsRoot.includes("\\") ? "\\" : "/";
+  const sep = projectsRoot !== null && projectsRoot.includes("\\") ? "\\" : "/";
   const profileId = chosenId ?? defaultProfileId(profiles, seatKind);
   const profile = profiles.find((p) => p.id === profileId);
-  const defaultPath = `${agentsRoot ?? "…"}${sep}${profilePrefix(profile)}-nn`;
+  const defaultPath = `${projectsRoot ?? "…"}${sep}${profilePrefix(profile)}-nn`;
 
   const choose = async () => {
     try {

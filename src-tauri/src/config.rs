@@ -140,7 +140,7 @@ pub const MAX_REVIEW_ROUNDS: u32 = 3;
 /// Env var carrying the agent's roles (`coder,reviewer`; empty = none) to claude and mira-mcp.
 /// Same value as `mira_mcp::ROLES_ENV`.
 pub const ROLES_ENV: &str = "MIRA_AGENT_ROLES";
-/// Profile store, relative to the agents root (`/`-separated; join component by component).
+/// Profile store, relative to the projects root (`/`-separated; join component by component).
 pub const PROFILES_DIR: &str = ".mira-bots/profiles";
 /// Rendered per-profile files under the app data dir: `<id>/settings.json`, `<id>/system-prompt.md`.
 pub const PROFILE_FILES_DIR: &str = "profiles";
@@ -191,6 +191,30 @@ pub const RESTARTING_TEXT: &str = "Genstarter med nye indstillinger";
 pub const STATUSLINE_ENABLED: bool = true;
 /// `hook_event_name` the hook exe gives a statusLine invocation.
 pub const STATUSLINE_EVENT: &str = "StatusLine";
+
+// --- Projects and the workspace file (step 4b) ---
+
+/// Default projects root folder name: `<home>/mira-bots/projects`.
+pub const PROJECTS_DIR_NAME: &str = "projects";
+/// Workspace rules file directly in the projects root.
+pub const WORKSPACE_FILE: &str = "mira-bots.workspace.json";
+/// The app's own settings (`{"projectsRoot": "<path>"}`) in the app data dir.
+pub const APP_SETTINGS_FILE: &str = "app-settings.json";
+/// Maximum project id length (chars).
+pub const PROJECT_ID_MAX_CHARS: usize = 64;
+/// Maximum length (chars) of `<root>/<id>`, so the agents' paths stay well below MAX_PATH.
+pub const PROJECT_PATH_MAX_CHARS: usize = 200;
+/// How long after the user typed in a terminal the dispatcher holds a delivery back (default of
+/// the workspace rule `userInputGraceMs`).
+pub const USER_INPUT_GRACE_MS: u64 = 5000;
+/// History note when a moved agent's queue goes back to the backlog.
+pub const MOVED_NOTE: &str = "agenten flyttede til et andet projekt";
+/// Default of `maxAgentsPerProject` (0 = unlimited).
+pub const MAX_AGENTS_PER_PROJECT: usize = 0;
+/// Default of `reviewByDefault`.
+pub const REVIEW_BY_DEFAULT: bool = true;
+/// Default of `agentsMayCreateProjects`.
+pub const AGENTS_MAY_CREATE_PROJECTS: bool = false;
 
 #[cfg(test)]
 mod tests {
@@ -297,6 +321,20 @@ mod tests {
         assert_eq!(RESTARTING_TEXT, "Genstarter med nye indstillinger");
         const { assert!(STATUSLINE_ENABLED) };
         assert_eq!(STATUSLINE_EVENT, "StatusLine");
+    }
+
+    #[test]
+    fn step4b_constants_match_the_plan() {
+        assert_eq!(PROJECTS_DIR_NAME, "projects");
+        assert_eq!(WORKSPACE_FILE, "mira-bots.workspace.json");
+        assert_eq!(APP_SETTINGS_FILE, "app-settings.json");
+        assert_eq!(PROJECT_ID_MAX_CHARS, 64);
+        assert_eq!(PROJECT_PATH_MAX_CHARS, 200);
+        assert_eq!(USER_INPUT_GRACE_MS, 5000);
+        assert_eq!(MOVED_NOTE, "agenten flyttede til et andet projekt");
+        assert_eq!(MAX_AGENTS_PER_PROJECT, 0);
+        const { assert!(REVIEW_BY_DEFAULT) };
+        const { assert!(!AGENTS_MAY_CREATE_PROJECTS) };
     }
 
     #[test]

@@ -28,7 +28,7 @@ export type SeatKind = "work" | "staff";
 /** Figure state derived from the agent status in the frontend. */
 export type BotState = "idle" | "work" | "wait" | "done";
 
-/** An agent profile (file `<agentsRoot>/.mira-bots/profiles/<id>.json`). */
+/** An agent profile (file `<projectsRoot>/.mira-bots/profiles/<id>.json`). */
 export interface AgentProfile {
   /** Empty in `saveProfile` for a new profile (the backend creates `custom-<8 hex>`). */
   id: string;
@@ -113,8 +113,26 @@ export interface AppInfo {
   /** False while the hook pipe is not listening; `spawn_agent` then refuses to start agents. */
   pipeReady: boolean;
   maxStaffAgents: number;
-  /** Parent of the default agent folders (`<home>/mira-bots/agents`). */
-  agentsRoot: string;
+  /** The projects root (`<home>/mira-bots/projects` or the app setting). */
+  projectsRoot: string;
+  /** The effective workspace rules (`mira-bots.workspace.json` over the defaults). */
+  rules: WorkspaceRules;
+}
+
+/** The rules of the workspace (defaults overridden by `mira-bots.workspace.json`). */
+export interface WorkspaceRules {
+  maxWorkAgents: number;
+  maxStaffAgents: number;
+  maxReviewRounds: number;
+  autoReviewOnStop: boolean;
+  createTicketRateLimit: number;
+  ticketBodyMaxChars: number;
+  reportBodyMaxChars: number;
+  reportsPerTicketMax: number;
+  reviewByDefault: boolean;
+  userInputGraceMs: number;
+  agentsMayCreateProjects: boolean;
+  maxAgentsPerProject: number;
 }
 
 /** The last tool call from an agent's MCP server (mira-mcp); arguments are never included. */
@@ -158,7 +176,7 @@ export interface Diagnostics {
   toolErrors: number;
   /** The latest MCP tool call from any agent since the app started; null before the first. */
   lastToolCall: LastToolCall | null;
-  /** Whether a Stop moves the in-progress ticket to review (AUTO_REVIEW_ON_STOP). */
+  /** Whether a Stop moves the in-progress ticket to review (workspace rule autoReviewOnStop). */
   autoReviewOnStop: boolean;
   pipeName: string;
   pipeReady: boolean;
@@ -167,7 +185,8 @@ export interface Diagnostics {
   lastHookEvent: LastHookEvent | null;
   logPath: string | null;
   appVersion: string;
-  agentsRoot: string;
+  /** The projects root in use (a changed setting applies after a restart). */
+  projectsRoot: string;
   runningAgents: number;
   /** `<app_data_dir>/tickets.json`. */
   ticketsPath: string;
@@ -176,7 +195,7 @@ export interface Diagnostics {
   /** tickets.json could not be read at startup: ticket changes are disabled until restart. */
   ticketsReadOnly: boolean;
   ticketsTotal: number;
-  /** `<agentsRoot>/.mira-bots/profiles`. */
+  /** `<projectsRoot>/.mira-bots/profiles`. */
   profilesPath: string;
   profilesLoaded: number;
   /** Set when profile files were broken (renamed to `.broken-<ts>`) or the folder was unusable. */
@@ -186,6 +205,15 @@ export interface Diagnostics {
   /** Tickets escalated after `MAX_REVIEW_ROUNDS` rejections. */
   ticketsEscalated: number;
   reportsTotal: number;
+  /** `<projectsRoot>/mira-bots.workspace.json`. */
+  workspaceFilePath: string;
+  workspaceFileExists: boolean;
+  /** Set when the workspace file could not be read (the defaults apply). */
+  workspaceWarning: string | null;
+  /** Project folders under the projects root. */
+  projectsTotal: number;
+  /** Profiles copied from the old agents folder at this start. */
+  profilesMigrated: number;
 }
 
 export interface AgentOutputPayload {

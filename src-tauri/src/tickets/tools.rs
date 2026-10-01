@@ -208,7 +208,7 @@ impl ToolsCtx {
             mcp_tools::SUBMIT_FOR_REVIEW => self.submit(id, args, now),
             mcp_tools::UPDATE_STATUS => self.update_status(id, args, now),
             mcp_tools::GET_WORKSPACE_RULES => {
-                serde_json::to_value(WorkspaceRules::current()).map_err(|e| e.to_string())
+                serde_json::to_value(WorkspaceRules::defaults()).map_err(|e| e.to_string())
             }
             mcp_tools::ADD_REPORT => self.add_report(id, args),
             mcp_tools::GET_REPORT => self.get_report(args),
@@ -1738,7 +1738,11 @@ mod tests {
         t.tools.set_spawn_port(Arc::new(move |req: SpawnByProfile| {
             rec.lock().unwrap().push(req.clone());
             if req.seat_kind == Some(SeatKind::Staff) {
-                return Err(crate::agent::AgentError::LimitReached(SeatKind::Staff).to_string());
+                return Err(crate::agent::AgentError::LimitReached {
+                    seat: SeatKind::Staff,
+                    max: 3,
+                }
+                .to_string());
             }
             let mut m = manager.lock().unwrap();
             let id = m.insert_fake("s-new", "/w/coder-01");
@@ -1766,7 +1770,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            crate::agent::AgentError::LimitReached(SeatKind::Staff).to_string()
+            crate::agent::AgentError::LimitReached {
+                seat: SeatKind::Staff,
+                max: 3,
+            }
+            .to_string()
         );
         assert_eq!(
             seen.lock().unwrap().clone(),
@@ -1852,7 +1860,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             r,
-            json!({"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20})
+            json!({"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0})
         );
     }
 

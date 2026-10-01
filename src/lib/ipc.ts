@@ -98,7 +98,7 @@ export const getAppInfo = () => invoke<AppInfo>(COMMANDS.getAppInfo);
 export const listAgents = () => invoke<AgentInfo[]>(COMMANDS.listAgents);
 /**
  * `profileId` null → "coder"; `overrides` replace the profile's model/effort; `cwd` null/blank →
- * default folder `<agentsRoot>/<prefix>-nn`; `seatKind` null → the profile's `defaultSeat`.
+ * default folder `<projectsRoot>/<prefix>-nn`; `seatKind` null → the profile's `defaultSeat`.
  */
 export const spawnAgent = (
   profileId: string | null,

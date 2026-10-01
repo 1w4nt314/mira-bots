@@ -485,6 +485,7 @@ impl TicketService {
             escalated: false,
             reviewer_agent_id: None,
             reports: Vec::new(),
+            project: None,
         };
         Ok(t)
     }
@@ -1647,6 +1648,7 @@ mod tests {
                     title: Some(" ny ".into()),
                     body: None,
                     skip_review: Some(true),
+                    project: None,
                 },
                 9,
             )

@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod app_settings;
 pub mod commands;
 pub mod config;
 pub mod diagnostics;
@@ -9,8 +10,10 @@ pub mod mcp;
 pub mod permissions;
 pub mod pipe;
 pub mod profiles;
+pub mod projects;
 pub mod tickets;
 pub mod workplace;
+pub mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -23,13 +26,14 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_log::{FileOpenStrategy, RotationStrategy, Target, TargetKind, TimezoneStrategy};
 
 use agent::claude_path::find_claude;
-use agent::workdir::agents_root;
+use agent::workdir::{ensure_dir, legacy_agents_root, projects_root};
 use agent::{now_ms, AgentManager, EventSink, SinkEvent};
+use app_settings::AppSettings;
 use commands::{AppPaths, AppState};
 use config::{
     CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
-    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR,
-    REPORTS_DIR, SETTINGS_FILE, SYSTEM_PROMPT_FILE, TICKETS_FILE,
+    LOG_MAX_FILE_SIZE, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR, REPORTS_DIR, SETTINGS_FILE,
+    SYSTEM_PROMPT_FILE, TICKETS_FILE, WORKSPACE_FILE,
 };
 use diagnostics::{log_level_from_env, probe_claude_version, HookStats, VersionProbe};
 use events::{AgentOutputPayload, EmitFn, StatusEvent, AGENTS_CHANGED, AGENT_OUTPUT};
@@ -37,11 +41,12 @@ use hooks::settings::write_settings_json;
 use island::IslandState;
 use permissions::PendingPermissions;
 use pipe::handler::{HandlerCtx, StatusObserver, ToolHandler};
-use profiles::store::{profiles_dir, ProfileStore};
+use profiles::store::{migrate_legacy_profiles, profiles_dir, ProfileStore};
 use profiles::ProfilesCtx;
 use tickets::dispatcher::{self, messages_for, DispatchMsg, Dispatcher, RealTimers};
 use tickets::tools::ToolsCtx;
 use tickets::{ManagerPort, TicketsCtx, AGENT_EXITED_NOTE};
+use workspace::WorkspaceReader;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -256,10 +261,9 @@ fn install_panic_hook() {
     }));
 }
 
-/// `<home>/mira-bots/agents`, with home from Tauri, else `USERPROFILE`/`HOME`, else `fallback`.
-fn resolve_agents_root(app: &AppHandle, fallback: &Path) -> PathBuf {
-    let home = app
-        .path()
+/// The home folder from Tauri, else `USERPROFILE`/`HOME`, else `fallback`.
+fn resolve_home(app: &AppHandle, fallback: &Path) -> PathBuf {
+    app.path()
         .home_dir()
         .ok()
         .or_else(|| {
@@ -269,8 +273,19 @@ fn resolve_agents_root(app: &AppHandle, fallback: &Path) -> PathBuf {
                 .find(|v| !v.is_empty())
                 .map(PathBuf::from)
         })
-        .unwrap_or_else(|| fallback.to_path_buf());
-    agents_root(&home)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+/// The projects root (plan4b A.1): the app setting when set and not blank, otherwise
+/// `<home>/mira-bots/projects`. Created if missing (a failure is only logged).
+fn resolve_projects_root(home: &Path, settings: &AppSettings) -> PathBuf {
+    let root = settings
+        .projects_root()
+        .unwrap_or_else(|| projects_root(home));
+    if let Err(e) = ensure_dir(&root) {
+        log::warn!("could not create the projects root {}: {e}", root.display());
+    }
+    root
 }
 
 /// Runs `claude --version` once on its own thread and stores the result in `slot`.
@@ -344,8 +359,21 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(f) = &log_file {
         log::info!("log file: {}", f.display());
     }
-    let agents_root = resolve_agents_root(&handle, &data_dir);
-    log::info!("default agent folders under {}", agents_root.display());
+    let home = resolve_home(&handle, &data_dir);
+    let settings = app_settings::load(&data_dir);
+    let projects_root = resolve_projects_root(&home, &settings);
+    log::info!("projects root: {}", projects_root.display());
+    let workspace = Arc::new(WorkspaceReader::new(projects_root.join(WORKSPACE_FILE)));
+    let first_snapshot = workspace.snapshot();
+    log::info!(
+        "workspace file: {} ({})",
+        workspace.path().display(),
+        if first_snapshot.file_exists {
+            "findes"
+        } else {
+            "mangler"
+        }
+    );
 
     // settings.json (and mcp.json / system-prompt.md) are rewritten before each spawn too;
     // writing them now makes the paths exist early. Without a hook exe a placeholder path is
@@ -394,7 +422,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let manager = Arc::new(Mutex::new(AgentManager::new(MAX_WORK_AGENTS)));
+    let mut agent_manager = AgentManager::new(first_snapshot.rules.max_work_agents);
+    agent_manager.set_limits(
+        first_snapshot.rules.max_work_agents,
+        first_snapshot.rules.max_staff_agents,
+    );
+    let manager = Arc::new(Mutex::new(agent_manager));
     let pending = Arc::new(Mutex::new(PendingPermissions::new()));
     let emit_handle = handle.clone();
     let emit: EmitFn = Arc::new(move |name: &str, payload: Value| {
@@ -403,9 +436,29 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Profiles: one JSON file each under <agents_root>/.mira-bots/profiles; the built-ins are
-    // generated on first start. The rendered per-profile files are written at spawn/save.
-    let profiles_dir = profiles_dir(&agents_root);
+    // Profiles: one JSON file each under <projects_root>/.mira-bots/profiles; the built-ins are
+    // generated on first start. The rendered per-profile files are written at spawn/save. The
+    // first time, the step 1–5 profiles are copied from <home>/mira-bots/agents (never moved).
+    let profiles_dir = profiles_dir(&projects_root);
+    let legacy_profiles = profiles::store::profiles_dir(&legacy_agents_root(&home));
+    let profiles_migrated = match migrate_legacy_profiles(&legacy_profiles, &profiles_dir) {
+        Ok(0) => 0,
+        Ok(n) => {
+            log::info!(
+                "{n} profiles copied from {} to {}",
+                legacy_profiles.display(),
+                profiles_dir.display()
+            );
+            n
+        }
+        Err(e) => {
+            log::warn!(
+                "could not copy the profiles from {}: {e}",
+                legacy_profiles.display()
+            );
+            0
+        }
+    };
     let profile_store = ProfileStore::load(profiles_dir.clone(), now_ms());
     match profile_store.warning() {
         Some(w) => log::warn!("profiles in {}: {w}", profiles_dir.display()),
@@ -426,6 +479,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         dispatch_tx.clone(),
         Arc::clone(&emit),
         data_dir.join(REPORTS_DIR),
+        Arc::clone(&workspace),
     ));
     let sink = tauri_sink(
         handle.clone(),
@@ -481,6 +535,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
+    let app_settings_path = app_settings::settings_path(&data_dir);
     app.manage(AppState {
         manager,
         pending,
@@ -493,7 +548,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             pipe_name,
             data_dir,
             log_file,
-            agents_root,
+            app_settings: app_settings_path,
+            projects_root,
             tickets_file,
             profiles_dir,
             profile_files_dir: data_dir_for_profiles,
@@ -507,6 +563,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tickets,
         tickets_warning,
         profiles,
+        workspace,
+        profiles_migrated,
     });
 
     if let Some(window) = app.get_webview_window(island::LABEL) {
