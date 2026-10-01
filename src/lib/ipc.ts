@@ -6,13 +6,15 @@ import type {
   AgentInfo,
   AgentOutputPayload,
   AgentOutputSnapshot,
-  AgentRole,
+  AgentProfile,
   AppInfo,
   Diagnostics,
+  Effort,
   HookEventPayload,
   PermissionRequestInfo,
   PermissionResolvedPayload,
   SeatKind,
+  SpawnOverrides,
   Ticket,
   TicketPatch,
   TicketState,
@@ -54,6 +56,13 @@ export const COMMANDS = {
   redispatchTicket: "redispatch_ticket",
   spawnAgentWithTicket: "spawn_agent_with_ticket",
   requestSubmission: "request_submission",
+  listProfiles: "list_profiles",
+  getProfile: "get_profile",
+  saveProfile: "save_profile",
+  deleteProfile: "delete_profile",
+  resetBuiltinProfile: "reset_builtin_profile",
+  setAgentModel: "set_agent_model",
+  setAgentEffort: "set_agent_effort",
 } as const;
 
 export const EVENTS = {
@@ -64,6 +73,7 @@ export const EVENTS = {
   hookEvent: "hook-event",
   workplaceSelect: "workplace-select",
   ticketsChanged: "tickets-changed",
+  profilesChanged: "profiles-changed",
 } as const;
 
 /** Commands reject with the Rust error string (Danish, user-facing). */
@@ -78,13 +88,17 @@ export function errorMessage(e: unknown): string {
 export const uiReady = () => invoke<void>(COMMANDS.uiReady);
 export const getAppInfo = () => invoke<AppInfo>(COMMANDS.getAppInfo);
 export const listAgents = () => invoke<AgentInfo[]>(COMMANDS.listAgents);
-/** `cwd` null/blank → default folder `<agentsRoot>/<role>-nn`; role/seatKind null → "none"/"work". */
+/**
+ * `profileId` null → "coder"; `overrides` replace the profile's model/effort; `cwd` null/blank →
+ * default folder `<agentsRoot>/<prefix>-nn`; `seatKind` null → the profile's `defaultSeat`.
+ */
 export const spawnAgent = (
+  profileId: string | null,
+  overrides: SpawnOverrides | null,
   cwd: string | null,
   prompt: string | null,
-  role: AgentRole | null,
   seatKind: SeatKind | null,
-) => invoke<AgentInfo>(COMMANDS.spawnAgent, { cwd, prompt, role, seatKind });
+) => invoke<AgentInfo>(COMMANDS.spawnAgent, { profileId, overrides, cwd, prompt, seatKind });
 export const stopAgent = (agentId: string) => invoke<void>(COMMANDS.stopAgent, { agentId });
 export const removeAgent = (agentId: string) => invoke<void>(COMMANDS.removeAgent, { agentId });
 /** `userInitiated` false for the terminal's automatic replies: they do not count as user typing. */
@@ -148,10 +162,38 @@ export const redispatchTicket = (id: string) => invoke<void>(COMMANDS.redispatch
 /** Like `spawnAgent`, with the ticket line as the first prompt; the ticket heads the new queue. */
 export const spawnAgentWithTicket = (
   ticketId: string,
+  profileId: string | null,
+  overrides: SpawnOverrides | null,
   cwd: string | null,
-  role: AgentRole | null,
   seatKind: SeatKind | null,
-) => invoke<AgentInfo>(COMMANDS.spawnAgentWithTicket, { ticketId, cwd, role, seatKind });
+) =>
+  invoke<AgentInfo>(COMMANDS.spawnAgentWithTicket, {
+    ticketId,
+    profileId,
+    overrides,
+    cwd,
+    seatKind,
+  });
+
+// profiles and model/effort (C5.4)
+/** Built-in profiles first, then the custom ones by name. */
+export const listProfiles = () => invoke<AgentProfile[]>(COMMANDS.listProfiles);
+export const getProfile = (id: string) => invoke<AgentProfile>(COMMANDS.getProfile, { id });
+/** `profile.id` empty → a new custom profile; returns the stored (validated) profile. */
+export const saveProfile = (profile: AgentProfile) =>
+  invoke<AgentProfile>(COMMANDS.saveProfile, { profile });
+/** Only custom profiles. */
+export const deleteProfile = (id: string) => invoke<void>(COMMANDS.deleteProfile, { id });
+/** Only built-in profiles: back to the default. */
+export const resetBuiltinProfile = (id: string) =>
+  invoke<AgentProfile>(COMMANDS.resetBuiltinProfile, { id });
+/** Restarts the agent with `--resume` and the new model (null → default); only when idle
+ *  without a ticket in progress. */
+export const setAgentModel = (agentId: string, model: string | null) =>
+  invoke<AgentInfo>(COMMANDS.setAgentModel, { agentId, model });
+/** Like `setAgentModel`, for the effort level. */
+export const setAgentEffort = (agentId: string, effort: Effort) =>
+  invoke<AgentInfo>(COMMANDS.setAgentEffort, { agentId, effort });
 
 // --- events (each returns the unlisten function) ----------------------------------------------
 
@@ -175,6 +217,9 @@ export const onWorkplaceSelect = (cb: (s: WorkplaceSelection) => void): Promise<
 /** Full ticket list (without history) after any ticket change. */
 export const onTicketsChanged = (cb: (tickets: TicketSummary[]) => void): Promise<UnlistenFn> =>
   listen<TicketSummary[]>(EVENTS.ticketsChanged, (e) => cb(e.payload));
+/** Full profile list after a profile was saved, deleted or reset. */
+export const onProfilesChanged = (cb: (profiles: AgentProfile[]) => void): Promise<UnlistenFn> =>
+  listen<AgentProfile[]>(EVENTS.profilesChanged, (e) => cb(e.payload));
 
 // --- dialog -----------------------------------------------------------------------------------
 

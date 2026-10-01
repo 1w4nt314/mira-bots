@@ -8,6 +8,7 @@ pub mod island;
 pub mod mcp;
 pub mod permissions;
 pub mod pipe;
+pub mod profiles;
 pub mod tickets;
 pub mod workplace;
 
@@ -27,8 +28,8 @@ use agent::{now_ms, AgentManager, EventSink, SinkEvent};
 use commands::{AppPaths, AppState};
 use config::{
     CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
-    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, MCP_CONFIG_FILE, MCP_EXE_ENV, SETTINGS_FILE,
-    SYSTEM_PROMPT_FILE, TICKETS_FILE,
+    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR,
+    SETTINGS_FILE, SYSTEM_PROMPT_FILE, TICKETS_FILE,
 };
 use diagnostics::{log_level_from_env, probe_claude_version, HookStats, VersionProbe};
 use events::{AgentOutputPayload, EmitFn, StatusEvent, AGENTS_CHANGED, AGENT_OUTPUT};
@@ -36,6 +37,8 @@ use hooks::settings::write_settings_json;
 use island::IslandState;
 use permissions::PendingPermissions;
 use pipe::handler::{HandlerCtx, StatusObserver, ToolHandler};
+use profiles::store::{profiles_dir, ProfileStore};
+use profiles::ProfilesCtx;
 use tickets::dispatcher::{self, messages_for, DispatchMsg, Dispatcher, RealTimers};
 use tickets::tools::ToolsCtx;
 use tickets::{ManagerPort, TicketsCtx, AGENT_EXITED_NOTE};
@@ -126,6 +129,7 @@ pub fn tauri_sink(
             agent_id,
             seq,
             bytes,
+            ..
         } => {
             let payload = AgentOutputPayload {
                 agent_id,
@@ -142,11 +146,25 @@ pub fn tauri_sink(
                 log::debug!("emit {AGENT_OUTPUT}: {e}");
             }
         }
-        SinkEvent::Exited { agent_id, code } => {
-            let exited = lock(&manager).mark_exited(&agent_id, code);
+        SinkEvent::Exited {
+            agent_id,
+            gen,
+            code,
+        } => {
+            // `None` too for the exit of a child replaced by a restart (older generation); that
+            // exit must not touch the new session (its permission requests, tickets, status).
+            let (exited, replaced) = {
+                let mut m = lock(&manager);
+                let replaced = m.pty_gen(&agent_id).is_some_and(|g| g != gen);
+                (m.mark_exited(&agent_id, gen, code), replaced)
+            };
             let known = exited.is_some();
             // Drop the PTY (ConPTY ClosePseudoConsole may block) only after the lock is released.
             drop(exited);
+            if replaced {
+                log::debug!("agent {agent_id}: old child (gen {gen}) exited after a restart");
+                return;
+            }
             // Handlers waiting on these answer `none` and emit permission-resolved themselves.
             lock(&pending).remove_for_agent(&agent_id);
             if known {
@@ -385,6 +403,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Profiles: one JSON file each under <agents_root>/.mira-bots/profiles; the built-ins are
+    // generated on first start. The rendered per-profile files are written at spawn/save.
+    let profiles_dir = profiles_dir(&agents_root);
+    let profile_store = ProfileStore::load(profiles_dir.clone(), now_ms());
+    match profile_store.warning() {
+        Some(w) => log::warn!("profiles in {}: {w}", profiles_dir.display()),
+        None => log::info!(
+            "{} profiles loaded from {}",
+            profile_store.len(),
+            profiles_dir.display()
+        ),
+    }
+    let profiles = Arc::new(ProfilesCtx::new(profile_store, Arc::clone(&emit)));
+
     let tickets_file = data_dir.join(TICKETS_FILE);
     let (service, tickets_warning) = tickets::load_tickets(tickets_file.clone(), now_ms());
     let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMsg>();
@@ -441,6 +473,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&pipe_ready),
     );
 
+    let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
     app.manage(AppState {
         manager,
         pending,
@@ -455,6 +488,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             log_file,
             agents_root,
             tickets_file,
+            profiles_dir,
+            profile_files_dir: data_dir_for_profiles,
         },
         island: IslandState::default(),
         pipe_ready,
@@ -464,6 +499,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         workplace_select: Mutex::new(None),
         tickets,
         tickets_warning,
+        profiles,
     });
 
     if let Some(window) = app.get_webview_window(island::LABEL) {
@@ -540,6 +576,13 @@ pub fn run() {
             commands::redispatch_ticket,
             commands::spawn_agent_with_ticket,
             commands::request_submission,
+            commands::list_profiles,
+            commands::get_profile,
+            commands::save_profile,
+            commands::delete_profile,
+            commands::reset_builtin_profile,
+            commands::set_agent_model,
+            commands::set_agent_effort,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs

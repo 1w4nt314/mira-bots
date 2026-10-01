@@ -22,6 +22,10 @@ pub use transport::PIPE_ENV;
 /// it on to this server, by inheritance and/or `${MIRA_AGENT_ID}` in mcp.json). Same value as
 /// `mira_hook::AGENT_ID_ENV`.
 pub const AGENT_ID_ENV: &str = "MIRA_AGENT_ID";
+/// Env var carrying the agent's roles (comma-separated wire names, e.g. `coder,reviewer`; empty
+/// = no roles). Set by the app on the claude process and passed on as `${MIRA_AGENT_ROLES}` in
+/// mcp.json.
+pub const ROLES_ENV: &str = "MIRA_AGENT_ROLES";
 /// Env var enabling diagnostics on stderr (`1`).
 pub const DEBUG_ENV: &str = "MIRA_MCP_DEBUG";
 /// Env override of [`MCP_CALL_TIMEOUT_MS`] (tests/debugging only).
@@ -46,6 +50,29 @@ pub fn is_missing(value: &str) -> bool {
 /// Reads env var `name`; empty or `${…}` counts as unset (see [`is_missing`]).
 pub fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !is_missing(v))
+}
+
+/// Splits a [`ROLES_ENV`] value: comma-separated, trimmed, empty parts and duplicates dropped,
+/// first occurrence kept. A missing value (see [`is_missing`]) means no roles. Unknown names are
+/// kept; they simply allow nothing extra (`tools::tools_for_roles`).
+pub fn parse_roles(value: &str) -> Vec<String> {
+    if is_missing(value) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if !out.iter().any(|r| r == part) {
+            out.push(part.to_string());
+        }
+    }
+    out
+}
+
+/// The agent's roles from [`ROLES_ENV`] (unset = no roles).
+pub fn roles_from_env() -> Vec<String> {
+    std::env::var(ROLES_ENV)
+        .map(|v| parse_roles(&v))
+        .unwrap_or_default()
 }
 
 pub fn debug_from_env() -> bool {
@@ -224,6 +251,20 @@ mod tests {
         assert_eq!(env_value(name).as_deref(), Some("a1"));
         std::env::remove_var(name);
         assert_eq!(env_value(name), None);
+    }
+
+    #[test]
+    fn roles_env_parsing() {
+        assert_eq!(parse_roles("coder,reviewer"), ["coder", "reviewer"]);
+        assert_eq!(
+            parse_roles(" coder , reviewer ,coder,, "),
+            ["coder", "reviewer"]
+        );
+        assert!(parse_roles("").is_empty());
+        assert!(parse_roles("   ").is_empty());
+        assert!(parse_roles("${MIRA_AGENT_ROLES}").is_empty());
+        assert_eq!(parse_roles("planner"), ["planner"]);
+        assert_eq!(ROLES_ENV, "MIRA_AGENT_ROLES");
     }
 
     #[test]

@@ -132,6 +132,65 @@ pub const MCP_CONFIG_FILE: &str = "mcp.json";
 /// System prompt addition in the app data dir, passed with `--append-system-prompt-file`.
 pub const SYSTEM_PROMPT_FILE: &str = "system-prompt.md";
 
+// --- Profiles, roles, model/effort, reviews, reports (step 5, C5.8) ---
+
+/// Rounds of review rejection before the ticket is escalated to the user.
+pub const MAX_REVIEW_ROUNDS: u32 = 3;
+/// Env var carrying the agent's roles (`coder,reviewer`; empty = none) to claude and mira-mcp.
+/// Same value as `mira_mcp::ROLES_ENV`.
+pub const ROLES_ENV: &str = "MIRA_AGENT_ROLES";
+/// Profile store, relative to the agents root (`/`-separated; join component by component).
+pub const PROFILES_DIR: &str = ".mira-bots/profiles";
+/// Rendered per-profile files under the app data dir: `<id>/settings.json`, `<id>/system-prompt.md`.
+pub const PROFILE_FILES_DIR: &str = "profiles";
+/// Profile used when a spawn names none.
+pub const DEFAULT_PROFILE_ID: &str = "coder";
+/// The built-in profiles, in list order.
+pub const BUILTIN_PROFILE_IDS: [&str; 7] = [
+    "coder",
+    "researcher",
+    "reviewer",
+    "coordinator",
+    "planner",
+    "debugger",
+    "specialist",
+];
+/// Model aliases Claude Code accepts for `--model` (research5 Q1).
+pub const MODEL_ALIASES: [&str; 9] = [
+    "default",
+    "best",
+    "fable",
+    "sonnet",
+    "opus",
+    "haiku",
+    "sonnet[1m]",
+    "opus[1m]",
+    "opusplan",
+];
+/// Maximum length of a full model id.
+pub const MODEL_ID_MAX_CHARS: usize = 64;
+/// Maximum profile name length (chars, after trimming).
+pub const PROFILE_NAME_MAX_CHARS: usize = 60;
+/// Maximum `promptAppend` length (chars).
+pub const PROMPT_APPEND_MAX_CHARS: usize = 4_000;
+/// Report files under the app data dir: `<ticketId>/reports/<nn>-<slug>.md`.
+pub const REPORTS_DIR: &str = "tickets";
+pub const REPORT_TITLE_MAX_CHARS: usize = 120;
+pub const REPORT_BODY_MAX_CHARS: usize = 20_000;
+pub const REPORTS_PER_TICKET_MAX: usize = 20;
+pub const REPORT_ON_SUBMIT_TITLE: &str = "Rapport ved aflevering";
+/// Review files, relative to the reviewer's cwd.
+pub const REVIEW_DIR: &str = ".mira-bots/reviews";
+pub const REVIEW_DELIVERY_MAX_ATTEMPTS: u32 = 3;
+pub const REVIEW_NOTE_MAX_CHARS: usize = 2_000;
+/// Agent detail while it restarts with `--resume` (model/effort change).
+pub const RESTARTING_TEXT: &str = "Genstarter med nye indstillinger";
+/// Whether the per-profile settings get a `statusLine` pointing at the hook exe (live
+/// model/effort). `false` leaves only PostModelSwitch and the requested values.
+pub const STATUSLINE_ENABLED: bool = true;
+/// `hook_event_name` the hook exe gives a statusLine invocation.
+pub const STATUSLINE_EVENT: &str = "StatusLine";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +265,37 @@ mod tests {
         assert_eq!(mira_mcp::SERVER_NAME, MCP_SERVER_NAME);
         assert_eq!(mira_mcp::PIPE_ENV, PIPE_ENV);
         assert_eq!(mira_mcp::AGENT_ID_ENV, AGENT_ID_ENV);
+    }
+
+    #[test]
+    fn step5_constants_match_the_plan() {
+        assert_eq!(MAX_REVIEW_ROUNDS, 3);
+        assert_eq!(ROLES_ENV, "MIRA_AGENT_ROLES");
+        assert_eq!(ROLES_ENV, mira_mcp::ROLES_ENV);
+        assert_eq!(PROFILES_DIR, ".mira-bots/profiles");
+        assert_eq!(PROFILE_FILES_DIR, "profiles");
+        assert_eq!(DEFAULT_PROFILE_ID, "coder");
+        assert!(BUILTIN_PROFILE_IDS.contains(&DEFAULT_PROFILE_ID));
+        assert_eq!(MODEL_ALIASES.len(), 9);
+        assert_eq!(MODEL_ID_MAX_CHARS, 64);
+        assert_eq!(PROFILE_NAME_MAX_CHARS, 60);
+        assert_eq!(PROMPT_APPEND_MAX_CHARS, 4_000);
+        assert_eq!(REPORTS_DIR, "tickets");
+        assert_eq!(
+            (
+                REPORT_TITLE_MAX_CHARS,
+                REPORT_BODY_MAX_CHARS,
+                REPORTS_PER_TICKET_MAX
+            ),
+            (120, 20_000, 20)
+        );
+        assert_eq!(REPORT_ON_SUBMIT_TITLE, "Rapport ved aflevering");
+        assert_eq!(REVIEW_DIR, ".mira-bots/reviews");
+        assert_eq!(REVIEW_DELIVERY_MAX_ATTEMPTS, 3);
+        assert_eq!(REVIEW_NOTE_MAX_CHARS, 2_000);
+        assert_eq!(RESTARTING_TEXT, "Genstarter med nye indstillinger");
+        const { assert!(STATUSLINE_ENABLED) };
+        assert_eq!(STATUSLINE_EVENT, "StatusLine");
     }
 
     #[test]

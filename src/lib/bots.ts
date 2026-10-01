@@ -1,15 +1,40 @@
 // Bot figures: SVG lookup per theme/role/state, the status -> figure-state mapping, the short
 // "done" phase after a finished turn, and the colour-scheme hook.
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import type { AgentInfo, AgentRole, AgentStatus, AgentStatusKind, BotState } from "./types";
+import type { AgentInfo, AgentStatus, AgentStatusKind, BotState, Role } from "./types";
 
-export type BotRole = AgentRole;
+/** File name part of a static figure (`bot-<name>-<state>.svg`). */
+export type BotRole =
+  | "none"
+  | "coder"
+  | "researcher"
+  | "reviewer"
+  | "koord"
+  | "planner"
+  | "debugger"
+  | "specialist";
+
+/**
+ * Static figure for a role set (mirrors `prefix_for` in Rust): one role and not a specialist →
+ * that role's figure (`koord` for the coordinator); no roles → `none`; otherwise `specialist`.
+ * Interim until the dynamic specialist figure (plan5 batch 3).
+ */
+export function figureFor(roles: readonly Role[], specialist: boolean): BotRole {
+  if (roles.length === 1 && !specialist) return roles[0] === "coordinator" ? "koord" : roles[0];
+  if (roles.length === 0 && !specialist) return "none";
+  return "specialist";
+}
+
+/** The figure of an agent (from its profile snapshot). */
+export const agentFigure = (agent: Pick<AgentInfo, "roles" | "specialist">): BotRole =>
+  figureFor(agent.roles, agent.specialist);
+
 export type Theme = "dark" | "light";
 
 /** How long the "done" figure shows after an agent went back to idle from a working state. */
 export const DONE_STATE_MS = 8000;
 
-// All 40 figures (2 themes x 5 roles x 4 states), bundled as separate asset URLs.
+// All static figures (2 themes x 10 names x 4 states), bundled as separate asset URLs.
 const BOT_SVGS = import.meta.glob<string>("../assets/bots/*/bot-*.svg", {
   eager: true,
   query: "?url",

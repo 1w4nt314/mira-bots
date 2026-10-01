@@ -1,16 +1,29 @@
 import { useEffect, useState } from "react";
-import type { Theme } from "../../lib/bots";
-import { errorMessage, pickFolder, spawnAgent, spawnAgentWithTicket } from "../../lib/ipc";
-import type { AgentRole, SeatKind, TicketSummary } from "../../lib/types";
+import { figureFor, type Theme } from "../../lib/bots";
+import {
+  errorMessage,
+  listProfiles,
+  pickFolder,
+  spawnAgent,
+  spawnAgentWithTicket,
+} from "../../lib/ipc";
+import type { AgentProfile, SeatKind, TicketSummary } from "../../lib/types";
 import BotFigure from "../BotFigure";
 import { ROLE_LABEL } from "./Seat";
 import StickyNote from "./tickets/StickyNote";
 
-const ROLES: AgentRole[] = ["none", "coder", "researcher", "reviewer", "koord"];
+/** Profile used when none is chosen (mirrors `DEFAULT_PROFILE_ID` in Rust). */
+const DEFAULT_PROFILE = "coder";
 
-/** Folder name prefix of the default folder (mirrors `AgentRole::prefix` in Rust). */
-function rolePrefix(role: AgentRole): string {
-  return role === "none" ? "bot" : role;
+function isSpecialist(p: AgentProfile): boolean {
+  return p.specialist ?? p.roles.length !== 1;
+}
+
+/** Folder name prefix of the default folder (mirrors `roles::prefix_for` in Rust). */
+function profilePrefix(p: AgentProfile | undefined): string {
+  if (p === undefined) return DEFAULT_PROFILE;
+  const fig = figureFor(p.roles, isSpecialist(p));
+  return fig === "none" ? "bot" : fig;
 }
 
 interface Props {
@@ -25,12 +38,19 @@ interface Props {
 
 export default function SpawnDialog(props: Props) {
   const { seatKind, theme, agentsRoot, ticket = null, onClose, onSpawned } = props;
-  const [role, setRole] = useState<AgentRole>("none");
+  const [profiles, setProfiles] = useState<AgentProfile[]>([]);
+  const [profileId, setProfileId] = useState<string>(DEFAULT_PROFILE);
   const [folderMode, setFolderMode] = useState<"default" | "custom">("default");
   const [folder, setFolder] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    listProfiles()
+      .then(setProfiles)
+      .catch((e: unknown) => setError(errorMessage(e)));
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -41,7 +61,8 @@ export default function SpawnDialog(props: Props) {
   }, [busy, onClose]);
 
   const sep = agentsRoot !== null && agentsRoot.includes("\\") ? "\\" : "/";
-  const defaultPath = `${agentsRoot ?? "…"}${sep}${rolePrefix(role)}-nn`;
+  const profile = profiles.find((p) => p.id === profileId);
+  const defaultPath = `${agentsRoot ?? "…"}${sep}${profilePrefix(profile)}-nn`;
 
   const choose = async () => {
     try {
@@ -63,8 +84,8 @@ export default function SpawnDialog(props: Props) {
       const text = prompt.trim();
       const agent =
         ticket !== null
-          ? await spawnAgentWithTicket(ticket.id, cwd, role, seatKind)
-          : await spawnAgent(cwd, text === "" ? null : text, role, seatKind);
+          ? await spawnAgentWithTicket(ticket.id, profileId, null, cwd, seatKind)
+          : await spawnAgent(profileId, null, cwd, text === "" ? null : text, seatKind);
       onSpawned(agent.id);
     } catch (e) {
       setError(errorMessage(e));
@@ -100,29 +121,31 @@ export default function SpawnDialog(props: Props) {
         )}
 
         <fieldset className="mt-4">
-          <legend className="mb-2 text-xs font-medium text-[var(--muted)]">Rolle</legend>
-          <div className="grid grid-cols-5 gap-2">
-            {ROLES.map((r) => (
+          <legend className="mb-2 text-xs font-medium text-[var(--muted)]">Profil</legend>
+          <div className="grid grid-cols-4 gap-2">
+            {profiles.map((p) => (
               <button
-                key={r}
+                key={p.id}
                 type="button"
-                onClick={() => setRole(r)}
-                aria-pressed={role === r}
-                title={ROLE_LABEL[r]}
+                onClick={() => setProfileId(p.id)}
+                aria-pressed={profileId === p.id}
+                title={p.roles.map((r) => ROLE_LABEL[r]).join(", ") || "Ingen roller"}
                 className={`flex flex-col items-center gap-1 rounded-xl border p-2 ${
-                  role === r
+                  profileId === p.id
                     ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40"
                     : "border-[var(--border)] hover:border-[var(--accent)]"
                 }`}
               >
-                <BotFigure role={r} state="idle" theme={theme} size={64} />
-                <span className="text-[11px]">{ROLE_LABEL[r]}</span>
+                <BotFigure
+                  role={figureFor(p.roles, isSpecialist(p))}
+                  state="idle"
+                  theme={theme}
+                  size={56}
+                />
+                <span className="w-full truncate text-center text-[11px]">{p.name}</span>
               </button>
             ))}
           </div>
-          <p className="mt-1 text-[11px] text-[var(--muted)]">
-            Rollen er kun visuel i denne version (figur og mappenavn).
-          </p>
         </fieldset>
 
         <fieldset className="mt-4 space-y-1.5">

@@ -1,5 +1,5 @@
-// Mirrors the IPC contract (commands C.1 + C2.1 + C3.2 + C4.10, events C.2 + C2.2 + C3.4, types
-// C.3 + C2.3 + C3.1 + C4.1).
+// Mirrors the IPC contract (commands C.1 + C2.1 + C3.2 + C4.10 + C5.4, events C.2 + C2.2 + C3.4 +
+// C5.4, types C.3 + C2.3 + C3.1 + C4.1 + C5.1).
 // All fields camelCase.
 
 export type AgentStatus =
@@ -14,14 +14,49 @@ export type AgentStatus =
 
 export type AgentStatusKind = AgentStatus["kind"];
 
-/** Visual role of an agent (figure and default folder name). */
-export type AgentRole = "none" | "coder" | "researcher" | "reviewer" | "koord";
+/** An agent role (0..6 per agent; wire names). The figure of `coordinator` is called `koord`. */
+export type Role = "coder" | "researcher" | "reviewer" | "coordinator" | "planner" | "debugger";
+
+/** Reasoning effort (`--effort`); `max` only as a flag, never in a settings file. */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+
+export type ProfileKind = "builtin" | "custom";
 
 /** Row of seats an agent occupies; each has its own limit (5 work, 2 staff). */
 export type SeatKind = "work" | "staff";
 
 /** Figure state derived from the agent status in the frontend. */
 export type BotState = "idle" | "work" | "wait" | "done";
+
+/** An agent profile (file `<agentsRoot>/.mira-bots/profiles/<id>.json`). */
+export interface AgentProfile {
+  /** Empty in `saveProfile` for a new profile (the backend creates `custom-<8 hex>`). */
+  id: string;
+  name: string;
+  /** Derived from the id by the backend. */
+  kind: ProfileKind;
+  roles: Role[];
+  /** null: derived (`roles.length !== 1`). */
+  specialist: boolean | null;
+  promptAppend: string;
+  /** Alias or full model id; null = Claude Code's default. */
+  model: string | null;
+  effort: Effort | null;
+  /** The app's own tool names (without prefix) denied on top of the role matrix. */
+  toolDeny: string[];
+  defaultSeat: SeatKind;
+  /** Raw permission rules added to `permissions.allow` / `permissions.deny`. */
+  extraAllow: string[];
+  extraDeny: string[];
+  /** Milliseconds since the Unix epoch. */
+  updatedAt: number;
+}
+
+/** Per-spawn overrides of the profile's model/effort. */
+export interface SpawnOverrides {
+  model?: string | null;
+  effort?: Effort | null;
+}
 
 export interface AgentInfo {
   id: string;
@@ -35,7 +70,18 @@ export interface AgentInfo {
   createdAt: number;
   /** Milliseconds since the Unix epoch. */
   lastEventAt: number;
-  role: AgentRole;
+  /** Profile snapshot taken at spawn; roles never change during a session. */
+  profileId: string;
+  profileName: string;
+  roles: Role[];
+  specialist: boolean;
+  /** Requested model, overwritten by the observed one (see `modelObserved`); null = default. */
+  model: string | null;
+  /** Requested effort, overwritten by the observed `effort.level`; null = default. */
+  effort: string | null;
+  modelObserved: boolean;
+  /** Open review assignments of this agent. */
+  openReviews: number;
   seatKind: SeatKind;
   /** The agent's ticket in progress (set by the backend's ticket links only). */
   currentTicketId: string | null;
@@ -130,6 +176,11 @@ export interface Diagnostics {
   /** tickets.json could not be read at startup: ticket changes are disabled until restart. */
   ticketsReadOnly: boolean;
   ticketsTotal: number;
+  /** `<agentsRoot>/.mira-bots/profiles`. */
+  profilesPath: string;
+  profilesLoaded: number;
+  /** Set when profile files were broken (renamed to `.broken-<ts>`) or the folder was unusable. */
+  profilesWarning: string | null;
 }
 
 export interface AgentOutputPayload {
@@ -217,7 +268,7 @@ export interface TicketPatch {
 }
 
 /** Sidebar tabs `openWorkplace` may select. */
-export type WorkplaceTab = "permissions" | "diagnostics" | "tickets";
+export type WorkplaceTab = "permissions" | "diagnostics" | "tickets" | "agents";
 
 /** Payload of `workplace-select` and result of `take_workplace_selection`. */
 export interface WorkplaceSelection {

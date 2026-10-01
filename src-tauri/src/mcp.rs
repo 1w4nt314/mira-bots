@@ -1,6 +1,7 @@
 //! The agents' MCP server (`mira-mcp`, step 4): the app's `mcp.json` (passed with
-//! `--mcp-config`), the system prompt addition `system-prompt.md` (passed with
-//! `--append-system-prompt-file`). The exe lookup is `lib.rs::find_mcp_exe`. All files live in the app
+//! `--mcp-config`, shared by all agents) and the common system prompt file `system-prompt.md`
+//! in the app data dir (diagnostics; since step 5 every agent gets its profile's prompt from
+//! `profiles::prompt`, passed with `--append-system-prompt-file`). The exe lookup is `lib.rs::find_mcp_exe`. All files live in the app
 //! data dir; the user's own `.mcp.json` and `~/.claude` are never read or written.
 
 use std::io;
@@ -8,25 +9,22 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::config::{AGENT_ID_ENV, MCP_CONFIG_FILE, MCP_SERVER_NAME, PIPE_ENV, SYSTEM_PROMPT_FILE};
+use crate::config::{
+    AGENT_ID_ENV, MCP_CONFIG_FILE, MCP_SERVER_NAME, PIPE_ENV, ROLES_ENV, SYSTEM_PROMPT_FILE,
+};
 use crate::hooks::settings::{command_path, write_atomic};
 
 /// Per-server tool timeout (ms) in mcp.json: a safety net only; mira-mcp answers within 10 s.
 pub const MCP_SERVER_TIMEOUT_MS: u64 = 30_000;
 
-/// `system-prompt.md` (C4.6), appended to every agent's system prompt.
-pub const SYSTEM_PROMPT: &str = "Du kører som agent i mira-bots. Dine opgaver kommer som tickets; hver ticket ligger som fil i .mira-bots/tickets/<kort-id>.md i din arbejdsmappe, og appen beder dig om at læse den.
+/// The common part of every agent's system prompt (C4.6 with the step-5 tool line); the profile
+/// prompt (`profiles::prompt::render_profile_prompt`) starts with it.
+pub const SYSTEM_PROMPT: &str = crate::profiles::prompt::COMMON_PROMPT;
 
-Regler:
-- Når en ticket er færdig, SKAL du kalde værktøjet mira_submit_for_review med en kort opsummering (hvad du gjorde, hvad brugeren bør kigge på). Afslut først dit svar bagefter. Uden kaldet står ticketen som \"ikke afleveret\".
-- Opdager du opfølgende arbejde, så opret en ny ticket med mira_create_ticket i stedet for at udvide opgaven.
-- mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje.
-- Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den.
-";
-
-/// The mcp.json document (C4.5): one stdio server `mira-bots` with the exe's absolute path
-/// (forward slashes), no args, the two env vars as `${VAR}` (Claude Code expands them from its
-/// own env, which it inherited from the app; inheritance alone would also work on Linux),
+/// The mcp.json document (C4.5, C5.11): one stdio server `mira-bots` with the exe's absolute
+/// path (forward slashes), no args, the env vars `MIRA_BOTS_PIPE`, `MIRA_AGENT_ID` and
+/// `MIRA_AGENT_ROLES` as `${VAR}` (Claude Code expands them from its own env, which it inherited
+/// from the app; inheritance alone would also work on Linux),
 /// `alwaysLoad` (otherwise the tools are deferred behind `ToolSearch`) and a timeout.
 ///
 /// TODO(windows-verify): Claude Code starts mira-mcp.exe from a path with spaces and `/` without
@@ -44,7 +42,7 @@ pub fn render_mcp_json(mcp_exe: &Path) -> Value {
         "alwaysLoad": true,
         "timeout": MCP_SERVER_TIMEOUT_MS,
     });
-    for var in [PIPE_ENV, AGENT_ID_ENV] {
+    for var in [PIPE_ENV, AGENT_ID_ENV, ROLES_ENV] {
         server["env"][var] = Value::String(format!("${{{var}}}"));
     }
     let mut servers = serde_json::Map::new();
@@ -101,7 +99,8 @@ mod tests {
                         "args": [],
                         "env": {
                             "MIRA_BOTS_PIPE": "${MIRA_BOTS_PIPE}",
-                            "MIRA_AGENT_ID": "${MIRA_AGENT_ID}"
+                            "MIRA_AGENT_ID": "${MIRA_AGENT_ID}",
+                            "MIRA_AGENT_ROLES": "${MIRA_AGENT_ROLES}"
                         },
                         "alwaysLoad": true,
                         "timeout": 30000
@@ -111,6 +110,14 @@ mod tests {
         );
         let cmd = v["mcpServers"]["mira-bots"]["command"].as_str().unwrap();
         assert!(!cmd.contains('\\') && !cmd.contains('"'));
+    }
+
+    #[test]
+    fn mcp_json_has_roles_env() {
+        let v = render_mcp_json(Path::new("/opt/mira-mcp"));
+        let env = &v["mcpServers"]["mira-bots"]["env"];
+        assert_eq!(env[mira_mcp::ROLES_ENV], "${MIRA_AGENT_ROLES}");
+        assert_eq!(env.as_object().unwrap().len(), 3);
     }
 
     #[test]

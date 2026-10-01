@@ -2,20 +2,30 @@
 //! `--settings`): the hooks plus `permissions.allow` for the app's own MCP tools. Up to step 3
 //! the file was `hooks.json` with only the hooks; writing settings.json removes that file.
 //! `~/.claude/settings.json` is never touched.
+//!
+//! Step 5: every profile gets its own rendered settings file
+//! `<app_data>/profiles/<id>/settings.json` ([`write_profile_settings`]), because Claude Code
+//! does not merge several `--settings` flags (research5 Q4). The root file is still written
+//! (fallback/diagnostics) but no longer passed to claude.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::config::{
     DEFAULT_HOOK_TIMEOUT_S, LEGACY_HOOKS_FILE, MCP_TOOL_PREFIX, PERMISSION_HOOK_TIMEOUT_S,
-    SESSION_END_HOOK_TIMEOUT_S, SETTINGS_FILE,
+    PROFILE_FILES_DIR, SESSION_END_HOOK_TIMEOUT_S, SETTINGS_FILE, STATUSLINE_ENABLED,
 };
+use crate::profiles::model::{AgentProfile, Effort};
 
-/// The events mira-bots listens to. SubagentStart/Stop are left out in step 1.
-pub const HOOK_EVENTS: [&str; 11] = [
+/// The events mira-bots listens to. SubagentStart/Stop are left out in step 1; PostModelSwitch
+/// (step 5) carries the model after `/model`, a fallback or `--resume`.
+// TODO(windows-verify): a Claude Code version that does not know PostModelSwitch (>= 2.1.139)
+// starts without an error with this settings file (plan5 D.62).
+pub const HOOK_EVENTS: [&str; 12] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -27,6 +37,7 @@ pub const HOOK_EVENTS: [&str; 11] = [
     "Stop",
     "StopFailure",
     "SessionEnd",
+    "PostModelSwitch",
 ];
 
 /// Hook timeout in seconds for an event.
@@ -85,6 +96,102 @@ pub fn render_settings_json(hook_exe: &Path) -> Value {
     })
 }
 
+/// `permissions` of a profile's settings file; `deny` is left out when empty.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProfilePermissions {
+    pub allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+/// `statusLine` of a profile's settings file: the hook exe, called without args.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct StatusLine {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub command: String,
+    pub padding: u32,
+}
+
+/// A profile's settings file (C5.10). A struct, so the keys keep this order in the file:
+/// `hooks`, `permissions`, `model`, `effortLevel`, `statusLine`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSettings {
+    pub hooks: Value,
+    pub permissions: ProfilePermissions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<StatusLine>,
+}
+
+/// `statusLine.command`: a shell command string, so a path with spaces is wrapped in `"`.
+pub fn statusline_command(hook_exe: &Path) -> String {
+    let p = command_path(hook_exe);
+    if p.contains(' ') {
+        format!("\"{p}\"")
+    } else {
+        p
+    }
+}
+
+/// The settings file of `profile` (C5.10): the hooks as in [`render_hooks`], allow
+/// (`mcp__mira-bots__*` + `extraAllow`), deny (role-bound tools the roles lack + `toolDeny` +
+/// `extraDeny`; omitted when empty), `model` when set, `effortLevel` when set and not `max`
+/// (settings files ignore `max`; it is only passed as `--effort`), and `statusLine` pointing at
+/// the hook exe when [`STATUSLINE_ENABLED`].
+///
+/// TODO(windows-verify): the statusLine with the quoted path to mira-hook.exe starts without an
+/// error in the TUI and the app shows the observed model (plan5 D.52); `permissions.deny` hides
+/// the role-bound tools from `/mcp` (D.51).
+pub fn profile_settings(hook_exe: &Path, profile: &AgentProfile) -> ProfileSettings {
+    ProfileSettings {
+        hooks: render_hooks(hook_exe),
+        permissions: ProfilePermissions {
+            allow: profile.allow_rules(),
+            deny: profile.deny_rules(),
+        },
+        model: profile.model.clone(),
+        effort_level: profile
+            .effort
+            .filter(|e| *e != Effort::Max)
+            .map(Effort::as_str),
+        status_line: STATUSLINE_ENABLED.then(|| StatusLine {
+            kind: "command",
+            command: statusline_command(hook_exe),
+            padding: 0,
+        }),
+    }
+}
+
+/// [`profile_settings`] as a JSON value.
+pub fn render_profile_settings(hook_exe: &Path, profile: &AgentProfile) -> Value {
+    serde_json::to_value(profile_settings(hook_exe, profile)).unwrap_or(Value::Null)
+}
+
+/// Writes `<data_dir>/profiles/<id>/settings.json` (pretty, keys in C5.10 order) atomically and
+/// returns its path. Called before every spawn/restart and when a profile is saved.
+///
+/// TODO(windows-verify): %APPDATA%\dk.mira.bots\profiles\<id>\settings.json exists and claude
+/// starts with `--settings` on it (plan5 D.50).
+pub fn write_profile_settings(
+    data_dir: &Path,
+    hook_exe: &Path,
+    profile: &AgentProfile,
+) -> io::Result<PathBuf> {
+    let target = data_dir
+        .join(PROFILE_FILES_DIR)
+        .join(&profile.id)
+        .join(SETTINGS_FILE);
+    let body = serde_json::to_string_pretty(&profile_settings(hook_exe, profile))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_atomic(&target, &body)?;
+    Ok(target)
+}
+
 /// Writes `target` atomically: a temp file in the same directory, then rename. The directory is
 /// created if needed; the temp file never survives a failure.
 pub(crate) fn write_atomic(target: &Path, body: &str) -> io::Result<()> {
@@ -133,10 +240,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contains_all_eleven_events() {
+    fn contains_all_twelve_events() {
         let v = render_settings_json(Path::new("/opt/mira-hook"));
         let hooks = v["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 11);
+        assert_eq!(hooks.len(), 12);
+        assert!(hooks.contains_key("PostModelSwitch"));
         for e in HOOK_EVENTS {
             assert!(hooks.contains_key(e), "missing {e}");
         }
@@ -191,6 +299,182 @@ mod tests {
         assert_eq!(keys, ["hooks", "permissions"]);
         assert_eq!(v["permissions"], json!({"allow": ["mcp__mira-bots__*"]}));
         assert_eq!(allow_rule(), "mcp__mira-bots__*");
+    }
+
+    use crate::agent::roles::Role;
+    use crate::profiles::model::builtin_profile;
+
+    fn profile(id: &str) -> AgentProfile {
+        builtin_profile(id).unwrap()
+    }
+
+    #[test]
+    fn profile_settings_has_twelve_events() {
+        for id in ["coder", "reviewer", "specialist"] {
+            let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile(id));
+            assert_eq!(v["hooks"].as_object().unwrap().len(), 12, "{id}");
+            assert_eq!(v["hooks"], render_hooks(Path::new("/opt/mira-hook")));
+        }
+    }
+
+    /// The coder file exactly (C5.10): all role-bound tools denied, no model/effort keys.
+    #[test]
+    fn coder_settings_denies_role_bound_tools() {
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("coder"));
+        assert_eq!(
+            v,
+            json!({
+                "hooks": render_hooks(Path::new("/opt/mira-hook")),
+                "permissions": {
+                    "allow": ["mcp__mira-bots__*"],
+                    "deny": [
+                        "mcp__mira-bots__mira_approve_ticket",
+                        "mcp__mira-bots__mira_assign_ticket",
+                        "mcp__mira-bots__mira_list_agents",
+                        "mcp__mira-bots__mira_list_profiles",
+                        "mcp__mira-bots__mira_reject_ticket",
+                        "mcp__mira-bots__mira_spawn_agent",
+                        "mcp__mira-bots__mira_unassign_ticket"
+                    ]
+                },
+                "statusLine": {"type": "command", "command": "/opt/mira-hook", "padding": 0}
+            })
+        );
+    }
+
+    /// The reviewer file exactly: git reads allowed, coordinator tools and commit/push denied.
+    #[test]
+    fn reviewer_settings_allows_git_reads_and_denies_commit_push() {
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("reviewer"));
+        assert_eq!(
+            v,
+            json!({
+                "hooks": render_hooks(Path::new("/opt/mira-hook")),
+                "permissions": {
+                    "allow": [
+                        "mcp__mira-bots__*",
+                        "Bash(git -C * diff *)",
+                        "Bash(git -C * log *)",
+                        "Bash(git -C * status *)",
+                        "Bash(git -C * show *)"
+                    ],
+                    "deny": [
+                        "mcp__mira-bots__mira_assign_ticket",
+                        "mcp__mira-bots__mira_list_agents",
+                        "mcp__mira-bots__mira_list_profiles",
+                        "mcp__mira-bots__mira_spawn_agent",
+                        "mcp__mira-bots__mira_unassign_ticket",
+                        "Bash(git commit *)",
+                        "Bash(git push *)"
+                    ]
+                },
+                "statusLine": {"type": "command", "command": "/opt/mira-hook", "padding": 0}
+            })
+        );
+        // No deny rule has parentheses on an mcp__ name (they would be ignored, research5 Q5).
+        for rule in v["permissions"]["deny"].as_array().unwrap() {
+            let r = rule.as_str().unwrap();
+            assert!(!(r.starts_with("mcp__") && r.contains('(')), "{r}");
+        }
+    }
+
+    #[test]
+    fn model_and_effort_keys_only_when_set() {
+        let hook = Path::new("/opt/mira-hook");
+        let v = render_profile_settings(hook, &profile("coder"));
+        assert!(v.get("model").is_none() && v.get("effortLevel").is_none());
+        for (effort, want) in [
+            (Effort::Low, Some("low")),
+            (Effort::Medium, Some("medium")),
+            (Effort::High, Some("high")),
+            (Effort::Xhigh, Some("xhigh")),
+            (Effort::Max, None),
+        ] {
+            let p = AgentProfile {
+                model: Some("sonnet".into()),
+                effort: Some(effort),
+                ..profile("coder")
+            };
+            let v = render_profile_settings(hook, &p);
+            assert_eq!(v["model"], "sonnet");
+            assert_eq!(
+                v.get("effortLevel").and_then(Value::as_str),
+                want,
+                "{effort}"
+            );
+        }
+        // Key order in the written file: hooks, permissions, model, effortLevel, statusLine.
+        let p = AgentProfile {
+            model: Some("claude-opus-5-5[1m]".into()),
+            effort: Some(Effort::High),
+            ..profile("reviewer")
+        };
+        let text = serde_json::to_string_pretty(&profile_settings(hook, &p)).unwrap();
+        let pos = |k: &str| {
+            text.find(&format!("\n  \"{k}\":"))
+                .unwrap_or_else(|| panic!("{k}"))
+        };
+        let order = ["hooks", "permissions", "model", "effortLevel", "statusLine"].map(pos);
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
+    }
+
+    #[test]
+    fn statusline_points_at_hook_exe() {
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("coder"));
+        assert_eq!(v["statusLine"]["command"], "/opt/mira-hook");
+        let v = render_profile_settings(
+            Path::new(r"C:\Program Files\mira-bots\resources\mira-hook.exe"),
+            &profile("coder"),
+        );
+        assert_eq!(
+            v["statusLine"],
+            json!({
+                "type": "command",
+                "command": "\"C:/Program Files/mira-bots/resources/mira-hook.exe\"",
+                "padding": 0
+            })
+        );
+        // The hooks themselves keep the unquoted exec form.
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "C:/Program Files/mira-bots/resources/mira-hook.exe"
+        );
+        assert_eq!(statusline_command(Path::new(r"C:\x\h.exe")), "C:/x/h.exe");
+    }
+
+    #[test]
+    fn specialist_has_no_deny_key() {
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("specialist"));
+        assert_eq!(v["permissions"], json!({"allow": ["mcp__mira-bots__*"]}));
+        // A profile with every role but some toolDeny does get the key.
+        let p = AgentProfile {
+            roles: Role::ALL.to_vec(),
+            tool_deny: vec!["mira_add_report".into()],
+            ..profile("coder")
+        };
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &p);
+        assert_eq!(
+            v["permissions"]["deny"],
+            json!(["mcp__mira-bots__mira_add_report"])
+        );
+    }
+
+    #[test]
+    fn write_profile_settings_goes_to_the_profile_folder() {
+        let base = temp_base();
+        let p = profile("reviewer");
+        let path = write_profile_settings(&base, Path::new("/opt/mira-hook"), &p).unwrap();
+        assert_eq!(
+            path,
+            base.join("profiles").join("reviewer").join("settings.json")
+        );
+        let read: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            read,
+            render_profile_settings(Path::new("/opt/mira-hook"), &p)
+        );
+        assert_eq!(file_names(path.parent().unwrap()), ["settings.json"]);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     fn temp_base() -> PathBuf {

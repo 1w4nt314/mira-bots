@@ -25,8 +25,9 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 log = "0.4"
 thiserror = "2"
+# Workspace crate (serde_json only): the role matrix `mira_mcp::tools::ROLE_TOOLS` lives there once.
+mira-mcp = { path = "../crates/mira-mcp" }
 
 [dev-dependencies]
 mira-hook = { path = "../crates/mira-hook" }
-mira-mcp = { path = "../crates/mira-mcp" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "test-util"] }

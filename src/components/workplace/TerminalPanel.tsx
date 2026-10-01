@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Theme } from "../../lib/bots";
+import { agentFigure, type Theme } from "../../lib/bots";
 import { errorMessage, openAgentFolder, removeAgent, stopAgent } from "../../lib/ipc";
 import { isExited, isStartingHint, statusLabel } from "../../lib/status";
 import type { AgentInfo, BotState } from "../../lib/types";
@@ -62,7 +62,7 @@ export default function TerminalPanel({ agent, botState, theme, onRemoved }: Pro
     <div className="flex min-h-0 flex-1 flex-col border-t border-[var(--border)]">
       <div className="flex shrink-0 items-center gap-3 px-3 py-2">
         <BotFigure
-          role={agent.role}
+          role={agentFigure(agent)}
           state={botState}
           theme={theme}
           exited={exited}

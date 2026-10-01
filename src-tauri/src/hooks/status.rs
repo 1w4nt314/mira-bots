@@ -107,6 +107,8 @@ pub fn apply(ev: &HookEvent) -> Transition {
             _ => Transition::unchanged(),
         },
         "Stop" | "StopFailure" => Transition::set(AgentStatus::Idle, None),
+        // Live model/effort only (plan5 A.4); the handler updates them separately.
+        "StatusLine" | "PostModelSwitch" => Transition::unchanged(),
         // SessionEnd: the PTY exit sets Exited. SubagentStart/Stop and the rest: no change.
         _ => Transition::unchanged(),
     }
@@ -204,6 +206,18 @@ mod tests {
         assert_eq!(apply(&ev(fx::SUBAGENT_STOP)), t(None, None));
         let start = r#"{"hook_event_name":"SubagentStart","session_id":"s"}"#;
         assert_eq!(apply(&ev(start)), t(None, None));
+    }
+
+    #[test]
+    fn statusline_and_model_switch_do_not_change_status() {
+        for e in ["StatusLine", "PostModelSwitch"] {
+            let ev = parse(&serde_json::json!({
+                "hook_event_name": e, "session_id": "s", "model": {"id": "claude-x"},
+                "to_model": "claude-x"
+            }))
+            .unwrap();
+            assert_eq!(apply(&ev), t(None, None), "{e}");
+        }
     }
 
     #[test]

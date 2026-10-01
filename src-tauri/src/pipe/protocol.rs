@@ -371,8 +371,8 @@ mod tests {
 
     #[test]
     fn hook_exe_frame_is_understood_by_the_app() {
-        let p =
-            mira_hook::payload::parse(r#"{"hook_event_name":"Stop","session_id":"s"}"#).unwrap();
+        let p = mira_hook::payload::parse(r#"{"hook_event_name":"Stop","session_id":"s"}"#, None)
+            .unwrap();
         let f = parse_hook(&mira_hook::payload::to_frame(&p, None)).unwrap();
         assert_eq!(f.event["session_id"], "s");
         assert_eq!(f.agent_id, None);

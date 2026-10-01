@@ -11,7 +11,15 @@ pub const MAX_STRING_CHARS: usize = 2000;
 /// Top-level fields that are never forwarded (large and useless for status).
 const DROPPED_FIELDS: [&str; 2] = ["tool_response", "transcript_path"];
 
-/// A parsed hook event. `event_name` comes from `hook_event_name` (argv is ignored).
+/// `hook_event_name` given to a statusLine invocation (plan5 A.4). Claude Code calls the
+/// statusLine command with a JSON object that has no `hook_event_name`.
+pub const STATUSLINE_EVENT: &str = "StatusLine";
+
+/// Extra top-level fields dropped from a StatusLine payload (large, unused by the app).
+const STATUSLINE_DROPPED_FIELDS: [&str; 3] = ["workspace", "cost", "context_window"];
+
+/// A parsed hook event. `event_name` comes from `hook_event_name`; argv only matters for a
+/// statusLine payload without one (see [`parse`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HookPayload {
     pub event_name: String,
@@ -45,11 +53,24 @@ fn string_field(v: &Value, key: &'static str) -> Result<String, Error> {
         .ok_or(Error::MissingField(key))
 }
 
-/// Parses the hook's stdin. Requires an object with string fields `hook_event_name` and `session_id`.
-pub fn parse(stdin: &str) -> Result<HookPayload, Error> {
-    let json: Value = serde_json::from_str(stdin).map_err(Error::Json)?;
+/// Whether an object without `hook_event_name` is a statusLine invocation: argv[1] says so, or
+/// the object has a `model` object (the statusLine JSON always does; hook events carry `model`
+/// as a string at most).
+fn is_statusline(json: &Value, argv_event: Option<&str>) -> bool {
+    argv_event == Some(STATUSLINE_EVENT) || json.get("model").is_some_and(Value::is_object)
+}
+
+/// Parses the hook's stdin. Requires an object with string fields `hook_event_name` and
+/// `session_id`. Exception (plan5 A.4): an object without `hook_event_name` that is a statusLine
+/// payload (`argv_event == Some("StatusLine")` or a `model` object) gets
+/// `"hook_event_name": "StatusLine"`.
+pub fn parse(stdin: &str, argv_event: Option<&str>) -> Result<HookPayload, Error> {
+    let mut json: Value = serde_json::from_str(stdin).map_err(Error::Json)?;
     if !json.is_object() {
         return Err(Error::NotAnObject);
+    }
+    if json.get("hook_event_name").is_none() && is_statusline(&json, argv_event) {
+        json["hook_event_name"] = Value::String(STATUSLINE_EVENT.to_string());
     }
     Ok(HookPayload {
         event_name: string_field(&json, "hook_event_name")?,
@@ -75,12 +96,18 @@ fn truncate_strings(v: &mut Value) {
     }
 }
 
-/// Drops top-level `tool_response` and `transcript_path` and truncates every string value
-/// (recursively) to [`MAX_STRING_CHARS`] chars. Nothing else is changed.
+/// Drops top-level `tool_response` and `transcript_path` (for StatusLine also `workspace`,
+/// `cost` and `context_window`) and truncates every string value (recursively) to
+/// [`MAX_STRING_CHARS`] chars. Nothing else is changed.
 pub fn trim(json: &mut Value) {
     if let Some(map) = json.as_object_mut() {
         for key in DROPPED_FIELDS {
             map.remove(key);
+        }
+        if map.get("hook_event_name").and_then(Value::as_str) == Some(STATUSLINE_EVENT) {
+            for key in STATUSLINE_DROPPED_FIELDS {
+                map.remove(key);
+            }
         }
     }
     truncate_strings(json);
@@ -143,6 +170,77 @@ pub fn to_frame(payload: &HookPayload, agent_id: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ordinary hook events: argv does not matter.
+    fn parse(stdin: &str) -> Result<HookPayload, Error> {
+        super::parse(stdin, None)
+    }
+
+    const STATUSLINE: &str = r#"{"session_id":"sess-9","transcript_path":"/t.jsonl","cwd":"/w","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"effort":{"level":"high"},"workspace":{"current_dir":"/w","project_dir":"/w"},"cost":{"total_cost_usd":0.5},"context_window":{"used":1},"version":"2.1.286"}"#;
+
+    #[test]
+    fn statusline_shape_gets_event_name() {
+        let mut p = super::parse(STATUSLINE, None).unwrap();
+        assert_eq!(p.event_name, "StatusLine");
+        assert_eq!(p.session_id, "sess-9");
+        trim(&mut p.json);
+        assert_eq!(p.json["hook_event_name"], "StatusLine");
+        assert_eq!(p.json["model"]["id"], "claude-opus-5-5");
+        assert_eq!(p.json["effort"]["level"], "high");
+        for gone in ["workspace", "cost", "context_window", "transcript_path"] {
+            assert!(p.json.get(gone).is_none(), "{gone}");
+        }
+        assert_eq!(p.json["version"], "2.1.286");
+        // Other events keep those fields (they never had a reason to lose them).
+        let mut stop =
+            parse(r#"{"hook_event_name":"Stop","session_id":"s","workspace":{"a":1}}"#).unwrap();
+        trim(&mut stop.json);
+        assert!(stop.json.get("workspace").is_some());
+        assert_eq!(budget(&p.event_name), Duration::from_secs(2));
+        assert!(!expects_reply(&p.event_name));
+    }
+
+    #[test]
+    fn statusline_argv_forces_event_name() {
+        // Without a model object (a model without effort support, or an older version).
+        let p = super::parse(r#"{"session_id":"s"}"#, Some("StatusLine")).unwrap();
+        assert_eq!(p.event_name, "StatusLine");
+        // An explicit hook_event_name always wins.
+        let p = super::parse(
+            r#"{"hook_event_name":"Stop","session_id":"s","model":{"id":"x"}}"#,
+            Some("StatusLine"),
+        )
+        .unwrap();
+        assert_eq!(p.event_name, "Stop");
+        // The frame carries it like any event.
+        let p = super::parse(STATUSLINE, Some("StatusLine")).unwrap();
+        let v: Value = serde_json::from_str(to_frame(&p, Some("a1")).trim_end()).unwrap();
+        assert_eq!(v["event"]["hook_event_name"], "StatusLine");
+        assert_eq!(v["agent_id"], "a1");
+    }
+
+    #[test]
+    fn missing_event_name_without_model_is_still_an_error() {
+        for (raw, argv) in [
+            (r#"{"session_id":"s"}"#, None),
+            (r#"{"session_id":"s"}"#, Some("Stop")),
+            // SessionStart-like `model` string is not a statusLine object.
+            (r#"{"session_id":"s","model":"claude-opus-5-5"}"#, None),
+        ] {
+            assert!(
+                matches!(
+                    super::parse(raw, argv),
+                    Err(Error::MissingField("hook_event_name"))
+                ),
+                "{raw} {argv:?}"
+            );
+        }
+        // A statusLine payload still needs a session id.
+        assert!(matches!(
+            super::parse(r#"{"model":{"id":"x"}}"#, None),
+            Err(Error::MissingField("session_id"))
+        ));
+    }
 
     const COMMON: &str = r#""session_id":"sess-1","transcript_path":"C:\\Users\\u\\.claude\\projects\\x.jsonl","cwd":"C:\\work\\demo","permission_mode":"default""#;
 

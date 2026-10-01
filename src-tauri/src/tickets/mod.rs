@@ -653,8 +653,9 @@ mod tests {
     fn dispatcher_types_into_a_real_pty_through_the_manager_port() {
         use crate::agent::manager::AgentMeta;
         use crate::agent::pty::SpawnSpec;
-        use crate::agent::{AgentRole, EventSink, SeatKind, SinkEvent};
+        use crate::agent::{EventSink, SeatKind, SinkEvent};
         use crate::config::{PTY_COLS, PTY_ROWS};
+        use crate::profiles::model::ProfileSnapshot;
         use crate::tickets::dispatcher::{Dispatcher, FakeTimers};
         use std::time::{Duration, Instant};
 
@@ -681,7 +682,7 @@ mod tests {
                 AgentMeta {
                     id: uuid::Uuid::new_v4().to_string(),
                     session_id: "s".into(),
-                    role: AgentRole::None,
+                    profile: ProfileSnapshot::default(),
                     seat_kind: SeatKind::Work,
                 },
                 sink,

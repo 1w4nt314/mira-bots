@@ -8,7 +8,7 @@ import {
   type Ref,
   type SyntheticEvent,
 } from "react";
-import { useTheme } from "../../../lib/bots";
+import { agentFigure, useTheme } from "../../../lib/bots";
 import { deleteTicket, errorMessage, getTicket } from "../../../lib/ipc";
 import { isExited } from "../../../lib/status";
 import {
@@ -149,7 +149,7 @@ function NoteFrame(props: FrameProps) {
               {agent !== null ? (
                 <>
                   <BotFigure
-                    role={agent.role}
+                    role={agentFigure(agent)}
                     state="idle"
                     theme={theme}
                     exited={isExited(agent)}

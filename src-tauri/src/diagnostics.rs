@@ -211,6 +211,15 @@ impl HookStats {
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(last);
     }
 
+    /// Counts one parsed frame without making it the last event (StatusLine frames: they arrive
+    /// several times a second and would drown the Diagnostics row).
+    pub fn count_only(&self, matched: bool) {
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
+        if !matched {
+            self.frames_unknown_session.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn received(&self) -> u64 {
         self.frames_received.load(Ordering::Relaxed)
     }
@@ -294,6 +303,13 @@ pub struct Diagnostics {
     pub tickets_read_only: bool,
     /// Number of tickets in memory.
     pub tickets_total: usize,
+    /// `<agents_root>/.mira-bots/profiles` (the profile store).
+    pub profiles_path: String,
+    /// Number of profiles loaded (built-in + custom).
+    pub profiles_loaded: usize,
+    /// Set when profile files were broken (renamed to `.broken-<ts>`) or the folder could not
+    /// be used.
+    pub profiles_warning: Option<String>,
 }
 
 #[cfg(test)]
@@ -499,6 +515,9 @@ mod tests {
             tickets_warning: None,
             tickets_read_only: false,
             tickets_total: 4,
+            profiles_path: "/h/mira-bots/agents/.mira-bots/profiles".into(),
+            profiles_loaded: 7,
+            profiles_warning: Some("1 profilfil(er) kunne ikke læses".into()),
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -531,7 +550,10 @@ mod tests {
                 "ticketsPath": "/d/tickets.json",
                 "ticketsWarning": null,
                 "ticketsReadOnly": false,
-                "ticketsTotal": 4
+                "ticketsTotal": 4,
+                "profilesPath": "/h/mira-bots/agents/.mira-bots/profiles",
+                "profilesLoaded": 7,
+                "profilesWarning": "1 profilfil(er) kunne ikke læses"
             })
         );
     }

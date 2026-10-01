@@ -18,6 +18,101 @@ pub const TOOL_NAMES: [&str; 5] = [
     UPDATE_STATUS,
 ];
 
+// Step 5 tools (plan5 C5.3). Their definitions and argument validation arrive with batch 2; the
+// names are needed now for the role matrix below, which the app also uses for its deny rules.
+pub const APPROVE_TICKET: &str = "mira_approve_ticket";
+pub const REJECT_TICKET: &str = "mira_reject_ticket";
+pub const ASSIGN_TICKET: &str = "mira_assign_ticket";
+pub const UNASSIGN_TICKET: &str = "mira_unassign_ticket";
+pub const SPAWN_AGENT: &str = "mira_spawn_agent";
+pub const LIST_AGENTS: &str = "mira_list_agents";
+pub const LIST_PROFILES: &str = "mira_list_profiles";
+pub const GET_WORKSPACE_RULES: &str = "mira_get_workspace_rules";
+pub const ADD_REPORT: &str = "mira_add_report";
+pub const GET_REPORT: &str = "mira_get_report";
+
+/// Tools every agent has, whatever its roles (plan5 A.2).
+pub const COMMON_TOOLS: [&str; 8] = [
+    CREATE_TICKET,
+    LIST_TICKETS,
+    GET_TICKET,
+    SUBMIT_FOR_REVIEW,
+    UPDATE_STATUS,
+    GET_WORKSPACE_RULES,
+    ADD_REPORT,
+    GET_REPORT,
+];
+
+/// Tools only some roles have (the union of [`ROLE_TOOLS`]).
+pub const ROLE_BOUND_TOOLS: [&str; 7] = [
+    APPROVE_TICKET,
+    REJECT_TICKET,
+    ASSIGN_TICKET,
+    UNASSIGN_TICKET,
+    SPAWN_AGENT,
+    LIST_AGENTS,
+    LIST_PROFILES,
+];
+
+/// Every tool name of plan5 C5.3, common ones first.
+pub const ALL_TOOL_NAMES: [&str; 15] = [
+    CREATE_TICKET,
+    LIST_TICKETS,
+    GET_TICKET,
+    SUBMIT_FOR_REVIEW,
+    UPDATE_STATUS,
+    GET_WORKSPACE_RULES,
+    ADD_REPORT,
+    GET_REPORT,
+    APPROVE_TICKET,
+    REJECT_TICKET,
+    ASSIGN_TICKET,
+    UNASSIGN_TICKET,
+    SPAWN_AGENT,
+    LIST_AGENTS,
+    LIST_PROFILES,
+];
+
+/// The role matrix (plan5 A.2): role wire name → the tools that role adds to [`COMMON_TOOLS`].
+/// The only copy: the app's tool gate and deny rules use this table too.
+pub const ROLE_TOOLS: &[(&str, &[&str])] = &[
+    ("coder", &[]),
+    ("researcher", &[]),
+    ("reviewer", &[APPROVE_TICKET, REJECT_TICKET]),
+    (
+        "coordinator",
+        &[
+            ASSIGN_TICKET,
+            UNASSIGN_TICKET,
+            SPAWN_AGENT,
+            LIST_AGENTS,
+            LIST_PROFILES,
+        ],
+    ),
+    ("planner", &[]),
+    ("debugger", &[]),
+];
+
+/// The tools allowed for `roles` (role wire names; unknown names add nothing), in
+/// [`ALL_TOOL_NAMES`] order without duplicates. No roles = [`COMMON_TOOLS`].
+pub fn tools_for_roles<S: AsRef<str>>(roles: &[S]) -> Vec<&'static str> {
+    ALL_TOOL_NAMES
+        .iter()
+        .copied()
+        .filter(|tool| {
+            COMMON_TOOLS.contains(tool)
+                || ROLE_TOOLS.iter().any(|(role, tools)| {
+                    tools.contains(tool) && roles.iter().any(|r| r.as_ref() == *role)
+                })
+        })
+        .collect()
+}
+
+/// Whether `tool` is allowed for `roles` (see [`tools_for_roles`]); unknown tools never are.
+pub fn is_allowed<S: AsRef<str>>(tool: &str, roles: &[S]) -> bool {
+    tools_for_roles(roles).contains(&tool)
+}
+
 /// Limits (chars) shared with the app's C4.12.
 pub const TITLE_MAX: usize = 200;
 pub const BODY_MAX: usize = 20_000;
@@ -259,6 +354,53 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_matrix_matches_the_plan() {
+        let none: [&str; 0] = [];
+        assert_eq!(tools_for_roles(&none), COMMON_TOOLS.to_vec());
+        for role in ["coder", "researcher", "planner", "debugger", "nobody"] {
+            assert_eq!(tools_for_roles(&[role]), COMMON_TOOLS.to_vec(), "{role}");
+        }
+        assert_eq!(tools_for_roles(&["reviewer"]).len(), 10);
+        assert_eq!(tools_for_roles(&["coordinator"]).len(), 13);
+        let all = [
+            "coder",
+            "researcher",
+            "reviewer",
+            "coordinator",
+            "planner",
+            "debugger",
+        ];
+        assert_eq!(tools_for_roles(&all), ALL_TOOL_NAMES.to_vec());
+        // Duplicates and order of the input do not matter.
+        assert_eq!(
+            tools_for_roles(&["coordinator", "reviewer", "reviewer"]),
+            ALL_TOOL_NAMES.to_vec()
+        );
+        assert!(is_allowed(APPROVE_TICKET, &["reviewer"]));
+        assert!(!is_allowed(APPROVE_TICKET, &["coordinator"]));
+        assert!(is_allowed(SPAWN_AGENT, &["coordinator".to_string()]));
+        assert!(!is_allowed("mira_nope", &all));
+        // The role-bound set is exactly the union of the matrix, disjoint from the common one.
+        let mut bound: Vec<&str> = ROLE_TOOLS
+            .iter()
+            .flat_map(|(_, t)| t.iter().copied())
+            .collect();
+        bound.sort_unstable();
+        let mut want = ROLE_BOUND_TOOLS.to_vec();
+        want.sort_unstable();
+        assert_eq!(bound, want);
+        assert!(ROLE_BOUND_TOOLS.iter().all(|t| !COMMON_TOOLS.contains(t)));
+        assert_eq!(
+            COMMON_TOOLS.len() + ROLE_BOUND_TOOLS.len(),
+            ALL_TOOL_NAMES.len()
+        );
+        // Every step-4 tool is a common tool.
+        assert!(TOOL_NAMES.iter().all(|t| COMMON_TOOLS.contains(t)));
+        let roles: Vec<&str> = ROLE_TOOLS.iter().map(|(r, _)| *r).collect();
+        assert_eq!(roles, all);
+    }
 
     fn name_ok(n: &str) -> bool {
         (1..=128).contains(&n.len())

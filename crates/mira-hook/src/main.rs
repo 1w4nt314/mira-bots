@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 
 fn main() {
     let debug = mira_hook::debug_from_env();
+    // The hooks' exec form passes the event name; the statusLine command passes nothing.
+    let argv_event = std::env::args().nth(1);
     let mut input = Vec::new();
     let read_ok = std::io::stdin()
         .lock()
@@ -16,6 +18,7 @@ fn main() {
             mira_hook::transport::pipe_name_from_env(),
             mira_hook::agent_id_from_env(),
             debug,
+            argv_event.as_deref(),
         ) {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout.write_all(out.as_bytes());

@@ -2,7 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{TICKETS_SCHEMA_VERSION, TICKET_SHORT_ID_LEN};
+use crate::config::{
+    AUTO_REVIEW_ON_STOP, CREATE_TICKET_RATE_LIMIT, MAX_REVIEW_ROUNDS, MAX_STAFF_AGENTS,
+    MAX_WORK_AGENTS, REPORTS_PER_TICKET_MAX, REPORT_BODY_MAX_CHARS, TICKETS_SCHEMA_VERSION,
+    TICKET_BODY_MAX_CHARS, TICKET_SHORT_ID_LEN,
+};
 
 /// Ticket id (uuid v4 string).
 pub type TicketId = String;
@@ -244,6 +248,37 @@ pub enum TicketError {
     NotInProgress,
     #[error("For mange tickets oprettet den seneste time (maks 20)")]
     RateLimited,
+}
+
+/// The rules of this workspace (plan5 C5.1): the "Regler" section of every profile's system
+/// prompt and, from batch 2, the result of `mira_get_workspace_rules`. Compile-time values.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRules {
+    pub max_work_agents: usize,
+    pub max_staff_agents: usize,
+    pub max_review_rounds: u32,
+    pub auto_review_on_stop: bool,
+    pub create_ticket_rate_limit: usize,
+    pub ticket_body_max_chars: usize,
+    pub report_body_max_chars: usize,
+    pub reports_per_ticket_max: usize,
+}
+
+impl WorkspaceRules {
+    /// The values from `config.rs`.
+    pub fn current() -> Self {
+        Self {
+            max_work_agents: MAX_WORK_AGENTS,
+            max_staff_agents: MAX_STAFF_AGENTS,
+            max_review_rounds: MAX_REVIEW_ROUNDS,
+            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
+            create_ticket_rate_limit: CREATE_TICKET_RATE_LIMIT,
+            ticket_body_max_chars: TICKET_BODY_MAX_CHARS,
+            report_body_max_chars: REPORT_BODY_MAX_CHARS,
+            reports_per_ticket_max: REPORTS_PER_TICKET_MAX,
+        }
+    }
 }
 
 impl From<TicketError> for String {

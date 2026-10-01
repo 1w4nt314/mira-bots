@@ -4,12 +4,14 @@ pub mod claude_path;
 pub mod manager;
 pub mod pty;
 pub mod ring_buffer;
+pub mod roles;
 pub mod workdir;
 
 pub use manager::{
-    AgentId, AgentInfo, AgentManager, AgentRole, EventSink, FrameMatch, MatchVia, SeatKind,
-    SinkEvent, SpawnContext, SpawnRequest,
+    build_resume_spec, build_spawn_spec, AgentId, AgentInfo, AgentManager, EventSink, FrameMatch,
+    MatchVia, SeatKind, SinkEvent, SpawnContext, SpawnRequest,
 };
+pub use roles::Role;
 
 use crate::config::{MAX_STAFF_AGENTS, MAX_WORK_AGENTS};
 
@@ -42,6 +44,12 @@ pub enum AgentError {
     InvalidPrompt,
     #[error("Agenten findes ikke")]
     NotFound,
+    /// Model/effort change of an agent that is unknown or has exited (plan5 C5.4).
+    #[error("Agenten kører ikke")]
+    NotRunning,
+    /// Model/effort change while the agent is not idle or has a ticket in progress (C5.6).
+    #[error("Agenten arbejder")]
+    Working,
     /// `remove` on an agent that has not exited (C.1 `remove_agent`).
     #[error("Agenten kører stadig")]
     StillRunning,

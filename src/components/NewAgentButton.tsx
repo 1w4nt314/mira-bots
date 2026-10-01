@@ -42,11 +42,12 @@ export default function NewAgentButton() {
       ? "Fandt ikke claude endnu — installer Claude Code eller sæt MIRA_CLAUDE_PATH"
       : null;
 
-  // One click: default folder, role "none", work seat (role/folder are chosen in Workplace).
+  // One click: default profile (coder), default folder, work seat (profile/folder are chosen in
+  // Workplace).
   const start = async () => {
     setBusy(true);
     try {
-      await spawnAgent(null, null, null, null);
+      await spawnAgent(null, null, null, null, "work");
     } catch (e) {
       dispatch({ type: "error/set", error: errorMessage(e) });
     } finally {

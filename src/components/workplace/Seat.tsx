@@ -1,16 +1,17 @@
 import { useDroppable } from "@dnd-kit/core";
-import type { Theme } from "../../lib/bots";
+import { agentFigure, type Theme } from "../../lib/bots";
 import { isExited, statusLabel } from "../../lib/status";
 import { agentDropId, emptyDropId } from "../../lib/tickets";
-import type { AgentInfo, AgentRole, BotState, SeatKind, TicketSummary } from "../../lib/types";
+import type { AgentInfo, BotState, Role, SeatKind, TicketSummary } from "../../lib/types";
 import BotFigure from "../BotFigure";
 
-export const ROLE_LABEL: Record<AgentRole, string> = {
-  none: "Ingen rolle",
+export const ROLE_LABEL: Record<Role, string> = {
   coder: "Koder",
   researcher: "Researcher",
   reviewer: "Reviewer",
-  koord: "Koordinator",
+  coordinator: "Koordinator",
+  planner: "Planlægger",
+  debugger: "Debugger",
 };
 
 interface Props {
@@ -105,7 +106,7 @@ export default function Seat(props: Props) {
           {agent.queueLength} i kø
         </span>
       )}
-      <BotFigure role={agent.role} state={botState} theme={theme} exited={exited} size={figure} />
+      <BotFigure role={agentFigure(agent)} state={botState} theme={theme} exited={exited} size={figure} />
       <span className="w-full truncate text-center text-xs font-medium">{agent.name}</span>
       <span className="w-full truncate text-center text-[10px] text-[var(--muted)]">
         {label}
@@ -116,9 +117,12 @@ export default function Seat(props: Props) {
           ▸ {currentTicket.title}
         </span>
       )}
-      {agent.role !== "none" && (
-        <span className="rounded bg-[var(--accent)]/15 px-1.5 text-[10px] text-[var(--accent)]">
-          {ROLE_LABEL[agent.role]}
+      {agent.roles.length > 0 && (
+        <span
+          className="max-w-full truncate rounded bg-[var(--accent)]/15 px-1.5 text-[10px] text-[var(--accent)]"
+          title={agent.profileName}
+        >
+          {agent.roles.map((r) => ROLE_LABEL[r]).join(" · ")}
         </span>
       )}
     </button>

@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 use super::protocol::{self, FrameError, Incoming, ToolFrame, ToolResult};
 use crate::agent::{now_ms, AgentManager};
-use crate::config::{MAX_PIPE_LINE, PERMISSION_APP_DEADLINE};
+use crate::config::{MAX_PIPE_LINE, PERMISSION_APP_DEADLINE, STATUSLINE_EVENT};
 use crate::diagnostics::{HookStats, LastHookEvent, LastToolCall};
 use crate::events::{
     HookEventPayload, PermissionResolvedPayload, StatusEvent, AGENTS_CHANGED, HOOK_EVENT,
@@ -213,32 +213,60 @@ where
     };
     let mut stream = reader.into_inner();
     let is_permission = ev.hook_event_name == "PermissionRequest";
+    let is_statusline = ev.hook_event_name == STATUSLINE_EVENT;
+    // Live model/effort (plan5 A.4): no status change, no dispatcher message, and not the
+    // agent's "first hook event" (the Starting hint stays).
+    let is_live = is_statusline || ev.hook_event_name == "PostModelSwitch";
 
     // One lock: match (and possibly rebind) plus clearing the Starting hint. No emit under it.
     let (found, hint_cleared) = {
         let mut m = lock(&ctx.manager);
         let found = m.match_frame(hint.as_deref(), &ev.session_id);
-        let cleared = found
-            .as_ref()
-            .is_some_and(|f| m.clear_starting_hint(&f.agent_id));
+        let cleared = !is_live
+            && found
+                .as_ref()
+                .is_some_and(|f| m.clear_starting_hint(&f.agent_id));
         (found, cleared)
     };
-    ctx.stats.record(
-        LastHookEvent {
-            name: ev.hook_event_name.clone(),
-            session_id: ev.session_id.clone(),
-            agent_id: hint.clone(),
-            at: now_ms(),
-        },
-        found.is_some(),
-    );
+    if is_statusline {
+        ctx.stats.count_only(found.is_some());
+    } else {
+        ctx.stats.record(
+            LastHookEvent {
+                name: ev.hook_event_name.clone(),
+                session_id: ev.session_id.clone(),
+                agent_id: hint.clone(),
+                at: now_ms(),
+            },
+            found.is_some(),
+        );
+    }
     log::debug!(
         "hook {} session={} agent_hint={hint:?} -> {found:?}",
         ev.hook_event_name,
         ev.session_id
     );
     let agent_id = found.as_ref().map(|f| f.agent_id.clone());
-    if let Some(f) = &found {
+    if let (Some(f), true) = (&found, is_live) {
+        if f.rebound {
+            log::info!("agent {} rebound to session {}", f.agent_id, ev.session_id);
+        }
+        let changed =
+            lock(&ctx.manager).set_live_model_effort(&f.agent_id, ev.model_id(), ev.effort_level());
+        if changed {
+            log::debug!(
+                "agent {} model={:?} effort={:?} ({})",
+                f.agent_id,
+                ev.model_id(),
+                ev.effort_level(),
+                ev.hook_event_name
+            );
+        }
+        // agents-changed only when something the UI shows changed.
+        if changed || f.rebound {
+            ctx.emit_agents();
+        }
+    } else if let Some(f) = &found {
         if f.rebound {
             log::info!("agent {} rebound to session {}", f.agent_id, ev.session_id);
         }
@@ -266,16 +294,19 @@ where
             });
         }
     }
-    ctx.emit(
-        HOOK_EVENT,
-        &HookEventPayload {
-            agent_id: agent_id.clone(),
-            session_id: ev.session_id.clone(),
-            hook_event_name: ev.hook_event_name.clone(),
-            tool_name: ev.tool_name.clone(),
-            received_at: now_ms(),
-        },
-    );
+    // The debug feed leaves StatusLine out (several frames a second).
+    if !is_statusline {
+        ctx.emit(
+            HOOK_EVENT,
+            &HookEventPayload {
+                agent_id: agent_id.clone(),
+                session_id: ev.session_id.clone(),
+                hook_event_name: ev.hook_event_name.clone(),
+                tool_name: ev.tool_name.clone(),
+                received_at: now_ms(),
+            },
+        );
+    }
 
     if !is_permission {
         return;
@@ -557,6 +588,92 @@ mod tests {
         assert_eq!(hook[0]["toolName"], "Edit");
     }
 
+    const STATUSLINE: &str = r#"{"hook_event_name":"StatusLine","session_id":"sess-1","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"effort":{"level":"high"}}"#;
+
+    /// Observer that records the events it is told about.
+    fn observe(h: &mut Harness) -> Arc<Mutex<Vec<StatusEvent>>> {
+        let seen: Arc<Mutex<Vec<StatusEvent>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        h.ctx.observer = Some(Arc::new(move |ev| s.lock().unwrap().push(ev)));
+        seen
+    }
+
+    #[tokio::test]
+    async fn statusline_frame_updates_model_and_effort_once() {
+        let mut h = harness(true);
+        let seen = observe(&mut h);
+        h.ctx
+            .manager
+            .lock()
+            .unwrap()
+            .set_status(&h.agent, AgentStatus::Idle, None)
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(round_trip(&h, &frame(STATUSLINE)).await, "");
+        }
+        let lists = h.emitted(AGENTS_CHANGED);
+        assert_eq!(lists.len(), 1, "two equal frames, one emit");
+        assert_eq!(lists[0][0]["model"], "claude-opus-5-5");
+        assert_eq!(lists[0][0]["effort"], "high");
+        assert_eq!(lists[0][0]["modelObserved"], true);
+        assert_eq!(h.status(), AgentStatus::Idle, "no status change");
+        assert!(seen.lock().unwrap().is_empty(), "no dispatcher message");
+        assert!(h.emitted(HOOK_EVENT).is_empty(), "not in the debug feed");
+        assert_eq!(h.ctx.stats.received(), 2);
+        assert_eq!(h.ctx.stats.last_event(), None, "does not drown Diagnostics");
+        // A changed effort (mid-session /effort) is emitted again.
+        let changed = STATUSLINE.replace("\"high\"", "\"xhigh\"");
+        round_trip(&h, &frame(&changed)).await;
+        let lists = h.emitted(AGENTS_CHANGED);
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[1][0]["effort"], "xhigh");
+    }
+
+    #[tokio::test]
+    async fn post_model_switch_updates_model() {
+        let mut h = harness(true);
+        let seen = observe(&mut h);
+        let ev = r#"{"hook_event_name":"PostModelSwitch","session_id":"sess-1","from_model":"claude-haiku-4-5-20251001","to_model":"claude-sonnet-5-5","requested_model":"sonnet","source":"resume"}"#;
+        round_trip(&h, &frame_with_agent(ev, &h.agent)).await;
+        let a = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(
+            (a.model.as_deref(), a.effort.as_deref(), a.model_observed),
+            (Some("claude-sonnet-5-5"), None, true)
+        );
+        assert_eq!(h.emitted(AGENTS_CHANGED).len(), 1);
+        assert!(seen.lock().unwrap().is_empty());
+        // It is an ordinary hook event otherwise: in the feed and the Diagnostics row.
+        assert_eq!(h.emitted(HOOK_EVENT).len(), 1);
+        assert_eq!(h.ctx.stats.last_event().unwrap().name, "PostModelSwitch");
+        // Unknown session: nothing changes.
+        let other = ev.replace("sess-1", "sess-x");
+        round_trip(&h, &frame(&other)).await;
+        assert_eq!(h.emitted(AGENTS_CHANGED).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn statusline_does_not_clear_starting_hint() {
+        let h = harness(true);
+        {
+            let mut m = h.ctx.manager.lock().unwrap();
+            m.backdate(&h.agent, 20_000);
+            assert!(m.apply_starting_hint(&h.agent, now_ms()).is_some());
+        }
+        round_trip(&h, &frame(STATUSLINE)).await;
+        let a = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(a.status, AgentStatus::Starting);
+        assert_eq!(
+            a.detail.as_deref(),
+            Some(crate::config::STARTING_HINT_TEXT),
+            "the trust dialog may still be open"
+        );
+        assert_eq!(a.model.as_deref(), Some("claude-opus-5-5"));
+        // The first real hook event still clears it.
+        round_trip(&h, &frame(fx::SESSION_START)).await;
+        let a = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!((a.status, a.detail), (AgentStatus::Idle, None));
+    }
+
     #[tokio::test]
     async fn b_whitelisted_tool_is_allowed_immediately() {
         let h = harness(false);
@@ -768,7 +885,7 @@ mod tests {
             .unwrap()
             .whitelist_add(&h.agent, "Bash")
             .unwrap();
-        let mut p = mira_hook::payload::parse(fx::PERMISSION_REQUEST).unwrap();
+        let mut p = mira_hook::payload::parse(fx::PERMISSION_REQUEST, None).unwrap();
         mira_hook::payload::trim(&mut p.json);
         let out = round_trip(&h, &mira_hook::payload::to_frame(&p, None)).await;
         let d = mira_hook::decision::parse_reply(&out);

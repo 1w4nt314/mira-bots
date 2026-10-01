@@ -39,6 +39,16 @@ pub struct HookEvent {
     /// a malformed `mcp_server` never fails the event.
     #[serde(default, rename = "mcp_server", deserialize_with = "mcp_server_source")]
     pub mcp_server_source: Option<String>,
+    /// `model`: an object `{id, display_name}` in a StatusLine payload, a string in SessionStart.
+    /// See [`HookEvent::model_id`].
+    #[serde(default)]
+    pub model: Option<Value>,
+    /// `effort`: `{level}` in StatusLine and tool events. See [`HookEvent::effort_level`].
+    #[serde(default)]
+    pub effort: Option<Value>,
+    /// PostModelSwitch: the model switched to (also after `--resume`).
+    #[serde(default)]
+    pub to_model: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -46,6 +56,38 @@ pub struct HookEvent {
 fn mcp_server_source<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     let v = Value::deserialize(d)?;
     Ok(v.get("source").and_then(Value::as_str).map(str::to_string))
+}
+
+impl HookEvent {
+    /// The live model id: `model.id` of a StatusLine payload, `to_model` of PostModelSwitch.
+    pub fn model_id(&self) -> Option<String> {
+        let id = match self.hook_event_name.as_str() {
+            "StatusLine" => self
+                .model
+                .as_ref()
+                .and_then(|m| m.get("id"))
+                .and_then(Value::as_str),
+            "PostModelSwitch" => self.to_model.as_deref(),
+            _ => None,
+        };
+        id.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// `effort.level` of a StatusLine payload (absent for models without effort).
+    pub fn effort_level(&self) -> Option<String> {
+        if self.hook_event_name != "StatusLine" {
+            return None;
+        }
+        self.effort
+            .as_ref()
+            .and_then(|e| e.get("level"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// Parses the `event` value of a pipe frame.
@@ -130,6 +172,44 @@ mod tests {
 
     fn parse_fixture(s: &str) -> HookEvent {
         parse(&serde_json::from_str::<Value>(s).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn statusline_and_model_switch_fields_parse() {
+        let ev = parse(&json!({
+            "hook_event_name": "StatusLine", "session_id": "s",
+            "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
+            "effort": {"level": "xhigh"}
+        }))
+        .unwrap();
+        assert_eq!(ev.model_id().as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(ev.effort_level().as_deref(), Some("xhigh"));
+        // Without effort (Haiku).
+        let ev = parse(&json!({
+            "hook_event_name": "StatusLine", "session_id": "s", "model": {"id": "claude-haiku-4-5"}
+        }))
+        .unwrap();
+        assert_eq!(
+            (ev.model_id().as_deref(), ev.effort_level()),
+            (Some("claude-haiku-4-5"), None)
+        );
+        let ev = parse(&json!({
+            "hook_event_name": "PostModelSwitch", "session_id": "s",
+            "from_model": "claude-haiku-4-5-20251001", "to_model": "claude-sonnet-5-5",
+            "requested_model": "sonnet", "source": "resume"
+        }))
+        .unwrap();
+        assert_eq!(ev.model_id().as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(ev.effort_level(), None);
+        assert_eq!(ev.source.as_deref(), Some("resume"));
+        // SessionStart's `model` string and tool events' effort are not "live" values here.
+        let ev = parse(&json!({
+            "hook_event_name": "SessionStart", "session_id": "s", "model": "claude-x",
+            "effort": {"level": "high"}
+        }))
+        .unwrap();
+        assert_eq!((ev.model_id(), ev.effort_level()), (None, None));
+        assert_eq!(ev.model, Some(json!("claude-x")));
     }
 
     #[test]

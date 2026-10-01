@@ -260,7 +260,7 @@ mod tests {
         let pipe = name.clone();
         let stdout = tokio::task::spawn_blocking(move || {
             let input = br#"{"hook_event_name":"PermissionRequest","session_id":"sess-e2e","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
-            mira_hook::run(input, Some(pipe), None, false)
+            mira_hook::run(input, Some(pipe), None, false, None)
         })
         .await
         .unwrap();
@@ -283,6 +283,7 @@ mod tests {
                 Some(pipe),
                 Some(agent_for_hook),
                 false,
+                None,
             )
         })
         .await

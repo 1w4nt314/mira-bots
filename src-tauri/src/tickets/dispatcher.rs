@@ -117,6 +117,9 @@ pub enum DispatchMsg {
     QueueChanged { agent_id: String },
     /// The agent stopped/exited/was removed (its tickets are already released).
     AgentGone { agent_id: String },
+    /// The agent is restarted with `--resume` (model/effort change, plan5 A.5): any delivery
+    /// state is dropped like for `AgentGone`; its queue continues at the next Idle.
+    AgentRestarting { agent_id: String },
     /// `spawn_agent_with_ticket`: the line went in as the positional prompt.
     SpawnedWithTicket { agent_id: String, ticket_id: String },
     /// "Send igen" from the UI.
@@ -259,7 +262,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             DispatchMsg::TurnEnded { agent_id, failed } => self.on_turn_ended(&agent_id, failed),
             DispatchMsg::QueueChanged { agent_id } => self.consider(&agent_id),
-            DispatchMsg::AgentGone { agent_id } => {
+            DispatchMsg::AgentGone { agent_id } | DispatchMsg::AgentRestarting { agent_id } => {
                 self.deliveries.remove(&agent_id);
             }
             DispatchMsg::SpawnedWithTicket {
@@ -1452,6 +1455,28 @@ mod tests {
             assert_eq!((t.state, t.issue), (S::Backlog, None));
         }
         assert!(h.d.deliveries.is_empty());
+    }
+
+    #[test]
+    fn restarting_cancels_pending_delivery() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "A");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        assert!(matches!(h.d.state("a1"), Delivery::Delaying { .. }));
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        assert!(h.d.deliveries.is_empty());
+        // The old timer does nothing; the queue continues at the next Idle (after SessionStart).
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes().is_empty());
+        assert_eq!(h.ticket(&t.id).state, S::Assigned);
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
     }
 
     // (10)
