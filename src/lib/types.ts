@@ -168,8 +168,11 @@ export interface TicketSummary {
   historyLen: number;
 }
 
-/** `get_ticket` result: with history. */
-export interface Ticket extends Omit<TicketSummary, "historyLen"> {
+/**
+ * `get_ticket` result: with history. The Rust `Ticket` has no `shortId` (only the summary does),
+ * so it is omitted here; use `shortId(id)` from `lib/tickets` if it is needed.
+ */
+export interface Ticket extends Omit<TicketSummary, "historyLen" | "shortId"> {
   history: TicketHistoryEntry[];
 }
 

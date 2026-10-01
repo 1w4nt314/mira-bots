@@ -2,21 +2,22 @@
 
 Et lille statusvindue ("island") øverst på skærmen, der viser dine Claude Code-agenter og lader dig svare Tillad/Afvis, når en agent beder om lov til at bruge et værktøj. Appen kører Claude Code CLI i baggrunden med dit eget abonnement.
 
-## Status: trin 2 — stadig tidligt, ikke brugbart endnu
+## Status: trin 3 — stadig tidligt, ikke brugbart endnu
 
-Trin 2 er bygget: Workplace-vindue, terminal pr. agent, diagnostik og standardmappe til nye agenter. Det er stadig et tidligt trin, og intet af det er afprøvet på Windows endnu (se listen nederst).
+Trin 3 er bygget: tickets med kø pr. agent, review og drag-and-drop oven på trin 2 (Workplace-vindue, terminal pr. agent, diagnostik og standardmappe til nye agenter). Det er stadig et tidligt trin, og intet af det er afprøvet på Windows endnu (se listen nederst).
 
 Det virker (når det er testet på Windows, se nedenfor):
 
 - Island-vindue, top-centreret på hovedskærmen, der folder ud ved hover.
-- Workplace-vindue med pladser (en række arbejdspladser og en række stabspladser), en bot-figur pr. agent og en sidebar med fanerne Tilladelser, Diagnostik og Tickets (Tickets er kun en pladsholder).
+- Workplace-vindue med pladser (en række arbejdspladser og en række stabspladser), en bot-figur pr. agent og en sidebar med fanerne Tilladelser, Diagnostik og Tickets.
 - Terminal pr. agent: agentens egen `claude`-session vises og kan styres med tastaturet i Workplace.
 - Start af agenter med ét klik i standardmappen, eller med valgfri mappe og rolle fra Workplace.
 - Statusvisning pr. agent (starter, klar, tænker, læser, redigerer, kører, afventer tilladelse, afsluttet).
 - Tillad / Afvis / "Altid for denne agent" på tilladelsesanmodninger.
+- Tickets: opret, træk på en agent eller en tom plads, kø pr. agent, review med Godkend/Afvis og manuelle flyt (se afsnittet Tickets).
 - Diagnostik og logfil til fejlsøgning.
 
-Det findes ikke endnu: tickets, kø, MCP, systembakke, autostart.
+Det findes ikke endnu: MCP (agenter kan ikke oprette tickets selv), systembakke, autostart.
 
 ## Sådan virker det
 
@@ -25,7 +26,7 @@ Island → Workplace → pladser → terminal:
 1. Islanden er det lille statusvindue øverst. Den viser agenterne og tilladelsesanmodninger, og har en knap til at åbne Workplace.
 2. Workplace er det store vindue. Hver agent sidder på en plads (arbejdsplads eller stabsplads) med en bot-figur, der viser tilstanden: hviler, arbejder, venter eller færdig.
 3. Vælg en plads, så åbnes agentens terminal i panelet. Det er den rigtige interaktive `claude`-session (via ConPTY), så du kan svare direkte i den.
-4. Roller (kode, research, review, koordinator) er i trin 2 rent visuelle tags: de vælger figur og mappenavn og giver ingen andre prompts, værktøjer eller rettigheder.
+4. Roller (kode, research, review, koordinator) er stadig rent visuelle tags: de vælger figur og mappenavn og giver ingen andre prompts, værktøjer eller rettigheder.
 5. Lofter: højst 5 agenter på arbejdspladser og 2 på stabspladser (kun kørende tæller med).
 
 ## Krav
@@ -38,6 +39,32 @@ Island → Workplace → pladser → terminal:
 ## Sådan starter du en agent
 
 Nye agenter starter som standard i en egen mappe under `%USERPROFILE%\mira-bots\agents\<navn>\`, fx `bot-01`, `bot-02` (med rolle: `coder-01` osv.). Appen opretter mappen og vælger det første ledige nummer. Et klik på knappen i islanden starter en agent i standardmappen. I Workplace kan du i stedet vælge rolle, plads og en anden mappe med mappevælgeren.
+
+## Tickets
+
+En ticket er en opgave, du selv opretter i fanen Tickets i Workplace (titel, valgfri beskrivelse og evt. "Spring review over"). Den går gennem disse trin:
+
+1. **Backlog**: nyoprettet, ingen agent.
+2. **I kø**: tildelt en agent. Hver agent har sin egen kø og får én ticket ad gangen.
+3. **I gang**: appen har afleveret ticketen til agenten, og agenten arbejder på den.
+4. **Review**: agenten er færdig, og du skal godkende. Afsnittet Review står øverst i fanen, og islanden viser en lille chip "n i review", der åbner Workplace på fanen Tickets.
+5. **Done** (Godkend) eller **Afvist** (Afvis med en påkrævet note).
+
+Sådan bruger du dem:
+
+- **Tildel**: træk en sticky note fra Backlog hen på en agents plads, eller brug knappen "Tildel…" på noten (tastaturvejen). Slip noten på en tom plads, så åbner appen dialogen "Ny agent til ticket" og starter agenten med ticketen først i køen.
+- **Kø**: i agentens terminalpanel vises den aktuelle ticket og køen. Her kan du flytte en ticket én plads frem eller fjerne den fra køen (tilbage til Backlog).
+- **Review**: Godkend flytter ticketen til Done. Afvis kræver en note; ticketen kommer så forrest i køen hos agenten (hvis den stadig kører, ellers i Backlog), og noten står i ticket-filen under "Afvist".
+- **Manuelle flyt**: knapperne i terminalpanelet kan flytte den aktuelle ticket til Review (eller Done ved "Spring review over") eller tilbage til Backlog, og en ticket i Review kan flyttes tilbage til I gang ("Ikke færdig"). Tickets i Backlog, Done og Afvist uden agent kan slettes.
+- **Send igen**: hvis afleveringen ikke blev bekræftet, eller turen fejlede, vises en advarsel på ticketen og i terminalpanelet. "Send igen" afleverer den aktuelle ticket til agenten på ny, når agenten er klar.
+
+**Sådan leveres en ticket.** Når agenten er klar og har en ticket i kø, skriver appen en fil `.mira-bots\tickets\<kort-id>.md` i agentens mappe (titel, id, beskrivelse, evt. afvisningsnote og et par regler) og taster én linje i agentens terminal, der peger på filen. Beskrivelsen sendes aldrig til terminalen, kun filen. Mappen `.mira-bots\` får en egen `.gitignore` med `*`, så den ikke dukker op i `git status` i agentmappen. Titlen renses, før den tastes (usynlige tegn, `@`, `/` og lignende, der kan udløse Claude Codes forslagslister). Appen venter ca. 0,75 sekund efter, at agenten er klar, taster linjen og sender Enter. Bekræftes afleveringen ikke inden for få sekunder, prøver appen Enter igen én gang og markerer derefter ticketen med en advarsel.
+
+**Når agenten er færdig.** Appen bruger Stop-hooket som "turen er slut": ticketen flyttes automatisk til Review (eller til Done, hvis den er oprettet med "Spring review over"), og agentens næste ticket i køen afleveres. Fejler turen (hooket StopFailure, fx en API-fejl), bliver ticketen i gang med advarslen "Turn fejlede", og du kan bruge "Send igen". Afbryder du turen med Esc, kommer der intet Stop; så bliver ticketen stående som I gang, indtil du selv flytter den.
+
+**Agenter kan ikke oprette tickets selv i trin 3.** Det kommer med MCP i trin 4. Roller er stadig kun visuelle og påvirker ikke, hvilke tickets en agent får.
+
+**Lagring.** Tickets ligger i `%APPDATA%\dk.mira.bots\tickets.json` og overlever genstart. Filen skrives atomisk (først en midlertidig fil, som så omdøbes). Kan filen ikke læses, omdøbes den til `tickets.json.broken-<tidspunkt>`, appen starter med en tom liste, og Diagnostik viser en advarsel. Ved hver start flyttes tickets, der var i kø eller i gang, tilbage til Backlog med noten "app genstartet"; Review, Done og Afvist er urørte. Stopper eller fjerner du en agent, eller afsluttes den, havner dens tickets også i Backlog med en note.
 
 ## Første gang i en mappe
 
@@ -89,6 +116,8 @@ npm run tauri dev         # kun Windows
 
 Trin 2 tilføjede to npm-afhængigheder, `@xterm/xterm` (6.0) og `@xterm/addon-fit` (0.11), og to Rust-plugins, `tauri-plugin-log` (fil-log) og `tauri-plugin-opener` (åbn mapper i Stifinder). De to plugins kaldes kun fra Rust; der er ingen tilsvarende npm-pakker.
 
+Trin 3 tilføjede én npm-afhængighed, `@dnd-kit/core` (6.3), til drag-and-drop, og ingen nye Rust-afhængigheder. Tickets gemmes i en JSON-fil bag traitet `TicketStore`. SQLite blev fravalgt, fordi den native afhængighed ikke kan krydstjekkes fra Linux mod Windows-target i dette miljø; trait'et gør det muligt at skifte lager senere.
+
 Verifikation fra repo-roden (kan køres på Linux; Windows-koden tjekkes ved cross-check):
 
 ```
@@ -134,6 +163,16 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 25. Standardmappen `%USERPROFILE%\mira-bots\agents\bot-01` oprettes, og `bot-01` genbruges efter genstart, når den er ledig.
 26. Kopiér i Diagnostik virker i WebView2; ellers vises et tekstfelt til at kopiere fra.
 27. Ydelse: 5 agenter med kraftigt output og ét åbent terminalpanel giver ingen mærkbar UI-lag.
+28. Levering i ConPTY: linjen skrevet som ét write efterfulgt af Enter som separat write 150 ms senere sender prompten i Claude Codes TUI (ikke indsat som tekst/linjeskift), og `UserPromptSubmit` kommer med en prompt, der begynder med `Ticket <kort-id>`.
+29. Bekræftelses-tidslinjen: 750 ms efter Stop er inputfeltet klar, og den ekstra Enter ved genforsøg sender ikke en tom prompt og lukker ingen dialog.
+30. Agenten læser `.mira-bots/tickets/<kort-id>.md` med `/` i stien uden tilladelsesspørgsmål, og `.mira-bots\.gitignore` holder mappen ude af `git status`.
+31. Træk med dnd-kit i WebView2: en sticky note kan trækkes til en plads med mus og touchpad, et klik (under 6 px) på en plads vælger stadig terminalen, og trækket følger markøren.
+32. Slip på en tom plads åbner dialogen med ticketen, "Start med ticket" starter agenten med linjen som første prompt, og den bekræftes inden 8 sekunder efter SessionStart.
+33. Stop-hooket flytter ticketen til Review (eller Done ved "Spring review over"), Esc midt i turen giver intet Stop, og en API-fejl giver "Turn fejlede" med fungerende "Send igen".
+34. `tickets.json` skrives atomisk i `%APPDATA%\dk.mira.bots\` (omdøbning over en eksisterende fil virker, ingen `.tmp` efterlades), og en beskadiget fil omdøbes til `.broken-<tidspunkt>` med advarsel i Diagnostik.
+35. Efter genstart står tickets, der var i kø eller i gang, i Backlog med noten "app genstartet", og Review/Done er urørte.
+36. Chippen "n i review" i den ikke-fokuserbare island åbner Workplace på fanen Tickets, både når vinduet oprettes og når det allerede er åbent.
+37. Stop/Fjern af en agent med kø: alle dens tickets står i Backlog med note, en igangværende aflevering skriver ikke mere i terminalen, og `queueLength` er 0.
 
 ## Licens og inspiration
 
