@@ -4,8 +4,9 @@ use std::time::Duration;
 
 /// Maximum number of simultaneously running work agents (seat kind `work`).
 pub const MAX_WORK_AGENTS: usize = 5;
+// TODO(windows-verify): D.69 (third staff seat: UI, mira_spawn_agent and the limit text)
 /// Maximum number of simultaneously running staff agents (seat kind `staff`).
-pub const MAX_STAFF_AGENTS: usize = 2;
+pub const MAX_STAFF_AGENTS: usize = 3;
 
 /// Tools that are auto-allowed for every new agent (copied at spawn). Empty by default.
 pub const DEFAULT_TOOL_WHITELIST: &[&str] = &[];
@@ -205,7 +206,7 @@ mod tests {
     #[test]
     fn limits_match_the_plan() {
         assert_eq!(MAX_WORK_AGENTS, 5);
-        assert_eq!(MAX_STAFF_AGENTS, 2);
+        assert_eq!(MAX_STAFF_AGENTS, 3);
         assert_eq!(STARTING_HINT_AFTER, Duration::from_secs(15));
         assert_eq!(LOG_KEEP_FILES, 3);
         assert_eq!(OUTPUT_RING_CAPACITY, 1_048_576);

@@ -12,7 +12,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useBotStates, useTheme } from "../../lib/bots";
 import {
   assignTicket,
@@ -20,6 +20,17 @@ import {
   onWorkplaceSelect,
   takeWorkplaceSelection,
 } from "../../lib/ipc";
+import {
+  clampFloorHeight,
+  deskLayout,
+  FLOOR_DEFAULT,
+  parseDetail,
+  parseFloorHeight,
+  SPLITTER_H,
+  STORAGE_KEYS,
+  type OfficeDetail,
+} from "../../lib/office";
+import { readLocal, writeLocal } from "../../lib/persist";
 import { assignSeats, STAFF_SEATS, WORK_SEATS } from "../../lib/seats";
 import { isExited } from "../../lib/status";
 import {
@@ -36,6 +47,7 @@ import type {
   WorkplaceTab,
 } from "../../lib/types";
 import { useStore } from "../../state/store";
+import OfficeDefs from "./office/OfficeDefs";
 import SeatGrid from "./SeatGrid";
 import Sidebar from "./Sidebar";
 import SpawnDialog from "./SpawnDialog";
@@ -59,6 +71,14 @@ export default function Workplace() {
     null,
   );
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
+  // Office look: detail level and floor height are remembered (localStorage via persist.ts).
+  const [detail, setDetail] = useState<OfficeDetail>(() => parseDetail(readLocal(STORAGE_KEYS.detail)));
+  const [floorHeight] = useState(() => parseFloorHeight(readLocal(STORAGE_KEYS.floorHeight)));
+  // Measured heights: the left column (`available`) and the floor itself (`floorMeasured`).
+  const [available, setAvailable] = useState(0);
+  const [floorMeasured, setFloorMeasured] = useState(FLOOR_DEFAULT);
+  const sectionRef = useRef<HTMLElement>(null);
+  const floorRef = useRef<HTMLDivElement>(null);
   const theme = useTheme();
   const botStates = useBotStates(agents);
   const seats = useMemo(() => assignSeats(agents), [agents]);
@@ -66,6 +86,26 @@ export default function Workplace() {
     () => new Map<string, TicketSummary>(tickets.map((t) => [t.id, t])),
     [tickets],
   );
+
+  useEffect(() => writeLocal(STORAGE_KEYS.detail, detail), [detail]);
+
+  // One observer for the column and the floor. The desk size only changes the floor's children,
+  // never its own height (that comes from `floorHeight` / flex), so there is no feedback loop.
+  useEffect(() => {
+    const section = sectionRef.current;
+    const floor = floorRef.current;
+    if (section === null || floor === null) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const h = Math.round(entry.contentRect.height);
+        if (entry.target === section) setAvailable(Math.max(0, h - SPLITTER_H));
+        else if (entry.target === floor) setFloorMeasured(h);
+      }
+    });
+    ro.observe(section);
+    ro.observe(floor);
+    return () => ro.disconnect();
+  }, []);
 
   // Selection handed over by the island: stored for a new window, pushed to an existing one.
   useEffect(() => {
@@ -194,14 +234,38 @@ export default function Workplace() {
 
   const activeTicket = activeTicketId === null ? null : (ticketsById.get(activeTicketId) ?? null);
 
+  // Before the first measurement `available` is 0: skip the upper bound instead of jumping.
+  const floorStyleHeight = clampFloorHeight(floorHeight, available > 0 ? available : Number.NaN);
+  const { deskH, fig } = deskLayout(floorMeasured, detail);
+  const floorStyle = {
+    height: floorStyleHeight,
+    flex: "none",
+    "--desk-h": `${deskH}px`,
+    "--fig": `${fig}px`,
+  } as CSSProperties;
+
   return (
     <TicketActionsContext.Provider value={ticketActions}>
-      <div className="flex h-full flex-col bg-[var(--bg)] text-sm text-[var(--fg)]">
+      <div
+        data-detail={detail}
+        data-term="normal"
+        className="flex h-full flex-col bg-[var(--bg)] text-sm text-[var(--fg)]"
+      >
         <header className="flex h-11 shrink-0 items-center gap-4 border-b border-[var(--border)] px-4">
           <h1 className="font-semibold">mira-bots · Workplace</h1>
           <span className="text-xs text-[var(--muted)]">
             {liveWork}/{maxWork} arbejdspladser · {liveStaff}/{maxStaff} stab
           </span>
+          <button
+            type="button"
+            onClick={() => setDetail((d) => (d === "more" ? "discreet" : "more"))}
+            aria-pressed={detail === "more"}
+            aria-label="Kontor-detaljer"
+            title="Kontor-detaljer: Diskret eller Lidt mere (huskes)"
+            className="rounded-md border border-[var(--border)] px-2 py-0.5 text-[11px] text-[var(--muted)] hover:border-[var(--accent)]"
+          >
+            Kontor: {detail === "more" ? "Lidt mere" : "Diskret"}
+          </button>
           {error !== null && (
             <span className="ml-auto truncate text-xs text-rose-500" role="alert" title={error}>
               {error}
@@ -217,19 +281,25 @@ export default function Workplace() {
           onDragCancel={() => setActiveTicketId(null)}
         >
           <main className="grid min-h-0 flex-1 grid-cols-[1fr_340px]">
-            <section className="flex min-h-0 min-w-0 flex-col">
-              <SeatGrid
-                seats={seats}
-                botStates={botStates}
-                theme={theme}
-                selectedId={selected?.id ?? null}
-                spawnDisabled={spawnDisabled}
-                limits={{ work: liveWork >= maxWork, staff: liveStaff >= maxStaff }}
-                tickets={ticketsById}
-                dragging={activeTicket !== null}
-                onSelect={setSelectedId}
-                onSpawn={(seatKind) => setSpawnFor({ seatKind, ticket: null })}
-              />
+            <section ref={sectionRef} className="relative flex min-h-0 min-w-0 flex-col">
+              <OfficeDefs />
+              <div ref={floorRef} className="office-floor" data-term="normal" style={floorStyle}>
+                <SeatGrid
+                  seats={seats}
+                  botStates={botStates}
+                  theme={theme}
+                  selectedId={selected?.id ?? null}
+                  spawnDisabled={spawnDisabled}
+                  limits={{ work: liveWork >= maxWork, staff: liveStaff >= maxStaff }}
+                  tickets={ticketsById}
+                  dragging={activeTicket !== null}
+                  onSelect={setSelectedId}
+                  onSpawn={(seatKind) => setSpawnFor({ seatKind, ticket: null })}
+                  detail={detail}
+                  mode="normal"
+                  fig={fig}
+                />
+              </div>
               {selected === null ? (
                 <div className="flex min-h-0 flex-1 items-center justify-center border-t border-[var(--border)] text-[var(--muted)]">
                   Vælg en plads for at se terminalen

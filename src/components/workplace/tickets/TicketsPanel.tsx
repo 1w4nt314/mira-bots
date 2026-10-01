@@ -72,7 +72,7 @@ export default function TicketsPanel() {
   const doneHidden = groups.done.length - doneShown.length;
 
   return (
-    <div className="space-y-4 p-3">
+    <div className="office-cork space-y-4 p-3">
       {fileWarning !== null && (
         <p
           className="rounded-lg border border-amber-400/50 bg-amber-300/20 px-2 py-1 text-xs text-amber-800 dark:text-amber-200"

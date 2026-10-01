@@ -22,7 +22,7 @@ export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export type ProfileKind = "builtin" | "custom";
 
-/** Row of seats an agent occupies; each has its own limit (5 work, 2 staff). */
+/** Row of seats an agent occupies; each has its own limit (5 work, 3 staff). */
 export type SeatKind = "work" | "staff";
 
 /** Figure state derived from the agent status in the frontend. */

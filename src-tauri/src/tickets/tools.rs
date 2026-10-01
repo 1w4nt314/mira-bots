@@ -1748,7 +1748,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             r,
-            json!({"maxWorkAgents":5,"maxStaffAgents":2,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20})
+            json!({"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20})
         );
     }
 

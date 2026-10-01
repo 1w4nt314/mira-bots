@@ -184,7 +184,7 @@ mod tests {
             "mira_add_report",
             "`report` i mira_submit_for_review",
             "mira_get_workspace_rules",
-            "Højst 5 arbejdsagenter og 2 stabsagenter",
+            "Højst 5 arbejdsagenter og 3 stabsagenter",
             "højst 3 gange",
             "Højst 20 rapporter pr. ticket, hver højst 20000 tegn.",
             "højst 20 tickets i timen",

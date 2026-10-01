@@ -1435,7 +1435,7 @@ mod tests {
         );
         assert_eq!(
             AgentError::LimitReached(SeatKind::Staff).to_string(),
-            "Loft på 2 stabspladser nået"
+            "Loft på 3 stabspladser nået"
         );
     }
 
@@ -1467,6 +1467,7 @@ mod tests {
         ));
         let s0 = m.insert_fake_with("s0", "/w/s", &[Role::Coordinator], SeatKind::Staff);
         m.insert_fake_with("s1", "/w/s", &[Role::Reviewer], SeatKind::Staff);
+        m.insert_fake_with("s2", "/w/s", &[Role::Planner], SeatKind::Staff);
         assert!(matches!(
             m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
             Err(AgentError::LimitReached(SeatKind::Staff))

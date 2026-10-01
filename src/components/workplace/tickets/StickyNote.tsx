@@ -102,7 +102,7 @@ function NoteFrame(props: FrameProps) {
     <div
       ref={rootRef}
       {...rootProps}
-      className={`rounded-lg border border-[var(--note-border)] bg-[var(--note-bg)] p-2 text-xs text-[var(--note-fg)] shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+      className={`office-note rounded-lg border border-[var(--note-border)] bg-[var(--note-bg)] p-2 text-xs text-[var(--note-fg)] shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
         grab ? "cursor-grab touch-none active:cursor-grabbing" : ""
       } ${dimmed ? "opacity-40" : ""} ${compact && !interactive ? "w-[260px] shadow-lg" : ""}`}
     >

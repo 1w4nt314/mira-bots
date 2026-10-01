@@ -288,7 +288,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": SPAWN_AGENT,
-            "description": "Starter en ny agent fra en profil (koordinator). Samme lofter som i appen (5 arbejdspladser, 2 stabspladser). Med firstTicketId får agenten den ticket som første opgave.",
+            "description": "Starter en ny agent fra en profil (koordinator). Samme lofter som i appen (5 arbejdspladser, 3 stabspladser). Med firstTicketId får agenten den ticket som første opgave.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

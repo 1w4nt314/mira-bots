@@ -1489,14 +1489,14 @@ mod tests {
             max_agents: 5,
             version: "0.1.0".into(),
             pipe_ready: false,
-            max_staff_agents: 2,
+            max_staff_agents: 3,
             agents_root: "/h/mira-bots/agents".into(),
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
             json!({"claudePath":null,"hookExe":"/h","settingsJson":"/d/settings.json",
                    "pipeName":"pipe","maxAgents":5,"version":"0.1.0","pipeReady":false,
-                   "maxStaffAgents":2,"agentsRoot":"/h/mira-bots/agents"})
+                   "maxStaffAgents":3,"agentsRoot":"/h/mira-bots/agents"})
         );
     }
 
@@ -1604,7 +1604,7 @@ mod tests {
         assert_eq!(d.claude_code_args_supported, None);
         assert_eq!(d.claude_code_mcp_supported, None);
         let info = state.app_info();
-        assert_eq!(info.max_staff_agents, 2);
+        assert_eq!(info.max_staff_agents, 3);
         assert_eq!(info.agents_root, d.agents_root);
         std::fs::remove_dir_all(&dir).unwrap();
     }
