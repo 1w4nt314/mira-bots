@@ -12,14 +12,22 @@ import {
   getAppInfo,
   listAgents,
   listPendingPermissions,
+  listProfiles,
   listTickets,
   onAgentsChanged,
   onPermissionRequest,
   onPermissionResolved,
+  onProfilesChanged,
   onTicketsChanged,
   uiReady,
 } from "../lib/ipc";
-import type { AgentInfo, AppInfo, PermissionRequestInfo, TicketSummary } from "../lib/types";
+import type {
+  AgentInfo,
+  AgentProfile,
+  AppInfo,
+  PermissionRequestInfo,
+  TicketSummary,
+} from "../lib/types";
 
 export interface State {
   agents: AgentInfo[];
@@ -30,6 +38,8 @@ export interface State {
   appInfo: AppInfo | null;
   /** All tickets without history (`tickets-changed` replaces the whole list). */
   tickets: TicketSummary[];
+  /** All agent profiles, built-in first (`profiles-changed` replaces the whole list). */
+  profiles: AgentProfile[];
 }
 
 export type Action =
@@ -40,7 +50,8 @@ export type Action =
   | { type: "ui/collapse" }
   | { type: "error/set"; error: string | null }
   | { type: "appInfo/set"; appInfo: AppInfo }
-  | { type: "tickets/set"; tickets: TicketSummary[] };
+  | { type: "tickets/set"; tickets: TicketSummary[] }
+  | { type: "profiles/set"; profiles: AgentProfile[] };
 
 export const initialState: State = {
   agents: [],
@@ -49,6 +60,7 @@ export const initialState: State = {
   error: null,
   appInfo: null,
   tickets: [],
+  profiles: [],
 };
 
 export function reducer(state: State, action: Action): State {
@@ -70,6 +82,8 @@ export function reducer(state: State, action: Action): State {
       return { ...state, appInfo: action.appInfo };
     case "tickets/set":
       return { ...state, tickets: action.tickets };
+    case "profiles/set":
+      return { ...state, profiles: action.profiles };
   }
 }
 
@@ -90,6 +104,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const unlisteners: UnlistenFn[] = [];
     // A `tickets-changed` that arrives before the initial `listTickets()` answer is newer.
     let ticketsFromEvent = false;
+    let profilesFromEvent = false;
 
     (async () => {
       try {
@@ -104,6 +119,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             ticketsFromEvent = true;
             dispatch({ type: "tickets/set", tickets });
           }),
+          onProfilesChanged((profiles) => {
+            profilesFromEvent = true;
+            dispatch({ type: "profiles/set", profiles });
+          }),
         ]);
         if (cancelled) {
           for (const u of subs) u();
@@ -113,15 +132,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // Only after the listeners exist: from now on permission requests go to this UI.
         await uiReady();
         // Both windows load the tickets; the island only uses the review count.
-        const [agents, pending, appInfo, tickets] = await Promise.all([
+        // Profiles feed the spawn dialog and the "Agenter" tab (both windows keep them current).
+        const [agents, pending, appInfo, tickets, profiles] = await Promise.all([
           listAgents(),
           listPendingPermissions(),
           getAppInfo(),
           listTickets(),
+          listProfiles(),
         ]);
         if (cancelled) return;
         dispatch({ type: "agents/set", agents });
         if (!ticketsFromEvent) dispatch({ type: "tickets/set", tickets });
+        if (!profilesFromEvent) dispatch({ type: "profiles/set", profiles });
         for (const request of pending) dispatch({ type: "permission/add", request });
         dispatch({ type: "appInfo/set", appInfo });
       } catch (e) {

@@ -1,8 +1,8 @@
-// Seat assignment for the workplace: 5 work seats and 2 staff seats.
+// Seat assignment for the workplace: 5 work seats and 3 staff seats.
 import type { AgentInfo } from "./types";
 
 export const WORK_SEATS = 5;
-export const STAFF_SEATS = 2;
+export const STAFF_SEATS = 3;
 
 export interface SeatAssignment {
   /** Always `WORK_SEATS` long; null = empty seat. */

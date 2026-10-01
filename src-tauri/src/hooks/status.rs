@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::event::{summarize_tool_input, HookEvent};
+use crate::config::MCP_TOOL_PREFIX;
 
 /// Visible agent status. Wire format: `{"kind":"editing"}`, `{"kind":"exited","code":1}`.
 /// There is no `Done`: a Stop hook means the turn ended, i.e. `Idle`.
@@ -23,10 +24,18 @@ pub enum AgentStatus {
 ///
 /// TODO(unverified): the tool-name lists below come from general knowledge of Claude Code's
 /// built-in tools, not from research. A wrong entry only means a wrong colour.
+///
+/// The app's own MCP tools (`mcp__mira-bots__*`) and `ToolSearch` count as thinking: they are
+/// bookkeeping, not work on the project (C4.9).
 pub fn status_for_tool(tool_name: &str) -> AgentStatus {
+    if tool_name.starts_with(MCP_TOOL_PREFIX) {
+        return AgentStatus::Thinking;
+    }
     match tool_name {
-        "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch"
-        | "ToolSearch" => AgentStatus::Reading,
+        "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch" => {
+            AgentStatus::Reading
+        }
+        "ToolSearch" => AgentStatus::Thinking,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => AgentStatus::Editing,
         "TodoWrite" | "AskUserQuestion" | "ExitPlanMode" | "EnterPlanMode" => AgentStatus::Thinking,
         // Bash, PowerShell, Task, Agent, Skill, mcp__* and everything unknown.
@@ -75,6 +84,18 @@ pub fn apply(ev: &HookEvent) -> Transition {
             tool_summary(ev),
         ),
         "PermissionRequest" => Transition::set(AgentStatus::WaitingPermission, tool_summary(ev)),
+        // An `isError` result of the app's own tools (e.g. "Du har ingen ticket i gang") is
+        // normal flow, not a failure to show.
+        // TODO(windows-verify): `PreToolUse` for our tools shows "Tænker" with the Danish label
+        // and `PostToolUseFailure` does not show red (plan4 D.47).
+        "PostToolUseFailure"
+            if ev
+                .tool_name
+                .as_deref()
+                .is_some_and(|n| n.starts_with(MCP_TOOL_PREFIX)) =>
+        {
+            Transition::unchanged()
+        }
         "PermissionDenied" | "PostToolUse" | "PostToolUseFailure" => {
             Transition::set(AgentStatus::Thinking, None)
         }
@@ -86,6 +107,8 @@ pub fn apply(ev: &HookEvent) -> Transition {
             _ => Transition::unchanged(),
         },
         "Stop" | "StopFailure" => Transition::set(AgentStatus::Idle, None),
+        // Live model/effort only (plan5 A.4); the handler updates them separately.
+        "StatusLine" | "PostModelSwitch" => Transition::unchanged(),
         // SessionEnd: the PTY exit sets Exited. SubagentStart/Stop and the rest: no change.
         _ => Transition::unchanged(),
     }
@@ -186,6 +209,18 @@ mod tests {
     }
 
     #[test]
+    fn statusline_and_model_switch_do_not_change_status() {
+        for e in ["StatusLine", "PostModelSwitch"] {
+            let ev = parse(&serde_json::json!({
+                "hook_event_name": e, "session_id": "s", "model": {"id": "claude-x"},
+                "to_model": "claude-x"
+            }))
+            .unwrap();
+            assert_eq!(apply(&ev), t(None, None), "{e}");
+        }
+    }
+
+    #[test]
     fn notification_without_type_is_unchanged() {
         let n = r#"{"hook_event_name":"Notification","session_id":"s","message":"hi"}"#;
         assert_eq!(apply(&ev(n)), t(None, None));
@@ -214,6 +249,73 @@ mod tests {
         for (name, want) in table {
             assert_eq!(status_for_tool(name), want, "tool {name}");
         }
+    }
+
+    fn tool_ev(event: &str, tool: &str) -> HookEvent {
+        let v = serde_json::json!({"hook_event_name": event, "session_id": "s", "tool_name": tool,
+                                   "tool_input": {"summary": "hemmelig", "note": "n"},
+                                   "mcp_server": {"name": "mira-bots", "source": "dynamic"}});
+        parse(&v).unwrap()
+    }
+
+    #[test]
+    fn own_mcp_tools_are_thinking_with_a_danish_label() {
+        let table = [
+            ("mira_create_ticket", "Opretter ticket"),
+            ("mira_list_tickets", "Læser tickets"),
+            ("mira_get_ticket", "Læser ticket"),
+            ("mira_submit_for_review", "Afleverer til review"),
+            ("mira_update_status", "Opdaterer status"),
+            ("mira_approve_ticket", "Godkender ticket"),
+            ("mira_reject_ticket", "Afviser ticket"),
+            ("mira_assign_ticket", "Tildeler ticket"),
+            ("mira_unassign_ticket", "Fjerner tildeling"),
+            ("mira_spawn_agent", "Starter agent"),
+            ("mira_list_agents", "Læser agenter"),
+            ("mira_list_profiles", "Læser profiler"),
+            ("mira_get_workspace_rules", "Læser regler"),
+            ("mira_add_report", "Skriver rapport"),
+            ("mira_get_report", "Læser rapport"),
+        ];
+        for (tool, label) in table {
+            let name = format!("mcp__mira-bots__{tool}");
+            assert_eq!(status_for_tool(&name), AgentStatus::Thinking);
+            assert_eq!(
+                apply(&tool_ev("PreToolUse", &name)),
+                t(Some(AgentStatus::Thinking), Some(label))
+            );
+            assert_eq!(
+                apply(&tool_ev("PostToolUse", &name)),
+                t(Some(AgentStatus::Thinking), None)
+            );
+        }
+    }
+
+    #[test]
+    fn tool_search_is_thinking() {
+        assert_eq!(status_for_tool("ToolSearch"), AgentStatus::Thinking);
+        let ev = tool_ev("PreToolUse", "ToolSearch");
+        assert_eq!(apply(&ev).status, Some(AgentStatus::Thinking));
+    }
+
+    #[test]
+    fn post_tool_use_failure_of_own_tools_changes_nothing() {
+        let ev = tool_ev(
+            "PostToolUseFailure",
+            "mcp__mira-bots__mira_submit_for_review",
+        );
+        assert_eq!(apply(&ev), t(None, None));
+        let ev = tool_ev("PostToolUseFailure", "mcp__mira-bots__mira_list_tickets");
+        assert_eq!(apply(&ev), t(None, None));
+        // Everything else as before.
+        assert_eq!(
+            apply(&tool_ev("PostToolUseFailure", "Bash")),
+            t(Some(AgentStatus::Thinking), None)
+        );
+        assert_eq!(
+            apply(&tool_ev("PostToolUseFailure", "mcp__x__y")),
+            t(Some(AgentStatus::Thinking), None)
+        );
     }
 
     #[test]

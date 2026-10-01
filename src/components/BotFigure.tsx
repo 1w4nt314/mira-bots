@@ -1,8 +1,11 @@
-import { botSrc, type BotRole, type Theme } from "../lib/bots";
-import type { BotState } from "../lib/types";
+import { memo } from "react";
+import { botSrc, type Theme } from "../lib/bots";
+import type { BotState, Role } from "../lib/types";
 
 interface Props {
-  role: BotRole;
+  /** The agent's or profile's roles (figure: one role → static SVG; specialist → generated). */
+  roles: readonly Role[];
+  specialist: boolean;
   state: BotState;
   theme: Theme;
   exited?: boolean;
@@ -12,12 +15,12 @@ interface Props {
   badge?: boolean;
 }
 
-export default function BotFigure({ role, state, theme, exited = false, size, badge = true }: Props) {
+function BotFigure({ roles, specialist, state, theme, exited = false, size, badge = true }: Props) {
   const width = Math.round((size * 240) / 250);
   return (
     <div className="flex shrink-0 flex-col items-center">
       <img
-        src={botSrc(theme, role, state)}
+        src={botSrc(theme, roles, specialist, state)}
         alt=""
         draggable={false}
         width={width}
@@ -33,3 +36,5 @@ export default function BotFigure({ role, state, theme, exited = false, size, ba
     </div>
   );
 }
+
+export default memo(BotFigure);

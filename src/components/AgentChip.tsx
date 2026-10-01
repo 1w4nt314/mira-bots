@@ -34,7 +34,8 @@ export default function AgentChip({ agent, theme, botState }: Props) {
       title={tooltip}
     >
       <BotFigure
-        role={agent.role}
+        roles={agent.roles}
+        specialist={agent.specialist}
         state={botState}
         theme={theme}
         exited={exited}

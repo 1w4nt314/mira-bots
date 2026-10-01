@@ -4,47 +4,24 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use super::pty::{self, PtyHandle, SpawnSpec};
 use super::ring_buffer::RingBuffer;
+use super::roles::{self, Role};
 use super::{now_ms, AgentError};
 use crate::config::{
     AGENT_ID_ENV, DEFAULT_TOOL_WHITELIST, MAX_STAFF_AGENTS, OUTPUT_RING_CAPACITY, PIPE_ENV,
-    PTY_COLS, PTY_ROWS, STARTING_HINT_AFTER, STARTING_HINT_TEXT,
+    PTY_COLS, PTY_ROWS, RESTARTING_TEXT, ROLES_ENV, STARTING_HINT_AFTER, STARTING_HINT_TEXT,
 };
 use crate::hooks::status::AgentStatus;
+use crate::profiles::model::ProfileSnapshot;
 
 /// uuid v4 as a string.
 pub type AgentId = String;
-
-/// Visual role of an agent (step 2: only the figure and the default folder name depend on it).
-/// Wire: `"none"|"coder"|"researcher"|"reviewer"|"koord"`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentRole {
-    #[default]
-    None,
-    Coder,
-    Researcher,
-    Reviewer,
-    Koord,
-}
-
-impl AgentRole {
-    /// Prefix of the default folder name (`bot-01`, `coder-02`, …).
-    pub fn prefix(&self) -> &'static str {
-        match self {
-            AgentRole::None => "bot",
-            AgentRole::Coder => "coder",
-            AgentRole::Researcher => "researcher",
-            AgentRole::Reviewer => "reviewer",
-            AgentRole::Koord => "koord",
-        }
-    }
-}
 
 /// Which row of seats an agent occupies; each has its own limit. Wire: `"work"|"staff"`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -79,7 +56,7 @@ pub struct FrameMatch {
 pub(crate) struct AgentMeta {
     pub id: AgentId,
     pub session_id: String,
-    pub role: AgentRole,
+    pub profile: ProfileSnapshot,
     pub seat_kind: SeatKind,
 }
 
@@ -104,7 +81,20 @@ pub struct AgentInfo {
     pub created_at: u64,
     /// Unix ms.
     pub last_event_at: u64,
-    pub role: AgentRole,
+    /// The profile snapshot taken at spawn (plan5 A.1); roles never change during a session.
+    pub profile_id: String,
+    pub profile_name: String,
+    pub roles: Vec<Role>,
+    pub specialist: bool,
+    /// The requested model (spawn/restart), overwritten by the observed one (statusLine,
+    /// PostModelSwitch); `None` = Claude Code's default. See `model_observed`.
+    pub model: Option<String>,
+    /// Like `model`: requested effort, overwritten by the observed `effort.level`.
+    pub effort: Option<String>,
+    /// Whether `model` was observed from the session rather than requested.
+    pub model_observed: bool,
+    /// Open review assignments of this agent (set by the tickets glue, batch 2; 0 until then).
+    pub open_reviews: usize,
     pub seat_kind: SeatKind,
     /// The agent's `inProgress` ticket. Only set through [`AgentManager::set_ticket_link`]
     /// (from the tickets glue); the manager knows nothing else about tickets.
@@ -113,18 +103,22 @@ pub struct AgentInfo {
     pub queue_length: usize,
 }
 
-/// What the manager reports from its PTY threads.
+/// What the manager reports from its PTY threads. `gen` is the agent's PTY generation the
+/// event comes from: a restart (`--resume`) starts a new generation, and events of an older one
+/// are ignored ([`AgentManager::mark_exited`]; output of an old child is never even reported).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SinkEvent {
     /// `seq` is the ring buffer's byte counter after this chunk.
     Output {
         agent_id: AgentId,
+        gen: u64,
         seq: u64,
         bytes: Vec<u8>,
     },
     /// The child exited. The receiver should call [`AgentManager::mark_exited`].
     Exited {
         agent_id: AgentId,
+        gen: u64,
         code: Option<i32>,
     },
 }
@@ -140,8 +134,9 @@ pub struct SpawnRequest {
     /// [`AgentError::InvalidPrompt`] instead of being rewritten, since claude would parse it as a
     /// flag. Empty/whitespace-only prompts are omitted.
     pub prompt: Option<String>,
-    pub role: AgentRole,
     pub seat_kind: SeatKind,
+    /// Profile id/name, roles, specialist and the requested model/effort.
+    pub profile: ProfileSnapshot,
 }
 
 /// Whether `prompt` would be parsed as a flag by claude (see [`SpawnRequest::prompt`]).
@@ -152,19 +147,36 @@ fn prompt_looks_like_flag(prompt: Option<&str>) -> bool {
 #[derive(Clone, Debug)]
 pub struct SpawnContext {
     pub claude: PathBuf,
-    pub hooks_json: PathBuf,
+    /// The profile's settings.json (`<app_data>/profiles/<id>/settings.json`: hooks,
+    /// permissions, model, effortLevel, statusLine), passed with `--settings`.
+    pub settings_json: PathBuf,
+    /// mcp.json, passed with `--mcp-config`; `None` when mira-mcp was not found.
+    pub mcp_config: Option<PathBuf>,
+    /// The profile's system-prompt.md, passed with `--append-system-prompt-file`; `None`
+    /// without mira-mcp (the prompt asks for tools that would not exist).
+    pub system_prompt: Option<PathBuf>,
     pub pipe_name: String,
 }
 
 pub struct Agent {
     pub info: AgentInfo,
     pty: Option<PtyHandle>,
+    /// Current PTY generation (see [`SinkEvent`]); shared with the reader closure of the child,
+    /// which drops output once a newer generation runs.
+    pty_gen: Arc<AtomicU64>,
     pub output: Arc<Mutex<RingBuffer>>,
     pub whitelist: Vec<String>,
     /// When the user last typed into the terminal (`write_user_input`, ms since epoch). The
     /// ticket dispatcher waits a grace period after it so it never types into a half-written
     /// prompt. The dispatcher's own writes (`write_input`) do not touch it.
     last_user_input_at: Option<u64>,
+    /// The current session has had a turn (a `UserPromptSubmit` or `Stop` was seen for it), so
+    /// Claude Code has written its transcript and `--resume` can find it. Reset when the
+    /// session id changes (`/clear`, a fresh restart). See [`AgentManager::restart_session`].
+    has_conversation: bool,
+    /// Set by a `--resume` restart (ms since epoch); a non-zero exit shortly after it, before the
+    /// session started, means the conversation could not be resumed ([`RESTART_FAILED_TEXT`]).
+    resume_started_at: Option<u64>,
 }
 
 pub struct AgentManager {
@@ -185,24 +197,40 @@ fn name_for(cwd: &Path) -> String {
         .unwrap_or_else(|| cwd.to_string_lossy().into_owned())
 }
 
-/// Command line for one interactive claude session:
-/// `claude --settings <hooks.json> --session-id <uuid> [prompt]`, env `MIRA_BOTS_PIPE` and
-/// `MIRA_AGENT_ID`. No `-p`, no `--permission-mode`, no `--setting-sources`.
-pub fn build_spawn_spec(
-    req: &SpawnRequest,
-    ctx: &SpawnContext,
-    session_id: &str,
-    agent_id: &str,
-) -> SpawnSpec {
+/// The flags shared by spawn and resume: `--settings <profile settings> [--mcp-config <mcp.json>]
+/// [--append-system-prompt-file <profile prompt>] [--model <m>] [--effort <e>]`.
+fn base_args(ctx: &SpawnContext, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--settings".to_string(),
-        ctx.hooks_json.to_string_lossy().into_owned(),
-        "--session-id".to_string(),
-        session_id.to_string(),
+        ctx.settings_json.to_string_lossy().into_owned(),
     ];
-    if let Some(p) = req.prompt.as_ref().filter(|p| !p.trim().is_empty()) {
-        args.push(p.clone());
+    // TODO(windows-verify): the order below starts claude with a positional prompt and loads
+    // the MCP server (plan4 D.39, D.43).
+    if let Some(m) = &ctx.mcp_config {
+        args.push("--mcp-config".to_string());
+        args.push(m.to_string_lossy().into_owned());
     }
+    if let Some(p) = &ctx.system_prompt {
+        args.push("--append-system-prompt-file".to_string());
+        args.push(p.to_string_lossy().into_owned());
+    }
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+    if let Some(e) = effort {
+        args.push("--effort".to_string());
+        args.push(e.to_string());
+    }
+    args
+}
+
+fn spec_with(
+    req: &SpawnRequest,
+    ctx: &SpawnContext,
+    args: Vec<String>,
+    agent_id: &str,
+) -> SpawnSpec {
     SpawnSpec {
         program: ctx.claude.clone(),
         args,
@@ -211,13 +239,151 @@ pub fn build_spawn_spec(
         // processes claude starts (plan D.6).
         // TODO(windows-verify): MIRA_AGENT_ID is inherited by mira-hook.exe too, the frame carries
         // `agent_id`, and after `/clear` the agent's sessionId follows (plan D.15).
+        // TODO(windows-verify): MIRA_AGENT_ROLES reaches mira-mcp.exe (`${VAR}` in mcp.json), so
+        // its tools/list is filtered (plan5 D.51).
         env: vec![
             (PIPE_ENV.to_string(), ctx.pipe_name.clone()),
             (AGENT_ID_ENV.to_string(), agent_id.to_string()),
+            (ROLES_ENV.to_string(), roles::join_list(&req.profile.roles)),
         ],
         cols: PTY_COLS,
         rows: PTY_ROWS,
     }
+}
+
+/// Command line for one interactive claude session (C5.11):
+/// `claude --settings <profile settings.json> [--mcp-config <mcp.json>]
+/// [--append-system-prompt-file <profile system-prompt.md>] [--model <m>] [--effort <e>]
+/// --session-id <uuid> [prompt]`, env `MIRA_BOTS_PIPE`, `MIRA_AGENT_ID` and `MIRA_AGENT_ROLES`
+/// (`coder,reviewer`; empty for no roles). `--model`/`--effort` only when the snapshot has them.
+/// No `-p`, no `--permission-mode`, no `--setting-sources`, no `--strict-mcp-config` (it would
+/// drop the user's own MCP servers), no `ANTHROPIC_MODEL`/`CLAUDE_CODE_EFFORT_LEVEL`.
+///
+/// `--mcp-config` is variadic: a value directly after its path would be read as one more config
+/// file ("MCP config file not found: …/<prompt>", research4 Q2). So its path is always followed
+/// by another flag, and `--session-id` always stands last before the positional prompt.
+pub fn build_spawn_spec(
+    req: &SpawnRequest,
+    ctx: &SpawnContext,
+    session_id: &str,
+    agent_id: &str,
+) -> SpawnSpec {
+    let effort = req.profile.effort.map(|e| e.as_str());
+    let mut args = base_args(ctx, req.profile.model.as_deref(), effort);
+    args.push("--session-id".to_string());
+    args.push(session_id.to_string());
+    if let Some(p) = req.prompt.as_ref().filter(|p| !p.trim().is_empty()) {
+        args.push(p.clone());
+    }
+    spec_with(req, ctx, args, agent_id)
+}
+
+/// How a restart continues the agent's session (plan5 A.5, review5 N1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestartSession {
+    /// `--resume <session id>`: the session has had a turn, so its transcript exists.
+    Resume(String),
+    /// `--session-id <new uuid>`: no turn yet, so no transcript; `--resume` would fail with
+    /// "No conversation found". The agent gets this new session id.
+    Fresh(String),
+}
+
+/// Detail of an agent whose `--resume` restart exited with an error before its session
+/// started (review5 N1).
+pub const RESTART_FAILED_TEXT: &str = "Genstart fejlede: samtalen kunne ikke genoptages";
+
+/// How long after a `--resume` restart an error exit counts as [`RESTART_FAILED_TEXT`].
+pub const RESUME_FAIL_WINDOW_MS: u64 = 15_000;
+
+/// Model value of a restart when none is requested: a resumed session would otherwise keep the
+/// transcript's model (C5.11b).
+pub const RESUME_DEFAULT_MODEL: &str = "default";
+
+/// Command line for a restart with new model/effort (C5.11b): the flags of
+/// [`build_spawn_spec`] up to the effort, with `--model` always present (the snapshot's model or
+/// `default`), and `--resume <session-id>` last; never a positional prompt. Same env.
+///
+/// TODO(windows-verify): the restarted agent keeps its transcript, SessionStart (source
+/// `resume`) turns it Idle and PostModelSwitch confirms the model; no process of the old session
+/// is left (plan5 D.53).
+pub fn build_resume_spec(
+    req: &SpawnRequest,
+    ctx: &SpawnContext,
+    session_id: &str,
+    agent_id: &str,
+) -> SpawnSpec {
+    build_restart_spec(
+        req,
+        ctx,
+        &RestartSession::Resume(session_id.to_string()),
+        agent_id,
+    )
+}
+
+/// Command line for a restart (C5.11b, review5 N1): like [`build_resume_spec`], but a
+/// [`RestartSession::Fresh`] session ends in `--session-id <new uuid>` instead of `--resume`
+/// (same profile files, `--model` always present, never a positional prompt). Same env.
+pub fn build_restart_spec(
+    req: &SpawnRequest,
+    ctx: &SpawnContext,
+    session: &RestartSession,
+    agent_id: &str,
+) -> SpawnSpec {
+    let model = req.profile.model.as_deref().unwrap_or(RESUME_DEFAULT_MODEL);
+    let effort = req.profile.effort.map(|e| e.as_str());
+    let mut args = base_args(ctx, Some(model), effort);
+    let (flag, session_id) = match session {
+        RestartSession::Resume(id) => ("--resume", id),
+        RestartSession::Fresh(id) => ("--session-id", id),
+    };
+    args.push(flag.to_string());
+    args.push(session_id.clone());
+    spec_with(req, ctx, args, agent_id)
+}
+
+/// Starts `spec` in a PTY as generation `gen` of agent `id`. Output is pushed into `output` and
+/// reported only while `gen_cell` still holds `gen`; the exit is always reported with `gen`.
+fn start_child(
+    spec: &SpawnSpec,
+    id: &str,
+    gen: u64,
+    gen_cell: &Arc<AtomicU64>,
+    output: &Arc<Mutex<RingBuffer>>,
+    sink: EventSink,
+) -> Result<PtyHandle, AgentError> {
+    let on_output = {
+        let output = Arc::clone(output);
+        let sink = Arc::clone(&sink);
+        let gen_cell = Arc::clone(gen_cell);
+        let agent_id = id.to_string();
+        move |bytes: &[u8]| {
+            if gen_cell.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let seq = {
+                let mut rb = output.lock().unwrap_or_else(|p| p.into_inner());
+                rb.push(bytes);
+                rb.seq()
+            };
+            sink(SinkEvent::Output {
+                agent_id: agent_id.clone(),
+                gen,
+                seq,
+                bytes: bytes.to_vec(),
+            });
+        }
+    };
+    let on_exit = {
+        let agent_id = id.to_string();
+        move |code: Option<i32>| {
+            sink(SinkEvent::Exited {
+                agent_id,
+                gen,
+                code,
+            })
+        }
+    };
+    pty::spawn(spec, on_output, on_exit)
 }
 
 impl AgentManager {
@@ -292,7 +458,7 @@ impl AgentManager {
         let meta = AgentMeta {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4().to_string(),
-            role: req.role,
+            profile: req.profile.clone(),
             seat_kind: req.seat_kind,
         };
         let spec = build_spawn_spec(&req, ctx, &meta.session_id, &meta.id);
@@ -310,33 +476,12 @@ impl AgentManager {
         let AgentMeta {
             id,
             session_id,
-            role,
+            profile,
             seat_kind,
         } = meta;
         let output = Arc::new(Mutex::new(RingBuffer::new(OUTPUT_RING_CAPACITY)));
-
-        let on_output = {
-            let output = Arc::clone(&output);
-            let sink = Arc::clone(&sink);
-            let agent_id = id.clone();
-            move |bytes: &[u8]| {
-                let seq = {
-                    let mut rb = output.lock().unwrap_or_else(|p| p.into_inner());
-                    rb.push(bytes);
-                    rb.seq()
-                };
-                sink(SinkEvent::Output {
-                    agent_id: agent_id.clone(),
-                    seq,
-                    bytes: bytes.to_vec(),
-                });
-            }
-        };
-        let on_exit = {
-            let agent_id = id.clone();
-            move |code: Option<i32>| sink(SinkEvent::Exited { agent_id, code })
-        };
-        let handle = pty::spawn(&spec, on_output, on_exit)?;
+        let gen_cell = Arc::new(AtomicU64::new(0));
+        let handle = start_child(&spec, &id, 0, &gen_cell, &output, sink)?;
 
         let now = now_ms();
         let info = AgentInfo {
@@ -349,16 +494,179 @@ impl AgentManager {
             pid: handle.pid(),
             created_at: now,
             last_event_at: now,
-            role,
+            profile_id: profile.profile_id,
+            profile_name: profile.profile_name,
+            roles: profile.roles,
+            specialist: profile.specialist,
+            model: profile.model,
+            effort: profile.effort.map(|e| e.as_str().to_string()),
+            model_observed: false,
+            open_reviews: 0,
             seat_kind,
             current_ticket_id: None,
             queue_length: 0,
         };
-        self.insert(info.clone(), Some(handle), output);
+        self.insert(info.clone(), Some(handle), output, gen_cell);
         Ok(info)
     }
 
-    fn insert(&mut self, info: AgentInfo, pty: Option<PtyHandle>, output: Arc<Mutex<RingBuffer>>) {
+    /// Restarts a live agent with a new command line (`--resume`, model/effort change; plan5
+    /// A.5): same id, seat, cwd, session id and ring buffer. The PTY generation is bumped first,
+    /// so the old child's exit and output are ignored; then the old child is killed and the new
+    /// one started. The agent shows `Starting` with [`RESTARTING_TEXT`] until its SessionStart;
+    /// `model`/`effort` become the requested values (`model_observed = false`).
+    ///
+    /// With [`RestartSession::Fresh`] the agent takes the new session id (session map updated).
+    ///
+    /// Returns the result and the old PTY handle, which the caller must drop after releasing the
+    /// manager lock (see [`Self::mark_exited`]). If the new child cannot be started the agent is
+    /// marked exited (the caller releases its tickets).
+    pub fn restart(
+        &mut self,
+        id: &str,
+        spec: SpawnSpec,
+        session: &RestartSession,
+        model: Option<String>,
+        effort: Option<String>,
+        sink: EventSink,
+    ) -> (Result<AgentInfo, AgentError>, Option<PtyHandle>) {
+        let Some(agent) = self.agents.get_mut(id) else {
+            return (Err(AgentError::NotFound), None);
+        };
+        if is_exited(&agent.info.status) {
+            return (Err(AgentError::NotFound), None);
+        }
+        let gen = agent.pty_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut old = agent.pty.take();
+        if let Some(pty) = old.as_mut() {
+            if let Err(e) = pty.kill() {
+                log::debug!("restart: kill agent {id}: {e}");
+            }
+        }
+        let now = now_ms();
+        match start_child(&spec, id, gen, &agent.pty_gen, &agent.output, sink) {
+            Ok(handle) => {
+                agent.info.pid = handle.pid();
+                agent.pty = Some(handle);
+                agent.info.status = AgentStatus::Starting;
+                agent.info.detail = Some(RESTARTING_TEXT.to_string());
+                agent.info.last_event_at = now;
+                agent.info.model = model;
+                agent.info.effort = effort;
+                agent.info.model_observed = false;
+                match session {
+                    RestartSession::Resume(_) => agent.resume_started_at = Some(now),
+                    RestartSession::Fresh(new_id) => {
+                        agent.resume_started_at = None;
+                        agent.has_conversation = false;
+                        let old_id = std::mem::replace(&mut agent.info.session_id, new_id.clone());
+                        let info = agent.info.clone();
+                        let old_key = session_key(&old_id);
+                        if self.by_session.get(&old_key).map(String::as_str) == Some(id) {
+                            self.by_session.remove(&old_key);
+                        }
+                        self.by_session.insert(session_key(new_id), id.to_string());
+                        return (Ok(info), old);
+                    }
+                }
+                (Ok(agent.info.clone()), old)
+            }
+            Err(e) => {
+                agent.info.status = AgentStatus::Exited { code: None };
+                agent.info.detail = None;
+                agent.info.pid = None;
+                agent.info.last_event_at = now;
+                agent.info.current_ticket_id = None;
+                agent.info.queue_length = 0;
+                (Err(e), old)
+            }
+        }
+    }
+
+    /// How a restart of agent `id` continues its session (review5 N1): `--resume` only when the
+    /// session has had a turn, otherwise a fresh session with a new uuid. `None` for unknown
+    /// agents.
+    pub fn restart_session(&self, id: &str) -> Option<RestartSession> {
+        let a = self.agents.get(id)?;
+        Some(if a.has_conversation {
+            RestartSession::Resume(a.info.session_id.clone())
+        } else {
+            RestartSession::Fresh(uuid::Uuid::new_v4().to_string())
+        })
+    }
+
+    /// The agent's session had a turn (`UserPromptSubmit` or `Stop`); see
+    /// [`Agent::has_conversation`]. Unknown agents are ignored.
+    pub fn mark_conversation(&mut self, id: &str) {
+        if let Some(a) = self.agents.get_mut(id) {
+            a.has_conversation = true;
+        }
+    }
+
+    /// See [`Agent::has_conversation`] (`false` for unknown agents).
+    pub fn has_conversation(&self, id: &str) -> bool {
+        self.agents.get(id).is_some_and(|a| a.has_conversation)
+    }
+
+    /// The agent's current PTY generation (`None` for unknown agents).
+    pub fn pty_gen(&self, id: &str) -> Option<u64> {
+        self.agents
+            .get(id)
+            .map(|a| a.pty_gen.load(Ordering::SeqCst))
+    }
+
+    /// Live model/effort from the session (statusLine, PostModelSwitch; plan5 A.4). `None` in a
+    /// field leaves it alone; a given model sets `model_observed`. Returns whether anything
+    /// changed (unknown/exited agents: `false`), so the caller emits only on a change.
+    pub fn set_live_model_effort(
+        &mut self,
+        id: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> bool {
+        let Some(a) = self.agents.get_mut(id) else {
+            return false;
+        };
+        if is_exited(&a.info.status) {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(m) = model.filter(|m| !m.is_empty()) {
+            if a.info.model.as_deref() != Some(m.as_str()) || !a.info.model_observed {
+                a.info.model = Some(m);
+                a.info.model_observed = true;
+                changed = true;
+            }
+        }
+        if let Some(e) = effort.filter(|e| !e.is_empty()) {
+            if a.info.effort.as_deref() != Some(e.as_str()) {
+                a.info.effort = Some(e);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Live (not exited) agents with `role`, oldest first.
+    pub fn with_role(&self, role: Role) -> Vec<AgentInfo> {
+        self.list()
+            .into_iter()
+            .filter(|a| !is_exited(&a.status) && a.roles.contains(&role))
+            .collect()
+    }
+
+    /// Live agents with the reviewer role (review routing, batch 2).
+    pub fn reviewers(&self) -> Vec<AgentInfo> {
+        self.with_role(Role::Reviewer)
+    }
+
+    fn insert(
+        &mut self,
+        info: AgentInfo,
+        pty: Option<PtyHandle>,
+        output: Arc<Mutex<RingBuffer>>,
+        pty_gen: Arc<AtomicU64>,
+    ) {
         self.by_session
             .insert(session_key(&info.session_id), info.id.clone());
         self.agents.insert(
@@ -366,12 +674,15 @@ impl AgentManager {
             Agent {
                 info,
                 pty,
+                pty_gen,
                 output,
                 whitelist: DEFAULT_TOOL_WHITELIST
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
                 last_user_input_at: None,
+                has_conversation: false,
+                resume_started_at: None,
             },
         );
     }
@@ -405,20 +716,37 @@ impl AgentManager {
     /// Returns the updated info and the PTY handle, which the caller must drop **after** releasing
     /// the manager lock: dropping it closes the pseudo terminal (ConPTY `ClosePseudoConsole` can
     /// block until output is drained), which also lets a ConPTY reader thread finish.
+    ///
+    /// `gen` is the generation from [`SinkEvent::Exited`]: the exit of a child replaced by a
+    /// restart is ignored (`None`).
     pub fn mark_exited(
         &mut self,
         id: &str,
+        gen: u64,
         code: Option<i32>,
     ) -> Option<(AgentInfo, Option<PtyHandle>)> {
         let agent = self.agents.get_mut(id)?;
+        if agent.pty_gen.load(Ordering::SeqCst) != gen {
+            return None;
+        }
+        let now = now_ms();
+        // A `--resume` restart that died with an error before its SessionStart (still Starting
+        // with the restart text): the conversation could not be resumed (review5 N1).
+        let resume_failed = code != Some(0)
+            && agent.info.status == AgentStatus::Starting
+            && agent.info.detail.as_deref() == Some(RESTARTING_TEXT)
+            && agent
+                .resume_started_at
+                .is_some_and(|t| now.saturating_sub(t) <= RESUME_FAIL_WINDOW_MS);
         // Keep a known code if stop() raced ahead with None; otherwise take the reported one.
         let keep =
             matches!(agent.info.status, AgentStatus::Exited { code: Some(_) }) && code.is_none();
         if !keep {
             agent.info.status = AgentStatus::Exited { code };
         }
-        agent.info.detail = None;
-        agent.info.last_event_at = now_ms();
+        agent.info.detail = resume_failed.then(|| RESTART_FAILED_TEXT.to_string());
+        agent.resume_started_at = None;
+        agent.info.last_event_at = now;
         agent.info.current_ticket_id = None;
         agent.info.queue_length = 0;
         let pty = agent.pty.take();
@@ -530,6 +858,18 @@ impl AgentManager {
         }
     }
 
+    /// Sets the agent's open review count (`openReviews`, from the tickets glue). Returns whether
+    /// it changed (unknown agent: `false`).
+    pub fn set_review_link(&mut self, id: &str, open_reviews: usize) -> bool {
+        match self.agents.get_mut(id) {
+            Some(a) if a.info.open_reviews != open_reviews => {
+                a.info.open_reviews = open_reviews;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Ids of every known agent (exited included).
     pub fn ids(&self) -> Vec<AgentId> {
         self.agents.keys().cloned().collect()
@@ -554,6 +894,8 @@ impl AgentManager {
             let rebound =
                 !session_id.is_empty() && !agent.info.session_id.eq_ignore_ascii_case(session_id);
             if rebound {
+                // A new session (e.g. `/clear`) has no transcript until its first turn.
+                agent.has_conversation = false;
                 let old = std::mem::replace(&mut agent.info.session_id, session_id.to_string());
                 let old_key = session_key(&old);
                 if self.by_session.get(&old_key) == Some(&id) {
@@ -634,10 +976,10 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Test helper: an agent without a PTY (role none, work seat).
+    /// Test helper: an agent without a PTY (no roles, work seat).
     #[cfg(test)]
     pub fn insert_fake(&mut self, session_id: &str, cwd: &str) -> AgentId {
-        self.insert_fake_with(session_id, cwd, AgentRole::None, SeatKind::Work)
+        self.insert_fake_with(session_id, cwd, &[], SeatKind::Work)
     }
 
     /// Test helper: an agent without a PTY.
@@ -646,7 +988,7 @@ impl AgentManager {
         &mut self,
         session_id: &str,
         cwd: &str,
-        role: AgentRole,
+        roles: &[Role],
         seat_kind: SeatKind,
     ) -> AgentId {
         let now = now_ms();
@@ -661,12 +1003,24 @@ impl AgentManager {
             pid: None,
             created_at: now,
             last_event_at: now,
-            role,
+            profile_id: "test".into(),
+            profile_name: "Test".into(),
+            roles: roles.to_vec(),
+            specialist: roles.len() != 1,
+            model: None,
+            effort: None,
+            model_observed: false,
+            open_reviews: 0,
             seat_kind,
             current_ticket_id: None,
             queue_length: 0,
         };
-        self.insert(info, None, Arc::new(Mutex::new(RingBuffer::new(1024))));
+        self.insert(
+            info,
+            None,
+            Arc::new(Mutex::new(RingBuffer::new(1024))),
+            Arc::new(AtomicU64::new(0)),
+        );
         id
     }
 
@@ -682,13 +1036,102 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::model::Effort;
     use serde_json::{json, Value};
 
     fn ctx(claude: PathBuf) -> SpawnContext {
         SpawnContext {
             claude,
-            hooks_json: PathBuf::from("/data/hooks.json"),
+            settings_json: PathBuf::from("/data/settings.json"),
+            mcp_config: None,
+            system_prompt: None,
             pipe_name: "pipe-x".into(),
+        }
+    }
+
+    fn ctx_with_mcp(claude: PathBuf) -> SpawnContext {
+        SpawnContext {
+            mcp_config: Some(PathBuf::from("/data/mcp.json")),
+            system_prompt: Some(PathBuf::from("/data/system-prompt.md")),
+            ..ctx(claude)
+        }
+    }
+
+    fn work_req(prompt: Option<&str>) -> SpawnRequest {
+        SpawnRequest {
+            cwd: PathBuf::from("/w/demo"),
+            prompt: prompt.map(str::to_string),
+            profile: ProfileSnapshot::default(),
+            seat_kind: SeatKind::Work,
+        }
+    }
+
+    #[test]
+    fn spawn_spec_with_mcp_server_and_system_prompt() {
+        let spec = build_spawn_spec(
+            &work_req(Some("fix it")),
+            &ctx_with_mcp(PathBuf::from("/bin/claude")),
+            "sid",
+            "aid",
+        );
+        assert_eq!(
+            spec.args,
+            [
+                "--settings",
+                "/data/settings.json",
+                "--mcp-config",
+                "/data/mcp.json",
+                "--append-system-prompt-file",
+                "/data/system-prompt.md",
+                "--session-id",
+                "sid",
+                "fix it"
+            ]
+        );
+        assert_eq!(
+            spec.env,
+            vec![
+                ("MIRA_BOTS_PIPE".to_string(), "pipe-x".to_string()),
+                ("MIRA_AGENT_ID".to_string(), "aid".to_string()),
+                ("MIRA_AGENT_ROLES".to_string(), String::new()),
+            ]
+        );
+    }
+
+    /// For every combination: `--mcp-config <path>` is followed by a flag (never the prompt),
+    /// `--session-id <sid>` is the last flag before the prompt, no `--strict-mcp-config`.
+    #[test]
+    fn spawn_spec_never_puts_the_prompt_after_mcp_config() {
+        let claude = PathBuf::from("/bin/claude");
+        for mcp in [false, true] {
+            for prompt_file in [false, true] {
+                for prompt in [None, Some("fix it"), Some("Ticket abc: x")] {
+                    let mut c = ctx(claude.clone());
+                    if mcp {
+                        c.mcp_config = Some(PathBuf::from("/data/mcp.json"));
+                    }
+                    if prompt_file {
+                        c.system_prompt = Some(PathBuf::from("/data/system-prompt.md"));
+                    }
+                    let a = build_spawn_spec(&work_req(prompt), &c, "sid", "aid").args;
+                    assert!(!a.iter().any(|x| x == "--strict-mcp-config" || x == "--"));
+                    if let Some(i) = a.iter().position(|x| x == "--mcp-config") {
+                        assert!(a[i + 2].starts_with("--"), "{a:?}");
+                    }
+                    assert_eq!(a.iter().any(|x| x == "--mcp-config"), mcp);
+                    assert_eq!(
+                        a.iter().any(|x| x == "--append-system-prompt-file"),
+                        prompt_file
+                    );
+                    let flags = if prompt.is_some() { 3 } else { 2 };
+                    assert_eq!(a[a.len() - flags], "--session-id", "{a:?}");
+                    assert_eq!(a[a.len() - flags + 1], "sid");
+                    if let Some(p) = prompt {
+                        assert_eq!(a.last().unwrap(), p);
+                    }
+                    assert_eq!(a[0], "--settings");
+                }
+            }
         }
     }
 
@@ -701,7 +1144,7 @@ mod tests {
         let req = SpawnRequest {
             cwd: PathBuf::from("/w/demo"),
             prompt: Some("fix it".into()),
-            role: AgentRole::None,
+            profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
         };
         let spec = build_spawn_spec(&req, &ctx(PathBuf::from("/bin/claude")), "sid", "aid");
@@ -710,7 +1153,7 @@ mod tests {
             spec.args,
             [
                 "--settings",
-                "/data/hooks.json",
+                "/data/settings.json",
                 "--session-id",
                 "sid",
                 "fix it"
@@ -722,6 +1165,7 @@ mod tests {
             vec![
                 ("MIRA_BOTS_PIPE".to_string(), "pipe-x".to_string()),
                 ("MIRA_AGENT_ID".to_string(), "aid".to_string()),
+                ("MIRA_AGENT_ROLES".to_string(), String::new()),
             ]
         );
         assert_eq!((spec.cols, spec.rows), (120, 30));
@@ -741,12 +1185,225 @@ mod tests {
             let req = SpawnRequest {
                 cwd: PathBuf::from("/w"),
                 prompt,
-                role: AgentRole::None,
+                profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
             };
             let spec = build_spawn_spec(&req, &ctx(PathBuf::from("c")), "s", "a");
             assert_eq!(spec.args.len(), 4);
         }
+    }
+
+    fn profile_req(model: Option<&str>, effort: Option<Effort>, roles: &[Role]) -> SpawnRequest {
+        SpawnRequest {
+            cwd: PathBuf::from("/w/demo"),
+            prompt: Some("fix it".into()),
+            seat_kind: SeatKind::Work,
+            profile: ProfileSnapshot {
+                profile_id: "reviewer".into(),
+                profile_name: "Reviewer".into(),
+                roles: roles.to_vec(),
+                specialist: false,
+                model: model.map(str::to_string),
+                effort,
+            },
+        }
+    }
+
+    fn profile_ctx() -> SpawnContext {
+        SpawnContext {
+            claude: PathBuf::from("/bin/claude"),
+            settings_json: PathBuf::from("/data/profiles/reviewer/settings.json"),
+            mcp_config: Some(PathBuf::from("/data/mcp.json")),
+            system_prompt: Some(PathBuf::from("/data/profiles/reviewer/system-prompt.md")),
+            pipe_name: "pipe-x".into(),
+        }
+    }
+
+    #[test]
+    fn spawn_spec_flag_order_with_model_and_effort() {
+        let req = profile_req(
+            Some("claude-opus-5-5[1m]"),
+            Some(Effort::Max),
+            &[Role::Reviewer],
+        );
+        let spec = build_spawn_spec(&req, &profile_ctx(), "sid", "aid");
+        assert_eq!(
+            spec.args,
+            [
+                "--settings",
+                "/data/profiles/reviewer/settings.json",
+                "--mcp-config",
+                "/data/mcp.json",
+                "--append-system-prompt-file",
+                "/data/profiles/reviewer/system-prompt.md",
+                "--model",
+                "claude-opus-5-5[1m]",
+                "--effort",
+                "max",
+                "--session-id",
+                "sid",
+                "fix it"
+            ]
+        );
+        // Without mira-mcp: no MCP/prompt flags, model/effort still there.
+        let mut c = profile_ctx();
+        c.mcp_config = None;
+        c.system_prompt = None;
+        let a = build_spawn_spec(&req, &c, "sid", "aid").args;
+        assert_eq!(
+            a,
+            [
+                "--settings",
+                "/data/profiles/reviewer/settings.json",
+                "--model",
+                "claude-opus-5-5[1m]",
+                "--effort",
+                "max",
+                "--session-id",
+                "sid",
+                "fix it"
+            ]
+        );
+        // Only one of them.
+        let a = build_spawn_spec(&profile_req(None, Some(Effort::Low), &[]), &c, "s", "a").args;
+        assert_eq!(a[2..], ["--effort", "low", "--session-id", "s", "fix it"]);
+        let a = build_spawn_spec(&profile_req(Some("haiku"), None, &[]), &c, "s", "a").args;
+        assert_eq!(a[2..], ["--model", "haiku", "--session-id", "s", "fix it"]);
+    }
+
+    #[test]
+    fn spawn_spec_without_model_effort() {
+        let spec = build_spawn_spec(&profile_req(None, None, &[]), &profile_ctx(), "sid", "aid");
+        assert!(!spec.args.iter().any(|a| a == "--model" || a == "--effort"));
+        assert_eq!(spec.args.len(), 9);
+        assert_eq!(spec.args[6..], ["--session-id", "sid", "fix it"]);
+        for bad in ["--resume", "--strict-mcp-config", "-p"] {
+            assert!(!spec.args.iter().any(|a| a == bad), "{bad}");
+        }
+        // Never the env overrides that would hide the user's own /model and --effort.
+        assert!(spec
+            .env
+            .iter()
+            .all(|(k, _)| k != "ANTHROPIC_MODEL" && k != "CLAUDE_CODE_EFFORT_LEVEL"));
+    }
+
+    #[test]
+    fn spawn_spec_env_has_roles() {
+        let env = |roles: &[Role]| {
+            build_spawn_spec(
+                &profile_req(None, None, roles),
+                &profile_ctx(),
+                "sid",
+                "aid",
+            )
+            .env
+        };
+        assert_eq!(
+            env(&[Role::Reviewer, Role::Coder]),
+            vec![
+                ("MIRA_BOTS_PIPE".to_string(), "pipe-x".to_string()),
+                ("MIRA_AGENT_ID".to_string(), "aid".to_string()),
+                ("MIRA_AGENT_ROLES".to_string(), "coder,reviewer".to_string()),
+            ]
+        );
+        assert_eq!(
+            env(&[])[2],
+            ("MIRA_AGENT_ROLES".to_string(), String::new()),
+            "no roles: empty string, not a missing variable"
+        );
+        assert_eq!(
+            env(&Role::ALL)[2].1,
+            "coder,researcher,reviewer,coordinator,planner,debugger"
+        );
+    }
+
+    #[test]
+    fn resume_spec_uses_resume_and_no_prompt() {
+        let req = profile_req(Some("sonnet"), Some(Effort::Xhigh), &[Role::Reviewer]);
+        let spec = build_resume_spec(&req, &profile_ctx(), "sid-1", "aid");
+        assert_eq!(
+            spec.args,
+            [
+                "--settings",
+                "/data/profiles/reviewer/settings.json",
+                "--mcp-config",
+                "/data/mcp.json",
+                "--append-system-prompt-file",
+                "/data/profiles/reviewer/system-prompt.md",
+                "--model",
+                "sonnet",
+                "--effort",
+                "xhigh",
+                "--resume",
+                "sid-1"
+            ]
+        );
+        assert!(!spec
+            .args
+            .iter()
+            .any(|a| a == "--session-id" || a == "fix it"));
+        assert_eq!(
+            spec.env,
+            build_spawn_spec(&req, &profile_ctx(), "x", "aid").env
+        );
+        assert_eq!(spec.cwd, PathBuf::from("/w/demo"));
+        // No model requested: `--model default` (otherwise the transcript's model would stay).
+        let a = build_resume_spec(&profile_req(None, None, &[]), &profile_ctx(), "s", "a").args;
+        assert_eq!(a[6..], ["--model", "default", "--resume", "s"]);
+        // `--mcp-config <path>` is followed by a flag here too.
+        let i = a.iter().position(|x| x == "--mcp-config").unwrap();
+        assert!(a[i + 2].starts_with("--"));
+    }
+
+    #[test]
+    fn live_model_only_emits_on_change() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("s", "/w/a");
+        assert!(m.set_live_model_effort(&id, Some("claude-opus-5-5".into()), Some("high".into())));
+        assert!(!m.set_live_model_effort(&id, Some("claude-opus-5-5".into()), Some("high".into())));
+        assert!(!m.set_live_model_effort(&id, None, None));
+        assert!(!m.set_live_model_effort(&id, Some(String::new()), None));
+        // Effort alone; model untouched.
+        assert!(m.set_live_model_effort(&id, None, Some("xhigh".into())));
+        let a = m.get(&id).unwrap();
+        assert_eq!(
+            (a.model.as_deref(), a.effort.as_deref(), a.model_observed),
+            (Some("claude-opus-5-5"), Some("xhigh"), true)
+        );
+        assert!(m.set_live_model_effort(&id, Some("claude-sonnet-5-5".into()), None));
+        assert!(!m.set_live_model_effort("nope", Some("x".into()), None));
+        m.stop(&id).unwrap();
+        assert!(!m.set_live_model_effort(&id, Some("claude-haiku".into()), None));
+    }
+
+    #[test]
+    fn reviewers_are_live_agents_with_the_role() {
+        let mut m = AgentManager::new(5);
+        let r1 = m.insert_fake_with("a", "/w/a", &[Role::Reviewer], SeatKind::Staff);
+        let r2 = m.insert_fake_with("b", "/w/b", &[Role::Coder, Role::Reviewer], SeatKind::Work);
+        let gone = m.insert_fake_with("c", "/w/c", &[Role::Reviewer], SeatKind::Staff);
+        m.insert_fake_with("d", "/w/d", &[Role::Coder], SeatKind::Work);
+        m.stop(&gone).unwrap();
+        let mut ids: Vec<String> = m.reviewers().into_iter().map(|a| a.id).collect();
+        ids.sort();
+        let mut want = vec![r1, r2];
+        want.sort();
+        assert_eq!(ids, want);
+        assert_eq!(m.with_role(Role::Coordinator).len(), 0);
+    }
+
+    #[test]
+    fn exits_of_an_older_generation_are_ignored() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("s", "/w/a");
+        assert_eq!(m.pty_gen(&id), Some(0));
+        assert!(
+            m.mark_exited(&id, 1, Some(0)).is_none(),
+            "a future gen is not ours"
+        );
+        assert!(matches!(m.get(&id).unwrap().status, AgentStatus::Starting));
+        assert!(m.mark_exited(&id, 0, Some(0)).is_some());
+        assert_eq!(m.pty_gen("nope"), None);
     }
 
     #[test]
@@ -758,7 +1415,7 @@ mod tests {
         let req = || SpawnRequest {
             cwd: PathBuf::from("/definitely/not/a/dir"),
             prompt: None,
-            role: AgentRole::None,
+            profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
         };
         let c = ctx(PathBuf::from("/nope/claude"));
@@ -766,7 +1423,7 @@ mod tests {
             m.spawn(req(), &c, null_sink()),
             Err(AgentError::LimitReached(SeatKind::Work))
         ));
-        m.mark_exited(&ids[0], Some(0));
+        m.mark_exited(&ids[0], 0, Some(0));
         // Past the limit now; fails on the next check instead.
         assert!(matches!(
             m.spawn(req(), &c, null_sink()),
@@ -778,7 +1435,7 @@ mod tests {
         );
         assert_eq!(
             AgentError::LimitReached(SeatKind::Staff).to_string(),
-            "Loft på 2 stabspladser nået"
+            "Loft på 3 stabspladser nået"
         );
     }
 
@@ -787,7 +1444,7 @@ mod tests {
         SpawnRequest {
             cwd: PathBuf::from("/definitely/not/a/dir"),
             prompt: None,
-            role: AgentRole::Coder,
+            profile: ProfileSnapshot::default(),
             seat_kind,
         }
     }
@@ -808,21 +1465,22 @@ mod tests {
             m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
             Err(AgentError::InvalidCwd)
         ));
-        let s0 = m.insert_fake_with("s0", "/w/s", AgentRole::Koord, SeatKind::Staff);
-        m.insert_fake_with("s1", "/w/s", AgentRole::Reviewer, SeatKind::Staff);
+        let s0 = m.insert_fake_with("s0", "/w/s", &[Role::Coordinator], SeatKind::Staff);
+        m.insert_fake_with("s1", "/w/s", &[Role::Reviewer], SeatKind::Staff);
+        m.insert_fake_with("s2", "/w/s", &[Role::Planner], SeatKind::Staff);
         assert!(matches!(
             m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
             Err(AgentError::LimitReached(SeatKind::Staff))
         ));
-        m.mark_exited(&s0, Some(0));
+        m.mark_exited(&s0, 0, Some(0));
         assert!(matches!(
             m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
             Err(AgentError::InvalidCwd)
         ));
         // Staff agents never count against the work limit.
         let mut m = AgentManager::with_limits(1, 2);
-        m.insert_fake_with("s0", "/w/s", AgentRole::None, SeatKind::Staff);
-        m.insert_fake_with("s1", "/w/s", AgentRole::None, SeatKind::Staff);
+        m.insert_fake_with("s0", "/w/s", &[], SeatKind::Staff);
+        m.insert_fake_with("s1", "/w/s", &[], SeatKind::Staff);
         assert!(matches!(
             m.spawn(doomed(SeatKind::Work), &c, null_sink()),
             Err(AgentError::InvalidCwd)
@@ -831,26 +1489,13 @@ mod tests {
     }
 
     #[test]
-    fn role_and_seat_kind_serde_lowercase() {
-        for (role, s) in [
-            (AgentRole::None, "none"),
-            (AgentRole::Coder, "coder"),
-            (AgentRole::Researcher, "researcher"),
-            (AgentRole::Reviewer, "reviewer"),
-            (AgentRole::Koord, "koord"),
-        ] {
-            assert_eq!(serde_json::to_value(role).unwrap(), json!(s));
-            assert_eq!(serde_json::from_value::<AgentRole>(json!(s)).unwrap(), role);
-        }
+    fn seat_kind_serde_lowercase() {
         for (seat, s) in [(SeatKind::Work, "work"), (SeatKind::Staff, "staff")] {
             assert_eq!(serde_json::to_value(seat).unwrap(), json!(s));
             assert_eq!(serde_json::from_value::<SeatKind>(json!(s)).unwrap(), seat);
         }
-        assert!(serde_json::from_value::<AgentRole>(json!("Coder")).is_err());
-        assert_eq!(AgentRole::default(), AgentRole::None);
+        assert!(serde_json::from_value::<SeatKind>(json!("Work")).is_err());
         assert_eq!(SeatKind::default(), SeatKind::Work);
-        assert_eq!(AgentRole::None.prefix(), "bot");
-        assert_eq!(AgentRole::Koord.prefix(), "koord");
     }
 
     #[test]
@@ -962,7 +1607,7 @@ mod tests {
             let req = SpawnRequest {
                 cwd: std::env::temp_dir(),
                 prompt: Some(prompt.into()),
-                role: AgentRole::None,
+                profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
             };
             assert!(
@@ -978,7 +1623,7 @@ mod tests {
             let req = SpawnRequest {
                 cwd: std::env::temp_dir(),
                 prompt: prompt.map(str::to_string),
-                role: AgentRole::None,
+                profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
             };
             assert!(
@@ -1001,7 +1646,7 @@ mod tests {
         let req = SpawnRequest {
             cwd: std::env::temp_dir(),
             prompt: None,
-            role: AgentRole::None,
+            profile: ProfileSnapshot::default(),
             seat_kind: SeatKind::Work,
         };
         assert!(matches!(
@@ -1043,15 +1688,15 @@ mod tests {
         assert_eq!(info.status, AgentStatus::Exited { code: None });
         assert!(m.set_status(&id, AgentStatus::Thinking, None).is_none());
         assert_eq!(
-            m.mark_exited(&id, Some(3)).unwrap().0.status,
+            m.mark_exited(&id, 0, Some(3)).unwrap().0.status,
             AgentStatus::Exited { code: Some(3) }
         );
         // A later None does not erase a known code.
         assert_eq!(
-            m.mark_exited(&id, None).unwrap().0.status,
+            m.mark_exited(&id, 0, None).unwrap().0.status,
             AgentStatus::Exited { code: Some(3) }
         );
-        assert!(m.mark_exited("nope", None).is_none());
+        assert!(m.mark_exited("nope", 0, None).is_none());
         assert!(m.remove(&id).unwrap().is_none(), "fake agent has no PTY");
         assert!(m.list().is_empty());
         assert_eq!(m.agent_id_for_session("s"), None);
@@ -1059,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_info_serializes_camel_case() {
+    fn agent_info_serializes_new_fields() {
         let mut m = AgentManager::new(5);
         let id = m.insert_fake("s", "/w/demo");
         let v = serde_json::to_value(m.get(&id).unwrap()).unwrap();
@@ -1073,7 +1718,14 @@ mod tests {
             "pid",
             "createdAt",
             "lastEventAt",
-            "role",
+            "profileId",
+            "profileName",
+            "roles",
+            "specialist",
+            "model",
+            "effort",
+            "modelObserved",
+            "openReviews",
             "seatKind",
             "currentTicketId",
             "queueLength",
@@ -1089,13 +1741,40 @@ mod tests {
             (json!("t1"), json!(2))
         );
         assert_eq!(v["status"], json!({"kind":"starting"}));
-        assert_eq!(v["role"], "none");
+        assert!(v.get("role").is_none(), "the step-4 field is gone");
+        assert_eq!(v["roles"], json!([]));
         assert_eq!(v["seatKind"], "work");
-        let id = m.insert_fake_with("s2", "/w/x", AgentRole::Researcher, SeatKind::Staff);
+        let id = m.insert_fake_with(
+            "s2",
+            "/w/x",
+            &[Role::Researcher, Role::Coordinator],
+            SeatKind::Staff,
+        );
+        m.set_live_model_effort(&id, Some("claude-opus-5-5".into()), Some("high".into()));
         let v = serde_json::to_value(m.get(&id).unwrap()).unwrap();
         assert_eq!(
-            (v["role"].clone(), v["seatKind"].clone()),
-            (json!("researcher"), json!("staff"))
+            (v["roles"].clone(), v["seatKind"].clone()),
+            (json!(["researcher", "coordinator"]), json!("staff"))
+        );
+        assert_eq!(
+            (
+                v["model"].clone(),
+                v["effort"].clone(),
+                v["modelObserved"].clone(),
+                v["openReviews"].clone(),
+                v["specialist"].clone(),
+                v["profileId"].clone(),
+                v["profileName"].clone()
+            ),
+            (
+                json!("claude-opus-5-5"),
+                json!("high"),
+                json!(true),
+                json!(0),
+                json!(true),
+                json!("test"),
+                json!("Test")
+            )
         );
     }
 
@@ -1114,7 +1793,7 @@ mod tests {
         assert!(!m.set_ticket_link(&id, None, 0));
         let id2 = m.insert_fake("s2", "/w/b");
         m.set_ticket_link(&id2, Some("t2".into()), 1);
-        let (info, _) = m.mark_exited(&id2, Some(0)).unwrap();
+        let (info, _) = m.mark_exited(&id2, 0, Some(0)).unwrap();
         assert_eq!((info.current_ticket_id, info.queue_length), (None, 0));
     }
 
@@ -1152,6 +1831,62 @@ mod tests {
         assert_eq!(m.get(&id).unwrap().detail, None);
     }
 
+    /// review5 N1: `--resume` only after a turn (UserPromptSubmit/Stop) of the current session;
+    /// a new session id (`/clear`) starts over.
+    #[test]
+    fn restart_session_resumes_only_after_a_turn() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("sess-1", "/w/a");
+        assert!(m.restart_session("nope").is_none());
+        let RestartSession::Fresh(new_id) = m.restart_session(&id).unwrap() else {
+            panic!("no turn yet: fresh session");
+        };
+        assert_ne!(new_id, "sess-1");
+        assert!(uuid::Uuid::parse_str(&new_id).is_ok());
+        m.mark_conversation(&id);
+        assert_eq!(
+            m.restart_session(&id),
+            Some(RestartSession::Resume("sess-1".into()))
+        );
+        // `/clear`: the frame rebinds the agent to a new session without a transcript.
+        m.match_frame(Some(&id), "sess-2").unwrap();
+        assert!(!m.has_conversation(&id));
+        assert!(matches!(
+            m.restart_session(&id),
+            Some(RestartSession::Fresh(_))
+        ));
+        // A frame of the same session does not reset it.
+        m.mark_conversation(&id);
+        m.match_frame(Some(&id), "SESS-2").unwrap();
+        assert!(m.has_conversation(&id));
+    }
+
+    #[test]
+    fn restart_spec_fresh_vs_resume() {
+        let req = profile_req(Some("haiku"), Some(Effort::Low), &[]);
+        let c = profile_ctx();
+        let resume = build_restart_spec(&req, &c, &RestartSession::Resume("s-1".into()), "aid");
+        assert_eq!(resume.args, build_resume_spec(&req, &c, "s-1", "aid").args);
+        let fresh = build_restart_spec(&req, &c, &RestartSession::Fresh("s-2".into()), "aid");
+        let n = fresh.args.len();
+        assert_eq!(fresh.args[n - 2..], ["--session-id", "s-2"]);
+        assert_eq!(
+            fresh.args[..n - 2],
+            resume.args[..n - 2],
+            "same profile flags"
+        );
+        assert!(!fresh.args.iter().any(|a| a == "--resume"));
+        assert_eq!(fresh.env, resume.env);
+        // No model requested: --model default, like a resume.
+        let fresh = build_restart_spec(
+            &profile_req(None, None, &[]),
+            &c,
+            &RestartSession::Fresh("s".into()),
+            "a",
+        );
+        assert!(fresh.args.windows(2).any(|w| w == ["--model", "default"]));
+    }
+
     #[cfg(unix)]
     mod unix_pty {
         use super::*;
@@ -1178,7 +1913,7 @@ mod tests {
             AgentMeta {
                 id: uuid::Uuid::new_v4().to_string(),
                 session_id: session.to_string(),
-                role: AgentRole::None,
+                profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
             }
         }
@@ -1248,7 +1983,7 @@ mod tests {
                 })
                 .collect();
             assert!(seqs.windows(2).all(|w| w[0] < w[1]));
-            let (exited, pty) = m.mark_exited(&info.id, Some(3)).unwrap();
+            let (exited, pty) = m.mark_exited(&info.id, 0, Some(3)).unwrap();
             assert_eq!(exited.status, AgentStatus::Exited { code: Some(3) });
             assert!(pty.is_some(), "the PTY handle is handed to the caller");
             assert_eq!(
@@ -1257,7 +1992,7 @@ mod tests {
             );
             // Dropped here, outside any manager lock; a second report has nothing left to hand.
             drop(pty);
-            let (_, again) = m.mark_exited(&info.id, None).unwrap();
+            let (_, again) = m.mark_exited(&info.id, 0, None).unwrap();
             assert!(again.is_none());
             assert!(m.remove(&info.id).unwrap().is_none());
         }
@@ -1284,7 +2019,7 @@ mod tests {
             let req = SpawnRequest {
                 cwd: std::env::temp_dir(),
                 prompt: None,
-                role: AgentRole::None,
+                profile: ProfileSnapshot::default(),
                 seat_kind: SeatKind::Work,
             };
             let c = ctx(PathBuf::from("/bin/sh"));
@@ -1342,6 +2077,174 @@ mod tests {
                 let _ = m.stop(&info.id);
             }
             let _ = events;
+        }
+
+        /// A restart keeps id, session, cwd, creation time and the ring buffer; the old child's
+        /// exit (generation 0) is ignored, the new child's output lands in the same buffer.
+        #[test]
+        fn restart_keeps_id_and_ignores_old_exit() {
+            let mut m = AgentManager::new(5);
+            let (sink, events) = collecting_sink();
+            let info = m
+                .spawn_spec(
+                    sh("echo first; sleep 30", vec![]),
+                    meta("sess-r"),
+                    sink.clone(),
+                )
+                .unwrap();
+            assert!(wait_for_output(&events, "first").contains("first"));
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            let (res, old) = m.restart(
+                &info.id,
+                sh("echo second; sleep 30", vec![]),
+                &RestartSession::Resume("sess-r".into()),
+                Some("opus".into()),
+                Some("high".into()),
+                sink.clone(),
+            );
+            let after = res.unwrap();
+            drop(old);
+            assert_eq!(after.id, info.id);
+            assert_eq!(after.session_id, "sess-r");
+            assert_eq!(after.created_at, info.created_at);
+            assert_eq!(after.status, AgentStatus::Starting);
+            assert_eq!(after.detail.as_deref(), Some(RESTARTING_TEXT));
+            assert_ne!(after.pid, info.pid);
+            assert_eq!(
+                (
+                    after.model.as_deref(),
+                    after.effort.as_deref(),
+                    after.model_observed
+                ),
+                (Some("opus"), Some("high"), false)
+            );
+            assert_eq!(m.pty_gen(&info.id), Some(1));
+            // The killed first child reports its exit with generation 0: ignored.
+            let t = Instant::now();
+            let old_gen = loop {
+                let found = events.lock().unwrap().iter().find_map(|e| match e {
+                    SinkEvent::Exited { gen, .. } => Some(*gen),
+                    _ => None,
+                });
+                if let Some(g) = found {
+                    break g;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "no exit of the old child"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(old_gen, 0);
+            assert!(m.mark_exited(&info.id, old_gen, None).is_none());
+            assert_eq!(m.get(&info.id).unwrap().status, AgentStatus::Starting);
+            // Same ring buffer: both outputs.
+            wait_for_output(&events, "second");
+            let (_, bytes) = m.output_snapshot(&info.id).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("first") && text.contains("second"), "{text}");
+            // Exited agents cannot be restarted.
+            m.stop(&info.id).unwrap();
+            let resume = RestartSession::Resume("sess-r".into());
+            let (res, _) = m.restart(
+                &info.id,
+                sh("true", vec![]),
+                &resume,
+                None,
+                None,
+                sink.clone(),
+            );
+            assert!(matches!(res, Err(AgentError::NotFound)));
+            let (res, _) = m.restart("nope", sh("true", vec![]), &resume, None, None, sink);
+            assert!(matches!(res, Err(AgentError::NotFound)));
+            assert_eq!(m.list().len(), 1);
+        }
+
+        /// The exit code of generation `gen` (waits up to 10 s).
+        fn wait_for_gen_exit(events: &Arc<Mutex<Vec<SinkEvent>>>, want: u64) -> Option<i32> {
+            let t = Instant::now();
+            loop {
+                let found = events.lock().unwrap().iter().find_map(|e| match e {
+                    SinkEvent::Exited { gen, code, .. } if *gen == want => Some(*code),
+                    _ => None,
+                });
+                if let Some(code) = found {
+                    return code;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "no exit of gen {want}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// review5 N1: a fresh restart takes the new session id (session map follows); a
+        /// `--resume` restart that dies with an error before its SessionStart gets
+        /// [`RESTART_FAILED_TEXT`], a later error exit does not.
+        #[test]
+        fn fresh_restart_rebinds_and_failed_resume_says_so() {
+            let mut m = AgentManager::new(5);
+            let (sink, events) = collecting_sink();
+            let info = m
+                .spawn_spec(sh("sleep 30", vec![]), meta("sess-a"), sink.clone())
+                .unwrap();
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            let fresh = RestartSession::Fresh("sess-new".into());
+            let (res, old) = m.restart(
+                &info.id,
+                sh("sleep 30", vec![]),
+                &fresh,
+                None,
+                None,
+                sink.clone(),
+            );
+            drop(old);
+            assert_eq!(res.unwrap().session_id, "sess-new");
+            assert_eq!(m.agent_id_for_session("SESS-NEW"), Some(info.id.clone()));
+            assert_eq!(m.agent_id_for_session("sess-a"), None);
+            assert!(!m.has_conversation(&info.id));
+
+            // The session had a turn → --resume; the resumed child exits 1 right away.
+            m.mark_conversation(&info.id);
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            let resume = m.restart_session(&info.id).unwrap();
+            assert_eq!(resume, RestartSession::Resume("sess-new".into()));
+            let (res, old) = m.restart(
+                &info.id,
+                sh("exit 1", vec![]),
+                &resume,
+                None,
+                None,
+                sink.clone(),
+            );
+            drop(old);
+            res.unwrap();
+            let code = wait_for_gen_exit(&events, 2);
+            assert_eq!(code, Some(1));
+            let (exited, _pty) = m.mark_exited(&info.id, 2, code).unwrap();
+            assert_eq!(exited.status, AgentStatus::Exited { code: Some(1) });
+            assert_eq!(exited.detail.as_deref(), Some(RESTART_FAILED_TEXT));
+
+            // After its SessionStart (Idle) an error exit is an ordinary exit.
+            let other = m
+                .spawn_spec(sh("sleep 30", vec![]), meta("sess-b"), sink.clone())
+                .unwrap();
+            m.set_status(&other.id, AgentStatus::Idle, None).unwrap();
+            let (res, old) = m.restart(
+                &other.id,
+                sh("sleep 0.3; exit 1", vec![]),
+                &RestartSession::Resume("sess-b".into()),
+                None,
+                None,
+                sink.clone(),
+            );
+            drop(old);
+            res.unwrap();
+            m.set_status(&other.id, AgentStatus::Idle, None).unwrap();
+            let code = wait_for_gen_exit(&events, 1);
+            let (exited, _pty) = m.mark_exited(&other.id, 1, code).unwrap();
+            assert_eq!(exited.detail, None);
         }
     }
 }

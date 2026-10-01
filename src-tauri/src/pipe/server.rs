@@ -240,6 +240,7 @@ mod tests {
             emit: Arc::new(|_: &str, _| {}),
             stats: Arc::new(crate::diagnostics::HookStats::default()),
             observer: None,
+            tools: None,
         };
         let name = std::env::temp_dir()
             .join(format!("mira-bots-test-{}.sock", uuid::Uuid::new_v4()))
@@ -259,7 +260,7 @@ mod tests {
         let pipe = name.clone();
         let stdout = tokio::task::spawn_blocking(move || {
             let input = br#"{"hook_event_name":"PermissionRequest","session_id":"sess-e2e","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
-            mira_hook::run(input, Some(pipe), None, false)
+            mira_hook::run(input, Some(pipe), None, false, None)
         })
         .await
         .unwrap();
@@ -282,6 +283,7 @@ mod tests {
                 Some(pipe),
                 Some(agent_for_hook),
                 false,
+                None,
             )
         })
         .await
@@ -311,6 +313,7 @@ mod tests {
             emit: Arc::new(|_: &str, _| {}),
             stats: Arc::new(crate::diagnostics::HookStats::default()),
             observer: None,
+            tools: None,
         };
         let name = std::env::temp_dir()
             .join(format!("mira-bots-no-such-dir-{}", uuid::Uuid::new_v4()))

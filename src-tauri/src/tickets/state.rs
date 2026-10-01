@@ -54,7 +54,8 @@ pub fn transition(
 }
 
 /// Like [`transition`], with an extra history note for events that carry none themselves
-/// (`Reject` and `ToBacklog` notes take precedence).
+/// (a `ToBacklog` note takes precedence; for `Reject` the extra note prefixes the rejection
+/// text: `"<extra>: <note>"`).
 pub fn transition_noted(
     t: &Ticket,
     ev: &TicketEvent,
@@ -91,6 +92,9 @@ pub fn transition_noted(
         (S::InProgress, E::Submit) => {
             // A finished turn supersedes an earlier turn failure.
             n.issue = None;
+            // A new review starts without a reviewer; routing decides (plan5 A.6).
+            n.reviewer_agent_id = None;
+            n.escalated = false;
             if t.skip_review {
                 n.rejection_note = None;
                 S::Done
@@ -101,6 +105,8 @@ pub fn transition_noted(
         (S::Review, E::Approve) => {
             n.rejection_note = None;
             n.issue = None;
+            // The reviewer stays for display; an escalation is settled.
+            n.escalated = false;
             S::Done
         }
         (S::Review, E::Reject { note: r }) => {
@@ -109,7 +115,14 @@ pub fn transition_noted(
                 return Err(TicketError::NeedsNote);
             }
             n.rejection_note = Some(r.to_string());
-            note = Some(r.to_string());
+            // An extra note (e.g. "afvist af <agent>") prefixes the rejection text.
+            note = Some(match note {
+                Some(prefix) => format!("{prefix}: {r}"),
+                None => r.to_string(),
+            });
+            n.review_round = t.review_round.saturating_add(1);
+            n.reviewer_agent_id = None;
+            n.escalated = false;
             S::Rejected
         }
         (S::Rejected, E::Requeue) => {
@@ -128,7 +141,11 @@ pub fn transition_noted(
             };
             S::Backlog
         }
-        (S::Review, E::Reopen) => S::InProgress,
+        (S::Review, E::Reopen) => {
+            n.reviewer_agent_id = None;
+            n.escalated = false;
+            S::InProgress
+        }
         _ => return Err(illegal()),
     };
 
@@ -151,6 +168,10 @@ fn clear_assignment(t: &mut Ticket) {
     t.assignee_agent_id = None;
     t.queue_position = None;
     t.issue = None;
+    // Back to the backlog = a fresh start for review too (plan5 C.9).
+    t.review_round = 0;
+    t.escalated = false;
+    t.reviewer_agent_id = None;
 }
 
 #[cfg(test)]
@@ -468,5 +489,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.assignee_agent_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn reject_counts_rounds_and_backlog_resets() {
+        let mut t = in_state(S::Review);
+        t.reviewer_agent_id = Some("rev".into());
+        t.escalated = true;
+        let r = transition_noted(
+            &t,
+            &TicketEvent::Reject {
+                note: " mangler test ".into(),
+            },
+            TicketActor::Agent,
+            Some("afvist af bot".into()),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.review_round, r.escalated, r.reviewer_agent_id.clone()),
+            (1, false, None)
+        );
+        assert_eq!(r.rejection_note.as_deref(), Some("mangler test"));
+        assert_eq!(
+            r.history.last().unwrap().note.as_deref(),
+            Some("afvist af bot: mangler test")
+        );
+        let r2 = transition(&r, &TicketEvent::Requeue, TicketActor::System, 3).unwrap();
+        assert_eq!(r2.review_round, 1, "requeue keeps the round");
+        let b = transition(
+            &r2,
+            &TicketEvent::ToBacklog { note: None },
+            TicketActor::User,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (b.review_round, b.escalated, b.reviewer_agent_id),
+            (0, false, None)
+        );
+
+        // Approve keeps the reviewer (display) and settles an escalation.
+        let mut t = in_state(S::Review);
+        t.reviewer_agent_id = Some("rev".into());
+        t.escalated = true;
+        t.review_round = 3;
+        let a = transition(&t, &TicketEvent::Approve, TicketActor::User, 5).unwrap();
+        assert_eq!(
+            (a.review_round, a.escalated, a.reviewer_agent_id.as_deref()),
+            (3, false, Some("rev"))
+        );
+        // Entering review again starts without a reviewer.
+        let mut p = in_state(S::InProgress);
+        p.reviewer_agent_id = Some("old".into());
+        p.review_round = 2;
+        let s = transition(&p, &TicketEvent::Submit, TicketActor::Agent, 6).unwrap();
+        assert_eq!(
+            (s.state, s.reviewer_agent_id, s.review_round),
+            (S::Review, None, 2)
+        );
     }
 }

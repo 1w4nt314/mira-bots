@@ -1,5 +1,6 @@
-//! One pipe connection = one hook invocation: read one frame, update status, emit events and,
-//! for PermissionRequest, answer with one decision line.
+//! One pipe connection = one frame. A hook frame: update status, emit events and, for
+//! PermissionRequest, answer with one decision line. A tool frame (mira-mcp, step 4): run the
+//! injected [`ToolHandler`] and answer with one `tool_result` line; nothing else happens.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -7,17 +8,19 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use super::protocol;
+use super::protocol::{self, FrameError, Incoming, ToolFrame, ToolResult};
 use crate::agent::{now_ms, AgentManager};
-use crate::config::{MAX_PIPE_LINE, PERMISSION_APP_DEADLINE};
-use crate::diagnostics::{HookStats, LastHookEvent};
+use crate::config::{MAX_PIPE_LINE, PERMISSION_APP_DEADLINE, STATUSLINE_EVENT};
+use crate::diagnostics::{HookStats, LastHookEvent, LastToolCall};
 use crate::events::{
     HookEventPayload, PermissionResolvedPayload, StatusEvent, AGENTS_CHANGED, HOOK_EVENT,
     PERMISSION_REQUEST, PERMISSION_RESOLVED,
 };
 use crate::hooks::event::{self, summarize_tool_input, HookEvent};
 use crate::hooks::status::{self, status_for_tool, AgentStatus};
-use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
+use crate::permissions::{
+    auto_allows_own_tool, Decision, PendingPermissions, PermissionRequestInfo,
+};
 
 pub use crate::events::EmitFn;
 
@@ -25,6 +28,18 @@ pub use crate::events::EmitFn;
 /// glue forwards it to the ticket dispatcher; the handler knows nothing about tickets). Called
 /// without any lock held; must not block.
 pub type StatusObserver = Arc<dyn Fn(StatusEvent) + Send + Sync>;
+
+/// Answers a tool frame from mira-mcp (the app glue binds it to `tickets::tools`; the handler
+/// knows nothing about tickets). Called on tokio's blocking pool (`spawn_blocking`), never on the
+/// connection's task: `mira_spawn_agent` creates folders, writes files and starts a process, and
+/// that must not stall the hook frames of other agents. Must answer with the frame's `request_id`.
+pub type ToolHandler = Arc<dyn Fn(ToolFrame) -> ToolResult + Send + Sync>;
+
+/// Answer when no [`ToolHandler`] is installed.
+pub const TOOLS_UNAVAILABLE: &str = "Værktøjer er ikke tilgængelige i appen";
+
+/// Answer when the [`ToolHandler`] panicked (the blocking task failed).
+pub const TOOL_FAILED: &str = "Værktøjet fejlede i appen";
 
 #[derive(Clone)]
 pub struct HandlerCtx {
@@ -35,6 +50,8 @@ pub struct HandlerCtx {
     pub stats: Arc<HookStats>,
     /// See [`StatusObserver`]; `None` in tests that do not care.
     pub observer: Option<StatusObserver>,
+    /// See [`ToolHandler`]; `None` answers every tool frame with [`TOOLS_UNAVAILABLE`].
+    pub tools: Option<ToolHandler>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -122,6 +139,20 @@ async fn write_reply<W: AsyncWrite + Unpin>(w: &mut W, decision: Decision) {
     }
 }
 
+/// Writes the `tool_result` line and shuts down the write half.
+async fn write_tool_result<W: AsyncWrite + Unpin>(w: &mut W, result: &ToolResult) {
+    let line = protocol::render_tool_result(result);
+    let res = async {
+        w.write_all(line.as_bytes()).await?;
+        w.flush().await?;
+        w.shutdown().await
+    }
+    .await;
+    if let Err(e) = res {
+        log::debug!("pipe tool_result {} not delivered: {e}", result.request_id);
+    }
+}
+
 /// Reads (and discards) until the client closes its end, for at most [`REPLY_DRAIN_TIMEOUT`].
 /// The hook exe closes right after reading the reply line, so EOF here means it got the line;
 /// only then is the server end dropped (Windows may discard unread bytes on `CloseHandle`).
@@ -159,13 +190,25 @@ where
     let Some(line) = read_frame_line(&mut reader).await else {
         return;
     };
-    let (hint, ev) = match protocol::parse_frame(&line)
-        .map_err(|e| e.to_string())
-        .and_then(|f| {
-            event::parse(&f.event)
-                .map(|ev| (f.agent_id, ev))
-                .map_err(|e| format!("invalid hook event: {e}"))
-        }) {
+    let hook = match protocol::parse_frame(&line) {
+        Ok(Incoming::Hook(f)) => f,
+        Ok(Incoming::Tool(f)) => {
+            handle_tool_frame(f, &ctx, reader.into_inner()).await;
+            return;
+        }
+        Err(FrameError::Kind(kind)) => {
+            log::debug!("pipe: ignoring frame of kind {kind:?}; closing");
+            return;
+        }
+        Err(e) => {
+            log::warn!("pipe: {e}");
+            return;
+        }
+    };
+    let (hint, ev) = match event::parse(&hook.event)
+        .map(|ev| (hook.agent_id, ev))
+        .map_err(|e| format!("invalid hook event: {e}"))
+    {
         Ok(v) => v,
         Err(e) => {
             log::warn!("pipe: {e}");
@@ -174,32 +217,67 @@ where
     };
     let mut stream = reader.into_inner();
     let is_permission = ev.hook_event_name == "PermissionRequest";
+    let is_statusline = ev.hook_event_name == STATUSLINE_EVENT;
+    // Live model/effort (plan5 A.4): no status change, no dispatcher message, and not the
+    // agent's "first hook event" (the Starting hint stays).
+    let is_live = is_statusline || ev.hook_event_name == "PostModelSwitch";
 
-    // One lock: match (and possibly rebind) plus clearing the Starting hint. No emit under it.
+    // A turn of the session: its transcript exists, so a restart may `--resume` it (review5 N1).
+    let is_turn = matches!(ev.hook_event_name.as_str(), "UserPromptSubmit" | "Stop");
+
+    // One lock: match (and possibly rebind), clearing the Starting hint and noting a turn. No
+    // emit under it.
     let (found, hint_cleared) = {
         let mut m = lock(&ctx.manager);
         let found = m.match_frame(hint.as_deref(), &ev.session_id);
-        let cleared = found
-            .as_ref()
-            .is_some_and(|f| m.clear_starting_hint(&f.agent_id));
+        let cleared = !is_live
+            && found
+                .as_ref()
+                .is_some_and(|f| m.clear_starting_hint(&f.agent_id));
+        if let (Some(f), true) = (&found, is_turn) {
+            m.mark_conversation(&f.agent_id);
+        }
         (found, cleared)
     };
-    ctx.stats.record(
-        LastHookEvent {
-            name: ev.hook_event_name.clone(),
-            session_id: ev.session_id.clone(),
-            agent_id: hint.clone(),
-            at: now_ms(),
-        },
-        found.is_some(),
-    );
+    if is_statusline {
+        ctx.stats.count_only(found.is_some());
+    } else {
+        ctx.stats.record(
+            LastHookEvent {
+                name: ev.hook_event_name.clone(),
+                session_id: ev.session_id.clone(),
+                agent_id: hint.clone(),
+                at: now_ms(),
+            },
+            found.is_some(),
+        );
+    }
     log::debug!(
         "hook {} session={} agent_hint={hint:?} -> {found:?}",
         ev.hook_event_name,
         ev.session_id
     );
     let agent_id = found.as_ref().map(|f| f.agent_id.clone());
-    if let Some(f) = &found {
+    if let (Some(f), true) = (&found, is_live) {
+        if f.rebound {
+            log::info!("agent {} rebound to session {}", f.agent_id, ev.session_id);
+        }
+        let changed =
+            lock(&ctx.manager).set_live_model_effort(&f.agent_id, ev.model_id(), ev.effort_level());
+        if changed {
+            log::debug!(
+                "agent {} model={:?} effort={:?} ({})",
+                f.agent_id,
+                ev.model_id(),
+                ev.effort_level(),
+                ev.hook_event_name
+            );
+        }
+        // agents-changed only when something the UI shows changed.
+        if changed || f.rebound {
+            ctx.emit_agents();
+        }
+    } else if let Some(f) = &found {
         if f.rebound {
             log::info!("agent {} rebound to session {}", f.agent_id, ev.session_id);
         }
@@ -227,16 +305,19 @@ where
             });
         }
     }
-    ctx.emit(
-        HOOK_EVENT,
-        &HookEventPayload {
-            agent_id: agent_id.clone(),
-            session_id: ev.session_id.clone(),
-            hook_event_name: ev.hook_event_name.clone(),
-            tool_name: ev.tool_name.clone(),
-            received_at: now_ms(),
-        },
-    );
+    // The debug feed leaves StatusLine out (several frames a second).
+    if !is_statusline {
+        ctx.emit(
+            HOOK_EVENT,
+            &HookEventPayload {
+                agent_id: agent_id.clone(),
+                session_id: ev.session_id.clone(),
+                hook_event_name: ev.hook_event_name.clone(),
+                tool_name: ev.tool_name.clone(),
+                received_at: now_ms(),
+            },
+        );
+    }
 
     if !is_permission {
         return;
@@ -256,8 +337,57 @@ where
     drain_until_closed(&mut stream).await;
 }
 
-/// Whitelist → allow now; UI not ready → none now; otherwise wait for the UI up to
-/// `PERMISSION_APP_DEADLINE` (108 s), then none.
+/// A tool frame: ask the [`ToolHandler`], record the call, write one `tool_result` line and wait
+/// for mira-mcp to close (it does so right after reading the line). No `hook-event`, no status
+/// change, no observer call. Arguments and results are never logged.
+async fn handle_tool_frame<S>(frame: ToolFrame, ctx: &HandlerCtx, mut stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let tool = frame.tool.clone();
+    let agent_id = frame.agent_id.clone();
+    let request_id = frame.request_id.clone();
+    let mut result = match &ctx.tools {
+        // Off the async worker: a slow tool (spawn) must not hold up other connections. The
+        // handler takes only std locks inside the closure; nothing is held across this await.
+        Some(handle) => {
+            let handle = Arc::clone(handle);
+            match tokio::task::spawn_blocking(move || handle(frame)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("tool {tool}: handler failed: {e}");
+                    ToolResult {
+                        request_id: request_id.clone(),
+                        outcome: Err(TOOL_FAILED.to_string()),
+                    }
+                }
+            }
+        }
+        None => ToolResult {
+            request_id: request_id.clone(),
+            outcome: Err(TOOLS_UNAVAILABLE.to_string()),
+        },
+    };
+    // The reply must carry the frame's id, whatever the handler did.
+    result.request_id = request_id;
+    let ok = result.outcome.is_ok();
+    ctx.stats.record_tool(LastToolCall {
+        tool: tool.clone(),
+        agent_id: agent_id.clone(),
+        ok,
+        at: now_ms(),
+    });
+    log::info!(
+        "tool {tool} agent={agent_id:?} -> {}",
+        if ok { "ok" } else { "error" }
+    );
+    write_tool_result(&mut stream, &result).await;
+    // TODO(windows-verify): mira-mcp gets the line before the server end is dropped (plan4 D.45).
+    drain_until_closed(&mut stream).await;
+}
+
+/// The app's own MCP tools ([`auto_allows_own_tool`]) or whitelist → allow now; UI not ready →
+/// none now; otherwise wait for the UI up to `PERMISSION_APP_DEADLINE` (108 s), then none.
 ///
 /// While waiting, `client` is read so a hook exe that goes away (EOF or error) is noticed: the
 /// request is then resolved as `none`, `permission-resolved{none}` is emitted and `None` is
@@ -272,6 +402,13 @@ async fn decide_permission<C: AsyncRead + Unpin>(
 ) -> Option<Decision> {
     let tool_name = ev.tool_name.clone().unwrap_or_default();
     let summary = summarize_tool_input(&tool_name, ev.tool_input.as_ref());
+
+    // Normally settings.json's `permissions.allow` means no PermissionRequest for these at all.
+    if auto_allows_own_tool(&tool_name, ev.mcp_server_source.as_deref()) {
+        log::info!("permission: {tool_name} auto-allowed (own MCP tool)");
+        apply_decision_status(ctx, agent_id, &tool_name, &summary, Decision::Allow);
+        return Some(Decision::Allow);
+    }
 
     let (whitelisted, agent_name) = {
         let m = lock(&ctx.manager);
@@ -395,6 +532,7 @@ mod tests {
                 }),
                 stats: Arc::new(HookStats::default()),
                 observer: None,
+                tools: None,
             },
             events,
             agent,
@@ -475,6 +613,92 @@ mod tests {
         assert_eq!(hook[0]["toolName"], "Edit");
     }
 
+    const STATUSLINE: &str = r#"{"hook_event_name":"StatusLine","session_id":"sess-1","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"effort":{"level":"high"}}"#;
+
+    /// Observer that records the events it is told about.
+    fn observe(h: &mut Harness) -> Arc<Mutex<Vec<StatusEvent>>> {
+        let seen: Arc<Mutex<Vec<StatusEvent>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        h.ctx.observer = Some(Arc::new(move |ev| s.lock().unwrap().push(ev)));
+        seen
+    }
+
+    #[tokio::test]
+    async fn statusline_frame_updates_model_and_effort_once() {
+        let mut h = harness(true);
+        let seen = observe(&mut h);
+        h.ctx
+            .manager
+            .lock()
+            .unwrap()
+            .set_status(&h.agent, AgentStatus::Idle, None)
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(round_trip(&h, &frame(STATUSLINE)).await, "");
+        }
+        let lists = h.emitted(AGENTS_CHANGED);
+        assert_eq!(lists.len(), 1, "two equal frames, one emit");
+        assert_eq!(lists[0][0]["model"], "claude-opus-5-5");
+        assert_eq!(lists[0][0]["effort"], "high");
+        assert_eq!(lists[0][0]["modelObserved"], true);
+        assert_eq!(h.status(), AgentStatus::Idle, "no status change");
+        assert!(seen.lock().unwrap().is_empty(), "no dispatcher message");
+        assert!(h.emitted(HOOK_EVENT).is_empty(), "not in the debug feed");
+        assert_eq!(h.ctx.stats.received(), 2);
+        assert_eq!(h.ctx.stats.last_event(), None, "does not drown Diagnostics");
+        // A changed effort (mid-session /effort) is emitted again.
+        let changed = STATUSLINE.replace("\"high\"", "\"xhigh\"");
+        round_trip(&h, &frame(&changed)).await;
+        let lists = h.emitted(AGENTS_CHANGED);
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[1][0]["effort"], "xhigh");
+    }
+
+    #[tokio::test]
+    async fn post_model_switch_updates_model() {
+        let mut h = harness(true);
+        let seen = observe(&mut h);
+        let ev = r#"{"hook_event_name":"PostModelSwitch","session_id":"sess-1","from_model":"claude-haiku-4-5-20251001","to_model":"claude-sonnet-5-5","requested_model":"sonnet","source":"resume"}"#;
+        round_trip(&h, &frame_with_agent(ev, &h.agent)).await;
+        let a = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(
+            (a.model.as_deref(), a.effort.as_deref(), a.model_observed),
+            (Some("claude-sonnet-5-5"), None, true)
+        );
+        assert_eq!(h.emitted(AGENTS_CHANGED).len(), 1);
+        assert!(seen.lock().unwrap().is_empty());
+        // It is an ordinary hook event otherwise: in the feed and the Diagnostics row.
+        assert_eq!(h.emitted(HOOK_EVENT).len(), 1);
+        assert_eq!(h.ctx.stats.last_event().unwrap().name, "PostModelSwitch");
+        // Unknown session: nothing changes.
+        let other = ev.replace("sess-1", "sess-x");
+        round_trip(&h, &frame(&other)).await;
+        assert_eq!(h.emitted(AGENTS_CHANGED).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn statusline_does_not_clear_starting_hint() {
+        let h = harness(true);
+        {
+            let mut m = h.ctx.manager.lock().unwrap();
+            m.backdate(&h.agent, 20_000);
+            assert!(m.apply_starting_hint(&h.agent, now_ms()).is_some());
+        }
+        round_trip(&h, &frame(STATUSLINE)).await;
+        let a = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!(a.status, AgentStatus::Starting);
+        assert_eq!(
+            a.detail.as_deref(),
+            Some(crate::config::STARTING_HINT_TEXT),
+            "the trust dialog may still be open"
+        );
+        assert_eq!(a.model.as_deref(), Some("claude-opus-5-5"));
+        // The first real hook event still clears it.
+        round_trip(&h, &frame(fx::SESSION_START)).await;
+        let a = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap();
+        assert_eq!((a.status, a.detail), (AgentStatus::Idle, None));
+    }
+
     #[tokio::test]
     async fn b_whitelisted_tool_is_allowed_immediately() {
         let h = harness(false);
@@ -489,6 +713,50 @@ mod tests {
         assert_eq!(h.status(), AgentStatus::Running);
         assert!(h.emitted(PERMISSION_REQUEST).is_empty());
         assert!(h.ctx.pending.lock().unwrap().list().is_empty());
+    }
+
+    fn own_tool_permission(source: Option<&str>) -> String {
+        let mut ev = json!({"session_id":"sess-1","hook_event_name":"PermissionRequest",
+                            "tool_name":"mcp__mira-bots__mira_submit_for_review",
+                            "tool_input":{"summary":"hemmelig"}});
+        if let Some(s) = source {
+            ev["mcp_server"] = json!({"name":"mira-bots","source":s});
+        }
+        format!("{}\n", json!({"v":1,"kind":"hook","event":ev}))
+    }
+
+    #[tokio::test]
+    async fn b2_own_mcp_tool_from_the_dynamic_server_is_allowed_without_ui() {
+        for source in [Some("dynamic"), None] {
+            let h = harness(true);
+            let out = round_trip(&h, &own_tool_permission(source)).await;
+            assert_eq!(reply_decision(&out), "allow", "source {source:?}");
+            assert_eq!(h.status(), AgentStatus::Thinking);
+            let detail = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap().detail;
+            assert_eq!(detail.as_deref(), Some("Afleverer til review"));
+            assert!(h.emitted(PERMISSION_REQUEST).is_empty());
+            assert!(h.ctx.pending.lock().unwrap().list().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn b3_same_name_from_a_user_server_is_not_auto_allowed() {
+        let h = harness(false);
+        let out = round_trip(&h, &own_tool_permission(Some("user"))).await;
+        assert_eq!(reply_decision(&out), "none");
+        assert_eq!(h.status(), AgentStatus::WaitingPermission);
+
+        let h = harness(true);
+        let (mut client, task) = h.start();
+        client
+            .write_all(own_tool_permission(Some("user")).as_bytes())
+            .await
+            .unwrap();
+        let req = wait_for_request(&h).await;
+        assert_eq!(req["toolName"], "mcp__mira-bots__mira_submit_for_review");
+        assert_eq!(req["summary"], "Afleverer til review");
+        drop(client);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -642,7 +910,7 @@ mod tests {
             .unwrap()
             .whitelist_add(&h.agent, "Bash")
             .unwrap();
-        let mut p = mira_hook::payload::parse(fx::PERMISSION_REQUEST).unwrap();
+        let mut p = mira_hook::payload::parse(fx::PERMISSION_REQUEST, None).unwrap();
         mira_hook::payload::trim(&mut p.json);
         let out = round_trip(&h, &mira_hook::payload::to_frame(&p, None)).await;
         let d = mira_hook::decision::parse_reply(&out);
@@ -882,5 +1150,208 @@ mod tests {
         let ev = fx::STOP.replace("sess-1", "someone-else");
         round_trip(&h, &frame(&ev)).await;
         assert!(take().is_empty());
+    }
+
+    fn tool_frame(request_id: &str, tool: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"v":1,"kind":"tool","agent_id":"agent-x","request_id":request_id,"tool":tool,"args":{"filter":"mine"}})
+        )
+    }
+
+    fn tool_reply(out: &str) -> Value {
+        assert!(out.ends_with('\n'), "reply must be one line: {out:?}");
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+        let v: Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(
+            (v["v"].clone(), v["kind"].clone()),
+            (json!(1), json!("tool_result"))
+        );
+        v
+    }
+
+    #[tokio::test]
+    async fn tool_frame_is_answered_by_the_injected_handler() {
+        let mut h = harness(true);
+        let seen: Arc<Mutex<Vec<ToolFrame>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        h.ctx.tools = Some(Arc::new(move |f: ToolFrame| {
+            sink.lock().unwrap().push(f.clone());
+            ToolResult {
+                request_id: f.request_id,
+                outcome: Ok(json!({"filter":"mine","tickets":[]})),
+            }
+        }));
+        let observed: Arc<Mutex<usize>> = Arc::default();
+        let n = Arc::clone(&observed);
+        h.ctx.observer = Some(Arc::new(move |_| *n.lock().unwrap() += 1));
+        let before = h.status();
+
+        let out = round_trip(&h, &tool_frame("77-1", "mira_list_tickets")).await;
+        let v = tool_reply(&out);
+        assert_eq!(v["request_id"], "77-1");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"], json!({"filter":"mine","tickets":[]}));
+
+        let frames = seen.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].agent_id.as_deref(), Some("agent-x"));
+        assert_eq!(frames[0].tool, "mira_list_tickets");
+        assert_eq!(frames[0].args, json!({"filter":"mine"}));
+
+        assert_eq!(
+            (h.ctx.stats.tool_calls(), h.ctx.stats.tool_errors()),
+            (1, 0)
+        );
+        let last = h.ctx.stats.last_tool_call().unwrap();
+        assert_eq!(
+            (last.tool.as_str(), last.agent_id.as_deref(), last.ok),
+            ("mira_list_tickets", Some("agent-x"), true)
+        );
+        // Not a hook frame: no events, no status change, no observer, no hook counters.
+        assert!(h.events.lock().unwrap().is_empty());
+        assert_eq!(h.status(), before);
+        assert_eq!(*observed.lock().unwrap(), 0);
+        assert_eq!(h.ctx.stats.received(), 0);
+    }
+
+    /// review5 N1: only UserPromptSubmit/Stop mark the session as having a conversation.
+    #[tokio::test]
+    async fn prompt_or_stop_marks_a_conversation() {
+        let h = harness(true);
+        let has = |h: &Harness| h.ctx.manager.lock().unwrap().has_conversation(&h.agent);
+        round_trip(&h, &frame(fx::PRE_TOOL_USE)).await;
+        round_trip(&h, &frame(STATUSLINE)).await;
+        assert!(!has(&h));
+        round_trip(&h, &frame(fx::USER_PROMPT_SUBMIT)).await;
+        assert!(has(&h));
+        let h = harness(true);
+        round_trip(&h, &frame(fx::STOP)).await;
+        assert!(has(&h));
+    }
+
+    /// A slow tool (`mira_spawn_agent`) runs on the blocking pool: on this single-threaded test
+    /// runtime a hook frame of another agent is handled while the tool handler still blocks.
+    #[tokio::test]
+    async fn a_slow_tool_does_not_block_hook_frames() {
+        let mut h = harness(true);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        h.ctx.tools = Some(Arc::new(move |f: ToolFrame| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            // Blocks until the hook frame below was handled (or gives up after 5 s).
+            let unblocked = go_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+            ToolResult {
+                request_id: f.request_id,
+                outcome: Ok(json!({ "unblocked": unblocked })),
+            }
+        }));
+
+        let (mut tool_client, tool_task) = h.start();
+        tool_client
+            .write_all(tool_frame("9-1", "mira_spawn_agent").as_bytes())
+            .await
+            .unwrap();
+        // The tool handler is running (and blocking) now.
+        entered_rx.await.unwrap();
+
+        // Meanwhile a hook frame is handled completely.
+        round_trip(&h, &frame(fx::PRE_TOOL_USE)).await;
+        assert_eq!(h.status(), AgentStatus::Editing);
+        go_tx.send(()).unwrap();
+
+        let mut out = String::new();
+        tool_client.read_to_string(&mut out).await.unwrap();
+        drop(tool_client);
+        tool_task.await.unwrap();
+        let v = tool_reply(&out);
+        assert_eq!(
+            (v["request_id"].clone(), v["result"].clone()),
+            (json!("9-1"), json!({"unblocked": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_error_and_missing_handler_answer_ok_false() {
+        let mut h = harness(true);
+        let out = round_trip(&h, &tool_frame("1-1", "mira_get_ticket")).await;
+        let v = tool_reply(&out);
+        assert_eq!(
+            v,
+            json!({"v":1,"kind":"tool_result","request_id":"1-1","ok":false,"error":TOOLS_UNAVAILABLE})
+        );
+        assert_eq!(
+            (h.ctx.stats.tool_calls(), h.ctx.stats.tool_errors()),
+            (1, 1)
+        );
+
+        // A handler error; a wrong request_id from the handler is corrected.
+        h.ctx.tools = Some(Arc::new(|_f: ToolFrame| ToolResult {
+            request_id: "other".into(),
+            outcome: Err("Ukendt agent".into()),
+        }));
+        let v = tool_reply(&round_trip(&h, &tool_frame("1-2", "mira_get_ticket")).await);
+        assert_eq!(v["request_id"], "1-2");
+        assert_eq!(
+            (v["ok"].clone(), v["error"].clone()),
+            (json!(false), json!("Ukendt agent"))
+        );
+        assert_eq!(
+            (h.ctx.stats.tool_calls(), h.ctx.stats.tool_errors()),
+            (2, 2)
+        );
+        assert!(h.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_kind_and_bad_tool_frames_close_without_reply() {
+        let mut h = harness(true);
+        let called: Arc<Mutex<usize>> = Arc::default();
+        let n = Arc::clone(&called);
+        h.ctx.tools = Some(Arc::new(move |f: ToolFrame| {
+            *n.lock().unwrap() += 1;
+            ToolResult {
+                request_id: f.request_id,
+                outcome: Ok(json!({})),
+            }
+        }));
+        for line in [
+            "{\"v\":1,\"kind\":\"something\",\"x\":1}\n",
+            "{\"v\":1,\"kind\":\"tool\",\"tool\":\"mira_list_tickets\"}\n",
+            "{\"v\":2,\"kind\":\"tool\",\"request_id\":\"r\",\"tool\":\"x\"}\n",
+        ] {
+            assert_eq!(round_trip(&h, line).await, "", "{line}");
+        }
+        assert_eq!(*called.lock().unwrap(), 0);
+        assert_eq!((h.ctx.stats.tool_calls(), h.ctx.stats.received()), (0, 0));
+        assert!(h.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_reply_waits_for_client_close_at_most_2_s() {
+        let h = harness(true);
+        let (mut client, task) = h.start();
+        client
+            .write_all(tool_frame("9-9", "mira_list_tickets").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(tool_reply(&line)["request_id"], "9-9");
+        let t0 = tokio::time::Instant::now();
+        task.await.unwrap();
+        assert!(t0.elapsed() >= REPLY_DRAIN_TIMEOUT);
+        drop(client);
     }
 }

@@ -5,7 +5,16 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn run_bin(input: &str, pipe: Option<&str>) -> (Option<i32>, Vec<u8>, Duration) {
+    run_bin_args(input, pipe, &[])
+}
+
+fn run_bin_args(
+    input: &str,
+    pipe: Option<&str>,
+    args: &[&str],
+) -> (Option<i32>, Vec<u8>, Duration) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mira-hook"));
+    cmd.args(args);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -55,4 +64,18 @@ fn garbage_stdin_exits_zero_silently() {
     let (code, stdout, _) = run_bin("{{{", Some("whatever"));
     assert_eq!(code, Some(0));
     assert!(stdout.is_empty());
+}
+
+/// The profiles' statusLine command (no args, JSON without `hook_event_name`): exit 0, empty
+/// stdout, quickly, also when the app is not reachable.
+#[test]
+fn statusline_payload_exits_zero_silently() {
+    let nope = std::env::temp_dir().join("mira-bots-nope-statusline.sock");
+    let input = r#"{"session_id":"x","model":{"id":"claude-opus-5-5"},"effort":{"level":"high"}}"#;
+    for args in [&[][..], &["StatusLine"][..]] {
+        let (code, stdout, took) = run_bin_args(input, nope.to_str(), args);
+        assert_eq!(code, Some(0));
+        assert!(stdout.is_empty());
+        assert!(took < Duration::from_millis(2500));
+    }
 }

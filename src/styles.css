@@ -36,6 +36,55 @@
   --term-bright-magenta: #a350c9;
   --term-bright-cyan: #26929a;
   --term-bright-white: #8c959f;
+
+  /* office (step 5b) */
+  --floor: #eceef1;
+  --floor-line: rgba(29, 33, 39, 0.05);
+  --wall: #e3e6eb;
+  --window: #f7f9fc;
+  --desk-hi: #ead9bb;
+  --desk-lo: #d8c4a1;
+  --desk-edge: #c4ad87;
+  --desk-edge2: #ad9670;
+  --apron: #eee2cc;
+  --apron2: #d4c19f;
+  --leg: #8f939b;
+  --chair: #b6bdc8;
+  --chair2: #99a2b0;
+  --mug: #f6f3ec;
+  --mug2: #d8d2c6;
+  --scr-idle: #4b5a6b;
+  --scr-work: #3f7fe6;
+  --scr-wait: #d9a21b;
+  --scr-done: #2f9e5a;
+  --screen-bezel: #0b1520;
+  --screen-rim: #2b4257;
+  --lap: #243649;
+  --lap2: #1a2a3a;
+  --glass: rgba(47, 111, 223, 0.05);
+  --glass-edge: #c6d2e6;
+  --cork: #f1e8d7;
+  --cork-dot: rgba(120, 90, 40, 0.12);
+  --dshadow: rgba(20, 25, 35, 0.28);
+  --cup: #8a94a0;
+  --paper: #ffffff;
+  --paper2: #e9ebee;
+  --pot: #c47a52;
+  --leaf: #5a9e6f;
+  --lampc: rgba(255, 214, 120, 0.45);
+  --cab: #a6aeb8;
+  --cab2: #8d95a0;
+  --cab3: #c0c6ce;
+  --bin: #9aa3ad;
+  --cooler: #e9ecef;
+  --cooler2: #cfd4da;
+  --water: #9fd0ea;
+  --board: #fdfdfd;
+  --frame: #6b5a44;
+  /* derived from --accent / --glass-edge, so they follow the theme automatically */
+  --accent-12: color-mix(in srgb, var(--accent) 12%, transparent);
+  --accent-14: color-mix(in srgb, var(--accent) 14%, transparent);
+  --glass-edge-55: color-mix(in srgb, var(--glass-edge) 55%, transparent);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -71,6 +120,51 @@
     --term-bright-magenta: #d69be6;
     --term-bright-cyan: #7dcdd3;
     --term-bright-white: #eef0f2;
+
+    /* office (step 5b) */
+    --floor: #191c21;
+    --floor-line: rgba(227, 229, 232, 0.05);
+    --wall: #1f2329;
+    --window: #262b33;
+    --desk-hi: #4e4233;
+    --desk-lo: #3f3528;
+    --desk-edge: #2f2820;
+    --desk-edge2: #241e17;
+    --apron: #3b3227;
+    --apron2: #2c251d;
+    --leg: #5b606a;
+    --chair: #3a4049;
+    --chair2: #2e333b;
+    --mug: #d9d4ca;
+    --mug2: #b7b1a6;
+    --scr-idle: #3a4552;
+    --scr-work: #5b8def;
+    --scr-wait: #e0b25a;
+    --scr-done: #5cc98a;
+    --screen-bezel: #0b1520;
+    --screen-rim: #34506a;
+    --lap: #2a3f55;
+    --lap2: #1e3043;
+    --glass: rgba(91, 141, 239, 0.07);
+    --glass-edge: #2f3a4d;
+    --cork: #26221b;
+    --cork-dot: rgba(240, 231, 194, 0.07);
+    --dshadow: rgba(0, 0, 0, 0.55);
+    --cup: #5c6670;
+    --paper: #d9dce0;
+    --paper2: #b9bec6;
+    --pot: #a8623f;
+    --leaf: #4f8e62;
+    --lampc: rgba(255, 214, 120, 0.35);
+    --cab: #4a525c;
+    --cab2: #3b424b;
+    --cab3: #5a626d;
+    --bin: #4a525c;
+    --cooler: #3a4049;
+    --cooler2: #2e343c;
+    --water: #6fb0d0;
+    --board: #c9cdd3;
+    --frame: #8a7557;
   }
 }
 
@@ -97,4 +191,310 @@ html[data-window="workplace"] #root {
   color: var(--fg);
   height: 100%;
   overflow: hidden;
+}
+
+/* --- office (step 5b) ------------------------------------------------------------------------ */
+.office-floor {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background-color: var(--floor);
+  background-image:
+    repeating-linear-gradient(0deg, transparent 0 35px, var(--floor-line) 35px 36px),
+    repeating-linear-gradient(114deg, transparent 0 130px, var(--floor-line) 130px 131px);
+}
+/* Too low for both seat rows and the terminal: the terminal wins, the floor scrolls (W5). */
+.office-floor[data-cramped] {
+  overflow-y: auto;
+}
+.office-wall {
+  height: 36px;
+  flex: none;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-left: 36px;
+  background: var(--wall);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 6px 14px -8px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+.office-win {
+  position: relative;
+  width: 92px;
+  height: 24px;
+  border-radius: 3px;
+  background: var(--window);
+  border: 1px solid var(--border);
+}
+.office-win::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 48%, var(--border) 48% 52%, transparent 52%);
+}
+.office-wall svg {
+  height: 36px;
+  width: auto;
+}
+.office-seats {
+  padding: 10px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: none;
+}
+.office-staff {
+  position: relative;
+  border: 1px solid var(--glass-edge);
+  border-radius: 14px;
+  padding: 12px 8px 6px;
+  background: linear-gradient(160deg, var(--glass), transparent 70%);
+  box-shadow:
+    inset 0 5px 0 var(--glass-edge-55),
+    6px 8px 14px -10px var(--dshadow);
+}
+.office-staff::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 14px;
+  pointer-events: none;
+  background: linear-gradient(115deg, transparent 30%, rgba(255, 255, 255, 0.07) 38%, transparent 46%);
+}
+.office-sign {
+  position: absolute;
+  top: -9px;
+  left: 14px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--glass-edge);
+  border-radius: 4px;
+  padding: 1px 7px;
+}
+.office-row3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  width: 62%;
+  margin: 0 auto;
+}
+.office-row5 {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+.office-decor {
+  position: absolute;
+  bottom: 6px;
+  width: 17%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 10px;
+  pointer-events: none;
+}
+.office-decor svg {
+  height: calc(var(--desk-h) * 0.5);
+  width: auto;
+  overflow: visible;
+}
+.office-decor-left {
+  left: 10px;
+}
+.office-decor-right {
+  right: 10px;
+}
+/* the rest of a seat is Tailwind in Seat.tsx */
+.office-seat {
+  height: var(--desk-h);
+  text-align: center;
+}
+.office-seat[aria-pressed="true"]::before {
+  content: "";
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  top: 0;
+  height: 60%;
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 20%, var(--accent-12), transparent 70%);
+}
+.office-fig {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  margin-bottom: calc(var(--fig) * -0.36);
+  margin-right: 30%;
+}
+.office-desk {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  width: min(100%, calc(var(--desk-h) * 0.76));
+}
+.office-desk-empty {
+  opacity: 0.75;
+}
+.office-plate-wrap {
+  position: absolute;
+  left: 8.5%;
+  width: 68%;
+  top: 56%;
+  height: 28%;
+  display: grid;
+  align-content: center;
+  padding: 0 3px;
+}
+.office-plate {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg);
+}
+.office-status {
+  font-size: 9px;
+  line-height: 1.2;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.office-below {
+  width: 100%;
+  height: 24px;
+  display: grid;
+  justify-items: center;
+  align-content: start;
+  margin-top: -3px;
+}
+.office-ticketline {
+  max-width: 100%;
+  font-size: 9.5px;
+  line-height: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.office-plus {
+  position: absolute;
+  left: 50%;
+  top: 18%;
+  transform: translateX(-50%);
+  font-size: 26px;
+  line-height: 1;
+  z-index: 3;
+}
+.office-seat[data-state="work"] .office-ln {
+  animation: office-ln 1.2s ease-in-out infinite;
+}
+.office-seat[data-state="work"] .office-ln:nth-child(2) {
+  animation-delay: 0.25s;
+}
+.office-seat[data-state="work"] .office-ln:nth-child(3) {
+  animation-delay: 0.5s;
+}
+@keyframes office-ln {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+/* TODO(windows-verify): D.68 (Windows "Animation effects" off must stop the blinking screen lines) */
+@media (prefers-reduced-motion: reduce) {
+  .office-ln {
+    animation: none !important;
+  }
+}
+/* max mode: one narrow strip with all seats */
+.office-floor[data-term="max"] .office-seats {
+  flex-direction: row;
+  gap: 8px;
+  padding: 6px 12px;
+}
+.office-floor[data-term="max"] .office-staff {
+  flex: 3;
+  padding: 3px 6px;
+  background: none;
+  box-shadow: none;
+  border-color: transparent;
+}
+.office-floor[data-term="max"] .office-staff::before,
+.office-floor[data-term="max"] .office-sign {
+  display: none;
+}
+.office-floor[data-term="max"] .office-row3 {
+  width: 100%;
+  gap: 2px;
+}
+.office-floor[data-term="max"] .office-row5 {
+  flex: 5;
+  gap: 2px;
+}
+.office-floor[data-term="max"] .office-seat {
+  height: 46px;
+}
+/* terminal splitter */
+.office-splitter {
+  position: relative;
+}
+.office-splitter::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  width: 40px;
+  height: 3px;
+  border-radius: 2px;
+  transform: translateX(-50%);
+  background: var(--border);
+}
+.office-splitter:hover::after,
+.office-splitter[data-active="true"]::after {
+  background: var(--accent);
+}
+.office-splitter[aria-disabled="true"]::after {
+  display: none;
+}
+.office-ibtn-on {
+  border-color: var(--accent) !important;
+  color: var(--accent);
+  background: var(--accent-14);
+}
+/* cork board behind the ticket notes ("more" only) */
+[data-detail="more"] .office-cork {
+  background-color: var(--cork);
+  background-image: radial-gradient(var(--cork-dot) 1px, transparent 1.2px);
+  background-size: 7px 7px;
+}
+[data-detail="more"] .office-note {
+  position: relative;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.14);
+}
+[data-detail="more"] .office-note::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  transform: translateX(-50%);
+  background: #d9534f;
+  box-shadow:
+    inset -1px -1px 0 rgba(0, 0, 0, 0.3),
+    0 1px 1px rgba(0, 0, 0, 0.3);
 }

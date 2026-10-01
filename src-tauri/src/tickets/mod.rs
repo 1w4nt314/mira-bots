@@ -1,8 +1,9 @@
 //! Step 3: tickets, per-agent queues, review and the dispatcher that types tickets into idle
 //! agents' terminals.
 //!
-//! Dependency direction: `tickets` → `agent`, `hooks::status`, `events`, `config`. Nothing in
-//! `agent`, `pipe` or `hooks` knows `tickets`.
+//! Dependency direction: `tickets` → `agent`, `hooks::status`, `events`, `config` (and the
+//! tool-frame types of `pipe::protocol`, step 4). Nothing in `agent`, `pipe` or `hooks` knows
+//! `tickets`: the app glue hands the pipe handler a closure over [`tools::ToolsCtx`].
 //!
 //! This file holds the app glue (plan B.8): [`TicketsCtx`] (shared service + manager links +
 //! emits + the dispatcher's channel) and [`ManagerPort`] (the dispatcher's view of the agents).
@@ -13,9 +14,11 @@
 pub mod dispatcher;
 pub mod model;
 pub mod prompt;
+pub mod reports;
 pub mod service;
 pub mod state;
 pub mod store;
+pub mod tools;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -24,17 +27,29 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::agent::roles::Role;
 use crate::agent::{now_ms, AgentManager};
+use crate::config::{
+    MAX_REVIEW_ROUNDS, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS,
+    TURN_FAILED_TEXT,
+};
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
+use crate::hooks::status::AgentStatus;
 use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
-use model::TicketError;
-use service::{TicketLinks, TicketService};
+use model::{
+    ReportAuthor, Ticket, TicketActor, TicketError, TicketReport, TicketState, TicketSummary,
+};
+use prompt::{clean_body, one_line};
+use reports::ReportStore;
+use service::{ReviewCounts, TicketLinks, TicketService, REVIEWER_REMOVED_NOTE};
 use store::JsonFileStore;
 
 /// History note when an agent's process ended on its own.
 pub const AGENT_EXITED_NOTE: &str = "agent afsluttet";
 /// History note when the user stopped or removed the agent.
 pub const AGENT_STOPPED_NOTE: &str = "agent stoppet";
+/// History note when a turn ended without `mira_submit_for_review` (step 4).
+pub const NOT_SUBMITTED_NOTE: &str = "turn afsluttet uden aflevering";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -62,6 +77,37 @@ pub fn load_tickets(path: PathBuf, now: u64) -> (TicketService, Option<String>) 
     (service, warning)
 }
 
+/// A report's title and body checked and cleaned for [`TicketsCtx::add_report`]: title one line,
+/// 1–[`REPORT_TITLE_MAX_CHARS`]; body without controls, trimmed, 1–[`REPORT_BODY_MAX_CHARS`].
+pub fn validate_report(title: &str, body: &str) -> Result<(String, String), String> {
+    let title = one_line(title);
+    if title.is_empty() {
+        return Err("Titel må ikke være tom".into());
+    }
+    if title.chars().count() > REPORT_TITLE_MAX_CHARS {
+        return Err(format!(
+            "Titlen er for lang (maks {REPORT_TITLE_MAX_CHARS} tegn)"
+        ));
+    }
+    let body = clean_body(body).trim().to_string();
+    if body.is_empty() {
+        return Err("Rapporten må ikke være tom".into());
+    }
+    if body.chars().count() > REPORT_BODY_MAX_CHARS {
+        return Err(format!(
+            "Rapporten er for lang (maks {REPORT_BODY_MAX_CHARS} tegn)"
+        ));
+    }
+    Ok((title, body))
+}
+
+/// `get_report` result (C5.4 `ReportContent`).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReportContent {
+    pub report: TicketReport,
+    pub body: String,
+}
+
 /// Shared ticket state of the app (in `AppState`, the pipe glue and the dispatcher).
 pub struct TicketsCtx {
     pub service: Mutex<TicketService>,
@@ -69,6 +115,11 @@ pub struct TicketsCtx {
     /// The dispatcher task's inbox.
     pub dispatch_tx: UnboundedSender<DispatchMsg>,
     pub emit: EmitFn,
+    /// Report files under `<app_data>/tickets`.
+    pub reports: ReportStore,
+    /// Serialises report writes (sequence number → file → metadata). Taken before, never
+    /// inside, the service lock.
+    report_lock: Mutex<()>,
 }
 
 impl TicketsCtx {
@@ -77,12 +128,15 @@ impl TicketsCtx {
         manager: Arc<Mutex<AgentManager>>,
         dispatch_tx: UnboundedSender<DispatchMsg>,
         emit: EmitFn,
+        reports_root: PathBuf,
     ) -> Self {
         TicketsCtx {
             service: Mutex::new(service),
             manager,
             dispatch_tx,
             emit,
+            reports: ReportStore::new(reports_root),
+            report_lock: Mutex::new(()),
         }
     }
 
@@ -103,15 +157,15 @@ impl TicketsCtx {
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
         changed: impl FnOnce(&T) -> bool,
     ) -> Result<T, String> {
-        let (result, list, links) = {
+        let (result, list, links, reviews) = {
             let mut svc = lock(&self.service);
             let result = f(&mut svc).map_err(String::from)?;
             if !changed(&result) {
                 return Ok(result);
             }
-            (result, svc.list(), svc.links())
+            (result, svc.list(), svc.links(), svc.open_review_counts())
         };
-        let agents_changed = self.apply_links(&links);
+        let agents_changed = self.apply_links(&links, &reviews);
         emit_json(&self.emit, TICKETS_CHANGED, &list);
         if agents_changed {
             self.emit_agents();
@@ -124,23 +178,24 @@ impl TicketsCtx {
         f(&lock(&self.service))
     }
 
-    /// Writes the links into the manager (agents without tickets get `None`/0). Returns whether
-    /// any agent changed. Takes only the manager lock.
-    fn apply_links(&self, links: &TicketLinks) -> bool {
+    /// Writes the links into the manager (agents without tickets get `None`/0, without reviews
+    /// 0). Returns whether any agent changed. Takes only the manager lock.
+    fn apply_links(&self, links: &TicketLinks, reviews: &ReviewCounts) -> bool {
         let mut m = lock(&self.manager);
         let mut changed = false;
         for id in m.ids() {
             let (current, len) = links.get(&id).cloned().unwrap_or_default();
             changed |= m.set_ticket_link(&id, current, len);
+            changed |= m.set_review_link(&id, reviews.get(&id).copied().unwrap_or(0));
         }
         changed
     }
 
-    /// Re-syncs the agents' ticket links from the service (e.g. after a new agent appeared) and
-    /// emits `agents-changed` if anything changed. Returns whether it did.
+    /// Re-syncs the agents' ticket links and open review counts from the service (e.g. after a
+    /// new agent appeared) and emits `agents-changed` if anything changed. Returns whether it did.
     pub fn sync_links(&self) -> bool {
-        let links = self.read(TicketService::links);
-        let changed = self.apply_links(&links);
+        let (links, reviews) = self.read(|s| (s.links(), s.open_review_counts()));
+        let changed = self.apply_links(&links, &reviews);
         if changed {
             self.emit_agents();
         }
@@ -150,6 +205,39 @@ impl TicketsCtx {
     fn emit_agents(&self) {
         let list = lock(&self.manager).list();
         emit_json(&self.emit, AGENTS_CHANGED, &list);
+    }
+
+    /// Sets the agent's detail (no-op for the same text) and emits `agents-changed` after the
+    /// manager lock is released. `only_if`: change only while the current detail passes.
+    pub fn set_agent_detail(
+        &self,
+        agent_id: &str,
+        detail: Option<String>,
+        only_if: impl FnOnce(Option<&str>) -> bool,
+    ) {
+        let list = {
+            let mut m = lock(&self.manager);
+            let current = m.get(agent_id).and_then(|a| a.detail);
+            if current == detail || !only_if(current.as_deref()) {
+                return;
+            }
+            if !m.set_detail(agent_id, detail) {
+                return;
+            }
+            m.list()
+        };
+        emit_json(&self.emit, AGENTS_CHANGED, &list);
+    }
+
+    /// Clears the agent's detail when it is the "turn ended without submitting" or "turn failed"
+    /// hint ([`NOT_SUBMITTED_TEXT`]/[`TURN_FAILED_TEXT`]): used when its ticket leaves in-progress
+    /// (submit, manual move), so the hint does not outlive the ticket. Other texts stay.
+    pub fn clear_stale_detail(&self, agent_id: &str) {
+        self.set_agent_detail(
+            agent_id,
+            None,
+            |d| matches!(d, Some(d) if d == NOT_SUBMITTED_TEXT || d == TURN_FAILED_TEXT),
+        );
     }
 
     /// Tells the dispatcher that these agents' queues changed (each id once).
@@ -181,12 +269,30 @@ impl TicketsCtx {
     /// the backlog with `note`, and any delivery sequence for it is cancelled (`AgentGone`).
     // TODO(windows-verify): after Stop/Remove of an agent with a queue, all its tickets are in the
     // backlog with the note, no more input reaches its terminal and `queueLength` is 0 (plan D.37).
+    ///
+    /// As a reviewer it also loses its review assignments (the tickets stay in review with the
+    /// note "reviewer <note>") and the reviews are routed again (plan5 A.6).
+    // TODO(windows-verify): a reviewer stopped mid-review leaves the ticket in Review without a
+    // reviewer, and it is routed to another reviewer if one exists (plan5 D.56).
     pub fn release_agent(&self, agent_id: &str, note: &str) -> Result<usize, String> {
         let now = now_ms();
         let released = self.mutate_if(|s| s.release_agent(agent_id, note, now), |v| !v.is_empty());
         self.send(DispatchMsg::AgentGone {
             agent_id: agent_id.to_string(),
         });
+        let reviews = self.mutate_if(
+            |s| s.release_reviewer(agent_id, note, now),
+            |v| !v.is_empty(),
+        );
+        match &reviews {
+            Ok(ids) if !ids.is_empty() => log::info!(
+                "agent {agent_id}: {} review(s) without reviewer ({note})",
+                ids.len()
+            ),
+            Ok(_) => {}
+            Err(e) => log::warn!("agent {agent_id}: releasing its reviews failed: {e}"),
+        }
+        self.route_reviews();
         let released = released?;
         if !released.is_empty() {
             log::info!(
@@ -196,9 +302,197 @@ impl TicketsCtx {
         }
         Ok(released.len())
     }
+
+    // ---- review routing (plan5 A.6) ----
+
+    /// Gives every ticket in review without a reviewer (and not escalated) to a reviewer, or
+    /// escalates it when it reached [`MAX_REVIEW_ROUNDS`]. Candidates: live agents with the
+    /// reviewer role other than the sender; the one with the fewest open reviews wins (tie: the
+    /// oldest, then the id). No candidate: the ticket waits for the user as before. Idempotent;
+    /// called after every way into review and whenever reviewers come or go. Returns the number
+    /// of tickets routed.
+    // TODO(windows-verify): a coder submits → the review file is in the reviewer's
+    // .mira-bots\reviews\ and the line is typed when the reviewer is idle (plan5 D.54); three
+    // rejections give "Eskaleret" and no new review line (plan5 D.55).
+    pub fn route_reviews(&self) -> usize {
+        let pending = self.read(TicketService::unrouted_reviews);
+        if pending.is_empty() {
+            return 0;
+        }
+        let reviewers = lock(&self.manager).reviewers();
+        let mut routed = 0;
+        for t in pending {
+            let now = now_ms();
+            if t.review_round >= MAX_REVIEW_ROUNDS {
+                match self.mutate_if(|s| s.escalate(&t.id, now), Option::is_some) {
+                    Ok(Some(_)) => log::info!(
+                        "review: ticket {} escalated after {} rounds",
+                        t.short_id(),
+                        t.review_round
+                    ),
+                    Ok(None) => {}
+                    Err(e) => log::warn!("review: escalating {} failed: {e}", t.short_id()),
+                }
+                continue;
+            }
+            let counts = self.read(TicketService::open_review_counts);
+            let best = reviewers
+                .iter()
+                .filter(|r| t.assignee_agent_id.as_deref() != Some(r.id.as_str()))
+                .min_by(|a, b| {
+                    let load =
+                        |r: &crate::agent::AgentInfo| counts.get(&r.id).copied().unwrap_or(0);
+                    (load(a), a.created_at, &a.id).cmp(&(load(b), b.created_at, &b.id))
+                });
+            let Some(r) = best else {
+                log::info!(
+                    "review: no reviewer for ticket {}; waiting for the user",
+                    t.short_id()
+                );
+                continue;
+            };
+            match self.mutate_if(
+                |s| s.route_review(&t.id, &r.id, &r.name, now),
+                Option::is_some,
+            ) {
+                Ok(Some(_)) => {
+                    routed += 1;
+                    log::info!("review: ticket {} -> reviewer {}", t.short_id(), r.id);
+                    self.send(DispatchMsg::ReviewAssigned {
+                        reviewer_agent_id: r.id.clone(),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!("review: routing {} failed: {e}", t.short_id()),
+            }
+        }
+        routed
+    }
+
+    /// `assign_reviewer` (C5.4): the ticket must be in review. `Some(agent)`: a live agent with
+    /// the reviewer role other than the sender replaces any current reviewer (an escalation is
+    /// cleared for this round; the round count is unchanged). `None`: the reviewer is removed
+    /// ("reviewer fjernet") and the ticket is routed again, unless it reached
+    /// [`MAX_REVIEW_ROUNDS`]: then it stays escalated (no new escalation note, review5 N5).
+    pub fn assign_reviewer(
+        &self,
+        ticket_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<TicketSummary, String> {
+        let t = self
+            .read(|s| s.get(ticket_id))
+            .ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Review {
+            return Err(TicketError::NotInReview.into());
+        }
+        let now = now_ms();
+        match agent_id {
+            Some(agent) => {
+                let info = lock(&self.manager)
+                    .get(agent)
+                    .filter(|a| !matches!(a.status, AgentStatus::Exited { .. }))
+                    .ok_or(TicketError::AgentNotLive)?;
+                if !info.roles.contains(&Role::Reviewer) {
+                    return Err(TicketError::NotAReviewer.into());
+                }
+                if t.assignee_agent_id.as_deref() == Some(agent) {
+                    return Err(TicketError::SenderCannotReview.into());
+                }
+                let tk = self.mutate(|s| s.set_reviewer(&t.id, agent, &info.name, now))?;
+                self.send(DispatchMsg::ReviewAssigned {
+                    reviewer_agent_id: agent.to_string(),
+                });
+                Ok(TicketSummary::from(&tk))
+            }
+            None => {
+                self.mutate_if(
+                    |s| s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, now),
+                    Option::is_some,
+                )?;
+                self.route_reviews();
+                self.read(|s| s.get(&t.id))
+                    .map(|tk| TicketSummary::from(&tk))
+                    .ok_or_else(|| TicketError::NotFound.into())
+            }
+        }
+    }
+
+    // ---- reports (plan5 A.8) ----
+
+    /// Adds a report to ticket `ticket_id` (full id): validates ([`validate_report`], ticket
+    /// exists, at most 20), writes the file, then the metadata; a failed metadata save removes
+    /// the file again. Ownership is the caller's business (tools: own ticket or review).
+    // TODO(windows-verify): mira_add_report writes
+    // %APPDATA%\dk.mira.bots\tickets\<id>\reports\01-<slug>.md (plan5 D.58).
+    pub fn add_report(
+        &self,
+        ticket_id: &str,
+        author: ReportAuthor,
+        title: &str,
+        body: &str,
+    ) -> Result<TicketReport, String> {
+        let (title, body) = validate_report(title, body)?;
+        let _guard = lock(&self.report_lock);
+        let seq = self.read(|s| s.next_report_seq(ticket_id))?;
+        let (path, size) = self
+            .reports
+            .write(ticket_id, seq, &title, &body)
+            .map_err(|e| format!("Kunne ikke gemme rapporten: {e}"))?;
+        let now = now_ms();
+        let report = TicketReport {
+            id: format!("{seq:02}"),
+            title,
+            author,
+            created_at: now,
+            path: path.clone(),
+            size,
+        };
+        if let Err(e) = self.mutate(|s| s.add_report_meta(ticket_id, report.clone(), now)) {
+            if let Err(rm) = self.reports.remove(ticket_id, &path) {
+                log::warn!("removing report file after a failed save: {rm}");
+            }
+            return Err(e);
+        }
+        log::info!(
+            "report {} added to ticket {ticket_id} ({size} bytes)",
+            report.id
+        );
+        Ok(report)
+    }
+
+    /// A report's metadata and text (`ticket_id`: full or short id).
+    pub fn get_report(&self, ticket_id: &str, report_id: &str) -> Result<ReportContent, String> {
+        let t: Ticket = self
+            .read(|s| s.get_by_any_id(ticket_id))
+            .ok_or(TicketError::NotFound)?;
+        let report = t
+            .reports
+            .iter()
+            .find(|r| r.id == report_id.trim())
+            .cloned()
+            .ok_or(TicketError::ReportNotFound)?;
+        let body = self.reports.read(&t.id, &report.path).map_err(|e| {
+            log::warn!("reading report {} of ticket {}: {e}", report.id, t.id);
+            String::from(TicketError::ReportNotFound)
+        })?;
+        Ok(ReportContent { report, body })
+    }
+
+    /// Deletes the ticket (service rules) and then its report folder (a failure there is logged).
+    pub fn delete_ticket(&self, id: &str) -> Result<(), String> {
+        self.mutate(|s| s.delete(id))?;
+        if let Err(e) = self.reports.remove_ticket_dir(id) {
+            log::warn!("removing the report folder of ticket {id} failed: {e}");
+        }
+        Ok(())
+    }
 }
 
 impl TicketsHost for Arc<TicketsCtx> {
+    fn reroute_reviews(&self) {
+        TicketsCtx::route_reviews(self);
+    }
+
     fn mutate<T>(
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
@@ -287,8 +581,10 @@ pub(crate) mod test_support {
         let emit: EmitFn = Arc::new(move |n: &str, v: Value| {
             sink.lock().unwrap().push((n.to_string(), v));
         });
+        let reports_root =
+            std::env::temp_dir().join(format!("mira-tickets-{}", uuid::Uuid::new_v4()));
         TestCtx {
-            ctx: Arc::new(TicketsCtx::new(svc, manager, tx, emit)),
+            ctx: Arc::new(TicketsCtx::new(svc, manager, tx, emit, reports_root)),
             rx,
             events,
             store,
@@ -412,7 +708,13 @@ mod tests {
             Box::new(store::MemoryStore::new()),
             model::TicketDoc::default(),
         );
-        let ctx = Arc::new(TicketsCtx::new(svc, Arc::clone(&m), tx, Arc::clone(&emit)));
+        let ctx = Arc::new(TicketsCtx::new(
+            svc,
+            Arc::clone(&m),
+            tx,
+            Arc::clone(&emit),
+            std::env::temp_dir().join("mira-unused-reports"),
+        ));
         assert!(slot.set(Arc::clone(&ctx)).is_ok());
         let tk = ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
         ctx.mutate(|s| s.assign(&tk.id, &ids[0], 2)).unwrap();
@@ -615,8 +917,9 @@ mod tests {
     fn dispatcher_types_into_a_real_pty_through_the_manager_port() {
         use crate::agent::manager::AgentMeta;
         use crate::agent::pty::SpawnSpec;
-        use crate::agent::{AgentRole, EventSink, SeatKind, SinkEvent};
+        use crate::agent::{EventSink, SeatKind, SinkEvent};
         use crate::config::{PTY_COLS, PTY_ROWS};
+        use crate::profiles::model::ProfileSnapshot;
         use crate::tickets::dispatcher::{Dispatcher, FakeTimers};
         use std::time::{Duration, Instant};
 
@@ -643,7 +946,7 @@ mod tests {
                 AgentMeta {
                     id: uuid::Uuid::new_v4().to_string(),
                     session_id: "s".into(),
-                    role: AgentRole::None,
+                    profile: ProfileSnapshot::default(),
                     seat_kind: SeatKind::Work,
                 },
                 sink,
@@ -712,5 +1015,380 @@ mod tests {
         let pty = lock(&m).remove(&a).unwrap();
         drop(pty);
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ---- step 5: review routing and reports ----
+
+    use crate::agent::roles::Role;
+    use crate::agent::SeatKind;
+
+    /// Agents: a1 (coder), r1 and r2 (reviewers, r1 older).
+    fn review_setup() -> (TestCtx, Arc<Mutex<AgentManager>>, String, String, String) {
+        let mut m = AgentManager::new(5);
+        let a1 = m.insert_fake_with("s-a1", "/w/a1", &[Role::Coder], SeatKind::Work);
+        let r1 = m.insert_fake_with("s-r1", "/w/r1", &[Role::Reviewer], SeatKind::Staff);
+        let r2 = m.insert_fake_with("s-r2", "/w/r2", &[Role::Reviewer], SeatKind::Staff);
+        m.backdate(&r1, 1_000);
+        let m = Arc::new(Mutex::new(m));
+        (test_ctx(Arc::clone(&m)), m, a1, r1, r2)
+    }
+
+    /// A ticket submitted by `agent` (in review, unrouted).
+    fn submitted(t: &TestCtx, agent: &str, title: &str) -> String {
+        let c = &t.ctx;
+        let tk = c.mutate(|s| s.create(title, "b", false, 1)).unwrap();
+        c.mutate(|s| s.assign(&tk.id, agent, 2)).unwrap();
+        c.mutate(|s| s.mark_dispatched(&tk.id, agent, 3)).unwrap();
+        c.mutate(|s| s.submit_by_agent(agent, None, "klar", 4))
+            .unwrap();
+        tk.id
+    }
+
+    fn reviewer_of(t: &TestCtx, id: &str) -> Option<String> {
+        t.ctx.read(|s| s.get(id)).unwrap().reviewer_agent_id
+    }
+
+    #[test]
+    fn route_picks_reviewer_with_fewest_open_reviews() {
+        let (mut t, _m, a1, r1, r2) = review_setup();
+        let t1 = submitted(&t, &a1, "x");
+        assert_eq!(t.ctx.route_reviews(), 1);
+        assert_eq!(
+            reviewer_of(&t, &t1).as_deref(),
+            Some(r1.as_str()),
+            "tie: oldest"
+        );
+        let t2 = submitted(&t, &a1, "y");
+        let t3 = submitted(&t, &a1, "z");
+        assert_eq!(t.ctx.route_reviews(), 2);
+        assert_eq!(reviewer_of(&t, &t2).as_deref(), Some(r2.as_str()));
+        assert_eq!(reviewer_of(&t, &t3).as_deref(), Some(r1.as_str()));
+        assert_eq!(t.ctx.route_reviews(), 0, "idempotent");
+        let sent = t.sent();
+        assert_eq!(
+            sent.iter()
+                .filter(|m| matches!(m, DispatchMsg::ReviewAssigned { .. }))
+                .count(),
+            3
+        );
+        assert!(sent.contains(&DispatchMsg::ReviewAssigned {
+            reviewer_agent_id: r2.clone()
+        }));
+        let hist = t.ctx.read(|s| s.get(&t1)).unwrap().history;
+        assert_eq!(
+            hist.last().unwrap().note.as_deref(),
+            Some("review tildelt r1")
+        );
+    }
+
+    #[test]
+    fn route_never_picks_the_sender() {
+        let (t, m, a1, r1, _r2) = review_setup();
+        // r2 gone; r1 submits its own work: no other reviewer → waits.
+        let _ = a1;
+        let r2 = lock(&m).reviewers()[1].id.clone();
+        lock(&m).stop(&r2).unwrap();
+        let mine = submitted(&t, &r1, "egen");
+        assert_eq!(t.ctx.route_reviews(), 0);
+        assert_eq!(reviewer_of(&t, &mine), None);
+    }
+
+    #[test]
+    fn route_with_no_reviewer_leaves_ticket_for_user() {
+        let (m, ids) = manager_with(1);
+        let t = test_ctx(m);
+        let id = submitted(&t, &ids[0], "x");
+        assert_eq!(t.ctx.route_reviews(), 0);
+        let tk = t.ctx.read(|s| s.get(&id)).unwrap();
+        assert_eq!(
+            (tk.state, tk.reviewer_agent_id, tk.escalated),
+            (TicketState::Review, None, false)
+        );
+        // The user can still approve as before.
+        t.ctx.mutate(|s| s.approve(&id, 9)).unwrap();
+    }
+
+    #[test]
+    fn route_escalates_at_three_rounds() {
+        let (mut t, _m, a1, r1, _r2) = review_setup();
+        let id = submitted(&t, &a1, "x");
+        for round in 0..MAX_REVIEW_ROUNDS {
+            assert_eq!(t.ctx.route_reviews(), 1, "round {round}");
+            let rev = reviewer_of(&t, &id).unwrap();
+            t.ctx
+                .mutate(|s| s.reject_by_agent(&rev, "r", &id, "mere", true, 10))
+                .unwrap();
+            t.ctx.mutate(|s| s.mark_dispatched(&id, "a1", 11)).unwrap();
+            t.ctx
+                .mutate(|s| s.submit_by_agent(&a1, None, "igen", 12))
+                .unwrap();
+        }
+        t.sent();
+        assert_eq!(t.ctx.route_reviews(), 0);
+        let tk = t.ctx.read(|s| s.get(&id)).unwrap();
+        assert_eq!(
+            (tk.review_round, tk.escalated, tk.reviewer_agent_id),
+            (3, true, None)
+        );
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some("eskaleret efter 3 runder")
+        );
+        assert!(
+            t.sent().is_empty(),
+            "no review line for an escalated ticket"
+        );
+        // The user can pick a reviewer by hand.
+        let s = t.ctx.assign_reviewer(&id, Some(&r1)).unwrap();
+        assert_eq!(
+            (s.escalated, s.reviewer_agent_id.as_deref()),
+            (false, Some(r1.as_str()))
+        );
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::ReviewAssigned {
+                reviewer_agent_id: r1.clone()
+            }]
+        );
+        // "Fjern reviewer" (review5 N5): escalated again at once, without routing and without a
+        // second escalation note; the round count stays.
+        let escalations = |t: &TestCtx| {
+            t.ctx
+                .read(|s| s.get(&id))
+                .unwrap()
+                .history
+                .iter()
+                .filter(|h| h.note.as_deref() == Some("eskaleret efter 3 runder"))
+                .count()
+        };
+        assert_eq!(escalations(&t), 1);
+        let s = t.ctx.assign_reviewer(&id, None).unwrap();
+        assert_eq!(
+            (s.escalated, s.reviewer_agent_id.as_deref(), s.review_round),
+            (true, None, 3)
+        );
+        assert_eq!(escalations(&t), 1);
+        assert!(t.sent().is_empty(), "no review line");
+        let tk = t.ctx.read(|s| s.get(&id)).unwrap();
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some("reviewer fjernet")
+        );
+        assert_eq!(t.ctx.route_reviews(), 0);
+    }
+
+    #[test]
+    fn assign_reviewer_rules() {
+        let (t, m, a1, r1, r2) = review_setup();
+        let id = submitted(&t, &a1, "x");
+        assert_eq!(
+            t.ctx.assign_reviewer(&id, Some(&a1)),
+            Err("Agenten er ikke reviewer".into())
+        );
+        assert_eq!(
+            t.ctx.assign_reviewer(&id, Some("nope")),
+            Err("Agenten kører ikke".into())
+        );
+        let other = submitted(&t, &r1, "egen");
+        assert_eq!(
+            t.ctx.assign_reviewer(&other, Some(&r1)),
+            Err("Afsenderen kan ikke reviewe sin egen ticket".into())
+        );
+        let backlog = t.ctx.mutate(|s| s.create("b", "", false, 1)).unwrap();
+        assert_eq!(
+            t.ctx.assign_reviewer(&backlog.id, Some(&r1)),
+            Err("Ticketen er ikke i review".into())
+        );
+        t.ctx.assign_reviewer(&id, Some(&r2)).unwrap();
+        assert_eq!(reviewer_of(&t, &id).as_deref(), Some(r2.as_str()));
+        // None: removed and routed again (r1 has the fewest open reviews).
+        let s = t.ctx.assign_reviewer(&id, None).unwrap();
+        assert_eq!(s.reviewer_agent_id.as_deref(), Some(r1.as_str()));
+        let notes: Vec<_> = t
+            .ctx
+            .read(|s| s.get(&id))
+            .unwrap()
+            .history
+            .into_iter()
+            .filter_map(|h| h.note)
+            .collect();
+        assert!(notes.contains(&"reviewer fjernet".to_string()));
+        drop(m);
+    }
+
+    #[test]
+    fn reviewer_exit_releases_assignments_and_reroutes() {
+        let (mut t, m, a1, r1, r2) = review_setup();
+        let id = submitted(&t, &a1, "x");
+        t.ctx.route_reviews();
+        assert_eq!(reviewer_of(&t, &id).as_deref(), Some(r1.as_str()));
+        t.sent();
+        lock(&m).stop(&r1).unwrap();
+        t.ctx.release_agent(&r1, AGENT_STOPPED_NOTE).unwrap();
+        assert_eq!(reviewer_of(&t, &id).as_deref(), Some(r2.as_str()));
+        let notes: Vec<_> = t
+            .ctx
+            .read(|s| s.get(&id))
+            .unwrap()
+            .history
+            .into_iter()
+            .filter_map(|h| h.note)
+            .collect();
+        assert!(
+            notes.contains(&"reviewer agent stoppet".to_string()),
+            "{notes:?}"
+        );
+        let sent = t.sent();
+        assert!(sent.contains(&DispatchMsg::AgentGone {
+            agent_id: r1.clone()
+        }));
+        assert!(sent.contains(&DispatchMsg::ReviewAssigned {
+            reviewer_agent_id: r2.clone()
+        }));
+        // The last reviewer goes too: the ticket stays in review for the user.
+        lock(&m).stop(&r2).unwrap();
+        t.ctx.release_agent(&r2, AGENT_EXITED_NOTE).unwrap();
+        let tk = t.ctx.read(|s| s.get(&id)).unwrap();
+        assert_eq!(
+            (tk.state, tk.reviewer_agent_id),
+            (TicketState::Review, None)
+        );
+    }
+
+    #[test]
+    fn open_reviews_link_is_synced() {
+        let (t, m, a1, r1, _r2) = review_setup();
+        submitted(&t, &a1, "x");
+        t.clear();
+        t.ctx.route_reviews();
+        assert_eq!(lock(&m).get(&r1).unwrap().open_reviews, 1);
+        let agents = t.emitted(AGENTS_CHANGED);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agent_json(&agents[0], &r1)["openReviews"], 1);
+        let id = t.ctx.read(|s| s.review_assignments())[0].ticket_id.clone();
+        t.ctx.mutate(|s| s.approve(&id, 20)).unwrap();
+        assert_eq!(lock(&m).get(&r1).unwrap().open_reviews, 0);
+    }
+
+    #[test]
+    fn add_report_writes_file_and_metadata() {
+        let (m, ids) = manager_with(1);
+        let t = test_ctx(m);
+        let tk = t.ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
+        t.clear();
+        let r = t
+            .ctx
+            .add_report(
+                &tk.id,
+                ReportAuthor::agent(&ids[0]),
+                " Første\nrapport ",
+                "# Hej\r\næøå\u{0}\n",
+            )
+            .unwrap();
+        assert_eq!((r.id.as_str(), r.title.as_str()), ("01", "Første rapport"));
+        assert_eq!(r.path, "reports/01-foerste-rapport.md");
+        let file = t
+            .ctx
+            .reports
+            .dir_for(&tk.id)
+            .unwrap()
+            .join("01-foerste-rapport.md");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "# Hej\næøå");
+        assert_eq!(r.size, "# Hej\næøå".len() as u64);
+        let lists = t.emitted(TICKETS_CHANGED);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0][0]["reportCount"], 1);
+        let got = t.ctx.get_report(&tk.short_id(), "01").unwrap();
+        assert_eq!((got.report, got.body.as_str()), (r.clone(), "# Hej\næøå"));
+        let v = serde_json::to_value(t.ctx.get_report(&tk.id, "01").unwrap()).unwrap();
+        assert_eq!(v["body"], "# Hej\næøå");
+        assert_eq!(v["report"]["id"], "01");
+        let r2 = t
+            .ctx
+            .add_report(&tk.id, ReportAuthor::user(), "To", "b")
+            .unwrap();
+        assert_eq!(r2.id, "02");
+        assert_eq!(
+            t.ctx.get_report(&tk.id, "09").unwrap_err(),
+            "Rapporten findes ikke"
+        );
+        let _ = std::fs::remove_dir_all(t.ctx.reports.root());
+    }
+
+    #[test]
+    fn report_limits() {
+        let (m, _) = manager_with(0);
+        let t = test_ctx(m);
+        let tk = t.ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
+        let add =
+            |title: &str, body: &str| t.ctx.add_report(&tk.id, ReportAuthor::user(), title, body);
+        assert_eq!(add(" \n ", "b").unwrap_err(), "Titel må ikke være tom");
+        assert_eq!(
+            add(&"t".repeat(121), "b").unwrap_err(),
+            "Titlen er for lang (maks 120 tegn)"
+        );
+        assert_eq!(add("t", " \n").unwrap_err(), "Rapporten må ikke være tom");
+        assert_eq!(
+            add("t", &"b".repeat(20_001)).unwrap_err(),
+            "Rapporten er for lang (maks 20000 tegn)"
+        );
+        assert_eq!(
+            t.ctx
+                .add_report("nope", ReportAuthor::user(), "t", "b")
+                .unwrap_err(),
+            "Ticketen findes ikke"
+        );
+        assert!(add(&"t".repeat(120), &"b".repeat(20_000)).is_ok());
+        for _ in 1..20 {
+            add("t", "b").unwrap();
+        }
+        assert_eq!(
+            add("t", "b").unwrap_err(),
+            "Ticketen har allerede 20 rapporter"
+        );
+        let dir = t.ctx.reports.dir_for(&tk.id).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 20);
+        let _ = std::fs::remove_dir_all(t.ctx.reports.root());
+    }
+
+    #[test]
+    fn get_report_refuses_path_traversal() {
+        let (m, _) = manager_with(0);
+        let t = test_ctx(m);
+        let tk = t.ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
+        let r = t
+            .ctx
+            .add_report(&tk.id, ReportAuthor::user(), "t", "b")
+            .unwrap();
+        // A tampered path in tickets.json is never followed.
+        let mut bad = r.clone();
+        bad.id = "02".into();
+        bad.path = "reports/../../../secret.txt".into();
+        t.ctx.mutate(|s| s.add_report_meta(&tk.id, bad, 2)).unwrap();
+        assert_eq!(
+            t.ctx.get_report(&tk.id, "02").unwrap_err(),
+            "Rapporten findes ikke"
+        );
+        assert!(t.ctx.get_report(&tk.id, "01").is_ok());
+        let _ = std::fs::remove_dir_all(t.ctx.reports.root());
+    }
+
+    #[test]
+    fn delete_ticket_removes_report_dir() {
+        let (m, _) = manager_with(0);
+        let t = test_ctx(m);
+        let tk = t.ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
+        t.ctx
+            .add_report(&tk.id, ReportAuthor::user(), "t", "b")
+            .unwrap();
+        let dir = t.ctx.reports.root().join(&tk.id);
+        assert!(dir.is_dir());
+        t.ctx.delete_ticket(&tk.id).unwrap();
+        assert!(!dir.exists());
+        assert!(t.ctx.read(|s| s.get(&tk.id)).is_none());
+        // A ticket without reports deletes fine too.
+        let tk2 = t.ctx.mutate(|s| s.create("y", "", false, 1)).unwrap();
+        t.ctx.delete_ticket(&tk2.id).unwrap();
+        let _ = std::fs::remove_dir_all(t.ctx.reports.root());
     }
 }

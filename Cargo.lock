@@ -2115,6 +2115,7 @@ dependencies = [
  "base64 0.22.1",
  "log",
  "mira-hook",
+ "mira-mcp",
  "portable-pty",
  "serde",
  "serde_json",
@@ -2130,6 +2131,13 @@ dependencies = [
 
 [[package]]
 name = "mira-hook"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "mira-mcp"
 version = "0.1.0"
 dependencies = [
  "serde_json",

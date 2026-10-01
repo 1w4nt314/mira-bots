@@ -5,8 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::model::Ticket;
-use crate::config::{TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
+use super::model::{Ticket, TicketState};
+use crate::config::{MAX_REVIEW_ROUNDS, REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
 
 /// Title used when nothing is left after sanitising.
 pub const EMPTY_TITLE: &str = "(uden titel)";
@@ -102,13 +102,22 @@ pub fn render_line(short: &str, title: &str) -> String {
     )
 }
 
+/// "Bed om aflevering" (C4.7): typed like a ticket line (one write, `\r` separately). It starts
+/// with "Du", never with "Ticket", so the dispatcher can never take it for a ticket delivery.
+pub fn request_submission_line(short: &str) -> String {
+    format!(
+        "Du afsluttede uden at aflevere ticket {short}. Kald mira_submit_for_review med en kort opsummering når opgaven er færdig; ellers fortsæt arbejdet."
+    )
+}
+
 /// The line for a ticket (sanitises the title).
 pub fn line_for(t: &Ticket) -> String {
     render_line(&t.short_id(), &sanitize_title(&t.title))
 }
 
-/// One-line form for headings: CRLF/CR/LF/tab → space, other controls removed.
-fn one_line(s: &str) -> String {
+/// One-line form for headings and agent-supplied titles/notes: CRLF/CR/LF/tab → space, other
+/// controls removed, trimmed.
+pub(crate) fn one_line(s: &str) -> String {
     s.chars()
         .filter_map(|c| match c {
             '\r' | '\n' | '\t' => Some(' '),
@@ -120,7 +129,16 @@ fn one_line(s: &str) -> String {
         .to_string()
 }
 
-/// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6).
+/// Body text from an agent (`mira_create_ticket`): CRLF → LF; C0/C1 controls removed except
+/// `\n`, `\t` and `\r`.
+pub fn clean_body(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t' | '\r'))
+        .collect()
+}
+
+/// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6, rules from plan4 C4.7).
 pub fn render_file(t: &Ticket, now_ms: u64) -> String {
     let short = t.short_id();
     let body = t.body.replace("\r\n", "\n");
@@ -156,8 +174,9 @@ pub fn render_file(t: &Ticket, now_ms: u64) -> String {
     }
     out.push_str(
         "## Regler\n\
-         - Opgaven er en ticket fra mira-bots. Når den er løst, afslut dit svar (turen); appen sender den til review.\n\
-         - Marker ikke selv ticketen som færdig, og opret ikke filer i .mira-bots/.\n",
+         - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
+         - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/.\n\
+         - Læg en rapport på ticketen med mira_add_report (eller `report` i mira_submit_for_review) når du har lavet noget brugeren skal kunne læse om.\n",
     );
     out
 }
@@ -182,6 +201,165 @@ pub fn write_ticket_file(cwd: &Path, t: &Ticket, now_ms: u64) -> io::Result<Path
     }
     let path = dir.join(format!("{}.md", t.short_id()));
     fs::write(&path, render_file(t, now_ms))?;
+    Ok(path)
+}
+
+// ---- review deliveries (plan5 C5.12) ----
+
+/// Text in the review line and file when the sender's agent no longer exists.
+pub const SENDER_DIR_UNKNOWN: &str = "afsenderens mappe kendes ikke længere";
+
+/// A folder path for the typed review line: one line, invisible chars removed, `@` (file-mention
+/// picker) as `(at)`. Separators, drive colons and spaces stay (it must remain a usable path).
+// TODO(windows-verify): a typed `C:\Users\…` path (colon + backslash) opens no emoji or command
+// suggestion in the TUI (plan5 D.54).
+fn line_safe_path(path: &str) -> String {
+    let s: String = path.chars().filter(|c| !is_invisible(*c)).collect();
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('@', "(at)")
+}
+
+/// The review line typed into the reviewer's terminal (C5.12; one line, always starts with
+/// "Review af ticket"). `title` must already be sanitised; `sender_cwd` `None` when the sender
+/// is gone; the report count is left out at 0.
+pub fn render_review_line(
+    short: &str,
+    title: &str,
+    sender_cwd: Option<&str>,
+    report_count: usize,
+) -> String {
+    let work = match sender_cwd {
+        Some(cwd) => format!("afsenderens arbejde ligger i {}", line_safe_path(cwd)),
+        None => SENDER_DIR_UNKNOWN.to_string(),
+    };
+    let fetch = if report_count == 0 {
+        format!("opsummering fås med mira_get_ticket {short}")
+    } else {
+        format!(
+            "opsummering og {report_count} rapport(er) fås med mira_get_ticket {short} og mira_get_report"
+        )
+    };
+    format!(
+        "Review af ticket {short}: {title}. Læs {REVIEW_DIR}/{short}.md i din mappe; {work}, og {fetch}. Kald mira_approve_ticket eller mira_reject_ticket med en note."
+    )
+}
+
+/// The review line for a ticket (sanitises the title).
+pub fn review_line_for(t: &Ticket, sender_cwd: Option<&str>) -> String {
+    render_review_line(
+        &t.short_id(),
+        &sanitize_title(&t.title),
+        sender_cwd,
+        t.reports.len(),
+    )
+}
+
+/// Who sent the ticket to review, for the review file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewSender {
+    pub name: String,
+    pub cwd: String,
+}
+
+/// When the ticket last went into review (history), else `updated_at`.
+fn submitted_at(t: &Ticket) -> u64 {
+    t.history
+        .iter()
+        .rev()
+        .find(|h| h.to == TicketState::Review && h.from != Some(TicketState::Review))
+        .map_or(t.updated_at, |h| h.at)
+}
+
+/// Content of `<reviewer cwd>/.mira-bots/reviews/<short>.md` (C5.12). `author_name` turns a
+/// report author into a display name.
+pub fn render_review_file(
+    t: &Ticket,
+    sender: Option<&ReviewSender>,
+    author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
+) -> String {
+    let short = t.short_id();
+    let (sender_line, git_dir) = match sender {
+        Some(s) => (
+            format!("{} ({})", one_line(&s.name), one_line(&s.cwd)),
+            one_line(&s.cwd),
+        ),
+        None => (SENDER_DIR_UNKNOWN.to_string(), "<afsenderens mappe>".into()),
+    };
+    let summary = t
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(ingen)");
+    let body = t.body.replace("\r\n", "\n");
+    let body = body.trim_end_matches('\n');
+    let body = if body.trim().is_empty() {
+        EMPTY_BODY
+    } else {
+        body
+    };
+    let mut out = format!(
+        "# Review af ticket {short}: {title}\n\
+         Afsender: {sender_line}   Runde: {round} af {MAX_REVIEW_ROUNDS}   Afleveret: {at}\n\
+         ## Opsummering fra afsenderen\n\
+         {summary}\n\
+         ## Rapporter\n",
+        title = one_line(&t.title),
+        // Capped like the card: a hand-picked reviewer of an escalated ticket (review_round = 3)
+        // reads "3 af 3", not "4 af 3" (review5 N5).
+        round = (t.review_round + 1).min(MAX_REVIEW_ROUNDS),
+        at = iso_utc(submitted_at(t)),
+    );
+    if t.reports.is_empty() {
+        out.push_str("(ingen)\n");
+    }
+    for r in &t.reports {
+        out.push_str(&format!(
+            "- {id} {title} ({author}, {at}) → mira_get_report {short} {id}\n",
+            id = r.id,
+            title = one_line(&r.title),
+            author = one_line(&author_name(&r.author)),
+            at = iso_utc(r.created_at),
+        ));
+    }
+    out.push_str(&format!(
+        "## Opgaven\n\
+         {body}\n\
+         ## Regler\n\
+         - Læs ændringerne med git -C \"{git_dir}\" diff/log/status/show; ret ikke selv i afsenderens mappe, og commit/push aldrig.\n\
+         - Afgør med mira_approve_ticket {short} (note: hvad du tjekkede) eller mira_reject_ticket {short} (note: hvad der mangler, konkret).\n\
+         - Læg gerne en review-rapport med mira_add_report før du afgør.\n"
+    ));
+    out
+}
+
+/// `<cwd>/.mira-bots/reviews`, joined component by component.
+pub fn review_dir(cwd: &Path) -> PathBuf {
+    REVIEW_DIR
+        .split('/')
+        .fold(cwd.to_path_buf(), |p, part| p.join(part))
+}
+
+/// Writes the review file in the reviewer's folder (overwriting) and, if missing,
+/// `<cwd>/.mira-bots/.gitignore` with `*`. Returns the file's path.
+pub fn write_review_file(
+    cwd: &Path,
+    t: &Ticket,
+    sender: Option<&ReviewSender>,
+    author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
+) -> io::Result<PathBuf> {
+    let dir = review_dir(cwd);
+    fs::create_dir_all(&dir)?;
+    if let Some(root) = dir.parent() {
+        let gitignore = root.join(".gitignore");
+        if !gitignore.exists() {
+            fs::write(&gitignore, "*\n")?;
+        }
+    }
+    let path = dir.join(format!("{}.md", t.short_id()));
+    fs::write(&path, render_review_file(t, sender, author_name))?;
     Ok(path)
 }
 
@@ -333,6 +511,18 @@ mod tests {
     }
 
     #[test]
+    fn request_submission_line_matches_the_contract() {
+        let l = request_submission_line("3f2a9c1e");
+        assert_eq!(
+            l,
+            "Du afsluttede uden at aflevere ticket 3f2a9c1e. Kald mira_submit_for_review med en kort opsummering når opgaven er færdig; ellers fortsæt arbejdet."
+        );
+        assert!(!l.starts_with("Ticket"));
+        assert!(!l.contains(['\r', '\n', '@']));
+        assert!(!FORBIDDEN_FIRST.contains(&l.chars().next().unwrap()));
+    }
+
+    #[test]
     fn render_file_has_header_body_and_rules() {
         let mut t = ticket(ID, TicketState::Assigned);
         t.title = "Ret\nlogin".into();
@@ -348,7 +538,13 @@ mod tests {
         assert!(f.contains("## Opgave\n\nLinje 1\n\n- punkt @x /y\n\n## Regler\n"));
         assert!(!f.contains('\r'));
         assert!(!f.contains("## Afvist:"));
-        assert!(f.ends_with("opret ikke filer i .mira-bots/.\n"));
+        assert!(f.ends_with(
+            "## Regler\n\
+             - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
+             - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/.\n\
+             - Læg en rapport på ticketen med mira_add_report (eller `report` i mira_submit_for_review) når du har lavet noget brugeren skal kunne læse om.\n"
+        ));
+        assert!(f.contains("mira_submit_for_review"));
 
         t.skip_review = true;
         t.body = String::new();
@@ -359,6 +555,16 @@ mod tests {
         assert!(f.contains(
             "## Afvist: Mangler test\nRet det ovenstående og afslut dit svar igen, så ticketen kommer til review på ny.\n\n## Regler\n"
         ));
+    }
+
+    #[test]
+    fn clean_body_and_one_line_strip_controls() {
+        assert_eq!(
+            clean_body("a\u{0}b\r\nc\td\re\u{7}\u{9b}f\n"),
+            "ab\nc\td\ref\n"
+        );
+        assert_eq!(clean_body("æøå **md**"), "æøå **md**");
+        assert_eq!(one_line("  Ret\r\nlogin\u{0}\tnu  "), "Ret  login nu");
     }
 
     #[test]
@@ -391,5 +597,93 @@ mod tests {
         assert_eq!(iso_utc(1_700_000_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso_utc(951_782_400_000), "2000-02-29T00:00:00Z");
         assert_eq!(iso_utc(1_791_158_399_999), "2026-10-04T23:59:59Z");
+    }
+
+    fn review_ticket() -> Ticket {
+        let mut t = ticket(ID, TicketState::Review);
+        t.title = "Ret @login /nu".into();
+        t.summary = Some("Rettet og testet".into());
+        t.review_round = 1;
+        t.history.push(crate::tickets::model::TicketHistoryEntry {
+            at: 1_700_000_000_000,
+            from: Some(TicketState::InProgress),
+            to: TicketState::Review,
+            by: crate::tickets::model::TicketActor::Agent,
+            note: None,
+        });
+        t
+    }
+
+    #[test]
+    fn review_line_text_matches_contract() {
+        let t = review_ticket();
+        assert_eq!(
+            review_line_for(&t, Some("C:/Users/x/mira-bots/agents/coder-01")),
+            "Review af ticket abcdef01: Ret (at)login \u{2215}nu. Læs .mira-bots/reviews/abcdef01.md i din mappe; afsenderens arbejde ligger i C:/Users/x/mira-bots/agents/coder-01, og opsummering fås med mira_get_ticket abcdef01. Kald mira_approve_ticket eller mira_reject_ticket med en note."
+        );
+        assert_eq!(
+            render_review_line("abcdef01", "T", None, 2),
+            "Review af ticket abcdef01: T. Læs .mira-bots/reviews/abcdef01.md i din mappe; afsenderens mappe kendes ikke længere, og opsummering og 2 rapport(er) fås med mira_get_ticket abcdef01 og mira_get_report. Kald mira_approve_ticket eller mira_reject_ticket med en note."
+        );
+        let line = render_review_line("abcdef01", "T", Some("/w/a@b\n c"), 0);
+        assert!(line.contains("ligger i /w/a(at)b c,"), "{line}");
+        assert!(!line.contains('\n') && !line.contains('\r'));
+        assert!(line.starts_with("Review af ticket "));
+    }
+
+    #[test]
+    fn review_file_follows_the_contract() {
+        let mut t = review_ticket();
+        t.reports.push(crate::tickets::model::TicketReport {
+            id: "01".into(),
+            title: "Ændringer".into(),
+            author: crate::tickets::model::ReportAuthor::agent("a1"),
+            created_at: 1_000,
+            path: "reports/01-aendringer.md".into(),
+            size: 4,
+        });
+        let sender = ReviewSender {
+            name: "coder-01".into(),
+            cwd: "/w/coder-01".into(),
+        };
+        let f = render_review_file(&t, Some(&sender), &|a| {
+            a.agent_id.clone().unwrap_or_else(|| "dig".into())
+        });
+        assert!(f.starts_with("# Review af ticket abcdef01: Ret @login /nu\n"));
+        assert!(f.contains(
+            "Afsender: coder-01 (/w/coder-01)   Runde: 2 af 3   Afleveret: 2023-11-14T22:13:20Z\n"
+        ));
+        assert!(f.contains("## Opsummering fra afsenderen\nRettet og testet\n## Rapporter\n"));
+        assert!(f.contains(
+            "- 01 Ændringer (a1, 1970-01-01T00:00:01Z) → mira_get_report abcdef01 01\n## Opgaven\n"
+        ));
+        assert!(f.contains("- Læs ændringerne med git -C \"/w/coder-01\" diff/log/status/show;"));
+        assert!(f.ends_with("- Læg gerne en review-rapport med mira_add_report før du afgør.\n"));
+        let f = render_review_file(&ticket(ID, TicketState::Review), None, &|_| String::new());
+        assert!(f.contains("Afsender: afsenderens mappe kendes ikke længere   Runde: 1 af 3"));
+        assert!(f.contains("## Opsummering fra afsenderen\n(ingen)\n## Rapporter\n(ingen)\n"));
+        // An escalated ticket with a hand-picked reviewer: capped at the last round.
+        let mut t = ticket(ID, TicketState::Review);
+        t.review_round = MAX_REVIEW_ROUNDS;
+        let f = render_review_file(&t, None, &|_| String::new());
+        assert!(f.contains("Runde: 3 af 3   "), "{f}");
+    }
+
+    #[test]
+    fn review_file_written_in_reviewer_cwd() {
+        let dir = std::env::temp_dir().join(format!("mira-review-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = review_ticket();
+        let p = write_review_file(&dir, &t, None, &|_| String::new()).unwrap();
+        assert_eq!(
+            p,
+            dir.join(".mira-bots").join("reviews").join("abcdef01.md")
+        );
+        assert!(p.is_file());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".mira-bots").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

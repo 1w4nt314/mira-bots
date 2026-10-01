@@ -6,15 +6,20 @@ import type {
   AgentInfo,
   AgentOutputPayload,
   AgentOutputSnapshot,
-  AgentRole,
+  AgentProfile,
   AppInfo,
   Diagnostics,
+  Effort,
   HookEventPayload,
   PermissionRequestInfo,
   PermissionResolvedPayload,
+  ReportContent,
+  ReviewAssignment,
   SeatKind,
+  SpawnOverrides,
   Ticket,
   TicketPatch,
+  TicketReport,
   TicketState,
   TicketSummary,
   WorkplaceSelection,
@@ -53,6 +58,19 @@ export const COMMANDS = {
   rejectTicket: "reject_ticket",
   redispatchTicket: "redispatch_ticket",
   spawnAgentWithTicket: "spawn_agent_with_ticket",
+  requestSubmission: "request_submission",
+  listProfiles: "list_profiles",
+  getProfile: "get_profile",
+  saveProfile: "save_profile",
+  deleteProfile: "delete_profile",
+  resetBuiltinProfile: "reset_builtin_profile",
+  setAgentModel: "set_agent_model",
+  setAgentEffort: "set_agent_effort",
+  addReport: "add_report",
+  getReport: "get_report",
+  openReportDir: "open_report_dir",
+  assignReviewer: "assign_reviewer",
+  listReviewAssignments: "list_review_assignments",
 } as const;
 
 export const EVENTS = {
@@ -63,6 +81,7 @@ export const EVENTS = {
   hookEvent: "hook-event",
   workplaceSelect: "workplace-select",
   ticketsChanged: "tickets-changed",
+  profilesChanged: "profiles-changed",
 } as const;
 
 /** Commands reject with the Rust error string (Danish, user-facing). */
@@ -77,13 +96,17 @@ export function errorMessage(e: unknown): string {
 export const uiReady = () => invoke<void>(COMMANDS.uiReady);
 export const getAppInfo = () => invoke<AppInfo>(COMMANDS.getAppInfo);
 export const listAgents = () => invoke<AgentInfo[]>(COMMANDS.listAgents);
-/** `cwd` null/blank → default folder `<agentsRoot>/<role>-nn`; role/seatKind null → "none"/"work". */
+/**
+ * `profileId` null → "coder"; `overrides` replace the profile's model/effort; `cwd` null/blank →
+ * default folder `<agentsRoot>/<prefix>-nn`; `seatKind` null → the profile's `defaultSeat`.
+ */
 export const spawnAgent = (
+  profileId: string | null,
+  overrides: SpawnOverrides | null,
   cwd: string | null,
   prompt: string | null,
-  role: AgentRole | null,
   seatKind: SeatKind | null,
-) => invoke<AgentInfo>(COMMANDS.spawnAgent, { cwd, prompt, role, seatKind });
+) => invoke<AgentInfo>(COMMANDS.spawnAgent, { profileId, overrides, cwd, prompt, seatKind });
 export const stopAgent = (agentId: string) => invoke<void>(COMMANDS.stopAgent, { agentId });
 export const removeAgent = (agentId: string) => invoke<void>(COMMANDS.removeAgent, { agentId });
 /** `userInitiated` false for the terminal's automatic replies: they do not count as user typing. */
@@ -138,15 +161,60 @@ export const approveTicket = (id: string) =>
 /** `note` must not be blank; the ticket goes first in the agent's queue (or the backlog). */
 export const rejectTicket = (id: string, note: string) =>
   invoke<TicketSummary>(COMMANDS.rejectTicket, { id, note });
+/** "Bed om aflevering": the ticket must be in progress with a running agent; the line is typed
+ *  once the agent is idle. */
+export const requestSubmission = (ticketId: string) =>
+  invoke<void>(COMMANDS.requestSubmission, { ticketId });
 /** "Send igen": the dispatcher decides whether the ticket can be delivered now. */
 export const redispatchTicket = (id: string) => invoke<void>(COMMANDS.redispatchTicket, { id });
 /** Like `spawnAgent`, with the ticket line as the first prompt; the ticket heads the new queue. */
 export const spawnAgentWithTicket = (
   ticketId: string,
+  profileId: string | null,
+  overrides: SpawnOverrides | null,
   cwd: string | null,
-  role: AgentRole | null,
   seatKind: SeatKind | null,
-) => invoke<AgentInfo>(COMMANDS.spawnAgentWithTicket, { ticketId, cwd, role, seatKind });
+) =>
+  invoke<AgentInfo>(COMMANDS.spawnAgentWithTicket, {
+    ticketId,
+    profileId,
+    overrides,
+    cwd,
+    seatKind,
+  });
+
+// profiles and model/effort (C5.4)
+/** Built-in profiles first, then the custom ones by name. */
+export const listProfiles = () => invoke<AgentProfile[]>(COMMANDS.listProfiles);
+export const getProfile = (id: string) => invoke<AgentProfile>(COMMANDS.getProfile, { id });
+/** `profile.id` empty → a new custom profile; returns the stored (validated) profile. */
+export const saveProfile = (profile: AgentProfile) =>
+  invoke<AgentProfile>(COMMANDS.saveProfile, { profile });
+/** Only custom profiles. */
+export const deleteProfile = (id: string) => invoke<void>(COMMANDS.deleteProfile, { id });
+/** Only built-in profiles: back to the default. */
+export const resetBuiltinProfile = (id: string) =>
+  invoke<AgentProfile>(COMMANDS.resetBuiltinProfile, { id });
+/** Restarts the agent with `--resume` and the new model (null → default); only when idle
+ *  without a ticket in progress. */
+export const setAgentModel = (agentId: string, model: string | null) =>
+  invoke<AgentInfo>(COMMANDS.setAgentModel, { agentId, model });
+/** Like `setAgentModel`, for the effort level. */
+export const setAgentEffort = (agentId: string, effort: Effort) =>
+  invoke<AgentInfo>(COMMANDS.setAgentEffort, { agentId, effort });
+/** The user adds a report to a ticket (author "user"). */
+export const addReport = (ticketId: string, title: string, body: string) =>
+  invoke<TicketReport>(COMMANDS.addReport, { ticketId, title, body });
+export const getReport = (ticketId: string, reportId: string) =>
+  invoke<ReportContent>(COMMANDS.getReport, { ticketId, reportId });
+/** Opens the ticket's report folder in Explorer (created first if needed). */
+export const openReportDir = (ticketId: string) =>
+  invoke<void>(COMMANDS.openReportDir, { ticketId });
+/** Picks the reviewer of a ticket in review; `null` removes it and routes the ticket again. */
+export const assignReviewer = (ticketId: string, agentId: string | null) =>
+  invoke<TicketSummary>(COMMANDS.assignReviewer, { ticketId, agentId });
+export const listReviewAssignments = () =>
+  invoke<ReviewAssignment[]>(COMMANDS.listReviewAssignments);
 
 // --- events (each returns the unlisten function) ----------------------------------------------
 
@@ -170,6 +238,9 @@ export const onWorkplaceSelect = (cb: (s: WorkplaceSelection) => void): Promise<
 /** Full ticket list (without history) after any ticket change. */
 export const onTicketsChanged = (cb: (tickets: TicketSummary[]) => void): Promise<UnlistenFn> =>
   listen<TicketSummary[]>(EVENTS.ticketsChanged, (e) => cb(e.payload));
+/** Full profile list after a profile was saved, deleted or reset. */
+export const onProfilesChanged = (cb: (profiles: AgentProfile[]) => void): Promise<UnlistenFn> =>
+  listen<AgentProfile[]>(EVENTS.profilesChanged, (e) => cb(e.payload));
 
 // --- dialog -----------------------------------------------------------------------------------
 

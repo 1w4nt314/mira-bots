@@ -1,8 +1,11 @@
 import type { Theme } from "../../lib/bots";
 import { errorMessage, removeAgent } from "../../lib/ipc";
+import type { OfficeDetail, TermMode } from "../../lib/office";
 import type { SeatAssignment } from "../../lib/seats";
 import type { BotState, SeatKind, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
+import RoomDecor from "./office/RoomDecor";
+import WallDecor from "./office/WallDecor";
 import Seat from "./Seat";
 
 interface Props {
@@ -18,14 +21,20 @@ interface Props {
   tickets: Map<string, TicketSummary>;
   /** A ticket note is being dragged. */
   dragging: boolean;
+  /** "more" adds the wall strip, room furniture and desk items. */
+  detail: OfficeDetail;
+  /** "max" shows the narrow strip (compact seats, no wall or furniture). */
+  mode: TermMode;
+  /** Figure height in px (from `deskLayout`). */
+  fig: number;
   onSelect: (agentId: string) => void;
   onSpawn: (seatKind: SeatKind) => void;
 }
 
 export default function SeatGrid(props: Props) {
   const { seats, botStates, theme, selectedId, spawnDisabled, limits, onSelect, onSpawn } = props;
-  const { tickets, dragging } = props;
-  const { dispatch } = useStore();
+  const { tickets, dragging, detail, mode, fig } = props;
+  const roomy = mode !== "max";
 
   const row = (kind: SeatKind, list: SeatAssignment["work"]) =>
     list.map((agent, i) => (
@@ -44,10 +53,38 @@ export default function SeatGrid(props: Props) {
           agent?.currentTicketId != null ? (tickets.get(agent.currentTicketId) ?? null) : null
         }
         dragging={dragging}
+        detail={detail}
+        compact={mode === "max"}
+        fig={fig}
         onSelect={onSelect}
         onSpawn={onSpawn}
       />
     ));
+
+  return (
+    <>
+      {detail === "more" && roomy && <WallDecor />}
+      <div className="office-seats">
+        <div className="office-staff" aria-label="Stabspladser">
+          <span className="office-sign">Stab</span>
+          {detail === "more" && roomy && <RoomDecor side="left" />}
+          <div className="office-row3">{row("staff", seats.staff)}</div>
+          {detail === "more" && roomy && <RoomDecor side="right" />}
+        </div>
+        <div className="office-row5" aria-label="Arbejdspladser">
+          {row("work", seats.work)}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * Agents without a seat (more live agents than seats). Rendered by Workplace outside the floor, so
+ * the floor's fixed height and `overflow: hidden` never clip it.
+ */
+export function SeatOverflow({ overflow }: { overflow: SeatAssignment["overflow"] }) {
+  const { dispatch } = useStore();
 
   const remove = async (id: string) => {
     try {
@@ -57,44 +94,27 @@ export default function SeatGrid(props: Props) {
     }
   };
 
+  if (overflow.length === 0) return null;
   return (
-    <div className="shrink-0 p-3">
-      <div className="flex gap-3">
-        <div className="grid min-w-0 flex-[5] grid-cols-5 gap-2" aria-label="Arbejdspladser">
-          {row("work", seats.work)}
-        </div>
-        <div
-          className="relative min-w-0 flex-[2] rounded-xl border border-dashed border-[var(--border)] p-2 pt-4"
-          aria-label="Stabspladser"
+    <div className="mx-3 my-1.5 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
+      <span>Uden plads:</span>
+      {overflow.map((a) => (
+        <span
+          key={a.id}
+          className="flex items-center gap-1 rounded border border-[var(--border)] px-1.5 py-0.5"
         >
-          <span className="absolute -top-2 left-3 bg-[var(--bg)] px-1 text-[10px] uppercase tracking-wide text-[var(--muted)]">
-            Stab
-          </span>
-          <div className="grid grid-cols-2 gap-2">{row("staff", seats.staff)}</div>
-        </div>
-      </div>
-      {seats.overflow.length > 0 && (
-        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
-          <span>Uden plads:</span>
-          {seats.overflow.map((a) => (
-            <span
-              key={a.id}
-              className="flex items-center gap-1 rounded border border-[var(--border)] px-1.5 py-0.5"
-            >
-              {a.name}
-              <button
-                type="button"
-                onClick={() => void remove(a.id)}
-                title={`Fjern ${a.name} fra listen`}
-                aria-label={`Fjern ${a.name}`}
-                className="rounded px-1 hover:bg-neutral-500/20"
-              >
-                Fjern
-              </button>
-            </span>
-          ))}
-        </div>
-      )}
+          {a.name}
+          <button
+            type="button"
+            onClick={() => void remove(a.id)}
+            title={`Fjern ${a.name} fra listen`}
+            aria-label={`Fjern ${a.name}`}
+            className="rounded px-1 hover:bg-neutral-500/20"
+          >
+            Fjern
+          </button>
+        </span>
+      ))}
     </div>
   );
 }

@@ -1,5 +1,8 @@
 //! mira-hook: forwards one Claude Code hook event (stdin JSON) to the mira-bots app over a pipe
 //! and, for PermissionRequest only, turns the app's answer into Claude Code's decision JSON.
+//! It is also the profiles' `statusLine` command (plan5 A.4): that JSON has no
+//! `hook_event_name`, gets `StatusLine` and is forwarded fire-and-forget; stdout stays empty (an
+//! empty status line in the TUI).
 //!
 //! Hard rule: this must never block or break Claude Code. Every failure path ends in exit code 0
 //! with empty stdout, within the per-event budget ([`payload::budget`]).
@@ -63,20 +66,25 @@ fn exchange(
 ///
 /// `pipe` is the pipe name from `MIRA_BOTS_PIPE`; `None` means "not started by the app".
 /// `agent_id` comes from `MIRA_AGENT_ID` and is forwarded in the frame when present.
+/// `argv_event` is `argv[1]` (the event name of the hooks' exec form, `StatusLine` if a
+/// statusLine command ever passes one); it only matters for input without `hook_event_name`.
 /// All I/O runs on a worker thread; the calling thread waits at most `payload::budget(event)`.
 /// The worker is never joined: the caller is expected to exit the process right after.
+// TODO(windows-verify): as the statusLine command (quoted path, no args) mira-hook.exe exits
+// quickly with empty stdout and the app shows the observed model/effort (plan5 D.52).
 pub fn run(
     input: &[u8],
     pipe: Option<String>,
     agent_id: Option<String>,
     debug: bool,
+    argv_event: Option<&str>,
 ) -> Option<String> {
     if input.len() > MAX_STDIN {
         log(debug, "stdin too large, ignoring");
         return None;
     }
     let text = std::str::from_utf8(input).ok()?;
-    let mut payload = match payload::parse(text) {
+    let mut payload = match payload::parse(text, argv_event) {
         Ok(p) => p,
         Err(e) => {
             log(debug, &format!("parse failed: {e}"));
@@ -142,7 +150,8 @@ mod tests {
                 br#"{"hook_event_name":"PermissionRequest","session_id":"s"}"#,
                 None,
                 None,
-                false
+                false,
+                None
             ),
             None
         );
@@ -151,10 +160,13 @@ mod tests {
 
     #[test]
     fn garbage_or_oversized_input_means_no_output() {
-        assert_eq!(run(b"not json", Some("x".into()), None, false), None);
-        assert_eq!(run(&[0xff, 0xfe], Some("x".into()), None, false), None);
+        assert_eq!(run(b"not json", Some("x".into()), None, false, None), None);
+        assert_eq!(
+            run(&[0xff, 0xfe], Some("x".into()), None, false, None),
+            None
+        );
         let big = vec![b' '; MAX_STDIN + 1];
-        assert_eq!(run(&big, Some("x".into()), None, false), None);
+        assert_eq!(run(&big, Some("x".into()), None, false, None), None);
     }
 
     #[test]
@@ -170,6 +182,7 @@ mod tests {
             ),
             None,
             false,
+            None,
         );
         assert_eq!(out, None);
         assert!(
@@ -222,6 +235,7 @@ mod tests {
                 Some(path.to_string_lossy().into_owned()),
                 Some("agent-42".into()),
                 false,
+                None,
             );
             assert_eq!(out, decision::to_stdout(&Decision::Allow));
             let frame: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
@@ -245,7 +259,8 @@ mod tests {
                     input,
                     Some(path.to_string_lossy().into_owned()),
                     None,
-                    false
+                    false,
+                    None
                 ),
                 None
             );
@@ -264,7 +279,8 @@ mod tests {
                     input,
                     Some(path.to_string_lossy().into_owned()),
                     None,
-                    false
+                    false,
+                    None
                 ),
                 None
             );
@@ -272,6 +288,32 @@ mod tests {
             let frame: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
             assert_eq!(frame["event"]["hook_event_name"], "Stop");
             assert!(frame.get("agent_id").is_none(), "no MIRA_AGENT_ID → no key");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn statusline_is_forwarded_without_output() {
+            let path = sock_path("statusline");
+            let server = serve_once(&path, None);
+            let t = Instant::now();
+            let input = br#"{"session_id":"s","model":{"id":"claude-opus-5-5"},"effort":{"level":"high"},"cost":{"x":1}}"#;
+            assert_eq!(
+                run(
+                    input,
+                    Some(path.to_string_lossy().into_owned()),
+                    Some("agent-7".into()),
+                    false,
+                    None
+                ),
+                None
+            );
+            assert!(t.elapsed() < Duration::from_secs(1));
+            let frame: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+            assert_eq!(frame["agent_id"], "agent-7");
+            assert_eq!(frame["event"]["hook_event_name"], "StatusLine");
+            assert_eq!(frame["event"]["model"]["id"], "claude-opus-5-5");
+            assert_eq!(frame["event"]["effort"]["level"], "high");
+            assert!(frame["event"].get("cost").is_none());
             let _ = std::fs::remove_file(&path);
         }
     }

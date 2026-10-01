@@ -5,8 +5,10 @@ pub mod diagnostics;
 pub mod events;
 pub mod hooks;
 pub mod island;
+pub mod mcp;
 pub mod permissions;
 pub mod pipe;
+pub mod profiles;
 pub mod tickets;
 pub mod workplace;
 
@@ -26,32 +28,37 @@ use agent::{now_ms, AgentManager, EventSink, SinkEvent};
 use commands::{AppPaths, AppState};
 use config::{
     CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
-    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, TICKETS_FILE,
+    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR,
+    REPORTS_DIR, SETTINGS_FILE, SYSTEM_PROMPT_FILE, TICKETS_FILE,
 };
 use diagnostics::{log_level_from_env, probe_claude_version, HookStats, VersionProbe};
 use events::{AgentOutputPayload, EmitFn, StatusEvent, AGENTS_CHANGED, AGENT_OUTPUT};
-use hooks::settings::write_hooks_json;
+use hooks::settings::write_settings_json;
 use island::IslandState;
 use permissions::PendingPermissions;
-use pipe::handler::{HandlerCtx, StatusObserver};
+use pipe::handler::{HandlerCtx, StatusObserver, ToolHandler};
+use profiles::store::{profiles_dir, ProfileStore};
+use profiles::ProfilesCtx;
 use tickets::dispatcher::{self, messages_for, DispatchMsg, Dispatcher, RealTimers};
+use tickets::tools::ToolsCtx;
 use tickets::{ManagerPort, TicketsCtx, AGENT_EXITED_NOTE};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Candidate locations of the hook exe, in lookup order:
-/// the `MIRA_HOOK_EXE` override, the installed resource dir (`resources/` first, then the dir
-/// itself), the directory of the running exe and, in debug builds, the workspace's
-/// `target/debug|release` (dev run from the repo).
-fn hook_exe_candidates(
+/// Candidate locations of a bundled helper exe `name` (without suffix: `mira-hook`,
+/// `mira-mcp`), in lookup order: the env override, the installed resource dir (`resources/`
+/// first, then the dir itself), the directory of the running exe and, in debug builds, the
+/// workspace's `target/debug|release` (dev run from the repo).
+fn exe_candidates(
+    name: &str,
     env_override: Option<PathBuf>,
     resource_dir: Option<&Path>,
     exe_dir: Option<&Path>,
     workspace_dir: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let name = format!("mira-hook{}", std::env::consts::EXE_SUFFIX);
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     let mut v = Vec::new();
     v.extend(env_override);
     if let Some(r) = resource_dir {
@@ -68,12 +75,10 @@ fn hook_exe_candidates(
     v
 }
 
-/// Finds `mira-hook`: `MIRA_HOOK_EXE` → `resource_dir()/resources/` → next to the app exe /
-/// workspace `target/` (dev). The first candidate that exists wins.
-// TODO(windows-verify): after an NSIS install the hook exe is found under
-// resource_dir()/resources/ (plan D.10).
-pub fn find_hook_exe(app: &AppHandle) -> Option<PathBuf> {
-    let env_override = std::env::var_os(HOOK_EXE_ENV)
+/// The first existing `name` exe: `<env_var>` → `resource_dir()/resources/` → next to the app
+/// exe / workspace `target/` (dev).
+fn find_exe(app: &AppHandle, name: &str, env_var: &str) -> Option<PathBuf> {
+    let env_override = std::env::var_os(env_var)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     let resource_dir = app.path().resource_dir().ok();
@@ -83,9 +88,30 @@ pub fn find_hook_exe(app: &AppHandle) -> Option<PathBuf> {
     let workspace = cfg!(debug_assertions)
         .then(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent())
         .flatten();
-    hook_exe_candidates(env_override, resource_dir.as_deref(), exe_dir, workspace)
-        .into_iter()
-        .find(|p| p.is_file())
+    exe_candidates(
+        name,
+        env_override,
+        resource_dir.as_deref(),
+        exe_dir,
+        workspace,
+    )
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// Finds `mira-hook`: `MIRA_HOOK_EXE` → `resource_dir()/resources/` → next to the app exe /
+/// workspace `target/` (dev). The first candidate that exists wins.
+// TODO(windows-verify): after an NSIS install the hook exe is found under
+// resource_dir()/resources/ (plan D.10).
+pub fn find_hook_exe(app: &AppHandle) -> Option<PathBuf> {
+    find_exe(app, "mira-hook", HOOK_EXE_ENV)
+}
+
+/// Finds `mira-mcp` the same way (`MIRA_MCP_EXE` override). `None`: agents get no tools.
+// TODO(windows-verify): after an NSIS install mira-mcp.exe is found under
+// resource_dir()/resources/ next to mira-hook.exe (plan4 D.39, D.48).
+pub fn find_mcp_exe(app: &AppHandle) -> Option<PathBuf> {
+    find_exe(app, "mira-mcp", MCP_EXE_ENV)
 }
 
 /// Binds the manager's PTY thread events to Tauri: output becomes `agent-output` (base64, only to
@@ -103,6 +129,7 @@ pub fn tauri_sink(
             agent_id,
             seq,
             bytes,
+            ..
         } => {
             let payload = AgentOutputPayload {
                 agent_id,
@@ -119,11 +146,25 @@ pub fn tauri_sink(
                 log::debug!("emit {AGENT_OUTPUT}: {e}");
             }
         }
-        SinkEvent::Exited { agent_id, code } => {
-            let exited = lock(&manager).mark_exited(&agent_id, code);
+        SinkEvent::Exited {
+            agent_id,
+            gen,
+            code,
+        } => {
+            // `None` too for the exit of a child replaced by a restart (older generation); that
+            // exit must not touch the new session (its permission requests, tickets, status).
+            let (exited, replaced) = {
+                let mut m = lock(&manager);
+                let replaced = m.pty_gen(&agent_id).is_some_and(|g| g != gen);
+                (m.mark_exited(&agent_id, gen, code), replaced)
+            };
             let known = exited.is_some();
             // Drop the PTY (ConPTY ClosePseudoConsole may block) only after the lock is released.
             drop(exited);
+            if replaced {
+                log::debug!("agent {agent_id}: old child (gen {gen}) exited after a restart");
+                return;
+            }
             // Handlers waiting on these answer `none` and emit permission-resolved themselves.
             lock(&pending).remove_for_agent(&agent_id);
             if known {
@@ -280,6 +321,11 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => log::info!("hook exe: {}", p.display()),
         None => log::warn!("mira-hook not found; agents cannot be started (set MIRA_HOOK_EXE)"),
     }
+    let mcp_exe = find_mcp_exe(&handle);
+    match &mcp_exe {
+        Some(p) => log::info!("mcp exe: {}", p.display()),
+        None => log::warn!("mira-mcp not found; agents get no tools (set MIRA_MCP_EXE)"),
+    }
     // Only logged: the lookup is repeated on every get_app_info/spawn_agent.
     match find_claude() {
         Some(p) => log::info!("claude: {}", p.display()),
@@ -301,19 +347,50 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let agents_root = resolve_agents_root(&handle, &data_dir);
     log::info!("default agent folders under {}", agents_root.display());
 
-    // hooks.json is rewritten before each spawn too; writing it now makes the path exist early.
-    // Without a hook exe a placeholder path is written; spawn_agent refuses to start agents.
+    // settings.json (and mcp.json / system-prompt.md) are rewritten before each spawn too;
+    // writing them now makes the paths exist early. Without a hook exe a placeholder path is
+    // written; spawn_agent refuses to start agents.
     let hook_for_file = hook_exe
         .clone()
         .unwrap_or_else(|| PathBuf::from("mira-hook-not-found"));
-    let hooks_json = match write_hooks_json(&data_dir, &hook_for_file) {
+    let settings_json = match write_settings_json(&data_dir, &hook_for_file) {
         Ok(p) => {
-            log::info!("hooks.json written: {}", p.display());
+            log::info!("settings.json written: {}", p.display());
             p
         }
         Err(e) => {
-            log::error!("could not write hooks.json in {}: {e}", data_dir.display());
-            data_dir.join("hooks.json")
+            log::error!(
+                "could not write settings.json in {}: {e}",
+                data_dir.display()
+            );
+            data_dir.join(SETTINGS_FILE)
+        }
+    };
+    // mcp.json only when mira-mcp exists (it would name a missing program otherwise).
+    let mcp_config = match &mcp_exe {
+        Some(exe) => match mcp::write_mcp_json(&data_dir, exe) {
+            Ok(p) => {
+                log::info!("mcp.json written: {}", p.display());
+                p
+            }
+            Err(e) => {
+                log::error!("could not write mcp.json in {}: {e}", data_dir.display());
+                data_dir.join(MCP_CONFIG_FILE)
+            }
+        },
+        None => data_dir.join(MCP_CONFIG_FILE),
+    };
+    let system_prompt = match mcp::write_system_prompt(&data_dir) {
+        Ok(p) => {
+            log::info!("system-prompt.md written: {}", p.display());
+            p
+        }
+        Err(e) => {
+            log::error!(
+                "could not write system-prompt.md in {}: {e}",
+                data_dir.display()
+            );
+            data_dir.join(SYSTEM_PROMPT_FILE)
         }
     };
 
@@ -326,6 +403,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Profiles: one JSON file each under <agents_root>/.mira-bots/profiles; the built-ins are
+    // generated on first start. The rendered per-profile files are written at spawn/save.
+    let profiles_dir = profiles_dir(&agents_root);
+    let profile_store = ProfileStore::load(profiles_dir.clone(), now_ms());
+    match profile_store.warning() {
+        Some(w) => log::warn!("profiles in {}: {w}", profiles_dir.display()),
+        None => log::info!(
+            "{} profiles loaded from {}",
+            profile_store.len(),
+            profiles_dir.display()
+        ),
+    }
+    let profiles = Arc::new(ProfilesCtx::new(profile_store, Arc::clone(&emit)));
+
     let tickets_file = data_dir.join(TICKETS_FILE);
     let (service, tickets_warning) = tickets::load_tickets(tickets_file.clone(), now_ms());
     let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMsg>();
@@ -334,6 +425,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&manager),
         dispatch_tx.clone(),
         Arc::clone(&emit),
+        data_dir.join(REPORTS_DIR),
     ));
     let sink = tauri_sink(
         handle.clone(),
@@ -361,6 +453,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
+    // Tool frames from mira-mcp → the agents' ticket tools (the pipe knows nothing about tickets).
+    // mira_spawn_agent goes through the UI's spawn path and limits (plan5 punkt 13); the
+    // closure looks the state up per call, so frames before `manage` get "not available".
+    let tool_handler: ToolHandler = {
+        let tools = Arc::new(ToolsCtx::new(Arc::clone(&tickets), Arc::clone(&profiles)));
+        let spawn_handle = handle.clone();
+        tools.set_spawn_port(Arc::new(move |req| {
+            commands::spawn_for_tool(&spawn_handle, req)
+        }));
+        Arc::new(move |frame| tools.handle_tool(frame, now_ms()))
+    };
+
     let pipe_ready = Arc::new(AtomicBool::new(false));
     let hook_stats = Arc::new(HookStats::default());
     pipe::server::start(
@@ -371,21 +475,28 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             emit,
             stats: Arc::clone(&hook_stats),
             observer: Some(observer),
+            tools: Some(tool_handler),
         },
         Arc::clone(&pipe_ready),
     );
 
+    let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
     app.manage(AppState {
         manager,
         pending,
         paths: AppPaths {
             hook_exe,
-            hooks_json,
+            settings_json,
+            mcp_exe,
+            mcp_config,
+            system_prompt,
             pipe_name,
             data_dir,
             log_file,
             agents_root,
             tickets_file,
+            profiles_dir,
+            profile_files_dir: data_dir_for_profiles,
         },
         island: IslandState::default(),
         pipe_ready,
@@ -395,6 +506,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         workplace_select: Mutex::new(None),
         tickets,
         tickets_warning,
+        profiles,
     });
 
     if let Some(window) = app.get_webview_window(island::LABEL) {
@@ -470,6 +582,19 @@ pub fn run() {
             commands::reject_ticket,
             commands::redispatch_ticket,
             commands::spawn_agent_with_ticket,
+            commands::request_submission,
+            commands::list_profiles,
+            commands::get_profile,
+            commands::save_profile,
+            commands::delete_profile,
+            commands::reset_builtin_profile,
+            commands::set_agent_model,
+            commands::set_agent_effort,
+            commands::add_report,
+            commands::get_report,
+            commands::open_report_dir,
+            commands::assign_reviewer,
+            commands::list_review_assignments,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -531,25 +656,29 @@ mod tests {
     }
 
     #[test]
-    fn hook_exe_candidates_follow_the_lookup_order() {
-        let c = hook_exe_candidates(
-            Some(PathBuf::from("/override/h")),
-            Some(Path::new("/res")),
-            Some(Path::new("/app")),
-            Some(Path::new("/ws")),
-        );
-        let n = format!("mira-hook{}", std::env::consts::EXE_SUFFIX);
-        assert_eq!(c[0], PathBuf::from("/override/h"));
-        assert_eq!(c[1], Path::new("/res").join("resources").join(&n));
-        assert_eq!(c[2], Path::new("/res").join(&n));
-        assert_eq!(c[3], Path::new("/app").join(&n));
-        assert_eq!(c[4], Path::new("/ws/target/debug").join(&n));
-        assert_eq!(c[5], Path::new("/ws/target/release").join(&n));
-        assert_eq!(c.len(), 6);
+    fn exe_candidates_follow_the_lookup_order() {
+        for name in ["mira-hook", "mira-mcp"] {
+            let c = exe_candidates(
+                name,
+                Some(PathBuf::from("/override/h")),
+                Some(Path::new("/res")),
+                Some(Path::new("/app")),
+                Some(Path::new("/ws")),
+            );
+            let n = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+            assert_eq!(c[0], PathBuf::from("/override/h"));
+            assert_eq!(c[1], Path::new("/res").join("resources").join(&n));
+            assert_eq!(c[2], Path::new("/res").join(&n));
+            assert_eq!(c[3], Path::new("/app").join(&n));
+            assert_eq!(c[4], Path::new("/ws/target/debug").join(&n));
+            assert_eq!(c[5], Path::new("/ws/target/release").join(&n));
+            assert_eq!(c.len(), 6);
+        }
     }
 
     #[test]
-    fn hook_exe_candidates_skip_missing_sources() {
-        assert!(hook_exe_candidates(None, None, None, None).is_empty());
+    fn exe_candidates_skip_missing_sources() {
+        assert!(exe_candidates("mira-hook", None, None, None, None).is_empty());
+        assert!(exe_candidates("mira-mcp", None, None, None, None).is_empty());
     }
 }

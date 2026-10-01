@@ -1,5 +1,5 @@
 [workspace]
-members = ["src-tauri", "crates/mira-hook"]
+members = ["src-tauri", "crates/mira-hook", "crates/mira-mcp"]
 resolver = "2"
 
 [profile.release]

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use log::LevelFilter;
 use serde::Serialize;
 
-use crate::config::HOOK_ARGS_MIN_VERSION;
+use crate::config::{HOOK_ARGS_MIN_VERSION, MCP_MIN_VERSION};
 
 /// `MIRA_LOG` value → level. `trace|debug|info|warn|error` (any case); anything else → `Info`.
 pub fn log_level_from_env(value: Option<&str>) -> LevelFilter {
@@ -61,17 +61,32 @@ pub fn supports_hook_args(v: (u32, u32, u32)) -> bool {
     v >= HOOK_ARGS_MIN_VERSION
 }
 
-/// `(claudeVersion, claudeVersionNote, claudeCodeArgsSupported)` for the diagnostics payload.
-pub fn version_fields(probe: &VersionProbe) -> (Option<String>, Option<String>, Option<bool>) {
+/// Whether the agent tools (step 4: `mcp_server.source` in permission requests) are understood by
+/// this Claude Code version.
+pub fn supports_mcp_tools(v: (u32, u32, u32)) -> bool {
+    v >= MCP_MIN_VERSION
+}
+
+/// `(claudeVersion, claudeVersionNote, claudeCodeArgsSupported, claudeCodeMcpSupported)` for the
+/// diagnostics payload.
+pub fn version_fields(
+    probe: &VersionProbe,
+) -> (Option<String>, Option<String>, Option<bool>, Option<bool>) {
     match probe {
-        VersionProbe::Pending => (None, Some("kører stadig".into()), None),
-        VersionProbe::NotFound => (None, Some("ikke fundet".into()), None),
-        VersionProbe::Failed(e) => (None, Some(e.clone()), None),
+        VersionProbe::Pending => (None, Some("kører stadig".into()), None, None),
+        VersionProbe::NotFound => (None, Some("ikke fundet".into()), None, None),
+        VersionProbe::Failed(e) => (None, Some(e.clone()), None, None),
         VersionProbe::Ok(v) => match parse_claude_version(v) {
-            Some(parsed) => (Some(v.clone()), None, Some(supports_hook_args(parsed))),
+            Some(parsed) => (
+                Some(v.clone()),
+                None,
+                Some(supports_hook_args(parsed)),
+                Some(supports_mcp_tools(parsed)),
+            ),
             None => (
                 Some(v.clone()),
                 Some("kunne ikke læse versionsnummeret".into()),
+                None,
                 None,
             ),
         },
@@ -159,14 +174,31 @@ pub struct LastHookEvent {
     pub at: u64,
 }
 
+/// The last tool frame (`mira-mcp`) the pipe handler answered. No arguments, ever.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LastToolCall {
+    pub tool: String,
+    pub agent_id: Option<String>,
+    /// Whether the answer was `ok: true`.
+    pub ok: bool,
+    /// Unix ms.
+    pub at: u64,
+}
+
 /// Counters updated by the pipe handler, shared with `AppState` (one `Arc`).
 #[derive(Debug, Default)]
 pub struct HookStats {
-    /// Every successfully parsed frame.
+    /// Every successfully parsed hook frame.
     pub frames_received: AtomicU64,
-    /// Parsed frames that matched no agent (neither by agent id nor by session id).
+    /// Parsed hook frames that matched no agent (neither by agent id nor by session id).
     pub frames_unknown_session: AtomicU64,
     pub last: Mutex<Option<LastHookEvent>>,
+    /// Every answered tool frame (step 4).
+    pub tool_calls: AtomicU64,
+    /// Tool frames answered with `ok: false`.
+    pub tool_errors: AtomicU64,
+    pub last_tool: Mutex<Option<LastToolCall>>,
 }
 
 impl HookStats {
@@ -177,6 +209,15 @@ impl HookStats {
             self.frames_unknown_session.fetch_add(1, Ordering::Relaxed);
         }
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(last);
+    }
+
+    /// Counts one parsed frame without making it the last event (StatusLine frames: they arrive
+    /// several times a second and would drown the Diagnostics row).
+    pub fn count_only(&self, matched: bool) {
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
+        if !matched {
+            self.frames_unknown_session.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn received(&self) -> u64 {
@@ -190,9 +231,33 @@ impl HookStats {
     pub fn last_event(&self) -> Option<LastHookEvent> {
         self.last.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
+
+    /// Records one answered tool frame (`last.ok == false` counts as an error).
+    pub fn record_tool(&self, last: LastToolCall) {
+        self.tool_calls.fetch_add(1, Ordering::Relaxed);
+        if !last.ok {
+            self.tool_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        *self.last_tool.lock().unwrap_or_else(|p| p.into_inner()) = Some(last);
+    }
+
+    pub fn tool_calls(&self) -> u64 {
+        self.tool_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn tool_errors(&self) -> u64 {
+        self.tool_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn last_tool_call(&self) -> Option<LastToolCall> {
+        self.last_tool
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
 }
 
-/// `get_diagnostics` result (C2.3), camelCase.
+/// `get_diagnostics` result (C2.3 + C4.1), camelCase.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostics {
@@ -200,9 +265,25 @@ pub struct Diagnostics {
     pub claude_version: Option<String>,
     pub claude_version_note: Option<String>,
     pub claude_code_args_supported: Option<bool>,
+    /// Claude Code >= 2.1.274 (the agent tools, step 4); `None` when the version is unknown.
+    pub claude_code_mcp_supported: Option<bool>,
     pub hook_exe: Option<String>,
-    pub hooks_json_path: String,
-    pub hooks_json_exists: bool,
+    /// `<app_data_dir>/settings.json` (hooks + permissions; `hooks.json` up to step 3).
+    pub settings_path: String,
+    pub settings_exists: bool,
+    /// The mira-mcp exe; `None`: not found, agents get no tools.
+    pub mcp_exe: Option<String>,
+    /// `<app_data_dir>/mcp.json` (written only when mira-mcp was found).
+    pub mcp_config_path: String,
+    pub mcp_config_exists: bool,
+    /// `<app_data_dir>/system-prompt.md`.
+    pub system_prompt_path: String,
+    /// Tool frames answered (all / `ok: false`) and the last one.
+    pub tool_calls: u64,
+    pub tool_errors: u64,
+    pub last_tool_call: Option<LastToolCall>,
+    /// [`crate::config::AUTO_REVIEW_ON_STOP`]: whether a Stop moves the ticket to review.
+    pub auto_review_on_stop: bool,
     pub pipe_name: String,
     pub pipe_ready: bool,
     pub frames_received: u64,
@@ -222,6 +303,19 @@ pub struct Diagnostics {
     pub tickets_read_only: bool,
     /// Number of tickets in memory.
     pub tickets_total: usize,
+    /// `<agents_root>/.mira-bots/profiles` (the profile store).
+    pub profiles_path: String,
+    /// Number of profiles loaded (built-in + custom).
+    pub profiles_loaded: usize,
+    /// Set when profile files were broken (renamed to `.broken-<ts>`) or the folder could not
+    /// be used.
+    pub profiles_warning: Option<String>,
+    /// Open review assignments (plan5 A.6).
+    pub review_assignments_open: usize,
+    /// Tickets escalated after [`crate::config::MAX_REVIEW_ROUNDS`] rejections.
+    pub tickets_escalated: usize,
+    /// Reports on all tickets.
+    pub reports_total: usize,
 }
 
 #[cfg(test)]
@@ -269,25 +363,40 @@ mod tests {
     fn version_fields_per_probe_state() {
         assert_eq!(
             version_fields(&VersionProbe::Pending),
-            (None, Some("kører stadig".into()), None)
+            (None, Some("kører stadig".into()), None, None)
         );
         assert_eq!(
             version_fields(&VersionProbe::NotFound),
-            (None, Some("ikke fundet".into()), None)
+            (None, Some("ikke fundet".into()), None, None)
         );
         assert_eq!(
             version_fields(&VersionProbe::Failed("exit 1: x".into())),
-            (None, Some("exit 1: x".into()), None)
+            (None, Some("exit 1: x".into()), None, None)
         );
         assert_eq!(
             version_fields(&VersionProbe::Ok("2.1.100 (Claude Code)".into())),
-            (Some("2.1.100 (Claude Code)".into()), None, Some(false))
+            (
+                Some("2.1.100 (Claude Code)".into()),
+                None,
+                Some(false),
+                Some(false)
+            )
         );
-        assert_eq!(
-            version_fields(&VersionProbe::Ok("2.1.286 (Claude Code)".into())).2,
-            Some(true)
-        );
-        assert_eq!(version_fields(&VersionProbe::Ok("??".into())).2, None);
+        // 2.1.139 has hook args but not the step 4 tools; 2.1.274 has both.
+        let v = |s: &str| version_fields(&VersionProbe::Ok(s.into()));
+        assert_eq!((v("2.1.139").2, v("2.1.139").3), (Some(true), Some(false)));
+        assert_eq!((v("2.1.273").2, v("2.1.273").3), (Some(true), Some(false)));
+        assert_eq!((v("2.1.274").2, v("2.1.274").3), (Some(true), Some(true)));
+        assert_eq!(v("2.1.286 (Claude Code)").3, Some(true));
+        assert_eq!((v("??").2, v("??").3), (None, None));
+    }
+
+    #[test]
+    fn mcp_tools_need_2_1_274() {
+        assert!(!supports_mcp_tools((2, 1, 273)));
+        assert!(supports_mcp_tools((2, 1, 274)));
+        assert!(supports_mcp_tools((2, 2, 0)));
+        assert!(!supports_mcp_tools((1, 9, 999)));
     }
 
     #[cfg(unix)]
@@ -330,6 +439,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_stats_count_and_remember() {
+        let s = HookStats::default();
+        assert_eq!((s.tool_calls(), s.tool_errors()), (0, 0));
+        assert_eq!(s.last_tool_call(), None);
+        s.record_tool(LastToolCall {
+            tool: "mira_list_tickets".into(),
+            agent_id: Some("a1".into()),
+            ok: true,
+            at: 5,
+        });
+        s.record_tool(LastToolCall {
+            tool: "mira_submit_for_review".into(),
+            agent_id: None,
+            ok: false,
+            at: 6,
+        });
+        assert_eq!((s.tool_calls(), s.tool_errors()), (2, 1));
+        assert_eq!(s.received(), 0, "tool frames are not hook frames");
+        let last = s.last_tool_call().unwrap();
+        assert_eq!(
+            serde_json::to_value(&last).unwrap(),
+            serde_json::json!({"tool":"mira_submit_for_review","agentId":null,"ok":false,"at":6})
+        );
+    }
+
+    #[test]
     fn hook_stats_count_and_remember() {
         let s = HookStats::default();
         let ev = |name: &str| LastHookEvent {
@@ -351,9 +486,23 @@ mod tests {
             claude_version: Some("2.1.200 (Claude Code)".into()),
             claude_version_note: None,
             claude_code_args_supported: Some(true),
+            claude_code_mcp_supported: Some(false),
             hook_exe: None,
-            hooks_json_path: "/d/hooks.json".into(),
-            hooks_json_exists: true,
+            settings_path: "/d/settings.json".into(),
+            settings_exists: true,
+            mcp_exe: None,
+            mcp_config_path: "/d/mcp.json".into(),
+            mcp_config_exists: false,
+            system_prompt_path: "/d/system-prompt.md".into(),
+            tool_calls: 7,
+            tool_errors: 2,
+            last_tool_call: Some(LastToolCall {
+                tool: "mira_submit_for_review".into(),
+                agent_id: Some("a".into()),
+                ok: false,
+                at: 11,
+            }),
+            auto_review_on_stop: false,
             pipe_name: "p".into(),
             pipe_ready: true,
             frames_received: 3,
@@ -372,6 +521,12 @@ mod tests {
             tickets_warning: None,
             tickets_read_only: false,
             tickets_total: 4,
+            profiles_path: "/h/mira-bots/agents/.mira-bots/profiles".into(),
+            profiles_loaded: 7,
+            profiles_warning: Some("1 profilfil(er) kunne ikke læses".into()),
+            review_assignments_open: 2,
+            tickets_escalated: 1,
+            reports_total: 5,
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -380,9 +535,18 @@ mod tests {
                 "claudeVersion": "2.1.200 (Claude Code)",
                 "claudeVersionNote": null,
                 "claudeCodeArgsSupported": true,
+                "claudeCodeMcpSupported": false,
                 "hookExe": null,
-                "hooksJsonPath": "/d/hooks.json",
-                "hooksJsonExists": true,
+                "settingsPath": "/d/settings.json",
+                "settingsExists": true,
+                "mcpExe": null,
+                "mcpConfigPath": "/d/mcp.json",
+                "mcpConfigExists": false,
+                "systemPromptPath": "/d/system-prompt.md",
+                "toolCalls": 7,
+                "toolErrors": 2,
+                "lastToolCall": {"tool": "mira_submit_for_review", "agentId": "a", "ok": false, "at": 11},
+                "autoReviewOnStop": false,
                 "pipeName": "p",
                 "pipeReady": true,
                 "framesReceived": 3,
@@ -395,7 +559,13 @@ mod tests {
                 "ticketsPath": "/d/tickets.json",
                 "ticketsWarning": null,
                 "ticketsReadOnly": false,
-                "ticketsTotal": 4
+                "ticketsTotal": 4,
+                "profilesPath": "/h/mira-bots/agents/.mira-bots/profiles",
+                "profilesLoaded": 7,
+                "profilesWarning": "1 profilfil(er) kunne ikke læses",
+                "reviewAssignmentsOpen": 2,
+                "ticketsEscalated": 1,
+                "reportsTotal": 5
             })
         );
     }

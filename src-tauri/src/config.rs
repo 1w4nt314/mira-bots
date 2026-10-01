@@ -4,8 +4,9 @@ use std::time::Duration;
 
 /// Maximum number of simultaneously running work agents (seat kind `work`).
 pub const MAX_WORK_AGENTS: usize = 5;
+// TODO(windows-verify): D.69 (third staff seat: UI, mira_spawn_agent and the limit text)
 /// Maximum number of simultaneously running staff agents (seat kind `staff`).
-pub const MAX_STAFF_AGENTS: usize = 2;
+pub const MAX_STAFF_AGENTS: usize = 3;
 
 /// Tools that are auto-allowed for every new agent (copied at spawn). Empty by default.
 pub const DEFAULT_TOOL_WHITELIST: &[&str] = &[];
@@ -55,6 +56,9 @@ pub const LOG_KEEP_FILES: usize = 3;
 pub const CLAUDE_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// First Claude Code version that supports exec-form hooks (`args`).
 pub const HOOK_ARGS_MIN_VERSION: (u32, u32, u32) = (2, 1, 139);
+/// First Claude Code version whose permission requests name the MCP server (`mcp_server.source`,
+/// step 4 tools); step 4 is verified against 2.1.286.
+pub const MCP_MIN_VERSION: (u32, u32, u32) = (2, 1, 274);
 
 /// A `Starting` agent without any hook event for this long gets [`STARTING_HINT_TEXT`] as detail.
 pub const STARTING_HINT_AFTER: Duration = Duration::from_secs(15);
@@ -96,6 +100,98 @@ pub const TURN_FAILED_TEXT: &str = "Turn fejlede, prøv igen eller skriv i termi
 /// History note when queued/in-progress tickets go back to the backlog at startup.
 pub const RESTART_NOTE: &str = "app genstartet";
 
+// --- Agent tools (step 4, C4.8) ---
+
+/// `true` restores step 3: a Stop moves the agent's inProgress ticket to review (done with
+/// skipReview). `false` (step 4): the ticket stays in progress with `issue: notSubmitted` until
+/// the agent calls `mira_submit_for_review` or the user moves it.
+pub const AUTO_REVIEW_ON_STOP: bool = false;
+
+/// Successful `mira_create_ticket` calls allowed per agent per rolling window.
+pub const CREATE_TICKET_RATE_LIMIT: usize = 20;
+/// The rate-limit window (ms).
+pub const CREATE_TICKET_RATE_WINDOW_MS: u64 = 3_600_000;
+/// Maximum `mira_submit_for_review` summary (chars).
+pub const TICKET_SUMMARY_MAX_CHARS: usize = 2_000;
+/// Maximum `mira_update_status` note (chars); longer notes are cut.
+pub const AGENT_NOTE_MAX_CHARS: usize = 120;
+/// Agent detail when a turn ended without `mira_submit_for_review`.
+pub const NOT_SUBMITTED_TEXT: &str = "Turn afsluttet uden aflevering";
+/// Env override for the mira-mcp exe location.
+pub const MCP_EXE_ENV: &str = "MIRA_MCP_EXE";
+/// The MCP server's name in mcp.json (same as `mira_mcp::SERVER_NAME`).
+pub const MCP_SERVER_NAME: &str = "mira-bots";
+/// Claude Code's name prefix for the server's tools (`mcp__<server>__`).
+pub const MCP_TOOL_PREFIX: &str = "mcp__mira-bots__";
+/// The app's own Claude Code settings file in the app data dir (hooks + permissions), passed
+/// with `--settings`.
+pub const SETTINGS_FILE: &str = "settings.json";
+/// Step 1–3 name of that file; removed when settings.json is written.
+pub const LEGACY_HOOKS_FILE: &str = "hooks.json";
+/// MCP config in the app data dir, passed with `--mcp-config`.
+pub const MCP_CONFIG_FILE: &str = "mcp.json";
+/// System prompt addition in the app data dir, passed with `--append-system-prompt-file`.
+pub const SYSTEM_PROMPT_FILE: &str = "system-prompt.md";
+
+// --- Profiles, roles, model/effort, reviews, reports (step 5, C5.8) ---
+
+/// Rounds of review rejection before the ticket is escalated to the user.
+pub const MAX_REVIEW_ROUNDS: u32 = 3;
+/// Env var carrying the agent's roles (`coder,reviewer`; empty = none) to claude and mira-mcp.
+/// Same value as `mira_mcp::ROLES_ENV`.
+pub const ROLES_ENV: &str = "MIRA_AGENT_ROLES";
+/// Profile store, relative to the agents root (`/`-separated; join component by component).
+pub const PROFILES_DIR: &str = ".mira-bots/profiles";
+/// Rendered per-profile files under the app data dir: `<id>/settings.json`, `<id>/system-prompt.md`.
+pub const PROFILE_FILES_DIR: &str = "profiles";
+/// Profile used when a spawn names none.
+pub const DEFAULT_PROFILE_ID: &str = "coder";
+/// The built-in profiles, in list order.
+pub const BUILTIN_PROFILE_IDS: [&str; 7] = [
+    "coder",
+    "researcher",
+    "reviewer",
+    "coordinator",
+    "planner",
+    "debugger",
+    "specialist",
+];
+/// Model aliases Claude Code accepts for `--model` (research5 Q1).
+pub const MODEL_ALIASES: [&str; 9] = [
+    "default",
+    "best",
+    "fable",
+    "sonnet",
+    "opus",
+    "haiku",
+    "sonnet[1m]",
+    "opus[1m]",
+    "opusplan",
+];
+/// Maximum length of a full model id.
+pub const MODEL_ID_MAX_CHARS: usize = 64;
+/// Maximum profile name length (chars, after trimming).
+pub const PROFILE_NAME_MAX_CHARS: usize = 60;
+/// Maximum `promptAppend` length (chars).
+pub const PROMPT_APPEND_MAX_CHARS: usize = 4_000;
+/// Report files under the app data dir: `<ticketId>/reports/<nn>-<slug>.md`.
+pub const REPORTS_DIR: &str = "tickets";
+pub const REPORT_TITLE_MAX_CHARS: usize = 120;
+pub const REPORT_BODY_MAX_CHARS: usize = 20_000;
+pub const REPORTS_PER_TICKET_MAX: usize = 20;
+pub const REPORT_ON_SUBMIT_TITLE: &str = "Rapport ved aflevering";
+/// Review files, relative to the reviewer's cwd.
+pub const REVIEW_DIR: &str = ".mira-bots/reviews";
+pub const REVIEW_DELIVERY_MAX_ATTEMPTS: u32 = 3;
+pub const REVIEW_NOTE_MAX_CHARS: usize = 2_000;
+/// Agent detail while it restarts with `--resume` (model/effort change).
+pub const RESTARTING_TEXT: &str = "Genstarter med nye indstillinger";
+/// Whether the per-profile settings get a `statusLine` pointing at the hook exe (live
+/// model/effort). `false` leaves only PostModelSwitch and the requested values.
+pub const STATUSLINE_ENABLED: bool = true;
+/// `hook_event_name` the hook exe gives a statusLine invocation.
+pub const STATUSLINE_EVENT: &str = "StatusLine";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,7 +206,7 @@ mod tests {
     #[test]
     fn limits_match_the_plan() {
         assert_eq!(MAX_WORK_AGENTS, 5);
-        assert_eq!(MAX_STAFF_AGENTS, 2);
+        assert_eq!(MAX_STAFF_AGENTS, 3);
         assert_eq!(STARTING_HINT_AFTER, Duration::from_secs(15));
         assert_eq!(LOG_KEEP_FILES, 3);
         assert_eq!(OUTPUT_RING_CAPACITY, 1_048_576);
@@ -141,6 +237,66 @@ mod tests {
             "Turn fejlede, prøv igen eller skriv i terminalen"
         );
         assert_eq!(RESTART_NOTE, "app genstartet");
+    }
+
+    #[test]
+    fn agent_tool_limits_match_the_plan() {
+        assert_eq!(CREATE_TICKET_RATE_LIMIT, 20);
+        assert_eq!(CREATE_TICKET_RATE_WINDOW_MS, 3_600_000);
+        assert_eq!(TICKET_SUMMARY_MAX_CHARS, 2_000);
+        assert_eq!(AGENT_NOTE_MAX_CHARS, 120);
+        assert_eq!(NOT_SUBMITTED_TEXT, "Turn afsluttet uden aflevering");
+    }
+
+    #[test]
+    fn step4_constants_match_the_plan() {
+        const { assert!(!AUTO_REVIEW_ON_STOP) };
+        assert_eq!(MCP_EXE_ENV, "MIRA_MCP_EXE");
+        assert_eq!(MCP_SERVER_NAME, "mira-bots");
+        assert_eq!(MCP_TOOL_PREFIX, "mcp__mira-bots__");
+        assert_eq!(SETTINGS_FILE, "settings.json");
+        assert_eq!(LEGACY_HOOKS_FILE, "hooks.json");
+        assert_eq!(MCP_CONFIG_FILE, "mcp.json");
+        assert_eq!(SYSTEM_PROMPT_FILE, "system-prompt.md");
+    }
+
+    #[test]
+    fn mcp_names_match_the_mcp_server() {
+        assert_eq!(MCP_TOOL_PREFIX, format!("mcp__{MCP_SERVER_NAME}__"));
+        assert_eq!(mira_mcp::SERVER_NAME, MCP_SERVER_NAME);
+        assert_eq!(mira_mcp::PIPE_ENV, PIPE_ENV);
+        assert_eq!(mira_mcp::AGENT_ID_ENV, AGENT_ID_ENV);
+    }
+
+    #[test]
+    fn step5_constants_match_the_plan() {
+        assert_eq!(MAX_REVIEW_ROUNDS, 3);
+        assert_eq!(ROLES_ENV, "MIRA_AGENT_ROLES");
+        assert_eq!(ROLES_ENV, mira_mcp::ROLES_ENV);
+        assert_eq!(PROFILES_DIR, ".mira-bots/profiles");
+        assert_eq!(PROFILE_FILES_DIR, "profiles");
+        assert_eq!(DEFAULT_PROFILE_ID, "coder");
+        assert!(BUILTIN_PROFILE_IDS.contains(&DEFAULT_PROFILE_ID));
+        assert_eq!(MODEL_ALIASES.len(), 9);
+        assert_eq!(MODEL_ID_MAX_CHARS, 64);
+        assert_eq!(PROFILE_NAME_MAX_CHARS, 60);
+        assert_eq!(PROMPT_APPEND_MAX_CHARS, 4_000);
+        assert_eq!(REPORTS_DIR, "tickets");
+        assert_eq!(
+            (
+                REPORT_TITLE_MAX_CHARS,
+                REPORT_BODY_MAX_CHARS,
+                REPORTS_PER_TICKET_MAX
+            ),
+            (120, 20_000, 20)
+        );
+        assert_eq!(REPORT_ON_SUBMIT_TITLE, "Rapport ved aflevering");
+        assert_eq!(REVIEW_DIR, ".mira-bots/reviews");
+        assert_eq!(REVIEW_DELIVERY_MAX_ATTEMPTS, 3);
+        assert_eq!(REVIEW_NOTE_MAX_CHARS, 2_000);
+        assert_eq!(RESTARTING_TEXT, "Genstarter med nye indstillinger");
+        const { assert!(STATUSLINE_ENABLED) };
+        assert_eq!(STATUSLINE_EVENT, "StatusLine");
     }
 
     #[test]

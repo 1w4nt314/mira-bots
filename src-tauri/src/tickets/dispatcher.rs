@@ -18,13 +18,14 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::model::{Ticket, TicketError, TicketIssue, TicketState};
-use super::prompt;
+use super::model::{ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState};
+use super::prompt::{self, ReviewSender};
 use super::service::TicketService;
 use crate::agent::now_ms;
 use crate::config::{
-    CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS, ENTER_DELAY_MS, RETRY_TIMEOUT_MS,
-    SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT,
+    AUTO_REVIEW_ON_STOP, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
+    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
+    TURN_FAILED_TEXT,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -37,6 +38,8 @@ pub const TURN_FAILED_NOTE: &str = "StopFailure";
 pub const TERMINAL_GONE_NOTE: &str = "Terminalen er væk";
 /// History note when a different prompt was submitted while the ticket line was being delivered.
 pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
+/// History note after the "Bed om aflevering" line was typed (the ticket is otherwise unchanged).
+pub const SUBMISSION_REQUESTED_NOTE: &str = "bedt om aflevering";
 
 /// No ticket is typed into a terminal the user typed into less than this long ago (their
 /// half-written prompt would be merged with the ticket line); the dispatch waits instead.
@@ -48,8 +51,8 @@ pub struct AgentSnapshot {
     pub name: String,
     pub cwd: PathBuf,
     pub status: AgentStatus,
-    /// Current detail text (to clear [`DELIVERY_FAILED_TEXT`]/[`TURN_FAILED_TEXT`] after a
-    /// successful delivery).
+    /// Current detail text (to clear [`DELIVERY_FAILED_TEXT`]/[`TURN_FAILED_TEXT`]/
+    /// [`NOT_SUBMITTED_TEXT`] after a successful delivery).
     pub detail: Option<String>,
     /// When the user last typed into the terminal ([`Timers::now_ms`] clock); see
     /// [`USER_INPUT_GRACE_MS`].
@@ -76,6 +79,10 @@ pub trait TicketsHost: Send {
     ) -> Result<T, String>;
     /// Read-only access under the service lock; no emits.
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T;
+    /// Routes tickets in review without a reviewer (plan5 A.6; `TicketsCtx::route_reviews`).
+    /// Called when an agent becomes idle and after an automatic move to review. No-op by
+    /// default (tests that do not route).
+    fn reroute_reviews(&self) {}
 }
 
 /// Schedules `msg` to be fed back into the dispatcher after `delay_ms`, and tells the time the
@@ -91,6 +98,10 @@ pub enum TimerKind {
     DispatchDelay,
     SendEnter,
     Confirm,
+    /// "Bed om aflevering": waiting for the user-input grace before typing the line.
+    NudgeDelay,
+    /// "Bed om aflevering": line typed, Enter pending.
+    NudgeEnter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,12 +119,19 @@ pub enum DispatchMsg {
     TurnEnded { agent_id: String, failed: bool },
     /// The agent's queue changed (assign, reorder, reject, …).
     QueueChanged { agent_id: String },
+    /// A review was assigned to this reviewer (plan5 A.6): deliver it when it is idle.
+    ReviewAssigned { reviewer_agent_id: String },
     /// The agent stopped/exited/was removed (its tickets are already released).
     AgentGone { agent_id: String },
+    /// The agent is restarted with `--resume` (model/effort change, plan5 A.5): any delivery
+    /// state is dropped like for `AgentGone`; its queue continues at the next Idle.
+    AgentRestarting { agent_id: String },
     /// `spawn_agent_with_ticket`: the line went in as the positional prompt.
     SpawnedWithTicket { agent_id: String, ticket_id: String },
     /// "Send igen" from the UI.
     Redispatch { ticket_id: String },
+    /// "Bed om aflevering" from the UI: type the nudge line into the in-progress ticket's agent.
+    RequestSubmission { ticket_id: String },
     Timer {
         agent_id: String,
         token: u64,
@@ -150,6 +168,32 @@ pub fn messages_for(ev: &StatusEvent) -> Vec<DispatchMsg> {
     }
 }
 
+/// What a delivery types: a work ticket ("Ticket …" line) or a review ("Review af ticket …"
+/// line, plan5 C5.12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryKind {
+    Work,
+    Review,
+}
+
+impl DeliveryKind {
+    /// The prefix a submitted prompt must start with to confirm this delivery.
+    fn prefix(self, ticket_id: &str) -> String {
+        let short = super::model::short_id(ticket_id);
+        match self {
+            DeliveryKind::Work => format!("Ticket {short}"),
+            DeliveryKind::Review => format!("Review af ticket {short}"),
+        }
+    }
+}
+
+/// What an idle agent gets next: its oldest undelivered review first, else its queue head.
+#[derive(Clone, Debug)]
+enum Item {
+    Work(Ticket),
+    Review(Ticket),
+}
+
 /// Per-agent delivery state (plan A.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Delivery {
@@ -162,6 +206,7 @@ enum Delivery {
     Typed {
         ticket_id: String,
         token: u64,
+        kind: DeliveryKind,
     },
     /// Enter sent, waiting for `UserPromptSubmit` or a busy status.
     Waiting {
@@ -170,9 +215,17 @@ enum Delivery {
         retried: bool,
         /// Came from `AwaitingSession`: a timeout falls back to an ordinary PTY dispatch.
         from_spawn: bool,
+        kind: DeliveryKind,
     },
     /// Spawned with the ticket line as positional prompt; waiting for the session to start.
     AwaitingSession {
+        ticket_id: String,
+        token: u64,
+    },
+    /// Typing the "Bed om aflevering" line (C4.7) for the in-progress `ticket_id`: waiting for
+    /// the grace period (`NudgeDelay`), then for the Enter (`NudgeEnter`). Nothing is confirmed:
+    /// the ticket stays in progress.
+    Nudging {
         ticket_id: String,
         token: u64,
     },
@@ -184,6 +237,8 @@ pub struct Dispatcher<H, P, T> {
     timers: T,
     deliveries: HashMap<String, Delivery>,
     next_token: u64,
+    /// See [`AUTO_REVIEW_ON_STOP`].
+    auto_review_on_stop: bool,
 }
 
 impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
@@ -194,7 +249,14 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             timers,
             deliveries: HashMap::new(),
             next_token: 0,
+            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
         }
+    }
+
+    /// Overrides [`AUTO_REVIEW_ON_STOP`] (tests).
+    pub fn with_auto_review(mut self, on: bool) -> Self {
+        self.auto_review_on_stop = on;
+        self
     }
 
     fn token(&mut self) -> u64 {
@@ -233,8 +295,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.on_prompt(&agent_id, prompt.as_deref())
             }
             DispatchMsg::TurnEnded { agent_id, failed } => self.on_turn_ended(&agent_id, failed),
-            DispatchMsg::QueueChanged { agent_id } => self.consider(&agent_id),
-            DispatchMsg::AgentGone { agent_id } => {
+            DispatchMsg::QueueChanged { agent_id }
+            | DispatchMsg::ReviewAssigned {
+                reviewer_agent_id: agent_id,
+            } => self.consider(&agent_id),
+            DispatchMsg::AgentGone { agent_id } | DispatchMsg::AgentRestarting { agent_id } => {
                 self.deliveries.remove(&agent_id);
             }
             DispatchMsg::SpawnedWithTicket {
@@ -245,6 +310,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.set(&agent_id, Delivery::AwaitingSession { ticket_id, token });
             }
             DispatchMsg::Redispatch { ticket_id } => self.redispatch(&ticket_id),
+            DispatchMsg::RequestSubmission { ticket_id } => self.on_request_submission(&ticket_id),
             DispatchMsg::Timer {
                 agent_id,
                 token,
@@ -253,14 +319,14 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
-    /// Starts a delivery sequence if the agent is free, idle and has a queued ticket.
+    /// Starts a delivery sequence if the agent is free, idle and has a review or a queued ticket.
     // TODO(windows-verify): 750 ms after Stop the input field is ready, and the extra Enter on
     // retry neither sends an empty prompt nor closes a dialog (plan D.29).
     fn consider(&mut self, agent_id: &str) {
         if *self.state(agent_id) != Delivery::Free {
             return;
         }
-        let Some((snap, _)) = self.ready_ticket(agent_id) else {
+        let Some((snap, _)) = self.ready_item(agent_id) else {
             return;
         };
         // The user typed recently: wait until the grace period is over (at least the usual delay).
@@ -279,19 +345,32 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         (elapsed < USER_INPUT_GRACE_MS).then(|| USER_INPUT_GRACE_MS - elapsed)
     }
 
-    /// The agent (idle, not exited) and its next ticket, if a delivery may start now.
-    fn ready_ticket(&self, agent_id: &str) -> Option<(AgentSnapshot, Ticket)> {
+    /// The agent (idle, not exited) and what it gets next, if a delivery may start now: its
+    /// oldest undelivered review assignment (plan5 A.6: reviews go before work), else its queue
+    /// head. Never while the agent has a ticket in progress: the next one waits until that one is
+    /// submitted or moved (step 4; also covers Esc mid-turn, which gives Idle without Stop).
+    fn ready_item(&self, agent_id: &str) -> Option<(AgentSnapshot, Item)> {
         let snap = self.port.snapshot(agent_id)?;
         if snap.status != AgentStatus::Idle {
             return None;
         }
+        if self.host.read(|s| s.current_for_agent(agent_id)).is_some() {
+            return None;
+        }
+        if let Some((_, t)) = self.host.read(|s| s.next_review_for(agent_id)) {
+            return Some((snap, Item::Review(t)));
+        }
         let ticket = self.host.read(|s| s.next_for_agent(agent_id))?;
-        Some((snap, ticket))
+        Some((snap, Item::Work(ticket)))
     }
 
     fn on_idle(&mut self, agent_id: &str) {
         match self.state(agent_id).clone() {
-            Delivery::Free => self.consider(agent_id),
+            Delivery::Free => {
+                // An idle agent may be a reviewer that came up after reviews were waiting.
+                self.host.reroute_reviews();
+                self.consider(agent_id);
+            }
             Delivery::AwaitingSession { ticket_id, token } => {
                 // The session is up; the positional prompt should be submitted soon.
                 self.schedule(
@@ -307,6 +386,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                         token,
                         retried: true,
                         from_spawn: true,
+                        kind: DeliveryKind::Work,
                     },
                 );
             }
@@ -316,66 +396,91 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     fn on_busy(&mut self, agent_id: &str) {
-        if let Delivery::Waiting { ticket_id, .. } | Delivery::AwaitingSession { ticket_id, .. } =
-            self.state(agent_id).clone()
-        {
-            self.confirm(agent_id, &ticket_id);
+        match self.state(agent_id).clone() {
+            Delivery::Waiting {
+                ticket_id, kind, ..
+            } => self.confirm(agent_id, &ticket_id, kind),
+            Delivery::AwaitingSession { ticket_id, .. } => {
+                self.confirm(agent_id, &ticket_id, DeliveryKind::Work)
+            }
+            _ => {}
         }
     }
 
     fn on_prompt(&mut self, agent_id: &str, prompt: Option<&str>) {
-        let (ticket_id, typed_by_us) = match self.state(agent_id) {
-            Delivery::Waiting { ticket_id, .. } | Delivery::Typed { ticket_id, .. } => {
-                (ticket_id.clone(), true)
+        let (ticket_id, typed_by_us, kind) = match self.state(agent_id) {
+            Delivery::Waiting {
+                ticket_id, kind, ..
             }
-            Delivery::AwaitingSession { ticket_id, .. } => (ticket_id.clone(), false),
+            | Delivery::Typed {
+                ticket_id, kind, ..
+            } => (ticket_id.clone(), true, *kind),
+            Delivery::AwaitingSession { ticket_id, .. } => {
+                (ticket_id.clone(), false, DeliveryKind::Work)
+            }
             _ => return,
         };
-        let expected = format!("Ticket {}", super::model::short_id(&ticket_id));
+        let expected = kind.prefix(&ticket_id);
         match prompt {
-            Some(p) if p.trim_start().starts_with(&expected) => self.confirm(agent_id, &ticket_id),
+            Some(p) if p.trim_start().starts_with(&expected) => {
+                self.confirm(agent_id, &ticket_id, kind)
+            }
             Some(_) if typed_by_us => {
                 // Another prompt went in while our line was in the terminal (typically the user's
                 // own text, possibly merged with the line). A busy status that follows belongs
                 // to that prompt, so it must not confirm the ticket: give up this delivery.
                 log::info!("dispatch {agent_id}: a different prompt was submitted; aborting");
-                self.delivery_failed(agent_id, &ticket_id, USER_TYPED_NOTE);
+                self.delivery_failed(agent_id, &ticket_id, USER_TYPED_NOTE, kind);
             }
             Some(_) => log::debug!("dispatch {agent_id}: submitted prompt is not the ticket line"),
             None => {
                 log::warn!("dispatch {agent_id}: UserPromptSubmit without prompt; counting it as delivered");
-                self.confirm(agent_id, &ticket_id);
+                self.confirm(agent_id, &ticket_id, kind);
             }
         }
     }
 
-    /// Delivery confirmed: the ticket goes in progress (or gets a "sent again" entry).
-    fn confirm(&mut self, agent_id: &str, ticket_id: &str) {
+    /// Delivery confirmed: the ticket goes in progress (or gets a "sent again" entry); a review
+    /// counts as delivered ("review sendt til <name>").
+    fn confirm(&mut self, agent_id: &str, ticket_id: &str, kind: DeliveryKind) {
         self.set(agent_id, Delivery::Free);
         let snap = self.port.snapshot(agent_id);
         let name = snap
             .as_ref()
             .map_or_else(|| agent_id.to_string(), |s| s.name.clone());
         let now = now_ms();
-        if let Err(e) = self
-            .host
-            .mutate(|s| s.mark_dispatched(ticket_id, &name, now))
-        {
-            log::warn!("dispatch {agent_id}: confirming ticket {ticket_id} failed: {e}");
+        let r = match kind {
+            DeliveryKind::Work => self
+                .host
+                .mutate(|s| s.mark_dispatched(ticket_id, &name, now))
+                .map(|_| ()),
+            DeliveryKind::Review => self
+                .host
+                .mutate(|s| s.mark_review_delivered(ticket_id, &name, now))
+                .map(|_| ()),
+        };
+        if let Err(e) = r {
+            log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}");
         }
         if snap.is_some_and(|s| {
             matches!(
                 s.detail.as_deref(),
-                Some(DELIVERY_FAILED_TEXT | TURN_FAILED_TEXT)
+                Some(DELIVERY_FAILED_TEXT | TURN_FAILED_TEXT | NOT_SUBMITTED_TEXT)
             )
         }) {
             self.port.set_detail(agent_id, None);
         }
     }
 
-    // TODO(windows-verify): Stop moves the ticket to review (done with skipReview) right after the
-    // answer; Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure shows the
-    // "Turn fejlede" hint and "Send igen" works (plan D.33).
+    /// Stop: with [`AUTO_REVIEW_ON_STOP`] the in-progress ticket goes to review (step 3).
+    /// Otherwise (step 4) a ticket still in progress was not submitted with
+    /// `mira_submit_for_review`: it keeps its state with `issue: notSubmitted` and the agent gets
+    /// [`NOT_SUBMITTED_TEXT`]; no next ticket is considered. Without a ticket in progress (e.g.
+    /// submitted by the tool in this turn) the queue moves on.
+    // TODO(windows-verify): Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure
+    // shows the "Turn fejlede" hint and "Send igen" works (plan D.33). Stop without
+    // `mira_submit_for_review` shows "Ikke afleveret"; with it, the ticket is in review before or
+    // right after the Stop (plan4 D.42).
     fn on_turn_ended(&mut self, agent_id: &str, failed: bool) {
         let now = now_ms();
         if failed {
@@ -395,11 +500,126 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             self.port
                 .set_detail(agent_id, Some(TURN_FAILED_TEXT.to_string()));
-        } else {
-            if let Err(e) = self.host.mutate(|s| s.complete_turn(agent_id, now)) {
-                log::warn!("dispatch {agent_id}: completing the turn failed: {e}");
+        } else if self.auto_review_on_stop {
+            match self.host.mutate(|s| s.complete_turn(agent_id, now)) {
+                Ok(Some(_)) => self.host.reroute_reviews(),
+                Ok(None) => {}
+                Err(e) => log::warn!("dispatch {agent_id}: completing the turn failed: {e}"),
             }
             self.consider(agent_id);
+        } else {
+            match self.host.mutate(|s| s.mark_not_submitted(agent_id, now)) {
+                Ok(Some(t)) => {
+                    log::info!(
+                        "dispatch {agent_id}: turn ended without submitting ticket {}",
+                        t.short_id()
+                    );
+                    self.port
+                        .set_detail(agent_id, Some(NOT_SUBMITTED_TEXT.to_string()));
+                }
+                Ok(None) => self.consider(agent_id),
+                Err(e) => log::warn!("dispatch {agent_id}: marking not submitted failed: {e}"),
+            }
+        }
+    }
+
+    /// "Bed om aflevering": the ticket must be in progress with an agent that is idle and has no
+    /// delivery running; otherwise this only logs. The line goes in after the user-input grace.
+    fn on_request_submission(&mut self, ticket_id: &str) {
+        let Some(t) = self.host.read(|s| s.get(ticket_id)) else {
+            log::info!("request submission: ticket {ticket_id} not found");
+            return;
+        };
+        let agent_id = match (&t.state, &t.assignee_agent_id) {
+            (TicketState::InProgress, Some(a)) => a.clone(),
+            _ => {
+                log::info!(
+                    "request submission: ticket {} is not in progress",
+                    t.short_id()
+                );
+                return;
+            }
+        };
+        let Some(snap) = self.port.snapshot(&agent_id) else {
+            log::info!("request submission: agent {agent_id} is gone");
+            return;
+        };
+        if snap.status != AgentStatus::Idle || *self.state(&agent_id) != Delivery::Free {
+            log::info!(
+                "request submission: agent {agent_id} is busy; ticket {} not nudged",
+                t.short_id()
+            );
+            return;
+        }
+        let delay = self.user_grace_left(&snap).unwrap_or(0);
+        let token = self.token();
+        self.schedule(&agent_id, token, TimerKind::NudgeDelay, delay);
+        self.set(
+            &agent_id,
+            Delivery::Nudging {
+                ticket_id: t.id,
+                token,
+            },
+        );
+    }
+
+    /// `NudgeDelay` came due: type the line if the agent is still idle, the user is not typing
+    /// and the ticket is still its in-progress ticket.
+    fn nudge_type(&mut self, agent_id: &str, ticket_id: &str, token: u64) {
+        let Some(snap) = self.port.snapshot(agent_id) else {
+            self.set(agent_id, Delivery::Free);
+            return;
+        };
+        if let Some(left) = self.user_grace_left(&snap) {
+            log::info!("dispatch {agent_id}: user typed recently; nudging in {left} ms");
+            self.schedule(agent_id, token, TimerKind::NudgeDelay, left);
+            return;
+        }
+        let current = self.host.read(|s| s.current_for_agent(agent_id));
+        let Some(t) = current.filter(|t| t.id == ticket_id) else {
+            log::info!("dispatch {agent_id}: ticket no longer in progress; no nudge");
+            self.set(agent_id, Delivery::Free);
+            return;
+        };
+        if snap.status != AgentStatus::Idle {
+            log::info!("dispatch {agent_id}: agent busy again; no nudge");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        let line = prompt::request_submission_line(&t.short_id());
+        if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
+            log::warn!("dispatch {agent_id}: typing the submission request failed: {e}");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        log::info!(
+            "dispatch {agent_id}: asked to submit ticket {}",
+            t.short_id()
+        );
+        self.schedule(agent_id, token, TimerKind::NudgeEnter, ENTER_DELAY_MS);
+    }
+
+    /// `NudgeEnter` came due: Enter, then the history note. The ticket's state and issue stay.
+    fn nudge_enter(&mut self, agent_id: &str, ticket_id: &str) {
+        self.set(agent_id, Delivery::Free);
+        if let Err(e) = self.port.write_input(agent_id, b"\r") {
+            log::warn!(
+                "dispatch {agent_id}: sending Enter after the submission request failed: {e}"
+            );
+            return;
+        }
+        let now = now_ms();
+        let r = self.host.mutate(|s| {
+            let issue = s.get(ticket_id).ok_or(TicketError::NotFound)?.issue;
+            s.set_issue(
+                ticket_id,
+                issue,
+                Some(SUBMISSION_REQUESTED_NOTE.into()),
+                now,
+            )
+        });
+        if let Err(e) = r {
+            log::warn!("dispatch {agent_id}: noting the submission request failed: {e}");
         }
     }
 
@@ -408,14 +628,19 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         match (state, kind) {
             (Delivery::Delaying { token: t }, TimerKind::DispatchDelay) if t == token => {
                 self.set(agent_id, Delivery::Free);
-                if let Some((snap, ticket)) = self.ready_ticket(agent_id) {
+                if let Some((snap, item)) = self.ready_item(agent_id) {
                     if let Some(left) = self.user_grace_left(&snap) {
                         // The user typed during the delay: try again when the grace is over.
                         log::info!("dispatch {agent_id}: user typed recently; waiting {left} ms");
                         self.schedule(agent_id, token, TimerKind::DispatchDelay, left);
                         self.set(agent_id, Delivery::Delaying { token });
                     } else {
-                        self.type_ticket(agent_id, &snap, &ticket, token);
+                        match item {
+                            Item::Work(ticket) => self.type_ticket(agent_id, &snap, &ticket, token),
+                            Item::Review(ticket) => {
+                                self.type_review(agent_id, &snap, &ticket, token)
+                            }
+                        }
                     }
                 }
             }
@@ -423,10 +648,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 Delivery::Typed {
                     ticket_id,
                     token: t,
+                    kind,
                 },
                 TimerKind::SendEnter,
             ) if t == token => {
-                if self.write_enter(agent_id, &ticket_id) {
+                if self.write_enter(agent_id, &ticket_id, kind) {
                     self.schedule(agent_id, token, TimerKind::Confirm, CONFIRM_TIMEOUT_MS);
                     self.set(
                         agent_id,
@@ -435,6 +661,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                             token,
                             retried: false,
                             from_spawn: false,
+                            kind,
                         },
                     );
                 }
@@ -445,12 +672,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     token: t,
                     retried,
                     from_spawn,
+                    kind,
                 },
                 TimerKind::Confirm,
             ) if t == token => {
                 if !retried {
                     // Enter may have been swallowed (popup, invisible chars): press it once more.
-                    if self.write_enter(agent_id, &ticket_id) {
+                    if self.write_enter(agent_id, &ticket_id, kind) {
                         self.schedule(agent_id, token, TimerKind::Confirm, RETRY_TIMEOUT_MS);
                         self.set(
                             agent_id,
@@ -459,6 +687,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                                 token,
                                 retried: true,
                                 from_spawn,
+                                kind,
                             },
                         );
                     }
@@ -469,9 +698,23 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     self.set(agent_id, Delivery::Free);
                     self.consider(agent_id);
                 } else {
-                    self.delivery_failed(agent_id, &ticket_id, DELIVERY_UNCONFIRMED_NOTE);
+                    self.delivery_failed(agent_id, &ticket_id, DELIVERY_UNCONFIRMED_NOTE, kind);
                 }
             }
+            (
+                Delivery::Nudging {
+                    ticket_id,
+                    token: t,
+                },
+                TimerKind::NudgeDelay,
+            ) if t == token => self.nudge_type(agent_id, &ticket_id, token),
+            (
+                Delivery::Nudging {
+                    ticket_id,
+                    token: t,
+                },
+                TimerKind::NudgeEnter,
+            ) if t == token => self.nudge_enter(agent_id, &ticket_id),
             _ => log::debug!("dispatch {agent_id}: ignoring stale {kind:?} timer"),
         }
     }
@@ -501,18 +744,99 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             Delivery::Typed {
                 ticket_id: ticket.id.clone(),
                 token,
+                kind: DeliveryKind::Work,
             },
         );
     }
 
-    /// Sends `\r` on its own. On failure the ticket goes to the backlog and `false` is returned.
+    /// A report author as a display name: "brugeren", the agent's name, or its id when gone.
+    fn author_name(&self, a: &ReportAuthor) -> String {
+        match (a.kind, &a.agent_id) {
+            (ReportAuthorKind::User, _) | (_, None) => "brugeren".to_string(),
+            (ReportAuthorKind::Agent, Some(id)) => self
+                .port
+                .snapshot(id)
+                .map_or_else(|| id.clone(), |s| s.name),
+        }
+    }
+
+    /// Writes the review file in the reviewer's folder and types the review line (C5.12);
+    /// Enter follows after `ENTER_DELAY_MS`. A failure counts as a failed review delivery (the
+    /// ticket stays in review with its reviewer).
+    // TODO(windows-verify): the reviewer reads .mira-bots\reviews\<short>.md and runs
+    // `git -C "<sender cwd>" diff .` without a prompt (allow rules); `git commit` is refused
+    // (plan5 D.54).
+    fn type_review(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
+        let sender = ticket
+            .assignee_agent_id
+            .as_deref()
+            .and_then(|a| self.port.snapshot(a))
+            .map(|s| ReviewSender {
+                name: s.name,
+                cwd: s.cwd.to_string_lossy().into_owned(),
+            });
+        let author = |a: &ReportAuthor| self.author_name(a);
+        if let Err(e) = prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author) {
+            log::warn!("dispatch {agent_id}: writing the review file failed: {e}");
+            self.review_failed(agent_id, &ticket.id);
+            return;
+        }
+        let line = prompt::review_line_for(ticket, sender.as_ref().map(|s| s.cwd.as_str()));
+        if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
+            log::warn!("dispatch {agent_id}: typing the review line failed: {e}");
+            self.review_failed(agent_id, &ticket.id);
+            return;
+        }
+        log::info!(
+            "dispatch {agent_id}: typed review of ticket {}",
+            ticket.short_id()
+        );
+        self.schedule(agent_id, token, TimerKind::SendEnter, ENTER_DELAY_MS);
+        self.set(
+            agent_id,
+            Delivery::Typed {
+                ticket_id: ticket.id.clone(),
+                token,
+                kind: DeliveryKind::Review,
+            },
+        );
+    }
+
+    /// A review delivery failed: one attempt used (after [`REVIEW_DELIVERY_MAX_ATTEMPTS`] the
+    /// history says so and no automatic retries follow), the reviewer gets
+    /// [`DELIVERY_FAILED_TEXT`]. The assignment stays; the next Idle tries again.
+    ///
+    /// [`REVIEW_DELIVERY_MAX_ATTEMPTS`]: crate::config::REVIEW_DELIVERY_MAX_ATTEMPTS
+    fn review_failed(&mut self, agent_id: &str, ticket_id: &str) {
+        self.set(agent_id, Delivery::Free);
+        let now = now_ms();
+        match self
+            .host
+            .mutate(|s| s.review_delivery_failed(ticket_id, now))
+        {
+            Ok(n) => {
+                log::warn!("dispatch {agent_id}: review of {ticket_id} not delivered (attempt {n})")
+            }
+            Err(e) => log::warn!("dispatch {agent_id}: noting the review failure failed: {e}"),
+        }
+        self.port
+            .set_detail(agent_id, Some(DELIVERY_FAILED_TEXT.to_string()));
+    }
+
+    /// Sends `\r` on its own. On failure a work ticket goes to the backlog (a review counts as
+    /// a failed delivery) and `false` is returned.
     // TODO(windows-verify): a separate `\r` write submits the typed line under ConPTY (plan D.28).
-    fn write_enter(&mut self, agent_id: &str, ticket_id: &str) -> bool {
+    fn write_enter(&mut self, agent_id: &str, ticket_id: &str, kind: DeliveryKind) -> bool {
         match self.port.write_input(agent_id, b"\r") {
             Ok(()) => true,
             Err(e) => {
                 log::warn!("dispatch {agent_id}: sending Enter failed: {e}");
-                self.send_to_backlog(agent_id, ticket_id, TERMINAL_GONE_NOTE);
+                match kind {
+                    DeliveryKind::Work => {
+                        self.send_to_backlog(agent_id, ticket_id, TERMINAL_GONE_NOTE)
+                    }
+                    DeliveryKind::Review => self.review_failed(agent_id, ticket_id),
+                }
                 false
             }
         }
@@ -527,8 +851,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     /// No confirmation after the retry, or another prompt went in: the ticket stays first in
-    /// the queue with an issue and `note` in its history.
-    fn delivery_failed(&mut self, agent_id: &str, ticket_id: &str, note: &str) {
+    /// the queue with an issue and `note` in its history (a review: see [`Self::review_failed`]).
+    fn delivery_failed(&mut self, agent_id: &str, ticket_id: &str, note: &str, kind: DeliveryKind) {
+        if kind == DeliveryKind::Review {
+            log::info!("dispatch {agent_id}: review delivery of {ticket_id} failed ({note})");
+            self.review_failed(agent_id, ticket_id);
+            return;
+        }
         self.set(agent_id, Delivery::Free);
         log::warn!("dispatch {agent_id}: delivery of ticket {ticket_id} failed ({note})");
         let now = now_ms();
@@ -548,12 +877,23 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     /// "Send igen": the queue head or the ticket in progress, to an idle agent with no delivery
-    /// running. Clears the issue and types the ticket right away.
+    /// running. Clears the issue and types the ticket right away. For a ticket in review with a
+    /// reviewer: the review's delivery attempts start over and it is offered to the reviewer.
     fn redispatch(&mut self, ticket_id: &str) {
         let Some(t) = self.host.read(|s| s.get(ticket_id)) else {
             log::info!("redispatch: ticket {ticket_id} not found");
             return;
         };
+        if t.state == TicketState::Review {
+            match self.host.mutate(|s| s.reset_review_delivery(ticket_id)) {
+                Ok(a) => self.consider(&a.reviewer_agent_id),
+                Err(e) => log::info!(
+                    "redispatch: review of {} not deliverable: {e}",
+                    t.short_id()
+                ),
+            }
+            return;
+        }
         let Some(agent_id) = t.assignee_agent_id.clone() else {
             log::info!("redispatch: ticket {} has no agent", t.short_id());
             return;
@@ -1124,10 +1464,11 @@ mod tests {
         assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
     }
 
-    // (5)
+    // (5) Step 3 behaviour, kept behind AUTO_REVIEW_ON_STOP = true.
     #[test]
     fn turn_end_moves_the_ticket_to_review_or_done() {
         let mut h = Harness::new();
+        h.d.auto_review_on_stop = true;
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1240,6 +1581,7 @@ mod tests {
     #[test]
     fn rejected_ticket_goes_first_and_its_file_has_the_note() {
         let mut h = Harness::new();
+        h.d.auto_review_on_stop = true;
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1286,6 +1628,28 @@ mod tests {
             assert_eq!((t.state, t.issue), (S::Backlog, None));
         }
         assert!(h.d.deliveries.is_empty());
+    }
+
+    #[test]
+    fn restarting_cancels_pending_delivery() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "A");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        assert!(matches!(h.d.state("a1"), Delivery::Delaying { .. }));
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        assert!(h.d.deliveries.is_empty());
+        // The old timer does nothing; the queue continues at the next Idle (after SessionStart).
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes().is_empty());
+        assert_eq!(h.ticket(&t.id).state, S::Assigned);
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
     }
 
     // (10)
@@ -1536,6 +1900,285 @@ mod tests {
         assert_eq!(h.writes(), vec![("a1".into(), line(&a)), enter("a1")]);
     }
 
+    // ---- step 4: Stop without submit, the in-progress guard, "Bed om aflevering" ----
+
+    fn stop(h: &mut Harness, agent: &str) {
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: agent.into(),
+            failed: false,
+        });
+        h.idle(agent);
+    }
+
+    /// Queues A and B for a1 and delivers A (confirmed, in progress).
+    fn a_in_progress(h: &mut Harness) -> (Ticket, Ticket) {
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        let b = h.queued("a1", "B");
+        deliver_until_enter(h, "a1");
+        h.submitted("a1", &line(&a));
+        assert_eq!(h.ticket(&a.id).state, S::InProgress);
+        (a, b)
+    }
+
+    fn request(h: &mut Harness, t: &Ticket) {
+        h.send(DispatchMsg::RequestSubmission {
+            ticket_id: t.id.clone(),
+        });
+    }
+
+    fn nudge(t: &Ticket) -> (String, String) {
+        ("a1".into(), prompt::request_submission_line(&t.short_id()))
+    }
+
+    #[test]
+    fn auto_review_follows_the_constant() {
+        let h = Harness::new();
+        assert_eq!(h.d.auto_review_on_stop, AUTO_REVIEW_ON_STOP);
+        assert!(!h.d.auto_review_on_stop);
+        let d = Dispatcher::new(h.d.host.clone(), h.port.clone(), h.timers.clone());
+        assert!(d.with_auto_review(true).auto_review_on_stop);
+    }
+
+    #[test]
+    fn stop_without_submit_keeps_the_ticket_in_progress_and_holds_the_queue() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.advance(10_000);
+        let now = h.ticket(&a.id);
+        assert_eq!(
+            (now.state, now.issue),
+            (S::InProgress, Some(TicketIssue::NotSubmitted))
+        );
+        let last = now.history.last().unwrap();
+        assert_eq!(
+            last.note.as_deref(),
+            Some(crate::tickets::NOT_SUBMITTED_NOTE)
+        );
+        assert_eq!(last.by, TicketActor::System);
+        assert_eq!(h.detail("a1").as_deref(), Some(NOT_SUBMITTED_TEXT));
+        // B is not typed although the queue has it.
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.ticket(&b.id).state, S::Assigned);
+        assert_eq!(h.timers.pending(), 0);
+    }
+
+    #[test]
+    fn stop_with_auto_review_moves_on_to_the_next_ticket() {
+        let mut h = Harness::new();
+        h.d.auto_review_on_stop = true;
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        assert_eq!(h.ticket(&a.id).state, S::Review);
+        assert_eq!(h.ticket(&a.id).issue, None);
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    #[test]
+    fn stop_without_a_ticket_in_progress_considers_the_queue() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        // E.g. the user's own prompt ended; nothing in progress.
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: "a1".into(),
+            failed: false,
+        });
+        assert_eq!(h.ticket(&a.id).issue, None);
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&a))]);
+        assert_eq!(h.detail("a1"), None);
+    }
+
+    #[test]
+    fn submit_by_the_tool_before_stop_lets_the_next_ticket_go() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.svc()
+            .submit_by_agent("a1", None, "Rettet login", 50)
+            .unwrap();
+        stop(&mut h, "a1");
+        let a_now = h.ticket(&a.id);
+        assert_eq!((a_now.state, a_now.issue), (S::Review, None));
+        assert_eq!(a_now.summary.as_deref(), Some("Rettet login"));
+        assert_eq!(h.detail("a1"), None);
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        assert_eq!(
+            &h.writes()[2..],
+            &[("a1".into(), line(&b_now)), enter("a1")]
+        );
+    }
+
+    #[test]
+    fn submit_after_a_not_submitted_stop_clears_it_and_the_queue_moves() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        assert_eq!(h.ticket(&a.id).issue, Some(TicketIssue::NotSubmitted));
+        h.svc().submit_by_agent("a1", None, "Færdig", 60).unwrap();
+        assert_eq!(h.ticket(&a.id).issue, None);
+        // tools.rs notifies the dispatcher; the agent is idle.
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    #[test]
+    fn no_ticket_is_typed_while_one_is_in_progress() {
+        let mut h = Harness::new();
+        let (_, b) = a_in_progress(&mut h);
+        // Esc mid-turn: Idle without Stop, then a queue change.
+        h.set_status("a1", AgentStatus::Idle);
+        h.idle("a1");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.ticket(&b.id).state, S::Assigned);
+    }
+
+    #[test]
+    fn confirm_clears_the_not_submitted_detail() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        assert_eq!(h.detail("a1").as_deref(), Some(NOT_SUBMITTED_TEXT));
+        // "Send til review" by the user.
+        h.svc().set_state(&a.id, S::Review, None, true, 70).unwrap();
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        h.submitted("a1", &line(&b_now));
+        assert_eq!(h.ticket(&b.id).state, S::InProgress);
+        assert_eq!(h.detail("a1"), None);
+    }
+
+    #[test]
+    fn request_submission_types_the_line_then_a_separate_enter() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        let before = h.ticket(&a.id);
+        request(&mut h, &a);
+        h.advance(0);
+        assert_eq!(h.writes()[2], nudge(&a));
+        assert!(!h.writes()[2].1.starts_with("Ticket"));
+        assert_eq!(h.writes().len(), 3);
+        h.advance(ENTER_DELAY_MS - 1);
+        assert_eq!(h.writes().len(), 3);
+        h.advance(1);
+        assert_eq!(h.writes()[3], enter("a1"));
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
+        // State and issue unchanged; only a history note.
+        let after = h.ticket(&a.id);
+        assert_eq!((after.state, after.issue), (before.state, before.issue));
+        assert_eq!(after.history.len(), before.history.len() + 1);
+        assert_eq!(
+            after.history.last().unwrap().note.as_deref(),
+            Some(SUBMISSION_REQUESTED_NOTE)
+        );
+        // Nothing else follows (only the stale confirm timer of the delivery is left).
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 4);
+    }
+
+    #[test]
+    fn request_submission_waits_for_the_user_input_grace() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.user_typed("a1");
+        request(&mut h, &a);
+        h.advance(USER_INPUT_GRACE_MS - 1);
+        assert_eq!(h.writes().len(), 2);
+        // Typing again during the wait postpones it once more.
+        h.user_typed("a1");
+        h.advance(1);
+        assert_eq!(h.writes().len(), 2);
+        h.advance(USER_INPUT_GRACE_MS);
+        assert_eq!(h.writes()[2], nudge(&a));
+    }
+
+    #[test]
+    fn request_submission_does_nothing_for_a_busy_agent_or_a_queued_ticket() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.set_status("a1", AgentStatus::Thinking);
+        request(&mut h, &a);
+        h.advance(10_000);
+        // A queued (not in progress) ticket is never nudged either.
+        h.set_status("a1", AgentStatus::Idle);
+        request(&mut h, &b);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.timers.pending(), 0);
+        // Not while a delivery sequence runs for the agent.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let c = h.queued("a1", "C");
+        h.idle("a1");
+        h.svc().mark_dispatched(&c.id, "bot-a1", 5).unwrap();
+        request(&mut h, &c);
+        assert!(matches!(h.d.state("a1"), Delivery::Delaying { .. }));
+    }
+
+    #[test]
+    fn foreign_prompt_or_busy_status_during_a_nudge_changes_nothing() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        request(&mut h, &a);
+        h.advance(0);
+        h.submitted("a1", "noget helt andet");
+        h.send(DispatchMsg::AgentBusy {
+            agent_id: "a1".into(),
+        });
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[3], enter("a1"));
+        let now = h.ticket(&a.id);
+        assert_eq!(
+            (now.state, now.issue),
+            (S::InProgress, Some(TicketIssue::NotSubmitted))
+        );
+        assert_eq!(h.ticket(&b.id).state, S::Assigned);
+    }
+
+    #[test]
+    fn nudge_write_failure_frees_the_agent_and_leaves_the_ticket() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        let before = h.ticket(&a.id);
+        lock(&h.port.0).fail_writes = true;
+        request(&mut h, &a);
+        h.advance(ENTER_DELAY_MS * 2);
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
+        assert_eq!(h.ticket(&a.id), before);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+    }
+
+    #[test]
+    fn nudge_is_dropped_when_the_ticket_moved_meanwhile() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.user_typed("a1");
+        request(&mut h, &a);
+        h.svc().set_state(&a.id, S::Review, None, true, 80).unwrap();
+        h.advance(USER_INPUT_GRACE_MS);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
+    }
+
     #[test]
     fn fake_timers_deliver_in_time_then_schedule_order() {
         let mut t = FakeTimers::new();
@@ -1588,5 +2231,225 @@ mod tests {
         run(rx2, d).await;
         assert_eq!(h.timers.pending(), 1);
         assert_eq!(h.ticket(&t.id).state, S::Assigned);
+    }
+
+    // ---- review deliveries (plan5 punkt 12) ----
+
+    /// A ticket submitted by `sender` and routed to `reviewer` (no message sent yet).
+    fn routed_review(h: &Harness, sender: &str, reviewer: &str, title: &str) -> Ticket {
+        let mut s = h.svc();
+        let t = s.create(title, "Gør det", false, 1).unwrap();
+        s.assign(&t.id, sender, 2).unwrap();
+        s.mark_dispatched(&t.id, sender, 3).unwrap();
+        s.submit_by_agent(sender, None, "Lavet", 4).unwrap();
+        s.route_review(&t.id, reviewer, &format!("bot-{reviewer}"), 5)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn review_line(h: &Harness, t: &Ticket, sender: &str) -> String {
+        let cwd = h.root.join(sender).to_string_lossy().into_owned();
+        prompt::review_line_for(&h.ticket(&t.id), Some(&cwd))
+    }
+
+    fn assigned(h: &mut Harness, reviewer: &str) {
+        h.send(DispatchMsg::ReviewAssigned {
+            reviewer_agent_id: reviewer.into(),
+        });
+    }
+
+    #[test]
+    fn review_assignment_is_typed_when_reviewer_idle() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Thinking);
+        let t = routed_review(&h, "a1", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert!(h.writes().is_empty(), "the reviewer is busy");
+        h.set_status("rev", AgentStatus::Idle);
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        let line = review_line(&h, &t, "a1");
+        assert!(line.starts_with(&format!("Review af ticket {}", t.short_id())));
+        assert_eq!(h.writes(), vec![("rev".into(), line.clone())]);
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes(), vec![("rev".into(), line), enter("rev")]);
+        // Nothing reached the sender; the ticket stays in review.
+        assert_eq!(h.ticket(&t.id).state, S::Review);
+    }
+
+    #[test]
+    fn review_file_written_in_reviewer_cwd() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Idle);
+        let t = routed_review(&h, "a1", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.advance(DISPATCH_DELAY_MS);
+        let path = prompt::review_dir(&h.root.join("rev")).join(format!("{}.md", t.short_id()));
+        let f = fs::read_to_string(path).unwrap();
+        let sender_cwd = h.root.join("a1").to_string_lossy().into_owned();
+        assert!(
+            f.contains(&format!("Afsender: bot-a1 ({sender_cwd})")),
+            "{f}"
+        );
+        assert!(f.contains("## Opsummering fra afsenderen\nLavet\n"));
+        assert!(!prompt::review_dir(&h.root.join("a1")).exists());
+    }
+
+    #[test]
+    fn review_goes_before_queued_work() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Idle);
+        let work = h.queued("rev", "Eget arbejde");
+        let t = routed_review(&h, "a1", "rev", "Ret login");
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("rev".into(), review_line(&h, &t, "a1"))]);
+        h.advance(ENTER_DELAY_MS);
+        h.submitted("rev", &review_line(&h, &t, "a1"));
+        assert_eq!(h.ticket(&work.id).state, S::Assigned);
+        // The review turn ends: now the work ticket follows.
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: "rev".into(),
+            failed: false,
+        });
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(
+            h.writes().last().unwrap(),
+            &("rev".to_string(), line(&work))
+        );
+    }
+
+    #[test]
+    fn review_line_confirms_on_prompt_prefix() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Idle);
+        let t = routed_review(&h, "a1", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        // A work-style "Ticket <short>" prompt is not the review line.
+        h.submitted("rev", &format!("Ticket {}: x", t.short_id()));
+        let a = h.svc().assignment_for_ticket(&t.id).unwrap();
+        assert_eq!(
+            (a.delivered_at, a.attempts),
+            (None, 1),
+            "aborted as a failure"
+        );
+        assert_eq!(h.detail("rev").as_deref(), Some(DELIVERY_FAILED_TEXT));
+
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        h.submitted(
+            "rev",
+            &format!("  Review af ticket {}: Ret login. Læs …", t.short_id()),
+        );
+        let a = h.svc().assignment_for_ticket(&t.id).unwrap();
+        assert!(a.delivered_at.is_some());
+        let tk = h.ticket(&t.id);
+        assert_eq!(tk.state, S::Review);
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some("review sendt til bot-rev")
+        );
+        assert_eq!(h.detail("rev"), None, "the failure hint is cleared");
+        // Delivered: no second typing at the next idle.
+        let n = h.writes().len();
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), n);
+
+        // A busy status confirms as well.
+        h.agent("rev2", AgentStatus::Idle);
+        let t2 = routed_review(&h, "a1", "rev2", "Andet");
+        assigned(&mut h, "rev2");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        h.send(DispatchMsg::AgentBusy {
+            agent_id: "rev2".into(),
+        });
+        assert!(h
+            .svc()
+            .assignment_for_ticket(&t2.id)
+            .unwrap()
+            .delivered_at
+            .is_some());
+    }
+
+    #[test]
+    fn review_delivery_failure_retries_next_idle_then_gives_up() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Idle);
+        let t = routed_review(&h, "a1", "rev", "Ret login");
+        for attempt in 1..=crate::config::REVIEW_DELIVERY_MAX_ATTEMPTS {
+            h.idle("rev");
+            h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS + RETRY_TIMEOUT_MS);
+            let a = h.svc().assignment_for_ticket(&t.id).unwrap();
+            assert_eq!((a.attempts, a.delivered_at), (attempt, None));
+            assert_eq!(h.detail("rev").as_deref(), Some(DELIVERY_FAILED_TEXT));
+        }
+        let tk = h.ticket(&t.id);
+        assert_eq!(
+            (tk.state, tk.reviewer_agent_id.as_deref()),
+            (S::Review, Some("rev"))
+        );
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some(crate::tickets::service::REVIEW_UNDELIVERED_NOTE)
+        );
+        let n = h.writes().len();
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), n, "no more automatic tries");
+        // "Send igen" starts over.
+        h.send(DispatchMsg::Redispatch {
+            ticket_id: t.id.clone(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().last().unwrap().1, review_line(&h, &t, "a1"));
+    }
+
+    #[test]
+    fn restarting_cancels_pending_review_delivery() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Idle);
+        let t = routed_review(&h, "a1", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().len(), 1);
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "rev".into(),
+        });
+        h.advance(ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS + RETRY_TIMEOUT_MS);
+        assert_eq!(h.writes().len(), 1, "no Enter after the restart");
+        let a = h.svc().assignment_for_ticket(&t.id).unwrap();
+        assert_eq!((a.attempts, a.delivered_at), (0, None));
+        // The queue continues at the next Idle.
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().len(), 2);
+    }
+
+    #[test]
+    fn work_ticket_in_progress_blocks_review_delivery() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("rev", AgentStatus::Idle);
+        let own = h.queued("rev", "Eget");
+        h.svc().mark_dispatched(&own.id, "bot-rev", 3).unwrap();
+        routed_review(&h, "a1", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert!(h.writes().is_empty());
+        h.svc().submit_by_agent("rev", None, "færdig", 9).unwrap();
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes()[0].1.starts_with("Review af ticket "));
     }
 }

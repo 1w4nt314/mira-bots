@@ -6,6 +6,17 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::config::MCP_TOOL_PREFIX;
+
+/// Fallback for the app's own MCP tools when settings.json's `permissions.allow` rule did not
+/// take effect and Claude Code asks anyway: `mcp__mira-bots__*` is allowed without the UI. When
+/// the hook names the server's source (`mcp_server.source`), it must be `"dynamic"` (our
+/// `--mcp-config` server), so a user server that happens to be called `mira-bots` is not
+/// auto-allowed; without that field (older Claude Code) the prefix alone decides.
+pub fn auto_allows_own_tool(tool_name: &str, mcp_server_source: Option<&str>) -> bool {
+    tool_name.starts_with(MCP_TOOL_PREFIX) && mcp_server_source.is_none_or(|s| s == "dynamic")
+}
+
 /// The app's answer to one PermissionRequest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -119,6 +130,18 @@ impl PendingPermissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_mcp_tools_are_auto_allowed_only_from_the_dynamic_server() {
+        let ping = "mcp__mira-bots__mira_list_tickets";
+        assert!(auto_allows_own_tool(ping, Some("dynamic")));
+        assert!(auto_allows_own_tool(ping, None));
+        assert!(!auto_allows_own_tool(ping, Some("user")));
+        assert!(!auto_allows_own_tool(ping, Some("project")));
+        assert!(!auto_allows_own_tool("mcp__other__x", Some("dynamic")));
+        assert!(!auto_allows_own_tool("mcp__mira-bots", Some("dynamic")));
+        assert!(!auto_allows_own_tool("Bash", None));
+    }
     use serde_json::json;
 
     fn info(id: &str, agent: &str, created: u64) -> PermissionRequestInfo {

@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { reviewCount } from "../../lib/tickets";
 import type { WorkplaceTab } from "../../lib/types";
 import { useStore } from "../../state/store";
 import DiagnosticsPanel from "./DiagnosticsPanel";
 import PermissionsPanel from "./PermissionsPanel";
 import TicketsPanel from "./tickets/TicketsPanel";
+
+// The profile list and editor load on first use (keeps the workplace chunk small).
+const ProfilesPanel = lazy(() => import("./agents/ProfilesPanel"));
 
 type Tab = WorkplaceTab;
 
@@ -39,6 +42,7 @@ export default function Sidebar({ requestedTab = null }: Props) {
       label: reviews > 0 ? `Tickets (${reviews})` : "Tickets",
       title: reviews > 0 ? `${reviews} ${reviews === 1 ? "ticket venter" : "tickets venter"} på review` : "Tickets",
     },
+    { id: "agents", label: "Agenter", title: "Agentprofiler: roller, model, effort og plads" },
   ];
 
   return (
@@ -66,6 +70,11 @@ export default function Sidebar({ requestedTab = null }: Props) {
         {tab === "permissions" && <PermissionsPanel />}
         {tab === "diagnostics" && <DiagnosticsPanel />}
         {tab === "tickets" && <TicketsPanel />}
+        {tab === "agents" && (
+          <Suspense fallback={<p className="p-3 text-xs text-[var(--muted)]">Henter…</p>}>
+            <ProfilesPanel />
+          </Suspense>
+        )}
       </div>
     </aside>
   );

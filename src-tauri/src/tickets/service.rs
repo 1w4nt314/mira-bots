@@ -13,17 +13,34 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 
 use super::model::{
-    short_id, Ticket, TicketActor, TicketDoc, TicketError, TicketHistoryEntry, TicketId,
-    TicketIssue, TicketPatch, TicketSource, TicketState, TicketSummary,
+    short_id, ReviewAssignment, Ticket, TicketActor, TicketDoc, TicketError, TicketHistoryEntry,
+    TicketId, TicketIssue, TicketPatch, TicketReport, TicketSource, TicketState, TicketSummary,
 };
 use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
-use crate::config::{RESTART_NOTE, TICKET_BODY_MAX_CHARS, TICKET_TITLE_MAX_CHARS};
+use super::NOT_SUBMITTED_NOTE;
+use crate::config::{
+    MAX_REVIEW_ROUNDS, REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS,
+    TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS,
+};
 
 /// History note when a turn ended normally (Stop hook).
 pub const TURN_ENDED_NOTE: &str = "auto: turn afsluttet";
 /// History note when a ticket in progress was delivered again.
 pub const RESENT_NOTE: &str = "sendt igen";
+/// History note after the review line could not be delivered [`REVIEW_DELIVERY_MAX_ATTEMPTS`]
+/// times (plan5 C5.8).
+pub const REVIEW_UNDELIVERED_NOTE: &str = "review kunne ikke leveres";
+/// History note when the user removed the reviewer.
+pub const REVIEWER_REMOVED_NOTE: &str = "reviewer fjernet";
+
+/// `"eskaleret efter 3 runder"`.
+pub fn escalated_note() -> String {
+    format!("eskaleret efter {MAX_REVIEW_ROUNDS} runder")
+}
+
+/// Per reviewer agent: its open review assignments (agents without any are absent).
+pub type ReviewCounts = HashMap<String, usize>;
 
 /// Per agent: the `inProgress` ticket (if any) and the number of queued (`assigned`) tickets.
 /// Agents without any ticket are absent.
@@ -60,6 +77,18 @@ fn validate_body(body: &str) -> Result<(), TicketError> {
     Ok(())
 }
 
+/// Trimmed summary of 1–[`TICKET_SUMMARY_MAX_CHARS`] chars.
+fn validate_summary(summary: &str) -> Result<String, TicketError> {
+    let s = summary.trim();
+    let n = s.chars().count();
+    if n == 0 || n > TICKET_SUMMARY_MAX_CHARS {
+        return Err(TicketError::Validation(format!(
+            "summary skal være en tekst på 1–{TICKET_SUMMARY_MAX_CHARS} tegn"
+        )));
+    }
+    Ok(s.to_string())
+}
+
 fn find_mut<'a>(doc: &'a mut TicketDoc, id: &str) -> Result<&'a mut Ticket, TicketError> {
     doc.tickets
         .iter_mut()
@@ -85,6 +114,40 @@ fn in_progress_of<'a>(doc: &'a TicketDoc, agent_id: &str) -> Option<&'a Ticket> 
     doc.tickets.iter().find(|t| {
         t.state == TicketState::InProgress && t.assignee_agent_id.as_deref() == Some(agent_id)
     })
+}
+
+/// Keeps the review assignments consistent with the tickets: an assignment stays only while its
+/// ticket is in review with that reviewer (one per ticket); a ticket in review whose reviewer has
+/// no assignment loses the reviewer (it is routed again).
+fn normalize_reviews(doc: &mut TicketDoc) {
+    let mut seen: HashSet<TicketId> = HashSet::new();
+    let tickets = &doc.tickets;
+    doc.review_assignments.retain(|a| {
+        let ok = tickets.iter().any(|t| {
+            t.id == a.ticket_id
+                && t.state == TicketState::Review
+                && t.reviewer_agent_id.as_deref() == Some(a.reviewer_agent_id.as_str())
+        });
+        ok && seen.insert(a.ticket_id.clone())
+    });
+    for t in doc.tickets.iter_mut() {
+        if t.state == TicketState::Review && t.reviewer_agent_id.is_some() && !seen.contains(&t.id)
+        {
+            t.reviewer_agent_id = None;
+        }
+    }
+}
+
+/// A history entry that keeps the state (`from == to`).
+fn note_entry(t: &mut Ticket, by: TicketActor, note: String, now: u64) {
+    t.updated_at = now;
+    t.history.push(TicketHistoryEntry {
+        at: now,
+        from: Some(t.state),
+        to: t.state,
+        by,
+        note: Some(note),
+    });
 }
 
 /// Rewrites queue positions: per agent the `assigned` tickets ordered by
@@ -142,6 +205,13 @@ impl TicketService {
             }
         };
         let mut svc = TicketService::new(store, doc);
+        // Reviewers did not survive the restart either: tickets in review wait for routing again.
+        let stale_reviews = !svc.doc.review_assignments.is_empty()
+            || svc
+                .doc
+                .tickets
+                .iter()
+                .any(|t| t.state == TicketState::Review && t.reviewer_agent_id.is_some());
         let stale: Vec<TicketId> = svc
             .doc
             .tickets
@@ -149,8 +219,14 @@ impl TicketService {
             .filter(|t| matches!(t.state, TicketState::Assigned | TicketState::InProgress))
             .map(|t| t.id.clone())
             .collect();
-        if !stale.is_empty() {
+        if !stale.is_empty() || stale_reviews {
             let r = svc.commit(|doc| {
+                doc.review_assignments.clear();
+                for t in doc.tickets.iter_mut() {
+                    if t.state == TicketState::Review {
+                        t.reviewer_agent_id = None;
+                    }
+                }
                 for id in &stale {
                     apply(
                         doc,
@@ -185,6 +261,7 @@ impl TicketService {
         let before = self.doc.clone();
         let result = f(&mut self.doc).and_then(|v| {
             normalize_queues(&mut self.doc);
+            normalize_reviews(&mut self.doc);
             self.persist().map(|()| v)
         });
         if result.is_err() {
@@ -267,6 +344,48 @@ impl TicketService {
         m
     }
 
+    /// A ticket by its full id or its short id (case-insensitive, surrounding spaces ignored).
+    pub fn get_by_any_id(&self, id: &str) -> Option<Ticket> {
+        let q = id.trim().to_lowercase();
+        if q.is_empty() {
+            return None;
+        }
+        self.doc
+            .tickets
+            .iter()
+            .find(|t| t.id.to_lowercase() == q)
+            .or_else(|| self.doc.tickets.iter().find(|t| t.short_id() == q))
+            .cloned()
+    }
+
+    /// The agent's own tickets ("mine"): the one in progress first, then its queue in order.
+    pub fn list_for_agent(&self, agent_id: &str) -> Vec<TicketSummary> {
+        let mut v: Vec<&Ticket> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| {
+                t.assignee_agent_id.as_deref() == Some(agent_id)
+                    && matches!(t.state, TicketState::Assigned | TicketState::InProgress)
+            })
+            .collect();
+        v.sort_by_key(|t| (t.state != TicketState::InProgress, t.queue_position));
+        v.into_iter().map(TicketSummary::from).collect()
+    }
+
+    /// Unassigned tickets, oldest first.
+    pub fn backlog(&self) -> Vec<TicketSummary> {
+        let mut v: Vec<TicketSummary> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| t.state == TicketState::Backlog)
+            .map(TicketSummary::from)
+            .collect();
+        v.sort_by_key(|t| t.created_at);
+        v
+    }
+
     /// The ticket to deliver next: `None` while the agent has one in progress, else the queue
     /// head.
     pub fn next_for_agent(&self, agent_id: &str) -> Option<Ticket> {
@@ -297,18 +416,39 @@ impl TicketService {
             title,
             body,
             skip_review,
+            (TicketSource::User, TicketActor::User),
             now,
         )
     }
 
-    /// `create` with injectable ids (tests force a short-id collision). Ids whose short id is
-    /// already taken are skipped.
+    /// `create` with injectable ids (tests force a short-id collision) and origin (`source`, and
+    /// the creation entry's `by`). Ids whose short id is already taken are skipped.
     pub(crate) fn create_with_id_source(
         &mut self,
         next_id: &mut dyn FnMut() -> String,
         title: &str,
         body: &str,
         skip_review: bool,
+        origin: (TicketSource, TicketActor),
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.new_ticket(next_id, title, body, skip_review, origin, now)?;
+        let id = t.id.clone();
+        self.commit(|doc| {
+            doc.tickets.push(t);
+            Ok(())
+        })?;
+        self.fetch(&id)
+    }
+
+    /// A validated backlog ticket with a fresh id (not yet in the document).
+    fn new_ticket(
+        &self,
+        next_id: &mut dyn FnMut() -> String,
+        title: &str,
+        body: &str,
+        skip_review: bool,
+        (source, by): (TicketSource, TicketActor),
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let title = validate_title(title)?;
@@ -321,31 +461,32 @@ impl TicketService {
             }
         };
         let t = Ticket {
-            id: id.clone(),
+            id,
             title,
             body: body.to_string(),
             state: TicketState::Backlog,
             assignee_agent_id: None,
             queue_position: None,
             skip_review,
-            source: TicketSource::User,
+            source,
             issue: None,
             rejection_note: None,
+            summary: None,
             created_at: now,
             updated_at: now,
             history: vec![TicketHistoryEntry {
                 at: now,
                 from: None,
                 to: TicketState::Backlog,
-                by: TicketActor::User,
+                by,
                 note: None,
             }],
+            review_round: 0,
+            escalated: false,
+            reviewer_agent_id: None,
+            reports: Vec::new(),
         };
-        self.commit(|doc| {
-            doc.tickets.push(t);
-            Ok(())
-        })?;
-        self.fetch(&id)
+        Ok(t)
     }
 
     /// Title/body/skipReview in any state (same validation as `create`).
@@ -520,11 +661,24 @@ impl TicketService {
         agent_live: bool,
         now: u64,
     ) -> Result<Ticket, TicketError> {
+        self.reject_as(id, note, agent_live, TicketActor::User, None, now)
+    }
+
+    /// [`Self::reject`] by `by`, with `prefix` before the note in the history.
+    fn reject_as(
+        &mut self,
+        id: &str,
+        note: &str,
+        agent_live: bool,
+        by: TicketActor,
+        prefix: Option<String>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
         let ev = TicketEvent::Reject {
             note: note.to_string(),
         };
         self.commit(|doc| {
-            let t = apply(doc, id, &ev, TicketActor::User, None, now)?;
+            let t = apply(doc, id, &ev, by, prefix, now)?;
             match (agent_live, t.assignee_agent_id) {
                 (true, Some(agent)) => {
                     // Make room at the front of the queue.
@@ -655,6 +809,26 @@ impl TicketService {
         self.fetch(id)
     }
 
+    /// The turn ended without `mira_submit_for_review`: the agent's inProgress ticket keeps its
+    /// state and gets `issue: notSubmitted` with [`NOT_SUBMITTED_NOTE`] (by the system).
+    /// `Ok(None)` when the agent has no ticket in progress (nothing saved).
+    pub fn mark_not_submitted(
+        &mut self,
+        agent_id: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let Some(t) = self.current_for_agent(agent_id) else {
+            return Ok(None);
+        };
+        self.set_issue(
+            &t.id,
+            Some(TicketIssue::NotSubmitted),
+            Some(NOT_SUBMITTED_NOTE.to_string()),
+            now,
+        )
+        .map(Some)
+    }
+
     /// Any non-backlog state → backlog by the system (delivery failure etc.).
     pub fn to_backlog(&mut self, id: &str, note: &str, now: u64) -> Result<Ticket, TicketError> {
         let ev = TicketEvent::ToBacklog {
@@ -696,6 +870,571 @@ impl TicketService {
                 .map(|id| apply(doc, id, &ev, TicketActor::System, None, now))
                 .collect::<Result<Vec<_>, _>>()
         })
+    }
+
+    // ---- agent tools API (tickets::tools; the caller has checked that the agent is live) ----
+
+    /// `mira_create_ticket`: like [`Self::create`], but `source: agent` and the creation entry
+    /// by the agent. With `assign_to` (agent id, coordinator name; the caller checked the role
+    /// and that the agent is live) the ticket goes last in that agent's queue in the same save.
+    pub fn create_by_agent(
+        &mut self,
+        title: &str,
+        body: &str,
+        skip_review: bool,
+        assign_to: Option<(&str, &str)>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.new_ticket(
+            &mut || uuid::Uuid::new_v4().to_string(),
+            title,
+            body,
+            skip_review,
+            (TicketSource::Agent, TicketActor::Agent),
+            now,
+        )?;
+        let id = t.id.clone();
+        self.commit(|doc| {
+            doc.tickets.push(t);
+            if let Some((agent_id, by_name)) = assign_to {
+                let ev = TicketEvent::Assign {
+                    agent_id: agent_id.to_string(),
+                };
+                let note = Some(format!("tildelt af koordinator {by_name}"));
+                apply(doc, &id, &ev, TicketActor::Agent, note, now)?;
+            }
+            Ok(())
+        })?;
+        self.fetch(&id)
+    }
+
+    /// `mira_submit_for_review`: the agent's ticket (`ticket_id`, full or short id, or else its
+    /// inProgress ticket) → review (done with skipReview), `summary` stored and noted in the
+    /// history by the agent. Clears `issue` (the Submit transition does).
+    pub fn submit_by_agent(
+        &mut self,
+        agent_id: &str,
+        ticket_id: Option<&str>,
+        summary: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let summary = validate_summary(summary)?;
+        let t = match ticket_id {
+            Some(id) => {
+                let t = self.get_by_any_id(id).ok_or(TicketError::NotFound)?;
+                if t.assignee_agent_id.as_deref() != Some(agent_id) {
+                    return Err(TicketError::NotYours);
+                }
+                if t.state != TicketState::InProgress {
+                    return Err(TicketError::NotInProgress);
+                }
+                t
+            }
+            None => self
+                .current_for_agent(agent_id)
+                .ok_or(TicketError::NoTicketInProgress)?,
+        };
+        self.commit(|doc| {
+            find_mut(doc, &t.id)?.summary = Some(summary.clone());
+            apply(
+                doc,
+                &t.id,
+                &TicketEvent::Submit,
+                TicketActor::Agent,
+                Some(summary),
+                now,
+            )
+        })?;
+        self.fetch(&t.id)
+    }
+
+    /// `mira_update_status`: a history entry (state unchanged, by the agent) with `note` on the
+    /// agent's inProgress ticket. `Ok(None)` when it has none (nothing saved).
+    pub fn note_by_agent(
+        &mut self,
+        agent_id: &str,
+        note: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let Some(t) = self.current_for_agent(agent_id) else {
+            return Ok(None);
+        };
+        self.commit(|doc| {
+            let t = find_mut(doc, &t.id)?;
+            t.updated_at = now;
+            t.history.push(TicketHistoryEntry {
+                at: now,
+                from: Some(t.state),
+                to: t.state,
+                by: TicketActor::Agent,
+                note: Some(note.to_string()),
+            });
+            Ok(())
+        })?;
+        self.fetch(&t.id).map(Some)
+    }
+
+    // ---- review routing and agent review/coordination tools (step 5) ----
+
+    /// Open review assignments per reviewer.
+    pub fn open_review_counts(&self) -> ReviewCounts {
+        let mut m = ReviewCounts::new();
+        for a in &self.doc.review_assignments {
+            *m.entry(a.reviewer_agent_id.clone()).or_default() += 1;
+        }
+        m
+    }
+
+    /// All review assignments, oldest first.
+    pub fn review_assignments(&self) -> Vec<ReviewAssignment> {
+        let mut v = self.doc.review_assignments.clone();
+        v.sort_by_key(|a| a.assigned_at);
+        v
+    }
+
+    /// The reviewer's assignments: undelivered first, each group oldest first.
+    pub fn assignments_for(&self, reviewer_id: &str) -> Vec<ReviewAssignment> {
+        let mut v: Vec<ReviewAssignment> = self
+            .doc
+            .review_assignments
+            .iter()
+            .filter(|a| a.reviewer_agent_id == reviewer_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|a| (a.delivered_at.is_some(), a.assigned_at));
+        v
+    }
+
+    pub fn assignment_for_ticket(&self, ticket_id: &str) -> Option<ReviewAssignment> {
+        self.doc
+            .review_assignments
+            .iter()
+            .find(|a| a.ticket_id == ticket_id)
+            .cloned()
+    }
+
+    /// The next review to type into `reviewer_id`: its oldest undelivered assignment that has
+    /// not used up its delivery attempts, with the ticket.
+    pub fn next_review_for(&self, reviewer_id: &str) -> Option<(ReviewAssignment, Ticket)> {
+        self.assignments_for(reviewer_id)
+            .into_iter()
+            .filter(|a| a.delivered_at.is_none() && a.attempts < REVIEW_DELIVERY_MAX_ATTEMPTS)
+            .find_map(|a| self.get(&a.ticket_id).map(|t| (a, t)))
+    }
+
+    /// Tickets in review without a reviewer and not escalated, oldest first.
+    pub fn unrouted_reviews(&self) -> Vec<Ticket> {
+        let mut v: Vec<Ticket> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| {
+                t.state == TicketState::Review && t.reviewer_agent_id.is_none() && !t.escalated
+            })
+            .cloned()
+            .collect();
+        v.sort_by_key(|t| (t.updated_at, t.created_at));
+        v
+    }
+
+    /// Number of escalated tickets (Diagnostics).
+    pub fn escalated_count(&self) -> usize {
+        self.doc.tickets.iter().filter(|t| t.escalated).count()
+    }
+
+    /// Number of reports on all tickets (Diagnostics).
+    pub fn report_count(&self) -> usize {
+        self.doc.tickets.iter().map(|t| t.reports.len()).sum()
+    }
+
+    /// Gives an unrouted review ticket to `reviewer_id`: assignment with `round = review_round`,
+    /// `reviewer_agent_id` set, history "review tildelt <name>" by the system. `Ok(None)` when the
+    /// ticket no longer needs routing (already routed, escalated, left review): idempotent.
+    pub fn route_review(
+        &mut self,
+        ticket_id: &str,
+        reviewer_id: &str,
+        reviewer_name: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Review || t.reviewer_agent_id.is_some() || t.escalated {
+            return Ok(None);
+        }
+        if t.assignee_agent_id.as_deref() == Some(reviewer_id) {
+            return Err(TicketError::SenderCannotReview);
+        }
+        self.set_reviewer_in(ticket_id, reviewer_id, reviewer_name, now)
+            .map(Some)
+    }
+
+    /// Manual reviewer choice (`assign_reviewer`): replaces any current reviewer and clears an
+    /// escalation. The caller checked the agent (live, reviewer role).
+    pub fn set_reviewer(
+        &mut self,
+        ticket_id: &str,
+        reviewer_id: &str,
+        reviewer_name: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Review {
+            return Err(TicketError::NotInReview);
+        }
+        if t.assignee_agent_id.as_deref() == Some(reviewer_id) {
+            return Err(TicketError::SenderCannotReview);
+        }
+        self.set_reviewer_in(ticket_id, reviewer_id, reviewer_name, now)
+    }
+
+    fn set_reviewer_in(
+        &mut self,
+        ticket_id: &str,
+        reviewer_id: &str,
+        reviewer_name: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.commit(|doc| {
+            doc.review_assignments.retain(|a| a.ticket_id != ticket_id);
+            let t = find_mut(doc, ticket_id)?;
+            t.reviewer_agent_id = Some(reviewer_id.to_string());
+            t.escalated = false;
+            let round = t.review_round;
+            note_entry(
+                t,
+                TicketActor::System,
+                format!("review tildelt {reviewer_name}"),
+                now,
+            );
+            doc.review_assignments.push(ReviewAssignment {
+                ticket_id: ticket_id.to_string(),
+                reviewer_agent_id: reviewer_id.to_string(),
+                round,
+                assigned_at: now,
+                delivered_at: None,
+                attempts: 0,
+            });
+            Ok(())
+        })?;
+        self.fetch(ticket_id)
+    }
+
+    /// The ticket reached [`MAX_REVIEW_ROUNDS`]: `escalated`, note "eskaleret efter 3 runder",
+    /// no routing. `Ok(None)` when it is not an unrouted review ticket (idempotent).
+    pub fn escalate(&mut self, ticket_id: &str, now: u64) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Review || t.escalated {
+            return Ok(None);
+        }
+        self.commit(|doc| {
+            let t = find_mut(doc, ticket_id)?;
+            t.escalated = true;
+            t.reviewer_agent_id = None;
+            note_entry(t, TicketActor::System, escalated_note(), now);
+            Ok(())
+        })?;
+        self.fetch(ticket_id).map(Some)
+    }
+
+    /// The review line was confirmed in the reviewer's terminal: `delivered_at`, note "review
+    /// sendt til <name>".
+    pub fn mark_review_delivered(
+        &mut self,
+        ticket_id: &str,
+        reviewer_name: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        if self.assignment_for_ticket(ticket_id).is_none() {
+            return Err(TicketError::NotInReview);
+        }
+        self.commit(|doc| {
+            if let Some(a) = doc
+                .review_assignments
+                .iter_mut()
+                .find(|a| a.ticket_id == ticket_id)
+            {
+                a.delivered_at = Some(now);
+            }
+            let t = find_mut(doc, ticket_id)?;
+            note_entry(
+                t,
+                TicketActor::System,
+                format!("review sendt til {reviewer_name}"),
+                now,
+            );
+            Ok(())
+        })?;
+        self.fetch(ticket_id)
+    }
+
+    /// A review delivery failed: `attempts += 1`; at [`REVIEW_DELIVERY_MAX_ATTEMPTS`] the note
+    /// "review kunne ikke leveres" (no more automatic tries). Returns the new attempt count.
+    pub fn review_delivery_failed(
+        &mut self,
+        ticket_id: &str,
+        now: u64,
+    ) -> Result<u32, TicketError> {
+        let a = self
+            .assignment_for_ticket(ticket_id)
+            .ok_or(TicketError::NotInReview)?;
+        let attempts = a.attempts.saturating_add(1);
+        self.commit(|doc| {
+            if let Some(a) = doc
+                .review_assignments
+                .iter_mut()
+                .find(|a| a.ticket_id == ticket_id)
+            {
+                a.attempts = attempts;
+            }
+            if attempts >= REVIEW_DELIVERY_MAX_ATTEMPTS {
+                let t = find_mut(doc, ticket_id)?;
+                note_entry(t, TicketActor::System, REVIEW_UNDELIVERED_NOTE.into(), now);
+            }
+            Ok(())
+        })?;
+        Ok(attempts)
+    }
+
+    /// "Send igen" for a review: the attempts start over and the line counts as undelivered.
+    pub fn reset_review_delivery(
+        &mut self,
+        ticket_id: &str,
+    ) -> Result<ReviewAssignment, TicketError> {
+        if self.assignment_for_ticket(ticket_id).is_none() {
+            return Err(TicketError::NotInReview);
+        }
+        self.commit(|doc| {
+            if let Some(a) = doc
+                .review_assignments
+                .iter_mut()
+                .find(|a| a.ticket_id == ticket_id)
+            {
+                a.attempts = 0;
+                a.delivered_at = None;
+            }
+            Ok(())
+        })?;
+        self.assignment_for_ticket(ticket_id)
+            .ok_or(TicketError::NotInReview)
+    }
+
+    /// Removes the ticket's reviewer and assignment (stays in review; routed again) and clears an
+    /// escalation, with `note` by `by`. A ticket that reached [`MAX_REVIEW_ROUNDS`] stays (or
+    /// becomes again) escalated without a new escalation note, so routing leaves it to the user
+    /// (review5 N5). `Ok(None)` when there is nothing to remove.
+    pub fn clear_reviewer(
+        &mut self,
+        ticket_id: &str,
+        note: &str,
+        by: TicketActor,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Review {
+            return Err(TicketError::NotInReview);
+        }
+        let keep_escalated = t.review_round >= MAX_REVIEW_ROUNDS;
+        if t.reviewer_agent_id.is_none() && (!t.escalated || keep_escalated) {
+            return Ok(None);
+        }
+        self.commit(|doc| {
+            doc.review_assignments.retain(|a| a.ticket_id != ticket_id);
+            let t = find_mut(doc, ticket_id)?;
+            t.reviewer_agent_id = None;
+            t.escalated = keep_escalated;
+            note_entry(t, by, note.to_string(), now);
+            Ok(())
+        })?;
+        self.fetch(ticket_id).map(Some)
+    }
+
+    /// The reviewer stopped/exited/was removed: all its assignments go; the tickets stay in
+    /// review without a reviewer (note "reviewer <note>"). One save (none when it had none).
+    pub fn release_reviewer(
+        &mut self,
+        agent_id: &str,
+        note: &str,
+        now: u64,
+    ) -> Result<Vec<TicketId>, TicketError> {
+        let ids: Vec<TicketId> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| {
+                t.state == TicketState::Review && t.reviewer_agent_id.as_deref() == Some(agent_id)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        let has_assignments = self
+            .doc
+            .review_assignments
+            .iter()
+            .any(|a| a.reviewer_agent_id == agent_id);
+        if ids.is_empty() && !has_assignments {
+            return Ok(Vec::new());
+        }
+        self.commit(|doc| {
+            doc.review_assignments
+                .retain(|a| a.reviewer_agent_id != agent_id);
+            for id in &ids {
+                let t = find_mut(doc, id)?;
+                t.reviewer_agent_id = None;
+                note_entry(t, TicketActor::System, format!("reviewer {note}"), now);
+            }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// The review checks shared by approve/reject (any id): in review, not the agent's own
+    /// submission, and the agent is its reviewer.
+    fn review_ticket_for(&self, agent_id: &str, ticket_id: &str) -> Result<Ticket, TicketError> {
+        let t = self.get_by_any_id(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Review {
+            return Err(TicketError::NotInReview);
+        }
+        if t.assignee_agent_id.as_deref() == Some(agent_id) {
+            return Err(TicketError::OwnSubmission);
+        }
+        if t.reviewer_agent_id.as_deref() != Some(agent_id) {
+            return Err(TicketError::NotYourReview);
+        }
+        Ok(t)
+    }
+
+    /// `mira_approve_ticket`: review → done by the agent, note "godkendt af <name>[: note]";
+    /// the assignment goes.
+    pub fn approve_by_agent(
+        &mut self,
+        agent_id: &str,
+        agent_name: &str,
+        ticket_id: &str,
+        note: Option<&str>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.review_ticket_for(agent_id, ticket_id)?;
+        let note = match note.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => format!("godkendt af {agent_name}: {n}"),
+            None => format!("godkendt af {agent_name}"),
+        };
+        self.commit(|doc| {
+            doc.review_assignments.retain(|a| a.ticket_id != t.id);
+            apply(
+                doc,
+                &t.id,
+                &TicketEvent::Approve,
+                TicketActor::Agent,
+                Some(note),
+                now,
+            )
+        })?;
+        self.fetch(&t.id)
+    }
+
+    /// `mira_reject_ticket`: like the user's reject (round + 1, first in the sender's queue when
+    /// it is live, else the backlog), by the agent with "afvist af <name>: <note>".
+    pub fn reject_by_agent(
+        &mut self,
+        agent_id: &str,
+        agent_name: &str,
+        ticket_id: &str,
+        note: &str,
+        sender_live: bool,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.review_ticket_for(agent_id, ticket_id)?;
+        if note.trim().is_empty() {
+            return Err(TicketError::NeedsNote);
+        }
+        self.reject_as(
+            &t.id,
+            note.trim(),
+            sender_live,
+            TicketActor::Agent,
+            Some(format!("afvist af {agent_name}")),
+            now,
+        )
+    }
+
+    /// `mira_assign_ticket` (coordinator; any id): backlog/rejected → last in `target`'s queue,
+    /// by the agent with "tildelt af koordinator <name>". The caller checked that `target` is
+    /// live.
+    pub fn assign_by_agent(
+        &mut self,
+        ticket_id: &str,
+        target: &str,
+        by_name: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.get_by_any_id(ticket_id).ok_or(TicketError::NotFound)?;
+        let note = Some(format!("tildelt af koordinator {by_name}"));
+        self.commit(|doc| {
+            if t.state == TicketState::Rejected {
+                apply(
+                    doc,
+                    &t.id,
+                    &TicketEvent::ToBacklog { note: None },
+                    TicketActor::Agent,
+                    None,
+                    now,
+                )?;
+            }
+            let ev = TicketEvent::Assign {
+                agent_id: target.to_string(),
+            };
+            apply(doc, &t.id, &ev, TicketActor::Agent, note, now)
+        })?;
+        self.fetch(&t.id)
+    }
+
+    /// `mira_unassign_ticket` (coordinator; any id): assigned → backlog by the agent.
+    pub fn unassign_by_agent(&mut self, ticket_id: &str, now: u64) -> Result<Ticket, TicketError> {
+        let t = self.get_by_any_id(ticket_id).ok_or(TicketError::NotFound)?;
+        self.commit(|doc| {
+            apply(
+                doc,
+                &t.id,
+                &TicketEvent::Unassign,
+                TicketActor::Agent,
+                None,
+                now,
+            )
+        })?;
+        self.fetch(&t.id)
+    }
+
+    /// The next report number of the ticket (1-based; never reused).
+    pub fn next_report_seq(&self, ticket_id: &str) -> Result<u32, TicketError> {
+        let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.reports.len() >= REPORTS_PER_TICKET_MAX {
+            return Err(TicketError::TooManyReports);
+        }
+        let max = t
+            .reports
+            .iter()
+            .filter_map(|r| r.id.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        Ok(max + 1)
+    }
+
+    /// Adds report metadata (the file is already written). At most [`REPORTS_PER_TICKET_MAX`].
+    pub fn add_report_meta(
+        &mut self,
+        ticket_id: &str,
+        report: TicketReport,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.commit(|doc| {
+            let t = find_mut(doc, ticket_id)?;
+            if t.reports.len() >= REPORTS_PER_TICKET_MAX {
+                return Err(TicketError::TooManyReports);
+            }
+            t.reports.push(report);
+            t.updated_at = now;
+            Ok(())
+        })?;
+        self.fetch(ticket_id)
     }
 }
 
@@ -793,7 +1532,14 @@ mod tests {
         let (mut s, _) = svc();
         let mut ids = vec!["abcdef01-0000-4000-8000-000000000001".to_string()].into_iter();
         let a = s
-            .create_with_id_source(&mut || ids.next().unwrap(), "a", "", false, 1)
+            .create_with_id_source(
+                &mut || ids.next().unwrap(),
+                "a",
+                "",
+                false,
+                (TicketSource::User, TicketActor::User),
+                1,
+            )
             .unwrap();
         let mut ids = vec![
             "ABCDEF01-9999-4000-8000-000000000002".to_string(),
@@ -801,7 +1547,14 @@ mod tests {
         ]
         .into_iter();
         let b = s
-            .create_with_id_source(&mut || ids.next().unwrap(), "b", "", false, 2)
+            .create_with_id_source(
+                &mut || ids.next().unwrap(),
+                "b",
+                "",
+                false,
+                (TicketSource::User, TicketActor::User),
+                2,
+            )
             .unwrap();
         assert_eq!(a.short_id(), "abcdef01");
         assert_eq!(b.short_id(), "12345678");
@@ -1183,6 +1936,7 @@ mod tests {
                 "11111111-0000-4000-8000-000000000000",
                 S::Assigned,
             )],
+            review_assignments: Vec::new(),
         });
         let on_disk = m.doc();
         m.fail_load();
@@ -1257,5 +2011,580 @@ mod tests {
         let titles: Vec<_> = s.list().into_iter().map(|t| t.title).collect();
         assert_eq!(titles, ["b", "c", "a"]);
         assert!(!s.is_empty());
+    }
+
+    // ---- agent tools API ----
+
+    /// A ticket in progress for `agent` (created by the user, assigned, dispatched).
+    fn in_progress(s: &mut TicketService, agent: &str, title: &str, skip: bool) -> Ticket {
+        let t = s.create(title, "b", skip, 1).unwrap();
+        s.assign(&t.id, agent, 2).unwrap();
+        s.mark_dispatched(&t.id, agent, 3).unwrap()
+    }
+
+    #[test]
+    fn submit_by_agent_needs_a_ticket_of_its_own_in_progress() {
+        let (mut s, _) = svc();
+        assert_eq!(
+            s.submit_by_agent("a1", None, "done", 5).unwrap_err(),
+            TicketError::NoTicketInProgress
+        );
+        let other = in_progress(&mut s, "a2", "other", false);
+        assert_eq!(
+            s.submit_by_agent("a1", Some(&other.id), "done", 5)
+                .unwrap_err(),
+            TicketError::NotYours
+        );
+        // Backlog ticket (no assignee) is not the agent's either.
+        let free = mk(&mut s, "free", 4);
+        assert_eq!(
+            s.submit_by_agent("a1", Some(&free.short_id()), "done", 5)
+                .unwrap_err(),
+            TicketError::NotYours
+        );
+        let mine = in_progress(&mut s, "a1", "mine", false);
+        let r = s.submit_by_agent("a1", None, "x", 6).unwrap();
+        assert_eq!(r.id, mine.id);
+        // Now in review: not in progress any more.
+        assert_eq!(
+            s.submit_by_agent("a1", Some(&mine.id), "again", 7)
+                .unwrap_err(),
+            TicketError::NotInProgress
+        );
+        assert_eq!(
+            s.submit_by_agent("a1", Some("ffffffff"), "x", 7)
+                .unwrap_err(),
+            TicketError::NotFound
+        );
+        for bad in ["", "   ", &"x".repeat(2_001)] {
+            assert_eq!(
+                s.submit_by_agent("a2", None, bad, 8)
+                    .unwrap_err()
+                    .to_string(),
+                "summary skal være en tekst på 1–2000 tegn"
+            );
+        }
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn submit_by_agent_moves_to_review_with_summary_and_clears_the_issue() {
+        let (mut s, m) = svc();
+        let t = in_progress(&mut s, "a1", "fix", false);
+        let marked = s.mark_not_submitted("a1", 4).unwrap().unwrap();
+        assert_eq!(marked.state, S::InProgress);
+        assert_eq!(marked.issue, Some(TicketIssue::NotSubmitted));
+        let last = marked.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some(NOT_SUBMITTED_NOTE))
+        );
+        let saves = m.saves();
+        let r = s
+            .submit_by_agent(
+                "a1",
+                Some(&t.short_id().to_uppercase()),
+                "  Rettet; se login.rs ",
+                5,
+            )
+            .unwrap();
+        assert_eq!(m.saves(), saves + 1);
+        assert_eq!(r.state, S::Review);
+        assert_eq!(r.summary.as_deref(), Some("Rettet; se login.rs"));
+        assert_eq!(r.issue, None);
+        let last = r.history.last().unwrap();
+        assert_eq!(
+            (last.from, last.to, last.by, last.note.as_deref()),
+            (
+                Some(S::InProgress),
+                S::Review,
+                TicketActor::Agent,
+                Some("Rettet; se login.rs")
+            )
+        );
+        assert_eq!(s.current_for_agent("a1"), None);
+        assert_eq!(
+            TicketSummary::from(&r).summary.as_deref(),
+            Some("Rettet; se login.rs")
+        );
+        // skipReview → done.
+        let t2 = in_progress(&mut s, "a1", "quick", true);
+        let d = s.submit_by_agent("a1", None, "ok", 6).unwrap();
+        assert_eq!((d.id, d.state), (t2.id, S::Done));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn mark_not_submitted_without_a_ticket_saves_nothing() {
+        let (mut s, m) = svc();
+        mk(&mut s, "x", 1);
+        let saves = m.saves();
+        assert_eq!(s.mark_not_submitted("a1", 2).unwrap(), None);
+        assert_eq!(s.note_by_agent("a1", "hej", 2).unwrap(), None);
+        assert_eq!(m.saves(), saves);
+    }
+
+    #[test]
+    fn create_by_agent_is_marked_as_agent_work() {
+        let (mut s, _) = svc();
+        let t = s
+            .create_by_agent("Følg op", "detaljer", true, None, 9)
+            .unwrap();
+        assert_eq!(t.source, TicketSource::Agent);
+        assert_eq!((t.state, t.skip_review), (S::Backlog, true));
+        assert_eq!(t.assignee_agent_id, None);
+        assert_eq!(t.history.len(), 1);
+        assert_eq!(t.history[0].by, TicketActor::Agent);
+        assert_eq!(
+            s.create_by_agent(" ", "", false, None, 9)
+                .unwrap_err()
+                .to_string(),
+            "Titel må ikke være tom"
+        );
+        // The user's tickets keep source/by user.
+        let u = mk(&mut s, "u", 10);
+        assert_eq!(
+            (u.source, u.history[0].by),
+            (TicketSource::User, TicketActor::User)
+        );
+    }
+
+    #[test]
+    fn note_by_agent_adds_a_history_entry_on_the_current_ticket() {
+        let (mut s, _) = svc();
+        let t = in_progress(&mut s, "a1", "x", false);
+        let n = s.note_by_agent("a1", "Kører tests", 7).unwrap().unwrap();
+        assert_eq!(n.id, t.id);
+        assert_eq!(n.state, S::InProgress);
+        assert_eq!(n.updated_at, 7);
+        let last = n.history.last().unwrap();
+        assert_eq!(
+            (last.from, last.to, last.by, last.note.as_deref()),
+            (
+                Some(S::InProgress),
+                S::InProgress,
+                TicketActor::Agent,
+                Some("Kører tests")
+            )
+        );
+    }
+
+    #[test]
+    fn list_for_agent_backlog_and_any_id_lookup() {
+        let (mut s, _) = svc();
+        let q1 = mk(&mut s, "q1", 1);
+        let q2 = mk(&mut s, "q2", 2);
+        let cur = mk(&mut s, "cur", 3);
+        let other = mk(&mut s, "other", 4);
+        let free = mk(&mut s, "free", 5);
+        s.assign(&cur.id, "a1", 6).unwrap();
+        s.mark_dispatched(&cur.id, "a1", 7).unwrap();
+        s.assign(&q2.id, "a1", 8).unwrap();
+        s.assign(&q1.id, "a1", 9).unwrap();
+        s.assign(&other.id, "a2", 10).unwrap();
+        let mine: Vec<String> = s
+            .list_for_agent("a1")
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(mine, vec!["cur", "q2", "q1"]);
+        let backlog: Vec<String> = s.backlog().into_iter().map(|t| t.title).collect();
+        assert_eq!(backlog, vec!["free"]);
+        assert!(s.list_for_agent("nobody").is_empty());
+
+        assert_eq!(s.get_by_any_id(&free.id).unwrap().id, free.id);
+        assert_eq!(
+            s.get_by_any_id(&free.id.to_uppercase()).unwrap().id,
+            free.id
+        );
+        assert_eq!(
+            s.get_by_any_id(&format!(" {} ", free.short_id()))
+                .unwrap()
+                .id,
+            free.id
+        );
+        assert_eq!(
+            s.get_by_any_id(&free.short_id().to_uppercase()).unwrap().id,
+            free.id
+        );
+        assert_eq!(s.get_by_any_id("nope"), None);
+        assert_eq!(s.get_by_any_id(""), None);
+    }
+
+    // ---- step 5: review routing, agent review/coordination, report metadata ----
+
+    /// A ticket submitted by `agent` (in review).
+    fn in_review(s: &mut TicketService, agent: &str, title: &str) -> Ticket {
+        let t = mk(s, title, 1);
+        s.assign(&t.id, agent, 2).unwrap();
+        s.mark_dispatched(&t.id, agent, 3).unwrap();
+        s.submit_by_agent(agent, None, "klar", 4).unwrap()
+    }
+
+    fn report(id: &str) -> TicketReport {
+        TicketReport {
+            id: id.into(),
+            title: "R".into(),
+            author: crate::tickets::model::ReportAuthor::user(),
+            created_at: 1,
+            path: format!("reports/{id}-r.md"),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn route_review_creates_assignment_and_history() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        assert_eq!(s.unrouted_reviews().len(), 1);
+        assert_eq!(
+            s.route_review(&t.id, "a1", "bot-a1", 5).unwrap_err(),
+            TicketError::SenderCannotReview
+        );
+        let r = s.route_review(&t.id, "rev", "bot-rev", 5).unwrap().unwrap();
+        assert_eq!(r.reviewer_agent_id.as_deref(), Some("rev"));
+        let last = r.history.last().unwrap();
+        assert_eq!(
+            (last.from, last.to, last.by, last.note.as_deref()),
+            (
+                Some(S::Review),
+                S::Review,
+                TicketActor::System,
+                Some("review tildelt bot-rev")
+            )
+        );
+        let a = s.assignment_for_ticket(&t.id).unwrap();
+        assert_eq!(
+            (
+                a.reviewer_agent_id.as_str(),
+                a.round,
+                a.assigned_at,
+                a.delivered_at,
+                a.attempts
+            ),
+            ("rev", 0, 5, None, 0)
+        );
+        assert_eq!(s.open_review_counts().get("rev"), Some(&1));
+        assert!(s.unrouted_reviews().is_empty());
+        // Idempotent: a second routing does nothing.
+        assert_eq!(s.route_review(&t.id, "rev2", "x", 6).unwrap(), None);
+        assert_eq!(s.review_assignments().len(), 1);
+        // Delivery bookkeeping.
+        assert_eq!(s.next_review_for("rev").unwrap().0.ticket_id, t.id);
+        let d = s.mark_review_delivered(&t.id, "bot-rev", 7).unwrap();
+        assert_eq!(
+            d.history.last().unwrap().note.as_deref(),
+            Some("review sendt til bot-rev")
+        );
+        assert!(s.next_review_for("rev").is_none());
+        // Leaving review (user moves it back to in progress) drops the assignment.
+        s.set_state(&t.id, S::InProgress, None, true, 8).unwrap();
+        assert!(s.review_assignments().is_empty());
+        assert_eq!(s.get(&t.id).unwrap().reviewer_agent_id, None);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn review_delivery_attempts_end_with_a_note() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        s.route_review(&t.id, "rev", "r", 5).unwrap();
+        assert_eq!(s.review_delivery_failed(&t.id, 6), Ok(1));
+        assert_eq!(s.review_delivery_failed(&t.id, 7), Ok(2));
+        assert!(s.next_review_for("rev").is_some());
+        assert_eq!(s.review_delivery_failed(&t.id, 8), Ok(3));
+        assert!(
+            s.next_review_for("rev").is_none(),
+            "no more automatic tries"
+        );
+        assert_eq!(
+            s.get(&t.id)
+                .unwrap()
+                .history
+                .last()
+                .unwrap()
+                .note
+                .as_deref(),
+            Some(REVIEW_UNDELIVERED_NOTE)
+        );
+        let a = s.reset_review_delivery(&t.id).unwrap();
+        assert_eq!((a.attempts, a.delivered_at), (0, None));
+        assert!(s.next_review_for("rev").is_some());
+    }
+
+    #[test]
+    fn approve_by_agent_rules() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        let queued = mk(&mut s, "q", 1);
+        assert_eq!(
+            s.approve_by_agent("rev", "r", &queued.id, None, 5),
+            Err(TicketError::NotInReview)
+        );
+        assert_eq!(
+            s.approve_by_agent("rev", "r", "nope", None, 5),
+            Err(TicketError::NotFound)
+        );
+        assert_eq!(
+            s.approve_by_agent("a1", "a", &t.id, None, 5),
+            Err(TicketError::OwnSubmission)
+        );
+        // Not routed yet: nobody is its reviewer.
+        assert_eq!(
+            s.approve_by_agent("rev", "r", &t.id, None, 5),
+            Err(TicketError::NotYourReview)
+        );
+        s.route_review(&t.id, "rev", "r", 5).unwrap();
+        assert_eq!(
+            s.approve_by_agent("other", "o", &t.id, None, 6),
+            Err(TicketError::NotYourReview)
+        );
+        let d = s
+            .approve_by_agent("rev", "bot-rev", &t.short_id(), Some(" tests ok "), 7)
+            .unwrap();
+        assert_eq!(d.state, S::Done);
+        assert_eq!(d.reviewer_agent_id.as_deref(), Some("rev"));
+        let last = d.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::Agent, Some("godkendt af bot-rev: tests ok"))
+        );
+        assert!(s.review_assignments().is_empty());
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn reject_by_agent_increments_round_and_requeues_front() {
+        let (mut s, _) = svc();
+        let first = mk(&mut s, "first", 1);
+        let t = in_review(&mut s, "a1", "x");
+        s.assign(&first.id, "a1", 5).unwrap();
+        s.route_review(&t.id, "rev", "r", 5).unwrap();
+        assert_eq!(
+            s.reject_by_agent("rev", "r", &t.id, "  ", true, 6),
+            Err(TicketError::NeedsNote)
+        );
+        let r = s
+            .reject_by_agent("rev", "bot-rev", &t.id, "mangler test", true, 7)
+            .unwrap();
+        assert_eq!(
+            (r.state, r.queue_position, r.review_round),
+            (S::Assigned, Some(0), 1)
+        );
+        assert_eq!(r.rejection_note.as_deref(), Some("mangler test"));
+        assert_eq!(r.reviewer_agent_id, None);
+        assert!(r.history.iter().any(|h| h.by == TicketActor::Agent
+            && h.note.as_deref() == Some("afvist af bot-rev: mangler test")));
+        assert_eq!(
+            positions(&s, "a1"),
+            vec![("x".into(), Some(0)), ("first".into(), Some(1))]
+        );
+        assert!(s.review_assignments().is_empty());
+        // A dead sender: to the backlog (round reset there).
+        s.mark_dispatched(&t.id, "a1", 8).unwrap();
+        s.submit_by_agent("a1", None, "igen", 9).unwrap();
+        assert_eq!(s.get(&t.id).unwrap().review_round, 1);
+        s.route_review(&t.id, "rev", "r", 10).unwrap();
+        let b = s
+            .reject_by_agent("rev", "r", &t.id, "nej", false, 11)
+            .unwrap();
+        assert_eq!((b.state, b.review_round), (S::Backlog, 0));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn escalate_and_clear_reviewer() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        let e = s.escalate(&t.id, 5).unwrap().unwrap();
+        assert!(e.escalated);
+        assert_eq!(
+            e.history.last().unwrap().note.as_deref(),
+            Some("eskaleret efter 3 runder")
+        );
+        assert_eq!(s.escalate(&t.id, 6).unwrap(), None, "idempotent");
+        assert!(s.unrouted_reviews().is_empty(), "escalated: no routing");
+        assert_eq!(s.escalated_count(), 1);
+        // The user picks a reviewer anyway.
+        let r = s.set_reviewer(&t.id, "rev", "r", 7).unwrap();
+        assert!(!r.escalated);
+        assert_eq!(s.review_assignments().len(), 1);
+        assert_eq!(
+            s.set_reviewer(&t.id, "a1", "a", 7),
+            Err(TicketError::SenderCannotReview)
+        );
+        let c = s
+            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.reviewer_agent_id, c.escalated), (None, false));
+        assert!(s.review_assignments().is_empty());
+        assert_eq!(
+            s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 9),
+            Ok(None)
+        );
+    }
+
+    /// review5 N5: removing the hand-picked reviewer of a ticket that used up its rounds keeps
+    /// it escalated (no routing, no second escalation note); an escalated ticket without a
+    /// reviewer has nothing to remove.
+    #[test]
+    fn clear_reviewer_keeps_escalation_after_max_rounds() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        s.commit(|doc| {
+            find_mut(doc, &t.id)?.review_round = MAX_REVIEW_ROUNDS;
+            Ok(())
+        })
+        .unwrap();
+        s.escalate(&t.id, 5).unwrap().unwrap();
+        assert_eq!(
+            s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 6),
+            Ok(None)
+        );
+        let r = s.set_reviewer(&t.id, "rev", "r", 7).unwrap();
+        assert_eq!((r.escalated, r.review_round), (false, MAX_REVIEW_ROUNDS));
+        let c = s
+            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (c.reviewer_agent_id.as_deref(), c.escalated, c.review_round),
+            (None, true, MAX_REVIEW_ROUNDS)
+        );
+        assert!(s.review_assignments().is_empty());
+        assert!(s.unrouted_reviews().is_empty(), "escalated: no routing");
+        assert_eq!(
+            c.history.last().unwrap().note.as_deref(),
+            Some(REVIEWER_REMOVED_NOTE)
+        );
+        assert_eq!(s.escalate(&t.id, 9).unwrap(), None, "no second escalation");
+    }
+
+    #[test]
+    fn release_reviewer_keeps_tickets_in_review() {
+        let (mut s, _) = svc();
+        let t1 = in_review(&mut s, "a1", "x");
+        let t2 = in_review(&mut s, "a2", "y");
+        s.route_review(&t1.id, "rev", "r", 5).unwrap();
+        s.route_review(&t2.id, "rev", "r", 5).unwrap();
+        let released = s.release_reviewer("rev", "agent stoppet", 6).unwrap();
+        assert_eq!(released.len(), 2);
+        for id in [&t1.id, &t2.id] {
+            let t = s.get(id).unwrap();
+            assert_eq!((t.state, t.reviewer_agent_id.clone()), (S::Review, None));
+            assert_eq!(
+                t.history.last().unwrap().note.as_deref(),
+                Some("reviewer agent stoppet")
+            );
+        }
+        assert!(s.review_assignments().is_empty());
+        assert_eq!(s.unrouted_reviews().len(), 2);
+        assert_eq!(
+            s.release_reviewer("rev", "x", 7).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn assign_by_agent_requires_backlog_or_rejected() {
+        let (mut s, _) = svc();
+        let b = mk(&mut s, "b", 1);
+        let t = s.assign_by_agent(&b.short_id(), "a1", "koord", 2).unwrap();
+        assert_eq!(
+            (t.state, t.assignee_agent_id.as_deref()),
+            (S::Assigned, Some("a1"))
+        );
+        let last = t.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::Agent, Some("tildelt af koordinator koord"))
+        );
+        let err = s.assign_by_agent(&b.id, "a2", "k", 3).unwrap_err();
+        assert!(
+            matches!(err, TicketError::IllegalTransition { .. }),
+            "{err:?}"
+        );
+        let u = s.unassign_by_agent(&b.id, 4).unwrap();
+        assert_eq!(u.state, S::Backlog);
+        let p = in_review(&mut s, "a1", "p");
+        assert!(s.assign_by_agent(&p.id, "a2", "k", 5).is_err());
+        assert_eq!(
+            s.assign_by_agent("nope", "a2", "k", 5),
+            Err(TicketError::NotFound)
+        );
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn create_by_agent_with_assign_to_queues_last() {
+        let (mut s, m) = svc();
+        let q = mk(&mut s, "q", 1);
+        s.assign(&q.id, "a1", 2).unwrap();
+        let saves = m.saves();
+        let t = s
+            .create_by_agent("Ny", "", false, Some(("a1", "koord")), 3)
+            .unwrap();
+        assert_eq!(m.saves(), saves + 1, "one save");
+        assert_eq!((t.state, t.queue_position), (S::Assigned, Some(1)));
+        assert_eq!(t.source, TicketSource::Agent);
+        assert_eq!(t.history.len(), 2);
+        assert_eq!(
+            t.history[1].note.as_deref(),
+            Some("tildelt af koordinator koord")
+        );
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn add_report_meta_limit_20() {
+        let (mut s, _) = svc();
+        let t = mk(&mut s, "x", 1);
+        assert_eq!(s.next_report_seq(&t.id), Ok(1));
+        for i in 1..=REPORTS_PER_TICKET_MAX {
+            let id = format!("{i:02}");
+            s.add_report_meta(&t.id, report(&id), 2).unwrap();
+        }
+        assert_eq!(s.next_report_seq(&t.id), Err(TicketError::TooManyReports));
+        assert_eq!(
+            s.add_report_meta(&t.id, report("21"), 3),
+            Err(TicketError::TooManyReports)
+        );
+        assert_eq!(s.get(&t.id).unwrap().reports.len(), 20);
+        assert_eq!(s.report_count(), 20);
+        assert_eq!(s.list()[0].report_count, 20);
+        assert_eq!(
+            s.add_report_meta("nope", report("01"), 3),
+            Err(TicketError::NotFound)
+        );
+    }
+
+    #[test]
+    fn delete_ticket_in_review_with_assignment_refused() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        s.route_review(&t.id, "rev", "r", 5).unwrap();
+        assert_eq!(s.delete(&t.id), Err(TicketError::NotDeletable));
+        assert_eq!(s.review_assignments().len(), 1);
+        s.approve(&t.id, 6).unwrap();
+        assert!(s.review_assignments().is_empty());
+        s.delete(&t.id).unwrap();
+        assert!(s.get(&t.id).is_none());
+    }
+
+    #[test]
+    fn restart_clears_reviewers_and_assignments() {
+        let (mut s, m) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        s.route_review(&t.id, "rev", "r", 5).unwrap();
+        let doc = m.doc().unwrap();
+        assert_eq!(doc.review_assignments.len(), 1);
+        let m2 = MemoryStore::with_doc(doc);
+        let (r, _) = TicketService::load_and_recover(Box::new(m2.clone()), 100);
+        assert!(r.review_assignments().is_empty());
+        let t2 = r.get(&t.id).unwrap();
+        assert_eq!((t2.state, t2.reviewer_agent_id), (S::Review, None));
+        assert_eq!(r.unrouted_reviews().len(), 1);
+        assert_eq!(m2.saves(), 1);
     }
 }
