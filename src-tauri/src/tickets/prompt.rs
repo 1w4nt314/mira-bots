@@ -307,7 +307,9 @@ pub fn render_review_file(
          {summary}\n\
          ## Rapporter\n",
         title = one_line(&t.title),
-        round = t.review_round + 1,
+        // Capped like the card: a hand-picked reviewer of an escalated ticket (review_round = 3)
+        // reads "3 af 3", not "4 af 3" (review5 N5).
+        round = (t.review_round + 1).min(MAX_REVIEW_ROUNDS),
         at = iso_utc(submitted_at(t)),
     );
     if t.reports.is_empty() {
@@ -660,6 +662,11 @@ mod tests {
         let f = render_review_file(&ticket(ID, TicketState::Review), None, &|_| String::new());
         assert!(f.contains("Afsender: afsenderens mappe kendes ikke længere   Runde: 1 af 3"));
         assert!(f.contains("## Opsummering fra afsenderen\n(ingen)\n## Rapporter\n(ingen)\n"));
+        // An escalated ticket with a hand-picked reviewer: capped at the last round.
+        let mut t = ticket(ID, TicketState::Review);
+        t.review_round = MAX_REVIEW_ROUNDS;
+        let f = render_review_file(&t, None, &|_| String::new());
+        assert!(f.contains("Runde: 3 af 3   "), "{f}");
     }
 
     #[test]

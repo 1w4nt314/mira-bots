@@ -371,8 +371,9 @@ impl TicketsCtx {
 
     /// `assign_reviewer` (C5.4): the ticket must be in review. `Some(agent)`: a live agent with
     /// the reviewer role other than the sender replaces any current reviewer (an escalation is
-    /// cleared). `None`: the reviewer is removed ("reviewer fjernet", escalation cleared) and the
-    /// ticket is routed again.
+    /// cleared for this round; the round count is unchanged). `None`: the reviewer is removed
+    /// ("reviewer fjernet") and the ticket is routed again, unless it reached
+    /// [`MAX_REVIEW_ROUNDS`]: then it stays escalated (no new escalation note, review5 N5).
     pub fn assign_reviewer(
         &self,
         ticket_id: &str,
@@ -1149,6 +1150,31 @@ mod tests {
                 reviewer_agent_id: r1.clone()
             }]
         );
+        // "Fjern reviewer" (review5 N5): escalated again at once, without routing and without a
+        // second escalation note; the round count stays.
+        let escalations = |t: &TestCtx| {
+            t.ctx
+                .read(|s| s.get(&id))
+                .unwrap()
+                .history
+                .iter()
+                .filter(|h| h.note.as_deref() == Some("eskaleret efter 3 runder"))
+                .count()
+        };
+        assert_eq!(escalations(&t), 1);
+        let s = t.ctx.assign_reviewer(&id, None).unwrap();
+        assert_eq!(
+            (s.escalated, s.reviewer_agent_id.as_deref(), s.review_round),
+            (true, None, 3)
+        );
+        assert_eq!(escalations(&t), 1);
+        assert!(t.sent().is_empty(), "no review line");
+        let tk = t.ctx.read(|s| s.get(&id)).unwrap();
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some("reviewer fjernet")
+        );
+        assert_eq!(t.ctx.route_reviews(), 0);
     }
 
     #[test]

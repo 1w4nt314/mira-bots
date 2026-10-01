@@ -365,7 +365,9 @@ mod tests {
                         "mcp__mira-bots__mira_spawn_agent",
                         "mcp__mira-bots__mira_unassign_ticket",
                         "Bash(git commit *)",
-                        "Bash(git push *)"
+                        "Bash(git push *)",
+                        "Bash(git -C * commit *)",
+                        "Bash(git -C * push *)"
                     ]
                 },
                 "statusLine": {"type": "command", "command": "/opt/mira-hook", "padding": 0}

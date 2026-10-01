@@ -382,8 +382,14 @@ const REVIEWER_ALLOW: [&str; 4] = [
     "Bash(git -C * status *)",
     "Bash(git -C * show *)",
 ];
-/// … and never commit or push.
-const REVIEWER_DENY: [&str; 2] = ["Bash(git commit *)", "Bash(git push *)"];
+/// … and never commit or push, also not in the `git -C <folder> …` form the review file asks
+/// for (`Bash(git commit *)` only matches a command line that starts with `git commit`).
+const REVIEWER_DENY: [&str; 4] = [
+    "Bash(git commit *)",
+    "Bash(git push *)",
+    "Bash(git -C * commit *)",
+    "Bash(git -C * push *)",
+];
 /// The specialist's prompt addition (C5.7).
 pub const SPECIALIST_PROMPT_APPEND: &str = "Du har flere roller; brug den der passer til ticketen.";
 
@@ -519,7 +525,8 @@ mod tests {
                 "specialist": null, "promptAppend": "", "model": null, "effort": null, "toolDeny": [],
                 "defaultSeat": "staff",
                 "extraAllow": ["Bash(git -C * diff *)", "Bash(git -C * log *)", "Bash(git -C * status *)", "Bash(git -C * show *)"],
-                "extraDeny": ["Bash(git commit *)", "Bash(git push *)"], "updatedAt": 0 })
+                "extraDeny": ["Bash(git commit *)", "Bash(git push *)", "Bash(git -C * commit *)",
+                    "Bash(git -C * push *)"], "updatedAt": 0 })
         );
         let spec = builtin_profile("specialist").unwrap();
         assert_eq!(spec.specialist, Some(true));
@@ -726,6 +733,8 @@ mod tests {
         want.extend([
             "Bash(git commit *)".to_string(),
             "Bash(git push *)".to_string(),
+            "Bash(git -C * commit *)".to_string(),
+            "Bash(git -C * push *)".to_string(),
         ]);
         assert_eq!(builtin_profile("reviewer").unwrap().deny_rules(), want);
         assert_eq!(

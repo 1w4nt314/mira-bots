@@ -170,6 +170,13 @@ pub struct Agent {
     /// ticket dispatcher waits a grace period after it so it never types into a half-written
     /// prompt. The dispatcher's own writes (`write_input`) do not touch it.
     last_user_input_at: Option<u64>,
+    /// The current session has had a turn (a `UserPromptSubmit` or `Stop` was seen for it), so
+    /// Claude Code has written its transcript and `--resume` can find it. Reset when the
+    /// session id changes (`/clear`, a fresh restart). See [`AgentManager::restart_session`].
+    has_conversation: bool,
+    /// Set by a `--resume` restart (ms since epoch); a non-zero exit shortly after it, before the
+    /// session started, means the conversation could not be resumed ([`RESTART_FAILED_TEXT`]).
+    resume_started_at: Option<u64>,
 }
 
 pub struct AgentManager {
@@ -271,6 +278,23 @@ pub fn build_spawn_spec(
     spec_with(req, ctx, args, agent_id)
 }
 
+/// How a restart continues the agent's session (plan5 A.5, review5 N1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestartSession {
+    /// `--resume <session id>`: the session has had a turn, so its transcript exists.
+    Resume(String),
+    /// `--session-id <new uuid>`: no turn yet, so no transcript; `--resume` would fail with
+    /// "No conversation found". The agent gets this new session id.
+    Fresh(String),
+}
+
+/// Detail of an agent whose `--resume` restart exited with an error before its session
+/// started (review5 N1).
+pub const RESTART_FAILED_TEXT: &str = "Genstart fejlede: samtalen kunne ikke genoptages";
+
+/// How long after a `--resume` restart an error exit counts as [`RESTART_FAILED_TEXT`].
+pub const RESUME_FAIL_WINDOW_MS: u64 = 15_000;
+
 /// Model value of a restart when none is requested: a resumed session would otherwise keep the
 /// transcript's model (C5.11b).
 pub const RESUME_DEFAULT_MODEL: &str = "default";
@@ -288,11 +312,32 @@ pub fn build_resume_spec(
     session_id: &str,
     agent_id: &str,
 ) -> SpawnSpec {
+    build_restart_spec(
+        req,
+        ctx,
+        &RestartSession::Resume(session_id.to_string()),
+        agent_id,
+    )
+}
+
+/// Command line for a restart (C5.11b, review5 N1): like [`build_resume_spec`], but a
+/// [`RestartSession::Fresh`] session ends in `--session-id <new uuid>` instead of `--resume`
+/// (same profile files, `--model` always present, never a positional prompt). Same env.
+pub fn build_restart_spec(
+    req: &SpawnRequest,
+    ctx: &SpawnContext,
+    session: &RestartSession,
+    agent_id: &str,
+) -> SpawnSpec {
     let model = req.profile.model.as_deref().unwrap_or(RESUME_DEFAULT_MODEL);
     let effort = req.profile.effort.map(|e| e.as_str());
     let mut args = base_args(ctx, Some(model), effort);
-    args.push("--resume".to_string());
-    args.push(session_id.to_string());
+    let (flag, session_id) = match session {
+        RestartSession::Resume(id) => ("--resume", id),
+        RestartSession::Fresh(id) => ("--session-id", id),
+    };
+    args.push(flag.to_string());
+    args.push(session_id.clone());
     spec_with(req, ctx, args, agent_id)
 }
 
@@ -471,6 +516,8 @@ impl AgentManager {
     /// one started. The agent shows `Starting` with [`RESTARTING_TEXT`] until its SessionStart;
     /// `model`/`effort` become the requested values (`model_observed = false`).
     ///
+    /// With [`RestartSession::Fresh`] the agent takes the new session id (session map updated).
+    ///
     /// Returns the result and the old PTY handle, which the caller must drop after releasing the
     /// manager lock (see [`Self::mark_exited`]). If the new child cannot be started the agent is
     /// marked exited (the caller releases its tickets).
@@ -478,6 +525,7 @@ impl AgentManager {
         &mut self,
         id: &str,
         spec: SpawnSpec,
+        session: &RestartSession,
         model: Option<String>,
         effort: Option<String>,
         sink: EventSink,
@@ -506,6 +554,21 @@ impl AgentManager {
                 agent.info.model = model;
                 agent.info.effort = effort;
                 agent.info.model_observed = false;
+                match session {
+                    RestartSession::Resume(_) => agent.resume_started_at = Some(now),
+                    RestartSession::Fresh(new_id) => {
+                        agent.resume_started_at = None;
+                        agent.has_conversation = false;
+                        let old_id = std::mem::replace(&mut agent.info.session_id, new_id.clone());
+                        let info = agent.info.clone();
+                        let old_key = session_key(&old_id);
+                        if self.by_session.get(&old_key).map(String::as_str) == Some(id) {
+                            self.by_session.remove(&old_key);
+                        }
+                        self.by_session.insert(session_key(new_id), id.to_string());
+                        return (Ok(info), old);
+                    }
+                }
                 (Ok(agent.info.clone()), old)
             }
             Err(e) => {
@@ -518,6 +581,31 @@ impl AgentManager {
                 (Err(e), old)
             }
         }
+    }
+
+    /// How a restart of agent `id` continues its session (review5 N1): `--resume` only when the
+    /// session has had a turn, otherwise a fresh session with a new uuid. `None` for unknown
+    /// agents.
+    pub fn restart_session(&self, id: &str) -> Option<RestartSession> {
+        let a = self.agents.get(id)?;
+        Some(if a.has_conversation {
+            RestartSession::Resume(a.info.session_id.clone())
+        } else {
+            RestartSession::Fresh(uuid::Uuid::new_v4().to_string())
+        })
+    }
+
+    /// The agent's session had a turn (`UserPromptSubmit` or `Stop`); see
+    /// [`Agent::has_conversation`]. Unknown agents are ignored.
+    pub fn mark_conversation(&mut self, id: &str) {
+        if let Some(a) = self.agents.get_mut(id) {
+            a.has_conversation = true;
+        }
+    }
+
+    /// See [`Agent::has_conversation`] (`false` for unknown agents).
+    pub fn has_conversation(&self, id: &str) -> bool {
+        self.agents.get(id).is_some_and(|a| a.has_conversation)
     }
 
     /// The agent's current PTY generation (`None` for unknown agents).
@@ -593,6 +681,8 @@ impl AgentManager {
                     .map(|s| s.to_string())
                     .collect(),
                 last_user_input_at: None,
+                has_conversation: false,
+                resume_started_at: None,
             },
         );
     }
@@ -639,14 +729,24 @@ impl AgentManager {
         if agent.pty_gen.load(Ordering::SeqCst) != gen {
             return None;
         }
+        let now = now_ms();
+        // A `--resume` restart that died with an error before its SessionStart (still Starting
+        // with the restart text): the conversation could not be resumed (review5 N1).
+        let resume_failed = code != Some(0)
+            && agent.info.status == AgentStatus::Starting
+            && agent.info.detail.as_deref() == Some(RESTARTING_TEXT)
+            && agent
+                .resume_started_at
+                .is_some_and(|t| now.saturating_sub(t) <= RESUME_FAIL_WINDOW_MS);
         // Keep a known code if stop() raced ahead with None; otherwise take the reported one.
         let keep =
             matches!(agent.info.status, AgentStatus::Exited { code: Some(_) }) && code.is_none();
         if !keep {
             agent.info.status = AgentStatus::Exited { code };
         }
-        agent.info.detail = None;
-        agent.info.last_event_at = now_ms();
+        agent.info.detail = resume_failed.then(|| RESTART_FAILED_TEXT.to_string());
+        agent.resume_started_at = None;
+        agent.info.last_event_at = now;
         agent.info.current_ticket_id = None;
         agent.info.queue_length = 0;
         let pty = agent.pty.take();
@@ -794,6 +894,8 @@ impl AgentManager {
             let rebound =
                 !session_id.is_empty() && !agent.info.session_id.eq_ignore_ascii_case(session_id);
             if rebound {
+                // A new session (e.g. `/clear`) has no transcript until its first turn.
+                agent.has_conversation = false;
                 let old = std::mem::replace(&mut agent.info.session_id, session_id.to_string());
                 let old_key = session_key(&old);
                 if self.by_session.get(&old_key) == Some(&id) {
@@ -1728,6 +1830,62 @@ mod tests {
         assert_eq!(m.get(&id).unwrap().detail, None);
     }
 
+    /// review5 N1: `--resume` only after a turn (UserPromptSubmit/Stop) of the current session;
+    /// a new session id (`/clear`) starts over.
+    #[test]
+    fn restart_session_resumes_only_after_a_turn() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("sess-1", "/w/a");
+        assert!(m.restart_session("nope").is_none());
+        let RestartSession::Fresh(new_id) = m.restart_session(&id).unwrap() else {
+            panic!("no turn yet: fresh session");
+        };
+        assert_ne!(new_id, "sess-1");
+        assert!(uuid::Uuid::parse_str(&new_id).is_ok());
+        m.mark_conversation(&id);
+        assert_eq!(
+            m.restart_session(&id),
+            Some(RestartSession::Resume("sess-1".into()))
+        );
+        // `/clear`: the frame rebinds the agent to a new session without a transcript.
+        m.match_frame(Some(&id), "sess-2").unwrap();
+        assert!(!m.has_conversation(&id));
+        assert!(matches!(
+            m.restart_session(&id),
+            Some(RestartSession::Fresh(_))
+        ));
+        // A frame of the same session does not reset it.
+        m.mark_conversation(&id);
+        m.match_frame(Some(&id), "SESS-2").unwrap();
+        assert!(m.has_conversation(&id));
+    }
+
+    #[test]
+    fn restart_spec_fresh_vs_resume() {
+        let req = profile_req(Some("haiku"), Some(Effort::Low), &[]);
+        let c = profile_ctx();
+        let resume = build_restart_spec(&req, &c, &RestartSession::Resume("s-1".into()), "aid");
+        assert_eq!(resume.args, build_resume_spec(&req, &c, "s-1", "aid").args);
+        let fresh = build_restart_spec(&req, &c, &RestartSession::Fresh("s-2".into()), "aid");
+        let n = fresh.args.len();
+        assert_eq!(fresh.args[n - 2..], ["--session-id", "s-2"]);
+        assert_eq!(
+            fresh.args[..n - 2],
+            resume.args[..n - 2],
+            "same profile flags"
+        );
+        assert!(!fresh.args.iter().any(|a| a == "--resume"));
+        assert_eq!(fresh.env, resume.env);
+        // No model requested: --model default, like a resume.
+        let fresh = build_restart_spec(
+            &profile_req(None, None, &[]),
+            &c,
+            &RestartSession::Fresh("s".into()),
+            "a",
+        );
+        assert!(fresh.args.windows(2).any(|w| w == ["--model", "default"]));
+    }
+
     #[cfg(unix)]
     mod unix_pty {
         use super::*;
@@ -1938,6 +2096,7 @@ mod tests {
             let (res, old) = m.restart(
                 &info.id,
                 sh("echo second; sleep 30", vec![]),
+                &RestartSession::Resume("sess-r".into()),
                 Some("opus".into()),
                 Some("high".into()),
                 sink.clone(),
@@ -1985,11 +2144,106 @@ mod tests {
             assert!(text.contains("first") && text.contains("second"), "{text}");
             // Exited agents cannot be restarted.
             m.stop(&info.id).unwrap();
-            let (res, _) = m.restart(&info.id, sh("true", vec![]), None, None, sink.clone());
+            let resume = RestartSession::Resume("sess-r".into());
+            let (res, _) = m.restart(
+                &info.id,
+                sh("true", vec![]),
+                &resume,
+                None,
+                None,
+                sink.clone(),
+            );
             assert!(matches!(res, Err(AgentError::NotFound)));
-            let (res, _) = m.restart("nope", sh("true", vec![]), None, None, sink);
+            let (res, _) = m.restart("nope", sh("true", vec![]), &resume, None, None, sink);
             assert!(matches!(res, Err(AgentError::NotFound)));
             assert_eq!(m.list().len(), 1);
+        }
+
+        /// The exit code of generation `gen` (waits up to 10 s).
+        fn wait_for_gen_exit(events: &Arc<Mutex<Vec<SinkEvent>>>, want: u64) -> Option<i32> {
+            let t = Instant::now();
+            loop {
+                let found = events.lock().unwrap().iter().find_map(|e| match e {
+                    SinkEvent::Exited { gen, code, .. } if *gen == want => Some(*code),
+                    _ => None,
+                });
+                if let Some(code) = found {
+                    return code;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "no exit of gen {want}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// review5 N1: a fresh restart takes the new session id (session map follows); a
+        /// `--resume` restart that dies with an error before its SessionStart gets
+        /// [`RESTART_FAILED_TEXT`], a later error exit does not.
+        #[test]
+        fn fresh_restart_rebinds_and_failed_resume_says_so() {
+            let mut m = AgentManager::new(5);
+            let (sink, events) = collecting_sink();
+            let info = m
+                .spawn_spec(sh("sleep 30", vec![]), meta("sess-a"), sink.clone())
+                .unwrap();
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            let fresh = RestartSession::Fresh("sess-new".into());
+            let (res, old) = m.restart(
+                &info.id,
+                sh("sleep 30", vec![]),
+                &fresh,
+                None,
+                None,
+                sink.clone(),
+            );
+            drop(old);
+            assert_eq!(res.unwrap().session_id, "sess-new");
+            assert_eq!(m.agent_id_for_session("SESS-NEW"), Some(info.id.clone()));
+            assert_eq!(m.agent_id_for_session("sess-a"), None);
+            assert!(!m.has_conversation(&info.id));
+
+            // The session had a turn → --resume; the resumed child exits 1 right away.
+            m.mark_conversation(&info.id);
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            let resume = m.restart_session(&info.id).unwrap();
+            assert_eq!(resume, RestartSession::Resume("sess-new".into()));
+            let (res, old) = m.restart(
+                &info.id,
+                sh("exit 1", vec![]),
+                &resume,
+                None,
+                None,
+                sink.clone(),
+            );
+            drop(old);
+            res.unwrap();
+            let code = wait_for_gen_exit(&events, 2);
+            assert_eq!(code, Some(1));
+            let (exited, _pty) = m.mark_exited(&info.id, 2, code).unwrap();
+            assert_eq!(exited.status, AgentStatus::Exited { code: Some(1) });
+            assert_eq!(exited.detail.as_deref(), Some(RESTART_FAILED_TEXT));
+
+            // After its SessionStart (Idle) an error exit is an ordinary exit.
+            let other = m
+                .spawn_spec(sh("sleep 30", vec![]), meta("sess-b"), sink.clone())
+                .unwrap();
+            m.set_status(&other.id, AgentStatus::Idle, None).unwrap();
+            let (res, old) = m.restart(
+                &other.id,
+                sh("sleep 0.3; exit 1", vec![]),
+                &RestartSession::Resume("sess-b".into()),
+                None,
+                None,
+                sink.clone(),
+            );
+            drop(old);
+            res.unwrap();
+            m.set_status(&other.id, AgentStatus::Idle, None).unwrap();
+            let code = wait_for_gen_exit(&events, 1);
+            let (exited, _pty) = m.mark_exited(&other.id, 1, code).unwrap();
+            assert_eq!(exited.detail, None);
         }
     }
 }

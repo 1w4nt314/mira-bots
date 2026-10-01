@@ -1219,7 +1219,9 @@ impl TicketService {
     }
 
     /// Removes the ticket's reviewer and assignment (stays in review; routed again) and clears an
-    /// escalation, with `note` by `by`. `Ok(None)` when it had neither reviewer nor escalation.
+    /// escalation, with `note` by `by`. A ticket that reached [`MAX_REVIEW_ROUNDS`] stays (or
+    /// becomes again) escalated without a new escalation note, so routing leaves it to the user
+    /// (review5 N5). `Ok(None)` when there is nothing to remove.
     pub fn clear_reviewer(
         &mut self,
         ticket_id: &str,
@@ -1231,14 +1233,15 @@ impl TicketService {
         if t.state != TicketState::Review {
             return Err(TicketError::NotInReview);
         }
-        if t.reviewer_agent_id.is_none() && !t.escalated {
+        let keep_escalated = t.review_round >= MAX_REVIEW_ROUNDS;
+        if t.reviewer_agent_id.is_none() && (!t.escalated || keep_escalated) {
             return Ok(None);
         }
         self.commit(|doc| {
             doc.review_assignments.retain(|a| a.ticket_id != ticket_id);
             let t = find_mut(doc, ticket_id)?;
             t.reviewer_agent_id = None;
-            t.escalated = false;
+            t.escalated = keep_escalated;
             note_entry(t, by, note.to_string(), now);
             Ok(())
         })?;
@@ -2420,6 +2423,42 @@ mod tests {
             s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 9),
             Ok(None)
         );
+    }
+
+    /// review5 N5: removing the hand-picked reviewer of a ticket that used up its rounds keeps
+    /// it escalated (no routing, no second escalation note); an escalated ticket without a
+    /// reviewer has nothing to remove.
+    #[test]
+    fn clear_reviewer_keeps_escalation_after_max_rounds() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        s.commit(|doc| {
+            find_mut(doc, &t.id)?.review_round = MAX_REVIEW_ROUNDS;
+            Ok(())
+        })
+        .unwrap();
+        s.escalate(&t.id, 5).unwrap().unwrap();
+        assert_eq!(
+            s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 6),
+            Ok(None)
+        );
+        let r = s.set_reviewer(&t.id, "rev", "r", 7).unwrap();
+        assert_eq!((r.escalated, r.review_round), (false, MAX_REVIEW_ROUNDS));
+        let c = s
+            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (c.reviewer_agent_id.as_deref(), c.escalated, c.review_round),
+            (None, true, MAX_REVIEW_ROUNDS)
+        );
+        assert!(s.review_assignments().is_empty());
+        assert!(s.unrouted_reviews().is_empty(), "escalated: no routing");
+        assert_eq!(
+            c.history.last().unwrap().note.as_deref(),
+            Some(REVIEWER_REMOVED_NOTE)
+        );
+        assert_eq!(s.escalate(&t.id, 9).unwrap(), None, "no second escalation");
     }
 
     #[test]

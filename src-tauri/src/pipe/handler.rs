@@ -30,12 +30,16 @@ pub use crate::events::EmitFn;
 pub type StatusObserver = Arc<dyn Fn(StatusEvent) + Send + Sync>;
 
 /// Answers a tool frame from mira-mcp (the app glue binds it to `tickets::tools`; the handler
-/// knows nothing about tickets). Called synchronously on the connection's task; it takes only
-/// short locks and must not block. Must answer with the frame's `request_id`.
+/// knows nothing about tickets). Called on tokio's blocking pool (`spawn_blocking`), never on the
+/// connection's task: `mira_spawn_agent` creates folders, writes files and starts a process, and
+/// that must not stall the hook frames of other agents. Must answer with the frame's `request_id`.
 pub type ToolHandler = Arc<dyn Fn(ToolFrame) -> ToolResult + Send + Sync>;
 
 /// Answer when no [`ToolHandler`] is installed.
 pub const TOOLS_UNAVAILABLE: &str = "Værktøjer er ikke tilgængelige i appen";
+
+/// Answer when the [`ToolHandler`] panicked (the blocking task failed).
+pub const TOOL_FAILED: &str = "Værktøjet fejlede i appen";
 
 #[derive(Clone)]
 pub struct HandlerCtx {
@@ -218,7 +222,11 @@ where
     // agent's "first hook event" (the Starting hint stays).
     let is_live = is_statusline || ev.hook_event_name == "PostModelSwitch";
 
-    // One lock: match (and possibly rebind) plus clearing the Starting hint. No emit under it.
+    // A turn of the session: its transcript exists, so a restart may `--resume` it (review5 N1).
+    let is_turn = matches!(ev.hook_event_name.as_str(), "UserPromptSubmit" | "Stop");
+
+    // One lock: match (and possibly rebind), clearing the Starting hint and noting a turn. No
+    // emit under it.
     let (found, hint_cleared) = {
         let mut m = lock(&ctx.manager);
         let found = m.match_frame(hint.as_deref(), &ev.session_id);
@@ -226,6 +234,9 @@ where
             && found
                 .as_ref()
                 .is_some_and(|f| m.clear_starting_hint(&f.agent_id));
+        if let (Some(f), true) = (&found, is_turn) {
+            m.mark_conversation(&f.agent_id);
+        }
         (found, cleared)
     };
     if is_statusline {
@@ -337,7 +348,21 @@ where
     let agent_id = frame.agent_id.clone();
     let request_id = frame.request_id.clone();
     let mut result = match &ctx.tools {
-        Some(handle) => handle(frame),
+        // Off the async worker: a slow tool (spawn) must not hold up other connections. The
+        // handler takes only std locks inside the closure; nothing is held across this await.
+        Some(handle) => {
+            let handle = Arc::clone(handle);
+            match tokio::task::spawn_blocking(move || handle(frame)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("tool {tool}: handler failed: {e}");
+                    ToolResult {
+                        request_id: request_id.clone(),
+                        outcome: Err(TOOL_FAILED.to_string()),
+                    }
+                }
+            }
+        }
         None => ToolResult {
             request_id: request_id.clone(),
             outcome: Err(TOOLS_UNAVAILABLE.to_string()),
@@ -1188,6 +1213,70 @@ mod tests {
         assert_eq!(h.status(), before);
         assert_eq!(*observed.lock().unwrap(), 0);
         assert_eq!(h.ctx.stats.received(), 0);
+    }
+
+    /// review5 N1: only UserPromptSubmit/Stop mark the session as having a conversation.
+    #[tokio::test]
+    async fn prompt_or_stop_marks_a_conversation() {
+        let h = harness(true);
+        let has = |h: &Harness| h.ctx.manager.lock().unwrap().has_conversation(&h.agent);
+        round_trip(&h, &frame(fx::PRE_TOOL_USE)).await;
+        round_trip(&h, &frame(STATUSLINE)).await;
+        assert!(!has(&h));
+        round_trip(&h, &frame(fx::USER_PROMPT_SUBMIT)).await;
+        assert!(has(&h));
+        let h = harness(true);
+        round_trip(&h, &frame(fx::STOP)).await;
+        assert!(has(&h));
+    }
+
+    /// A slow tool (`mira_spawn_agent`) runs on the blocking pool: on this single-threaded test
+    /// runtime a hook frame of another agent is handled while the tool handler still blocks.
+    #[tokio::test]
+    async fn a_slow_tool_does_not_block_hook_frames() {
+        let mut h = harness(true);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        h.ctx.tools = Some(Arc::new(move |f: ToolFrame| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            // Blocks until the hook frame below was handled (or gives up after 5 s).
+            let unblocked = go_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+            ToolResult {
+                request_id: f.request_id,
+                outcome: Ok(json!({ "unblocked": unblocked })),
+            }
+        }));
+
+        let (mut tool_client, tool_task) = h.start();
+        tool_client
+            .write_all(tool_frame("9-1", "mira_spawn_agent").as_bytes())
+            .await
+            .unwrap();
+        // The tool handler is running (and blocking) now.
+        entered_rx.await.unwrap();
+
+        // Meanwhile a hook frame is handled completely.
+        round_trip(&h, &frame(fx::PRE_TOOL_USE)).await;
+        assert_eq!(h.status(), AgentStatus::Editing);
+        go_tx.send(()).unwrap();
+
+        let mut out = String::new();
+        tool_client.read_to_string(&mut out).await.unwrap();
+        drop(tool_client);
+        tool_task.await.unwrap();
+        let v = tool_reply(&out);
+        assert_eq!(
+            (v["request_id"].clone(), v["result"].clone()),
+            (json!("9-1"), json!({"unblocked": true}))
+        );
     }
 
     #[tokio::test]

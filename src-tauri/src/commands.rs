@@ -15,11 +15,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::agent::claude_path::find_claude;
+use crate::agent::manager::{build_restart_spec, RestartSession};
 use crate::agent::roles::prefix_for;
 use crate::agent::workdir::{ensure_dir, next_agent_dir};
 use crate::agent::{
-    build_resume_spec, now_ms, AgentError, AgentInfo, AgentManager, EventSink, SeatKind,
-    SpawnContext, SpawnRequest,
+    now_ms, AgentError, AgentInfo, AgentManager, EventSink, SeatKind, SpawnContext, SpawnRequest,
 };
 use crate::config::{
     AUTO_REVIEW_ON_STOP, DEFAULT_PROFILE_ID, MAX_STAFF_AGENTS, MAX_WORK_AGENTS, SETTINGS_FILE,
@@ -828,8 +828,10 @@ pub fn restart_request(
     }
 }
 
-/// Gate → profile files → kill + `--resume` under the same agent id → `AgentRestarting` to the
+/// Gate → profile files → kill + restart under the same agent id → `AgentRestarting` to the
 /// dispatcher → `agents-changed`. Pending permission requests of the old session are released.
+/// `--resume` only when the session has had a turn; otherwise a fresh session with a new id
+/// (no transcript exists yet, `--resume` would fail; review5 N1).
 fn restart_agent(
     app: &AppHandle,
     state: &AppState,
@@ -842,21 +844,26 @@ fn restart_agent(
     let profile = state.profiles.get(&info.profile_id);
     let ctx = spawn_context(state, &info.profile_id, profile.as_ref())?;
     let req = restart_request(&info, model.clone(), effort);
-    let spec = build_resume_spec(&req, &ctx, &info.session_id, agent_id);
     lock(&state.pending).remove_for_agent(agent_id);
-    let (result, old_pty) = {
+    let (result, old_pty, resumed) = {
         let mut m = lock(&state.manager);
         // Checked again under the lock: the agent may have started working meanwhile.
         if let Err(e) = check_restartable(m.get(agent_id).as_ref()) {
             return Err(e.into());
         }
-        m.restart(
+        // Decided under the same lock as the restart (a turn may have ended meanwhile).
+        let session = m.restart_session(agent_id).ok_or(AgentError::NotRunning)?;
+        let resumed = matches!(session, RestartSession::Resume(_));
+        let spec = build_restart_spec(&req, &ctx, &session, agent_id);
+        let (result, old_pty) = m.restart(
             agent_id,
             spec,
+            &session,
             model.clone(),
             effort.map(|e| e.as_str().to_string()),
             Arc::clone(&state.sink),
-        )
+        );
+        (result, old_pty, resumed)
     };
     // Close the old pseudo terminal only after the manager lock is released (it may block).
     drop(old_pty);
@@ -866,7 +873,8 @@ fn restart_agent(
     match result {
         Ok(info) => {
             log::info!(
-                "agent {agent_id} restarted with model={} effort={}",
+                "agent {agent_id} restarted ({}) with model={} effort={}",
+                if resumed { "resume" } else { "fresh session" },
                 model.as_deref().unwrap_or("default"),
                 effort.map_or("-", Effort::as_str)
             );
@@ -884,7 +892,7 @@ fn restart_agent(
     }
 }
 
-/// Restarts the agent with `--resume` and the new model (`null` → `--model default`). Only when
+/// Restarts the agent (`--resume`, or a fresh session without a turn yet) with the new model (`null` → `--model default`). Only when
 /// it is Idle without a ticket in progress.
 #[tauri::command]
 pub fn set_agent_model(
@@ -903,7 +911,7 @@ pub fn set_agent_model(
     restart_agent(&app, &state, &agent_id, Some(model), None)
 }
 
-/// Restarts the agent with `--resume` and the new effort (a concrete level; no flag can reset
+/// Restarts the agent (like `set_agent_model`) with the new effort (a concrete level; no flag can reset
 /// it to the model's default).
 #[tauri::command]
 pub fn set_agent_effort(
@@ -1853,16 +1861,26 @@ mod tests {
             system_prompt: None,
             pipe_name: "p".into(),
         };
-        let spec = build_resume_spec(
-            &restart_request(&info, None, Some(Effort::High)),
-            &ctx,
-            &info.session_id,
-            &a,
-        );
+        let req = restart_request(&info, None, Some(Effort::High));
+        let spec = build_restart_spec(&req, &ctx, &RestartSession::Resume("s".into()), &a);
         assert_eq!(
             spec.args[2..],
             ["--model", "default", "--effort", "high", "--resume", "s"]
         );
+        // No turn yet: a fresh session with the same flags and the new id instead of --resume.
+        let spec = build_restart_spec(&req, &ctx, &RestartSession::Fresh("n".into()), &a);
+        assert_eq!(
+            spec.args[2..],
+            [
+                "--model",
+                "default",
+                "--effort",
+                "high",
+                "--session-id",
+                "n"
+            ]
+        );
+        assert!(!spec.args.iter().any(|x| x == "--resume"));
     }
 
     #[test]
