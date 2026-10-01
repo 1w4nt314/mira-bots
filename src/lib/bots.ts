@@ -1,6 +1,8 @@
-// Bot figures: SVG lookup per theme/role/state, the status -> figure-state mapping, the short
+// Bot figures: static SVG lookup or the generated specialist figure per theme/roles/state, the status -> figure-state mapping, the short
 // "done" phase after a finished turn, and the colour-scheme hook.
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { renderBot } from "./botCore";
+import { figureNameFor, sortRoles } from "./roles";
 import type { AgentInfo, AgentStatus, AgentStatusKind, BotState, Role } from "./types";
 
 /** File name part of a static figure (`bot-<name>-<state>.svg`). */
@@ -11,30 +13,38 @@ export type BotRole =
   | "reviewer"
   | "koord"
   | "planner"
-  | "debugger"
-  | "specialist";
+  | "debugger";
+
+/** How a role set is drawn: a bundled static SVG, or the generated (specialist) figure. */
+export type Figure = { kind: "static"; name: BotRole } | { kind: "dynamic" };
 
 /**
- * Static figure for a role set (mirrors `prefix_for` in Rust): one role and not a specialist →
- * that role's figure (`koord` for the coordinator); no roles → `none`; otherwise `specialist`.
- * Interim until the dynamic specialist figure (plan5 batch 3).
+ * Figure for a role set (mirrors `prefix_for` in Rust, except that every specialist is drawn by
+ * `renderBot`):
+ *
+ * | roles             | specialist | figure                    |
+ * |-------------------|------------|---------------------------|
+ * | [coder]           | false      | static "coder"            |
+ * | [coordinator]     | false      | static "koord"            |
+ * | [planner]         | false      | static "planner"          |
+ * | []                | false      | static "none"             |
+ * | [coder]           | true       | dynamic                   |
+ * | [coder, reviewer] | any        | dynamic                   |
+ * | []                | true       | dynamic                   |
  */
-export function figureFor(roles: readonly Role[], specialist: boolean): BotRole {
-  if (roles.length === 1 && !specialist) return roles[0] === "coordinator" ? "koord" : roles[0];
-  if (roles.length === 0 && !specialist) return "none";
-  return "specialist";
+export function figureFor(roles: readonly Role[], specialist: boolean): Figure {
+  if (roles.length === 1 && !specialist) return { kind: "static", name: figureNameFor(roles[0]) };
+  if (roles.length === 0 && !specialist) return { kind: "static", name: "none" };
+  return { kind: "dynamic" };
 }
-
-/** The figure of an agent (from its profile snapshot). */
-export const agentFigure = (agent: Pick<AgentInfo, "roles" | "specialist">): BotRole =>
-  figureFor(agent.roles, agent.specialist);
 
 export type Theme = "dark" | "light";
 
 /** How long the "done" figure shows after an agent went back to idle from a working state. */
 export const DONE_STATE_MS = 8000;
 
-// All static figures (2 themes x 10 names x 4 states), bundled as separate asset URLs.
+// All static figures (2 themes x 10 names x 4 states), bundled as separate asset URLs. The
+// static specialist files are no longer used (specialists are generated), but stay in assets.
 const BOT_SVGS = import.meta.glob<string>("../assets/bots/*/bot-*.svg", {
   eager: true,
   query: "?url",
@@ -43,14 +53,42 @@ const BOT_SVGS = import.meta.glob<string>("../assets/bots/*/bot-*.svg", {
 
 const FALLBACK_KEY = "../assets/bots/dark/bot-none-idle.svg";
 
-/** URL of the figure; falls back to the neutral idle bot so `src` is never undefined. */
-export function botSrc(theme: Theme, role: BotRole, state: BotState): string {
+function staticSrc(theme: Theme, name: BotRole, state: BotState): string {
   return (
-    BOT_SVGS[`../assets/bots/${theme}/bot-${role}-${state}.svg`] ??
+    BOT_SVGS[`../assets/bots/${theme}/bot-${name}-${state}.svg`] ??
     BOT_SVGS[`../assets/bots/${theme}/bot-none-idle.svg`] ??
     BOT_SVGS[FALLBACK_KEY] ??
     ""
   );
+}
+
+// Generated figures by `theme|state|roles|spec` (at most 2 x 4 x 64 x 2 entries).
+const DYNAMIC_CACHE = new Map<string, string>();
+
+/**
+ * `src` of a figure: a static asset URL, or for a specialist a `data:image/svg+xml` URL of
+ * `renderBot` (memoised). Only known role names reach the SVG, never user text.
+ */
+// TODO(windows-verify): the generated specialist figure (data URL with CSS animations in <img>)
+// renders in WebView2 on seats, chips and in the profile editor preview, in both themes; the
+// static planner/debugger figures show (plan D.59).
+export function botSrc(
+  theme: Theme,
+  roles: readonly Role[],
+  specialist: boolean,
+  state: BotState,
+): string {
+  const fig = figureFor(roles, specialist);
+  if (fig.kind === "static") return staticSrc(theme, fig.name, state);
+  const names = sortRoles(roles).map(figureNameFor);
+  const key = `${theme}|${state}|${names.join(",")}|${specialist ? 1 : 0}`;
+  let url = DYNAMIC_CACHE.get(key);
+  if (url === undefined) {
+    const svg = renderBot({ state, roles: names, dark: theme === "dark", specialist, id: "screen" });
+    url = `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+    DYNAMIC_CACHE.set(key, url);
+  }
+  return url;
 }
 
 /**

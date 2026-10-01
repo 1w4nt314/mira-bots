@@ -72,6 +72,16 @@ export const ACTOR_LABEL: Record<TicketActor, string> = {
   agent: "agenten",
 };
 
+/** Short local date and time ("01.10. 14.05") for history lines and reports. */
+export function formatAt(ms: number): string {
+  return new Date(ms).toLocaleString("da-DK", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 /**
  * First 8 characters of the uuid without dashes, lower case (mirrors `short_id` in Rust; the
  * backend also sends `shortId`, this is for ids alone).
@@ -421,9 +431,101 @@ export function draggedTicketId(id: string): string | null {
  * | "tickets"      | "tickets"         |
  * | "permissions"  | "permissions"     |
  * | "diagnostics"  | "diagnostics"     |
+ * | "agents"       | "agents"          |
  * | "Tickets"      | null              |
  * | null           | null              |
  */
 export function parseWorkplaceTab(tab: string | null): WorkplaceTab | null {
-  return tab === "tickets" || tab === "permissions" || tab === "diagnostics" ? tab : null;
+  return tab === "tickets" || tab === "permissions" || tab === "diagnostics" || tab === "agents"
+    ? tab
+    : null;
+}
+
+// --- review between agents, coordination (plan5 A.6/A.7) --------------------------------------
+
+/** Mirrors `MAX_REVIEW_ROUNDS` in Rust: after this many rejections the user decides. */
+export const MAX_REVIEW_ROUNDS = 3;
+
+/**
+ * The review round shown on the card (`reviewRound` counts rejections so far; the review file
+ * says "Runde r+1 af 3"), capped at the maximum once escalated.
+ *
+ * | reviewRound | reviewRoundText   |
+ * |-------------|-------------------|
+ * | 0           | "Runde 1 af 3"    |
+ * | 2           | "Runde 3 af 3"    |
+ * | 3           | "Runde 3 af 3"    |
+ * | 7           | "Runde 3 af 3"    |
+ */
+export function reviewRoundText(t: Pick<TicketSummary, "reviewRound">): string {
+  return `Runde ${Math.min(t.reviewRound + 1, MAX_REVIEW_ROUNDS)} af ${MAX_REVIEW_ROUNDS}`;
+}
+
+/**
+ * Agents the user may pick as reviewer of `t` (`assign_reviewer`): running, with the reviewer
+ * role, not the sender, not already its reviewer; fewest open reviews first, then oldest.
+ *
+ * | agent                                   | candidate |
+ * |-----------------------------------------|-----------|
+ * | reviewer role, idle, not the sender     | yes       |
+ * | reviewer role, exited                   | no        |
+ * | reviewer role, the sender (assignee)    | no        |
+ * | reviewer role, already `reviewerAgentId`| no        |
+ * | coder only                              | no        |
+ */
+export function reviewerCandidates(
+  agents: readonly AgentInfo[],
+  t: Pick<TicketSummary, "assigneeAgentId" | "reviewerAgentId">,
+): AgentInfo[] {
+  return agents
+    .filter(
+      (a) =>
+        isLive(a) &&
+        a.roles.includes("reviewer") &&
+        a.id !== t.assigneeAgentId &&
+        a.id !== t.reviewerAgentId,
+    )
+    .sort((a, b) => a.openReviews - b.openReviews || a.createdAt - b.createdAt);
+}
+
+/**
+ * Tickets the agent reviews right now: in review with `reviewerAgentId === agentId`, oldest
+ * first (input order).
+ */
+export function reviewsFor(tickets: readonly TicketSummary[], agentId: string): TicketSummary[] {
+  return tickets.filter((t) => t.state === "review" && t.reviewerAgentId === agentId);
+}
+
+/**
+ * A ticket on a staff agent is a "koordineringsopgave" (plan5 A.7).
+ *
+ * | agent seat | isCoordinationTask |
+ * |------------|--------------------|
+ * | staff      | true               |
+ * | work       | false              |
+ * | no agent   | false              |
+ */
+export function isCoordinationTask(agent: Pick<AgentInfo, "seatKind"> | null): boolean {
+  return agent !== null && agent.seatKind === "staff";
+}
+
+/** Tooltip on "Skift model"/"Skift effort" while switching is not possible. */
+export const AGENT_BUSY_TEXT = "Agenten arbejder — vent til den er idle uden ticket i gang";
+
+/**
+ * Why "Skift model"/"Skift effort" is disabled, or null when the agent can be restarted (mirrors
+ * the backend's `AgentWorking` rule: idle and no ticket in progress).
+ *
+ * | status   | currentTicketId | switchBlocked       |
+ * |----------|-----------------|---------------------|
+ * | idle     | null            | null                |
+ * | idle     | "t1"            | AGENT_BUSY_TEXT     |
+ * | thinking | null            | AGENT_BUSY_TEXT     |
+ * | starting | null            | AGENT_BUSY_TEXT     |
+ * | exited   | null            | "Agenten kører ikke"|
+ */
+export function switchBlocked(agent: Pick<AgentInfo, "status" | "currentTicketId">): string | null {
+  if (agent.status.kind === "exited") return "Agenten kører ikke";
+  if (agent.status.kind !== "idle" || agent.currentTicketId !== null) return AGENT_BUSY_TEXT;
+  return null;
 }

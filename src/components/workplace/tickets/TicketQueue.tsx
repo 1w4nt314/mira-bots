@@ -13,6 +13,7 @@ import {
   canRequestSubmission,
   DELIVERY_FAILED_TEXT,
   hasRedispatchIssue,
+  isCoordinationTask,
   ISSUE_HINT,
   ISSUE_LABEL,
   moveUp,
@@ -138,10 +139,12 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
   );
 
   const total = (current === null ? 0 : 1) + queue.length + review.length;
+  // Tickets on a staff agent (coordinator, reviewer) are coordination tasks (plan5 A.7).
+  const heading = isCoordinationTask(agent) ? "Koordineringsopgaver" : "Tickets";
   const summary =
     total === 0
-      ? "Tickets: ingen"
-      : `Tickets: ${current === null ? "ingen i gang" : "1 i gang"} · ${queue.length} i kø${
+      ? `${heading}: ingen`
+      : `${heading}: ${current === null ? "ingen i gang" : "1 i gang"} · ${queue.length} i kø${
           review.length > 0 ? ` · ${review.length} i review` : ""
         }`;
 

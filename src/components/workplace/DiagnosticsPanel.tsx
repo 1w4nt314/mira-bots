@@ -35,6 +35,12 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "ticketsTotal", label: "Tickets" },
   { key: "ticketsWarning", label: "Tickets-advarsel" },
   { key: "ticketsReadOnly", label: "Tickets skrivebeskyttet" },
+  { key: "profilesPath", label: "Profiler" },
+  { key: "profilesLoaded", label: "Profiler indlæst" },
+  { key: "profilesWarning", label: "Profil-advarsel" },
+  { key: "reviewAssignmentsOpen", label: "Åbne reviews (agenter)" },
+  { key: "ticketsEscalated", label: "Eskalerede tickets" },
+  { key: "reportsTotal", label: "Rapporter" },
   { key: "logPath", label: "Logfil" },
 ];
 
@@ -79,6 +85,12 @@ function warningsFor(d: Diagnostics): string[] {
     out.push("mcp.json mangler");
   }
   if (d.ticketsWarning !== null) out.push(d.ticketsWarning);
+  if (d.profilesWarning !== null) out.push(d.profilesWarning);
+  if (d.ticketsEscalated > 0) {
+    out.push(
+      `${d.ticketsEscalated} ${d.ticketsEscalated === 1 ? "ticket er eskaleret" : "tickets er eskaleret"} efter 3 afvisninger — afgør dem under Tickets`,
+    );
+  }
   if (d.framesReceived === 0 && d.runningAgents > 0) {
     out.push(
       "Ingen hook-events modtaget endnu — hvis en agent står på 'Starter', så svar på trust-spørgsmålet i dens terminal",

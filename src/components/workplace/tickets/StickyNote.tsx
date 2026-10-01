@@ -8,13 +8,15 @@ import {
   type Ref,
   type SyntheticEvent,
 } from "react";
-import { agentFigure, useTheme } from "../../../lib/bots";
+import { useTheme } from "../../../lib/bots";
 import { deleteTicket, errorMessage, getTicket } from "../../../lib/ipc";
 import { isExited } from "../../../lib/status";
 import {
   ACTOR_LABEL,
   canDelete,
   canDrag,
+  formatAt,
+  isCoordinationTask,
   ISSUE_HINT,
   ISSUE_LABEL,
   STATE_BADGE_CLASS,
@@ -25,6 +27,7 @@ import type { AgentInfo, TicketHistoryEntry, TicketSummary } from "../../../lib/
 import BotFigure from "../../BotFigure";
 import { smallBtn, useRun } from "./actions";
 import AssignMenu from "./AssignMenu";
+import ReportsSection from "./ReportsSection";
 import ReviewActions from "./ReviewActions";
 
 interface Props {
@@ -121,6 +124,14 @@ function NoteFrame(props: FrameProps) {
             fra agent
           </span>
         )}
+        {t.state !== "done" && isCoordinationTask(agent) && (
+          <span
+            className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-800 dark:text-amber-200"
+            title="Ticketen ligger hos en agent på en stabsplads (fx en koordinator)"
+          >
+            koordineringsopgave
+          </span>
+        )}
         {t.rejectionNote !== null && (
           <span
             className="ml-auto rounded bg-rose-500/15 px-1 text-[10px] text-rose-700 dark:text-rose-300"
@@ -149,7 +160,8 @@ function NoteFrame(props: FrameProps) {
               {agent !== null ? (
                 <>
                   <BotFigure
-                    role={agentFigure(agent)}
+                    roles={agent.roles}
+                    specialist={agent.specialist}
                     state="idle"
                     theme={theme}
                     exited={isExited(agent)}
@@ -172,6 +184,8 @@ function NoteFrame(props: FrameProps) {
       {showActions && (
         <div onPointerDown={stop} onKeyDown={stop} className="cursor-auto">
           <NoteActions ticket={t} agent={agent} onNotice={props.onNotice} />
+          {/* The review card shows the reports unfolded itself. */}
+          {t.state !== "review" && <ReportsSection ticket={t} />}
           <HistoryFold ticket={t} />
         </div>
       )}
@@ -228,15 +242,6 @@ function NoteActions({
       {buttons.length > 0 && <div className="mt-1.5 flex flex-wrap items-center gap-1.5">{buttons}</div>}
     </>
   );
-}
-
-function formatAt(ms: number): string {
-  return new Date(ms).toLocaleString("da-DK", {
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 function historyLine(h: TicketHistoryEntry): string {

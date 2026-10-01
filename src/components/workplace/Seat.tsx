@@ -1,18 +1,10 @@
 import { useDroppable } from "@dnd-kit/core";
-import { agentFigure, type Theme } from "../../lib/bots";
+import type { Theme } from "../../lib/bots";
+import { rolesText } from "../../lib/roles";
 import { isExited, statusLabel } from "../../lib/status";
 import { agentDropId, emptyDropId } from "../../lib/tickets";
-import type { AgentInfo, BotState, Role, SeatKind, TicketSummary } from "../../lib/types";
+import type { AgentInfo, BotState, SeatKind, TicketSummary } from "../../lib/types";
 import BotFigure from "../BotFigure";
-
-export const ROLE_LABEL: Record<Role, string> = {
-  coder: "Koder",
-  researcher: "Researcher",
-  reviewer: "Reviewer",
-  coordinator: "Koordinator",
-  planner: "Planlægger",
-  debugger: "Debugger",
-};
 
 interface Props {
   agent: AgentInfo | null;
@@ -106,7 +98,14 @@ export default function Seat(props: Props) {
           {agent.queueLength} i kø
         </span>
       )}
-      <BotFigure role={agentFigure(agent)} state={botState} theme={theme} exited={exited} size={figure} />
+      <BotFigure
+        roles={agent.roles}
+        specialist={agent.specialist}
+        state={botState}
+        theme={theme}
+        exited={exited}
+        size={figure}
+      />
       <span className="w-full truncate text-center text-xs font-medium">{agent.name}</span>
       <span className="w-full truncate text-center text-[10px] text-[var(--muted)]">
         {label}
@@ -117,14 +116,12 @@ export default function Seat(props: Props) {
           ▸ {currentTicket.title}
         </span>
       )}
-      {agent.roles.length > 0 && (
-        <span
-          className="max-w-full truncate rounded bg-[var(--accent)]/15 px-1.5 text-[10px] text-[var(--accent)]"
-          title={agent.profileName}
-        >
-          {agent.roles.map((r) => ROLE_LABEL[r]).join(" · ")}
-        </span>
-      )}
+      <span
+        className="max-w-full truncate rounded bg-[var(--accent)]/15 px-1.5 text-[10px] text-[var(--accent)]"
+        title={`Profil: ${agent.profileName}\nRoller: ${rolesText(agent.roles)}`}
+      >
+        {agent.profileName}
+      </span>
     </button>
   );
 }

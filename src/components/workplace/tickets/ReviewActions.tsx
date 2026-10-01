@@ -1,7 +1,14 @@
-import { useState } from "react";
-import { approveTicket, rejectTicket } from "../../../lib/ipc";
+import { useEffect, useRef, useState } from "react";
+import { useTheme } from "../../../lib/bots";
+import { approveTicket, assignReviewer, rejectTicket } from "../../../lib/ipc";
+import { rolesText } from "../../../lib/roles";
+import { isExited } from "../../../lib/status";
+import { reviewerCandidates, reviewRoundText } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
+import { useStore } from "../../../state/store";
+import BotFigure from "../../BotFigure";
 import { smallBtn, useRun, useTicketActions } from "./actions";
+import ReportsSection from "./ReportsSection";
 
 interface Props {
   ticket: TicketSummary;
@@ -43,8 +50,113 @@ function AgentSummary({ summary }: { summary: string | null }) {
   );
 }
 
+/** "Vælg reviewer…": a small menu of the running reviewer agents that may review the ticket. */
+function ReviewerMenu({ ticket }: { ticket: TicketSummary }) {
+  const { state } = useStore();
+  const run = useRun();
+  const theme = useTheme();
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  const candidates = reviewerCandidates(state.agents, ticket);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (box.current !== null && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  return (
+    <div ref={box} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        disabled={candidates.length === 0}
+        aria-expanded={open}
+        title={
+          candidates.length === 0
+            ? "Ingen anden kørende agent med reviewer-rollen"
+            : "Vælg hvilken reviewer-agent der skal reviewe ticketen"
+        }
+        className={smallBtn}
+      >
+        Vælg reviewer…
+      </button>
+      {open && (
+        <ul
+          role="menu"
+          className="absolute left-0 top-full z-30 mt-1 w-[220px] space-y-0.5 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-1 text-[11px] text-[var(--fg)] shadow-lg"
+        >
+          {candidates.map((a) => (
+            <li key={a.id}>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  void run(() => assignReviewer(ticket.id, a.id));
+                }}
+                title={`${a.profileName} · ${rolesText(a.roles)}`}
+                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left hover:bg-[var(--accent)]/15"
+              >
+                <BotFigure roles={a.roles} specialist={a.specialist} state="idle" theme={theme} size={18} badge={false} />
+                <span className="min-w-0 flex-1 truncate">{a.name}</span>
+                <span className="shrink-0 opacity-60">{a.openReviews} åbne</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Who reviews the ticket: the reviewer agent's figure and name, or "venter på dig". */
+function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
+  const { state } = useStore();
+  const theme = useTheme();
+  const reviewer =
+    ticket.reviewerAgentId === null ? null : state.agents.find((a) => a.id === ticket.reviewerAgentId);
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+      <span className="opacity-80">Reviewer:</span>
+      {ticket.reviewerAgentId === null ? (
+        <span className="font-medium">venter på dig</span>
+      ) : reviewer === undefined || reviewer === null ? (
+        <span className="opacity-70">reviewer findes ikke længere</span>
+      ) : (
+        <span className="inline-flex min-w-0 items-center gap-1" title={`${reviewer.profileName} · ${rolesText(reviewer.roles)}`}>
+          <BotFigure
+            roles={reviewer.roles}
+            specialist={reviewer.specialist}
+            state="idle"
+            theme={theme}
+            exited={isExited(reviewer)}
+            size={18}
+            badge={false}
+          />
+          <span className="truncate font-medium">{reviewer.name}</span>
+        </span>
+      )}
+      <span className="opacity-70">· {reviewRoundText(ticket)}</span>
+      {ticket.escalated && (
+        <span
+          className="rounded bg-rose-500/20 px-1 text-[10px] font-medium text-rose-700 dark:text-rose-300"
+          title="3 afvisninger — afgør selv"
+        >
+          Eskaleret til dig
+        </span>
+      )}
+    </div>
+  );
+}
+
 /**
- * Review of a finished ticket: the agent's summary above the buttons, "Godkend" (→ Done),
+ * Review of a finished ticket: the reviewer (agent or "venter på dig"), the round of 3 and the
+ * "Eskaleret til dig" badge, "Vælg reviewer…" / "Fjern reviewer", the agent's summary above the
+ * buttons, "Godkend" (→ Done),
  * "Afvis…" with a required note (the ticket goes back first in the agent's queue, or to the
  * backlog when the agent no longer runs; it leaves the Review list either way), and "Åbn
  * terminal" to look at the agent's work.
@@ -84,6 +196,7 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
 
   return (
     <div className="mt-1.5 space-y-1.5">
+      <ReviewerLine ticket={ticket} />
       <AgentSummary summary={ticket.summary} />
       <div className="flex flex-wrap gap-1.5">
         <button
@@ -114,6 +227,18 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
         >
           Åbn terminal
         </button>
+        <ReviewerMenu ticket={ticket} />
+        {ticket.reviewerAgentId !== null && (
+          <button
+            type="button"
+            onClick={() => void run(() => assignReviewer(ticket.id, null))}
+            disabled={busy}
+            title="Fjern revieweren; appen finder en anden reviewer, hvis der er en, ellers venter ticketen på dig"
+            className={smallBtn}
+          >
+            Fjern reviewer
+          </button>
+        )}
       </div>
       {rejecting && (
         <div className="space-y-1">
@@ -158,6 +283,7 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
           </div>
         </div>
       )}
+      <ReportsSection ticket={ticket} defaultOpen />
     </div>
   );
 }

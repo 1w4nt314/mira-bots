@@ -9,7 +9,8 @@
     "tauri": "tauri",
     "dev:hook": "cargo build -p mira-hook -p mira-mcp",
     "build:hook": "cargo build --release -p mira-hook -p mira-mcp",
-    "copy:hook": "node scripts/copy-hook.mjs"
+    "copy:hook": "node scripts/copy-hook.mjs",
+    "test:node": "node scripts/test-terminal-input.mjs && node scripts/test-bot-core.mjs && node scripts/test-markdown.mjs && node scripts/test-models.mjs && node scripts/test-tickets.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "~6.3.1",

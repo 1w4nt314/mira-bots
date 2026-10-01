@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { figureFor, type Theme } from "../../lib/bots";
+import type { Theme } from "../../lib/bots";
 import {
   errorMessage,
   listProfiles,
@@ -7,24 +7,23 @@ import {
   spawnAgent,
   spawnAgentWithTicket,
 } from "../../lib/ipc";
-import type { AgentProfile, SeatKind, TicketSummary } from "../../lib/types";
+import { effortLabel, modelLabel } from "../../lib/models";
+import { folderPrefix, isSpecialist, rolesText } from "../../lib/roles";
+import type { AgentProfile, Effort, SeatKind, SpawnOverrides, TicketSummary } from "../../lib/types";
+import { useStore } from "../../state/store";
 import BotFigure from "../BotFigure";
-import { ROLE_LABEL } from "./Seat";
+import ModelPicker, { EffortSelect, modelChoiceValid } from "./agents/ModelPicker";
 import StickyNote from "./tickets/StickyNote";
 
 /** Profile used when none is chosen (mirrors `DEFAULT_PROFILE_ID` in Rust). */
 const DEFAULT_PROFILE = "coder";
 
-function isSpecialist(p: AgentProfile): boolean {
-  return p.specialist ?? p.roles.length !== 1;
-}
-
 /** Folder name prefix of the default folder (mirrors `roles::prefix_for` in Rust). */
 function profilePrefix(p: AgentProfile | undefined): string {
-  if (p === undefined) return DEFAULT_PROFILE;
-  const fig = figureFor(p.roles, isSpecialist(p));
-  return fig === "none" ? "bot" : fig;
+  return p === undefined ? DEFAULT_PROFILE : folderPrefix(p.roles, isSpecialist(p));
 }
+
+const SEAT_TEXT: Record<SeatKind, string> = { work: "arbejdsplads", staff: "stabsplads" };
 
 interface Props {
   seatKind: SeatKind;
@@ -38,19 +37,25 @@ interface Props {
 
 export default function SpawnDialog(props: Props) {
   const { seatKind, theme, agentsRoot, ticket = null, onClose, onSpawned } = props;
-  const [profiles, setProfiles] = useState<AgentProfile[]>([]);
+  const { state, dispatch } = useStore();
+  const profiles = state.profiles;
   const [profileId, setProfileId] = useState<string>(DEFAULT_PROFILE);
+  const [overrideModel, setOverrideModel] = useState<string | null>(null);
+  const [overrideEffort, setOverrideEffort] = useState<Effort | null>(null);
   const [folderMode, setFolderMode] = useState<"default" | "custom">("default");
   const [folder, setFolder] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The store loads the profiles at start; fetch them here only if that has not happened.
+  const empty = profiles.length === 0;
   useEffect(() => {
+    if (!empty) return;
     listProfiles()
-      .then(setProfiles)
+      .then((list) => dispatch({ type: "profiles/set", profiles: list }))
       .catch((e: unknown) => setError(errorMessage(e)));
-  }, []);
+  }, [empty, dispatch]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -82,10 +87,14 @@ export default function SpawnDialog(props: Props) {
     try {
       const cwd = folderMode === "custom" ? folder : null;
       const text = prompt.trim();
+      const overrides: SpawnOverrides | null =
+        overrideModel !== null || overrideEffort !== null
+          ? { model: overrideModel, effort: overrideEffort }
+          : null;
       const agent =
         ticket !== null
-          ? await spawnAgentWithTicket(ticket.id, profileId, null, cwd, seatKind)
-          : await spawnAgent(profileId, null, cwd, text === "" ? null : text, seatKind);
+          ? await spawnAgentWithTicket(ticket.id, profileId, overrides, cwd, seatKind)
+          : await spawnAgent(profileId, overrides, cwd, text === "" ? null : text, seatKind);
       onSpawned(agent.id);
     } catch (e) {
       setError(errorMessage(e));
@@ -93,7 +102,10 @@ export default function SpawnDialog(props: Props) {
     }
   };
 
-  const canStart = !busy && (folderMode === "default" || folder !== null);
+  const overridesValid = modelChoiceValid(overrideModel);
+  const canStart = !busy && overridesValid && (folderMode === "default" || folder !== null);
+  // The seat the user clicked wins over the profile's default seat.
+  const seatDiffers = profile !== undefined && profile.defaultSeat !== seatKind;
 
   return (
     <div
@@ -129,7 +141,7 @@ export default function SpawnDialog(props: Props) {
                 type="button"
                 onClick={() => setProfileId(p.id)}
                 aria-pressed={profileId === p.id}
-                title={p.roles.map((r) => ROLE_LABEL[r]).join(", ") || "Ingen roller"}
+                title={`${rolesText(p.roles)}\nModel: ${modelLabel(p.model)} · Effort: ${effortLabel(p.effort)}`}
                 className={`flex flex-col items-center gap-1 rounded-xl border p-2 ${
                   profileId === p.id
                     ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40"
@@ -137,7 +149,8 @@ export default function SpawnDialog(props: Props) {
                 }`}
               >
                 <BotFigure
-                  role={figureFor(p.roles, isSpecialist(p))}
+                  roles={p.roles}
+                  specialist={isSpecialist(p)}
                   state="idle"
                   theme={theme}
                   size={56}
@@ -146,7 +159,34 @@ export default function SpawnDialog(props: Props) {
               </button>
             ))}
           </div>
+          {seatDiffers && profile !== undefined && (
+            <p className="mt-1.5 text-[11px] text-[var(--muted)]">
+              {profile.name} står normalt på en {SEAT_TEXT[profile.defaultSeat]}; agenten starter på
+              den {SEAT_TEXT[seatKind]} du valgte.
+            </p>
+          )}
         </fieldset>
+
+        <details className="mt-3">
+          <summary className="cursor-pointer select-none text-xs text-[var(--muted)] hover:text-[var(--fg)]">
+            Overskriv model/effort
+            {(overrideModel !== null || overrideEffort !== null) && " (ændret)"}
+          </summary>
+          <div className="mt-2 grid grid-cols-2 gap-3">
+            <ModelPicker
+              key={profileId}
+              value={overrideModel}
+              onChange={setOverrideModel}
+              standardLabel={`Fra profilen (${modelLabel(profile?.model ?? null)})`}
+            />
+            <EffortSelect
+              value={overrideEffort}
+              onChange={setOverrideEffort}
+              standardLabel={`Fra profilen (${effortLabel(profile?.effort ?? null)})`}
+            />
+          </div>
+          <p className="mt-1 text-[11px] text-[var(--muted)]">Gælder kun denne agent; profilen ændres ikke.</p>
+        </details>
 
         <fieldset className="mt-4 space-y-1.5">
           <legend className="mb-1 text-xs font-medium text-[var(--muted)]">Mappe</legend>

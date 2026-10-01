@@ -1,4 +1,4 @@
-import { agentFigure, type Theme } from "../lib/bots";
+import type { Theme } from "../lib/bots";
 import { errorMessage, openWorkplace, removeAgent, stopAgent } from "../lib/ipc";
 import { isExited, isStartingHint, statusLabel } from "../lib/status";
 import type { AgentInfo, BotState } from "../lib/types";
@@ -34,7 +34,8 @@ export default function AgentChip({ agent, theme, botState }: Props) {
       title={tooltip}
     >
       <BotFigure
-        role={agentFigure(agent)}
+        roles={agent.roles}
+        specialist={agent.specialist}
         state={botState}
         theme={theme}
         exited={exited}
