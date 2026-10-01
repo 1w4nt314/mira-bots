@@ -1,5 +1,5 @@
-// Mirrors the IPC contract (commands C.1 + C2.1 + C3.2, events C.2 + C2.2 + C3.4, types C.3 +
-// C2.3 + C3.1).
+// Mirrors the IPC contract (commands C.1 + C2.1 + C3.2 + C4.10, events C.2 + C2.2 + C3.4, types
+// C.3 + C2.3 + C3.1 + C4.1).
 // All fields camelCase.
 
 export type AgentStatus =
@@ -95,16 +95,9 @@ export interface Diagnostics {
   claudeVersion: string | null;
   /** E.g. "kører stadig", "ikke fundet" or the probe's error text. */
   claudeVersionNote: string | null;
-  /** Whether hooks.json's exec-form `args` is supported (>= 2.1.139); null when unknown. */
+  /** Whether settings.json's exec-form `args` is supported (>= 2.1.139); null when unknown. */
   claudeCodeArgsSupported: boolean | null;
   hookExe: string | null;
-  /**
-   * @deprecated No longer sent by the backend (renamed to `settingsPath`/`settingsExists` in
-   * step 4); still read by DiagnosticsPanel until the step 4 frontend batch replaces them.
-   */
-  hooksJsonPath?: string;
-  /** @deprecated See `hooksJsonPath`. */
-  hooksJsonExists?: boolean;
   /** `<app_data_dir>/settings.json` (hooks + permissions). */
   settingsPath: string;
   settingsExists: boolean;
@@ -115,8 +108,8 @@ export interface Diagnostics {
   systemPromptPath: string;
   toolCalls: number;
   toolErrors: number;
-  // TODO(step 4 frontend): `lastToolCall: LastToolCall | null` is sent too; add it together with
-  // DiagnosticsPanel's formatValue, which only knows LastHookEvent objects.
+  /** The latest MCP tool call from any agent since the app started; null before the first. */
+  lastToolCall: LastToolCall | null;
   /** Whether a Stop moves the in-progress ticket to review (AUTO_REVIEW_ON_STOP). */
   autoReviewOnStop: boolean;
   pipeName: string;
@@ -166,8 +159,13 @@ export interface HookEventPayload {
 
 export type TicketState = "backlog" | "assigned" | "inProgress" | "review" | "done" | "rejected";
 export type TicketActor = "user" | "system" | "agent";
-export type TicketSource = "user";
-export type TicketIssue = "deliveryFailed" | "turnFailed";
+/** Who created the ticket: the user (UI) or an agent (`mira_create_ticket`). */
+export type TicketSource = "user" | "agent";
+/**
+ * `notSubmitted`: the agent's turn ended (Stop) without `mira_submit_for_review`; the ticket stays
+ * in progress.
+ */
+export type TicketIssue = "deliveryFailed" | "turnFailed" | "notSubmitted";
 
 export interface TicketHistoryEntry {
   /** Milliseconds since the Unix epoch. */
@@ -191,6 +189,8 @@ export interface TicketSummary {
   source: TicketSource;
   issue: TicketIssue | null;
   rejectionNote: string | null;
+  /** The agent's summary from `mira_submit_for_review`; null when moved by hand. */
+  summary: string | null;
   /** Milliseconds since the Unix epoch. */
   createdAt: number;
   /** Milliseconds since the Unix epoch. */

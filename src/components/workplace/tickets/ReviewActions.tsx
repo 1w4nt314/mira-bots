@@ -9,10 +9,45 @@ interface Props {
   onNotice?: (text: string) => void;
 }
 
+/** Above this the summary starts clamped with a "vis mere" toggle (about six lines). */
+const SUMMARY_CLAMP_CHARS = 300;
+
+/** The agent's `summary` from `mira_submit_for_review`, or a note that it was moved by hand. */
+function AgentSummary({ summary }: { summary: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  if (summary === null) {
+    return <p className="text-[11px] italic opacity-70">(ingen opsummering — flyttet manuelt)</p>;
+  }
+  const long = summary.length > SUMMARY_CLAMP_CHARS || summary.split("\n").length > 6;
+  return (
+    <div>
+      <div className="text-[11px] font-medium opacity-80">Agentens opsummering:</div>
+      <p
+        className={`mt-0.5 whitespace-pre-wrap break-words text-[11px] ${
+          long && !expanded ? "line-clamp-6" : ""
+        }`}
+      >
+        {summary}
+      </p>
+      {long && (
+        <button
+          type="button"
+          onClick={() => setExpanded((e) => !e)}
+          aria-expanded={expanded}
+          className="mt-0.5 text-[11px] underline opacity-70 hover:opacity-100"
+        >
+          {expanded ? "vis mindre" : "vis mere"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /**
- * Review of a finished ticket: "Godkend" (→ Done), "Afvis…" with a required note (the ticket
- * goes back first in the agent's queue, or to the backlog when the agent no longer runs; it
- * leaves the Review list either way), and "Åbn terminal" to look at the agent's work.
+ * Review of a finished ticket: the agent's summary above the buttons, "Godkend" (→ Done),
+ * "Afvis…" with a required note (the ticket goes back first in the agent's queue, or to the
+ * backlog when the agent no longer runs; it leaves the Review list either way), and "Åbn
+ * terminal" to look at the agent's work.
  */
 export default function ReviewActions({ ticket, agent, onNotice }: Props) {
   const run = useRun();
@@ -49,6 +84,7 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
 
   return (
     <div className="mt-1.5 space-y-1.5">
+      <AgentSummary summary={ticket.summary} />
       <div className="flex flex-wrap gap-1.5">
         <button
           type="button"

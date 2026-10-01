@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import {
   redispatchTicket,
   reorderQueue,
+  requestSubmission,
   setTicketState,
   unassignTicket,
 } from "../../../lib/ipc";
@@ -9,10 +10,13 @@ import { isExited } from "../../../lib/status";
 import {
   canRedispatch,
   canReopen,
+  canRequestSubmission,
   DELIVERY_FAILED_TEXT,
+  hasRedispatchIssue,
   ISSUE_HINT,
   ISSUE_LABEL,
   moveUp,
+  NOT_SUBMITTED_TEXT,
   queueFor,
   STATE_BADGE_CLASS,
   STATE_LABEL,
@@ -52,7 +56,8 @@ function Title({ t }: { t: TicketSummary }) {
 
 /**
  * The selected agent's tickets above its terminal: the ticket in progress (with "Send igen" after
- * a failed turn or delivery, and manual moves since Esc gives no Stop), the queue with "Flyt op"
+ * a failed turn or delivery, "Send til review" / "Bed om aflevering" after a turn that ended
+ * without `mira_submit_for_review`, and manual moves since Esc gives no Stop), the queue with "Flyt op"
  * and "Fjern fra kø", and its tickets waiting in review ("Ikke færdig").
  */
 export default function TicketQueue({ agent }: { agent: AgentInfo }) {
@@ -70,13 +75,51 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
   }, [state.tickets, agent.id]);
 
   // The ticket "Send igen" applies to: the running one after a failed turn, or the queue head
-  // after a failed delivery.
+  // after a failed delivery. `notSubmitted` has its own buttons (below) and is never redispatched.
   const issueTicket =
-    current !== null && current.issue !== null
+    current !== null && hasRedispatchIssue(current)
       ? current
-      : (queue.find((t) => t.issue !== null) ?? null);
+      : (queue.find(hasRedispatchIssue) ?? null);
+  const notSubmitted = current !== null && current.issue === "notSubmitted" ? current : null;
   const hintText =
-    agent.detail === DELIVERY_FAILED_TEXT || agent.detail === TURN_FAILED_TEXT ? agent.detail : null;
+    agent.detail === DELIVERY_FAILED_TEXT ||
+    agent.detail === TURN_FAILED_TEXT ||
+    agent.detail === NOT_SUBMITTED_TEXT
+      ? agent.detail
+      : null;
+  // The hint row carries the notSubmitted buttons when the agent's detail shows the hint; the
+  // ticket's own row carries them otherwise (detail cleared or replaced by a status line).
+  const submitButtonsInHint = notSubmitted !== null && hintText === NOT_SUBMITTED_TEXT;
+
+  const submitButtons = (t: TicketSummary) => (
+    <>
+      <button
+        type="button"
+        onClick={() => void run(() => setTicketState(t.id, "review", null))}
+        title={
+          t.skipReview
+            ? "Flyt ticketen til Done uden agentens opsummering"
+            : "Flyt ticketen til Review uden agentens opsummering"
+        }
+        className={smallBtn}
+      >
+        {t.skipReview ? "Færdig" : "Send til review"}
+      </button>
+      <button
+        type="button"
+        onClick={() => void run(() => requestSubmission(t.id))}
+        disabled={!canRequestSubmission(t, agent)}
+        title={
+          canRequestSubmission(t, agent)
+            ? "Taster en kort besked i terminalen, der beder agenten kalde mira_submit_for_review"
+            : "Virker når agenten er Klar"
+        }
+        className={smallBtn}
+      >
+        Bed om aflevering
+      </button>
+    </>
+  );
 
   const resend = (t: TicketSummary) => (
     <button
@@ -112,6 +155,7 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
           <div className="flex items-center gap-2 rounded-lg border border-amber-400/50 bg-amber-300/20 px-2 py-1 text-amber-800 dark:text-amber-200">
             <span className="min-w-0 flex-1">{hintText}</span>
             {issueTicket !== null && resend(issueTicket)}
+            {submitButtonsInHint && notSubmitted !== null && submitButtons(notSubmitted)}
           </div>
         )}
 
@@ -123,19 +167,22 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
             <Title t={current} />
             <Badge t={current} />
             <IssueBadge t={current} />
-            {current.issue !== null && hintText === null && resend(current)}
-            <button
-              type="button"
-              onClick={() => void run(() => setTicketState(current.id, "review", null))}
-              title={
-                current.skipReview
-                  ? "Marker som færdig (ticketen springer review over og går til Done)"
-                  : "Agenten er færdig (fx efter Esc): flyt ticketen til Review"
-              }
-              className={smallBtn}
-            >
-              {current.skipReview ? "Færdig" : "Til review"}
-            </button>
+            {hasRedispatchIssue(current) && hintText === null && resend(current)}
+            {notSubmitted !== null && !submitButtonsInHint && submitButtons(notSubmitted)}
+            {notSubmitted === null && (
+              <button
+                type="button"
+                onClick={() => void run(() => setTicketState(current.id, "review", null))}
+                title={
+                  current.skipReview
+                    ? "Marker som færdig (ticketen springer review over og går til Done)"
+                    : "Agenten er færdig (fx efter Esc): flyt ticketen til Review"
+                }
+                className={smallBtn}
+              >
+                {current.skipReview ? "Færdig" : "Til review"}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => void run(() => setTicketState(current.id, "backlog", "flyttet tilbage af brugeren"))}
@@ -154,7 +201,7 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
                 <span className="w-5 shrink-0 text-right font-mono text-[var(--muted)]">{i + 1}.</span>
                 <Title t={t} />
                 <IssueBadge t={t} />
-                {i === 0 && t.issue !== null && hintText === null && resend(t)}
+                {i === 0 && hasRedispatchIssue(t) && hintText === null && resend(t)}
                 <button
                   type="button"
                   onClick={() => {

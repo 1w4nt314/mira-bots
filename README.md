@@ -2,9 +2,9 @@
 
 Et lille statusvindue ("island") øverst på skærmen, der viser dine Claude Code-agenter og lader dig svare Tillad/Afvis, når en agent beder om lov til at bruge et værktøj. Appen kører Claude Code CLI i baggrunden med dit eget abonnement.
 
-## Status: trin 3 — stadig tidligt, ikke brugbart endnu
+## Status: trin 4 — stadig tidligt, ikke brugbart endnu
 
-Trin 3 er bygget: tickets med kø pr. agent, review og drag-and-drop oven på trin 2 (Workplace-vindue, terminal pr. agent, diagnostik og standardmappe til nye agenter). Det er stadig et tidligt trin, og intet af det er afprøvet på Windows endnu (se listen nederst).
+Trin 4 er bygget: agenterne får selv værktøjer til ticket-systemet (en lokal MCP-server, `mira-mcp.exe`) og afleverer deres arbejde med `mira_submit_for_review`. Det ligger oven på trin 3 (tickets med kø pr. agent, review og drag-and-drop) og trin 2 (Workplace-vindue, terminal pr. agent, diagnostik og standardmappe til nye agenter). Det er stadig et tidligt trin, og intet af det er afprøvet på Windows endnu (se listen nederst).
 
 Det virker (når det er testet på Windows, se nedenfor):
 
@@ -15,9 +15,10 @@ Det virker (når det er testet på Windows, se nedenfor):
 - Statusvisning pr. agent (starter, klar, tænker, læser, redigerer, kører, afventer tilladelse, afsluttet).
 - Tillad / Afvis / "Altid for denne agent" på tilladelsesanmodninger.
 - Tickets: opret, træk på en agent eller en tom plads, kø pr. agent, review med Godkend/Afvis og manuelle flyt (se afsnittet Tickets).
+- Agentens værktøjer: agenten kan aflevere sin ticket med en opsummering, oprette nye tickets, læse tickets og sætte en statuslinje (se afsnittet Agentens værktøjer).
 - Diagnostik og logfil til fejlsøgning.
 
-Det findes ikke endnu: MCP (agenter kan ikke oprette tickets selv), systembakke, autostart.
+Det findes ikke endnu: systembakke, autostart og roller med egen adfærd (agenterne kan hverken tildele tickets, godkende eller starte andre agenter).
 
 ## Sådan virker det
 
@@ -34,6 +35,7 @@ Island → Workplace → pladser → terminal:
 - Windows 10 version 1809 eller nyere.
 - Nyeste Claude Code installeret og logget ind. `claude` skal kunne findes som `%USERPROFILE%\.local\bin\claude.exe` eller i `PATH`. Ellers sæt miljøvariablen `MIRA_CLAUDE_PATH` til den fulde sti.
 - Claude Code version 2.1.139 eller nyere. Appens hooks bruger exec-form (`command` + `args`), som ældre versioner ikke understøtter. Fanen Diagnostik viser den fundne version og om `args` understøttes.
+- `mira-mcp.exe` (agentens værktøjer) skal ligge ved siden af `mira-hook.exe`; installeren lægger dem begge i `resources`. Findes den ikke, kører agenterne uden værktøjer, og Diagnostik viser en advarsel.
 - WebView2 (følger med Windows 11; installeren henter den på Windows 10).
 
 ## Sådan starter du en agent
@@ -47,7 +49,7 @@ En ticket er en opgave, du selv opretter i fanen Tickets i Workplace (titel, val
 1. **Backlog**: nyoprettet, ingen agent.
 2. **I kø**: tildelt en agent. Hver agent har sin egen kø og får én ticket ad gangen.
 3. **I gang**: appen har afleveret ticketen til agenten, og agenten arbejder på den.
-4. **Review**: agenten er færdig, og du skal godkende. Afsnittet Review står øverst i fanen, og islanden viser en lille chip "n i review", der åbner Workplace på fanen Tickets.
+4. **Review**: agenten har afleveret (`mira_submit_for_review`) eller du har flyttet ticketen selv, og du skal godkende. Agentens opsummering står på kortet. Afsnittet Review står øverst i fanen, og islanden viser en lille chip "n i review", der åbner Workplace på fanen Tickets.
 5. **Done** (Godkend) eller **Afvist** (Afvis med en påkrævet note).
 
 Sådan bruger du dem:
@@ -57,14 +59,39 @@ Sådan bruger du dem:
 - **Review**: Godkend flytter ticketen til Done. Afvis kræver en note; ticketen kommer så forrest i køen hos agenten (hvis den stadig kører, ellers i Backlog), og noten står i ticket-filen under "Afvist".
 - **Manuelle flyt**: knapperne i terminalpanelet kan flytte den aktuelle ticket til Review (eller Done ved "Spring review over") eller tilbage til Backlog, og en ticket i Review kan flyttes tilbage til I gang ("Ikke færdig"). Tickets i Backlog, Done og Afvist uden agent kan slettes.
 - **Send igen**: hvis afleveringen ikke blev bekræftet, eller turen fejlede, vises en advarsel på ticketen og i terminalpanelet. "Send igen" afleverer den aktuelle ticket til agenten på ny, når agenten er klar.
+- **Ikke afleveret**: se "Når agenten er færdig" nedenfor.
+- **Fra agent**: tickets, som en agent selv har oprettet, har et lille mærke "fra agent" og ligger i Backlog; historikken viser handlinger fra agenten som "agenten".
 
 **Sådan leveres en ticket.** Når agenten er klar og har en ticket i kø, skriver appen en fil `.mira-bots\tickets\<kort-id>.md` i agentens mappe (titel, id, beskrivelse, evt. afvisningsnote og et par regler) og taster én linje i agentens terminal, der peger på filen. Beskrivelsen sendes aldrig til terminalen, kun filen. Mappen `.mira-bots\` får en egen `.gitignore` med `*`, så den ikke dukker op i `git status` i agentmappen. Titlen renses, før den tastes (usynlige tegn, `@`, `/` og lignende, der kan udløse Claude Codes forslagslister). Appen venter ca. 0,75 sekund efter, at agenten er klar, taster linjen og sender Enter. Bekræftes afleveringen ikke inden for få sekunder, prøver appen Enter igen én gang og markerer derefter ticketen med en advarsel.
 
-**Når agenten er færdig.** Appen bruger Stop-hooket som "turen er slut": ticketen flyttes automatisk til Review (eller til Done, hvis den er oprettet med "Spring review over"), og agentens næste ticket i køen afleveres. Fejler turen (hooket StopFailure, fx en API-fejl), bliver ticketen i gang med advarslen "Turn fejlede", og du kan bruge "Send igen". Afbryder du turen med Esc, kommer der intet Stop; så bliver ticketen stående som I gang, indtil du selv flytter den.
+**Når agenten er færdig.** Agenten afleverer selv ved at kalde værktøjet `mira_submit_for_review` med en kort opsummering: ticketen flyttes til Review (eller til Done, hvis den er oprettet med "Spring review over"), opsummeringen vises på review-kortet, og agentens næste ticket i køen afleveres, når agenten er klar. Stop-hooket betyder kun "turen er slut". Slutter turen uden aflevering, bliver ticketen stående som I gang med advarslen "Ikke afleveret" (agentens statuslinje: "Turn afsluttet uden aflevering"), og køen rykker ikke. Terminalpanelet viser to knapper:
 
-**Agenter kan ikke oprette tickets selv i trin 3.** Det kommer med MCP i trin 4. Roller er stadig kun visuelle og påvirker ikke, hvilke tickets en agent får.
+- **Send til review**: flytter ticketen til Review (eller Done) uden agentens opsummering, når du selv vurderer, at opgaven er løst.
+- **Bed om aflevering**: taster en kort linje i terminalen, der beder agenten kalde `mira_submit_for_review`. Den virker kun, når agenten er klar, og linjen sendes først, når du ikke selv har skrevet i terminalen et øjeblik.
+
+Mens en agent har en ticket i gang, taster appen aldrig den næste ticket ind; først når ticketen er afleveret eller flyttet. Det gælder også, hvis du afbryder turen med Esc (der kommer intet Stop): ticketen står som I gang, indtil agenten afleverer, eller du flytter den. Fejler turen (hooket StopFailure, fx en API-fejl), bliver ticketen i gang med advarslen "Turn fejlede", og du kan bruge "Send igen". Konstanten `AUTO_REVIEW_ON_STOP` i `src-tauri/src/config.rs` (standard `false`) gendanner trin 3-adfærden, hvor Stop selv flytter ticketen til Review; det kræver en ny bygning.
+
+**Roller** er stadig kun visuelle og påvirker ikke, hvilke tickets en agent får.
 
 **Lagring.** Tickets ligger i `%APPDATA%\dk.mira.bots\tickets.json` og overlever genstart. Filen skrives atomisk (først en midlertidig fil, som så omdøbes). Er filen beskadiget, omdøbes den til `tickets.json.broken-<tidspunkt>`, appen starter med en tom liste, og Diagnostik viser en advarsel. Kan filen slet ikke åbnes (fx låst af antivirus eller backup), starter Tickets skrivebeskyttet med en advarsel i Tickets-fanen, og filen røres ikke, før du genstarter appen. Ved hver start flyttes tickets, der var i kø eller i gang, tilbage til Backlog med noten "app genstartet"; Review, Done og Afvist er urørte. Stopper eller fjerner du en agent, eller afsluttes den, havner dens tickets også i Backlog med en note.
+
+## Agentens værktøjer
+
+Fra trin 4 har hver agent en lille lokal MCP-server, `mira-mcp.exe`, som Claude Code starter ved siden af sessionen. Den taler kun med appen over den samme named pipe som hooks (ingen porte, ingen netværk). Agenten får fem værktøjer (hos Claude hedder de `mcp__mira-bots__<navn>`):
+
+- `mira_submit_for_review`: afleverer agentens igangværende ticket med en opsummering (1-2000 tegn). Ticketen går til Review, eller til Done ved "Spring review over". Det er den måde, en agent siger "færdig" på.
+- `mira_create_ticket`: opretter en ny ticket i Backlog (titel, valgfri beskrivelse, evt. "spring review over"). Tickets oprettet af en agent bliver aldrig tildelt automatisk, og en agent kan højst oprette 20 pr. time.
+- `mira_list_tickets`: lister tickets uden beskrivelse og historik (`mine`, `backlog` eller `all`).
+- `mira_get_ticket`: henter én ticket med beskrivelse og historik (fuldt id eller kort-id).
+- `mira_update_status`: sætter en kort statuslinje (højst 120 tegn), der vises ved agenten og noteres på ticketen. Ændrer ingen tilstand.
+
+Der findes ingen værktøjer til at godkende, afvise, tildele eller starte agenter; det er stadig dig, der gør det.
+
+**Sådan leveres værktøjerne.** Appen skriver tre filer i `%APPDATA%\dk.mira.bots\`: `settings.json` (hooks og forhåndsgodkendelse), `mcp.json` (peger på `mira-mcp.exe`) og `system-prompt.md` (et kort tillæg til agentens systemprompt). Hver agent startes som `claude --settings <settings.json> --mcp-config <mcp.json> --append-system-prompt-file <system-prompt.md> --session-id <id>`. `mira-mcp.exe` bundles ved siden af `mira-hook.exe` (under `resources`), og `MIRA_BOTS_PIPE` og `MIRA_AGENT_ID` følger med til serveren, så et værktøjskald altid havner hos den rigtige agent. Findes `mira-mcp.exe` ikke, skrives `mcp.json` og systemprompten ikke, agenterne kører uden værktøjer, og Diagnostik viser "Agentværktøjer utilgængelige: mira-mcp mangler".
+
+**Forhåndsgodkendelse.** Appens egne værktøjer står som `permissions.allow` (`mcp__mira-bots__*`) i appens egen `settings.json`, ikke i din. Dine egne MCP-servere og dine egne tilladelsesregler virker uændret ved siden af, og `~/.claude` og projekternes `.mcp.json` røres aldrig. Som ekstra sikkerhedsnet tillader appen selv et værktøjskald til `mira-bots`-serveren i tilladelsesflowet, hvis reglen af en eller anden grund ikke virker.
+
+**Systemprompten.** Tillægget i `system-prompt.md` (på dansk) siger, at opgaverne ligger som filer i `.mira-bots/tickets/`, at agenten skal kalde `mira_submit_for_review` med en opsummering, når en ticket er færdig (uden kaldet står den som "ikke afleveret"), at opfølgende arbejde skal oprettes som ny ticket med `mira_create_ticket`, og at agenten ikke selv må røre mappen `.mira-bots/`. Ticket-filen indeholder de samme regler. Er der ingen aflevering, når turen slutter, se "Når agenten er færdig" ovenfor.
 
 ## Første gang i en mappe
 
@@ -76,7 +103,7 @@ Tip: kør `claude` én gang i en almindelig terminal i `%USERPROFILE%\mira-bots\
 
 ## Sådan virker hooks
 
-Appen skriver sin egen `hooks.json` i `%APPDATA%\dk.mira.bots\` og starter hver agent som `claude --settings <den fil>`. Hooks-filen peger på `mira-hook.exe`, som sender hændelser til appen over en named pipe og (kun ved tilladelsesanmodninger) venter på dit svar. Er appen ikke startet, gør `mira-hook.exe` ingenting, og Claude Code påvirkes ikke.
+Appen skriver sin egen `settings.json` i `%APPDATA%\dk.mira.bots\` og starter hver agent som `claude --settings <den fil>` (plus `--mcp-config` og `--append-system-prompt-file`, se Agentens værktøjer). Filen indeholder hooks, der peger på `mira-hook.exe`, som sender hændelser til appen over en named pipe og (kun ved tilladelsesanmodninger) venter på dit svar. Er appen ikke startet, gør `mira-hook.exe` ingenting, og Claude Code påvirkes ikke. Den samme fil har også én tilladelsesregel, `permissions.allow`, der kun gælder appens egne værktøjer (`mcp__mira-bots__*`). Før trin 4 hed filen `hooks.json`; den gamle fil fjernes ved første start.
 
 Appen sætter `MIRA_BOTS_PIPE` og `MIRA_AGENT_ID` i agentens miljø. `MIRA_AGENT_ID` bruges til at koble hook-events til den rigtige agent, også efter `/clear`.
 
@@ -84,7 +111,7 @@ Din egen `~/.claude/settings.json` røres aldrig. Dine eksisterende globale hook
 
 ## Diagnostik og log
 
-Fanen Diagnostik i Workplace viser blandt andet Claude Code-sti og -version, om hooks med `args` understøttes, hooks.json, pipen, antal modtagne hook-events og det sidste event. Knappen Kopiér lægger det hele på udklipsholderen som tekst til en fejlrapport, og Åbn logmappe åbner mappen med loggen.
+Fanen Diagnostik i Workplace viser blandt andet Claude Code-sti og -version, om hooks med `args` understøttes, `settings.json`, `mcp.json` og systemprompt-filens stier, om `mira-mcp.exe` er fundet, pipen, antal modtagne hook-events og det sidste event samt antal værktøjskald, antal værktøjskald med fejl og det sidste værktøjskald (kun værktøjets navn, agenten og om det lykkedes, aldrig indholdet). Diagnostik advarer, når `mira-mcp.exe` eller `settings.json` mangler. Knappen Kopiér lægger det hele på udklipsholderen som tekst til en fejlrapport, og Åbn logmappe åbner mappen med loggen.
 
 Loggen ligger i `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log`. Den roteres ved hver start, og de seneste tre gamle filer gemmes. Sæt `MIRA_LOG=debug` (eller `trace`, `info`, `warn`, `error`) for mere detaljeret log; standard er `info`, og debug giver bl.a. én linje pr. hook-event.
 
@@ -92,7 +119,7 @@ Loggen ligger i `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log`. Den roteres ve
 
 - Du er selv ansvarlig for din Claude-plan og for at overholde Anthropics vilkår.
 - Appen laver intet login og rører ikke dine credentials. Den læser ikke `~/.claude` og ændrer ikke `claude`-programmet.
-- Appen bruger kun `--settings` med sin egen hooks-fil. Den bruger ikke `--print`/`-p`, og den slår ikke tilladelsestjek fra.
+- Appen giver Claude Code kun sine egne filer: `--settings` (hooks og én tilladelsesregel for appens egne værktøjer), `--mcp-config` (appens egen MCP-server) og `--append-system-prompt-file`. Den bruger ikke `--print`/`-p`, og den slår ikke tilladelsestjek fra.
 - Brug af API-nøgle som alternativ kommer i et senere trin. Indtil da bruger `claude` den login, du allerede har.
 
 ## Hent en installer
@@ -118,6 +145,10 @@ Trin 2 tilføjede to npm-afhængigheder, `@xterm/xterm` (6.0) og `@xterm/addon-f
 
 Trin 3 tilføjede én npm-afhængighed, `@dnd-kit/core` (6.3), til drag-and-drop, og ingen nye Rust-afhængigheder. Tickets gemmes i en JSON-fil bag traitet `TicketStore`. SQLite blev fravalgt, fordi den native afhængighed ikke kan krydstjekkes fra Linux mod Windows-target i dette miljø; trait'et gør det muligt at skifte lager senere.
 
+Trin 4 tilføjede crate'en `crates/mira-mcp` (binæren `mira-mcp`): en håndskrevet JSON-RPC 2.0-server over stdin/stdout, der kun afhænger af `serde_json` (som `mira-hook`). Den officielle Rust-SDK (`rmcp`) blev fravalgt, fordi den trækker `tokio` og omkring 63 crates med, til fem simple værktøjer. Den transport, der er fælles med `mira-hook`, er kopieret i stedet for at flyttes til en delt crate, så den Windows-verificerede hook-exe ikke røres; en test holder konstanterne ens. Ingen nye npm-afhængigheder. `cargo test -p mira-mcp` kører serverens egne tests (inkl. en test, der starter den rigtige binær). `npm run build:hook` bygger både `mira-hook` og `mira-mcp`, og `npm run copy:hook` lægger begge i `src-tauri/resources/`.
+
+Appens filer i `%APPDATA%\dk.mira.bots\`: `settings.json`, `mcp.json`, `system-prompt.md` (alle tre genskrives ved hver start og før hver agentstart) og `tickets.json`.
+
 Verifikation fra repo-roden (kan køres på Linux; Windows-koden tjekkes ved cross-check):
 
 ```
@@ -130,7 +161,7 @@ cargo fmt --all --check
 npm run build
 ```
 
-Miljøvariabler: `MIRA_CLAUDE_PATH` (sti til `claude`), `MIRA_HOOK_EXE` (sti til `mira-hook`), `MIRA_HOOK_DEBUG=1` (hook-logning på stderr), `MIRA_LOG` (logniveau for appen, standard `info`). `MIRA_BOTS_PIPE` og `MIRA_AGENT_ID` sættes af appen selv.
+Miljøvariabler: `MIRA_CLAUDE_PATH` (sti til `claude`), `MIRA_HOOK_EXE` (sti til `mira-hook`), `MIRA_MCP_EXE` (sti til `mira-mcp`), `MIRA_HOOK_DEBUG=1` (hook-logning på stderr), `MIRA_MCP_DEBUG=1` (logning fra `mira-mcp` på stderr), `MIRA_MCP_TIMEOUT_MS` (kun til test og fejlsøgning: hvor længe `mira-mcp` venter på appen, standard 10000), `MIRA_LOG` (logniveau for appen, standard `info`). `MIRA_BOTS_PIPE` og `MIRA_AGENT_ID` sættes af appen selv.
 
 ## Skal testes på Windows
 
@@ -145,7 +176,7 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 7. Named pipe: ny instans pr. forbindelse ved samtidige hændelser, og genforsøg ved optaget pipe.
 8. Ved tilladelsesanmodning vises terminalens egen dialog ikke, mens hooket venter, og den vises efter et "intet svar".
 9. Stop af en agent afslutter `claude.exe`, og der efterlades ingen `node`/`claude`-processer efter "Afslut".
-10. `mira-hook.exe` findes under `resources/` efter NSIS-installation.
+10. `mira-hook.exe` og `mira-mcp.exe` findes under `resources/` efter NSIS-installation.
 11. Mappevælgeren åbner foran islanden og giver en sti, som start af agent accepterer.
 12. Et tomt `resources`-mønster i `tauri.conf.json` passerer `tauri build` på Windows-CI.
 13. MSI-target bygger på `windows-latest` (ellers kun NSIS).
@@ -168,13 +199,23 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 30. Agenten læser `.mira-bots/tickets/<kort-id>.md` med `/` i stien uden tilladelsesspørgsmål, og `.mira-bots\.gitignore` holder mappen ude af `git status`.
 31. Træk med dnd-kit i WebView2: en sticky note kan trækkes til en plads med mus og touchpad, et klik (under 6 px) på en plads vælger stadig terminalen, og trækket følger markøren.
 32. Slip på en tom plads åbner dialogen med ticketen, "Start med ticket" starter agenten med linjen som første prompt, og den bekræftes inden 8 sekunder efter SessionStart.
-33. Stop-hooket flytter ticketen til Review (eller Done ved "Spring review over"), Esc midt i turen giver intet Stop, og en API-fejl giver "Turn fejlede" med fungerende "Send igen".
+33. Med `AUTO_REVIEW_ON_STOP = true` flytter Stop-hooket ticketen til Review (eller Done ved "Spring review over"); Esc midt i turen giver intet Stop, og en API-fejl giver "Turn fejlede" med fungerende "Send igen".
 34. `tickets.json` skrives atomisk i `%APPDATA%\dk.mira.bots\` (omdøbning over en eksisterende fil virker, ingen `.tmp` efterlades), og en beskadiget fil omdøbes til `.broken-<tidspunkt>` med advarsel i Diagnostik.
 35. Efter genstart står tickets, der var i kø eller i gang, i Backlog med noten "app genstartet", og Review/Done er urørte.
 36. Chippen "n i review" i den ikke-fokuserbare island åbner Workplace på fanen Tickets, både når vinduet oprettes og når det allerede er åbent.
 37. Stop/Fjern af en agent med kø: alle dens tickets står i Backlog med note, en igangværende aflevering skriver ikke mere i terminalen, og `queueLength` er 0.
 38. xterms automatiske svar (Device Attributes, cursor- og fokusrapporter) tæller ikke som brugerinput under ConPTY og udsætter ikke ticket-levering, mens tastetryk, piletaster og indsat tekst (også bracketed paste via Shift+Insert eller højreklik) gør.
 
+39. Claude Code starter `mira-mcp.exe` fra `--mcp-config` med en sti med mellemrum og `/` uden `cmd /c`; `/mcp` viser `mira-bots` som connected, og de fem værktøjer er synlige uden `ToolSearch`.
+40. `MIRA_BOTS_PIPE` og `MIRA_AGENT_ID` når `mira-mcp.exe` (arv og/eller `${VAR}`-udvidelse); et værktøjskald rammer den rigtige agent, også efter `/clear`.
+41. Ingen tilladelsesprompt for `mcp__mira-bots__*` via appens `settings.json` (`permissions.allow`); dine egne MCP-servere og allow-regler virker stadig.
+42. `mira_submit_for_review` flytter ticketen til Review med opsummeringen synlig på kortet; Stop uden kald giver "Ikke afleveret"; "Bed om aflevering" taster linjen og Enter, og agenten svarer med et kald; "Send til review" virker som fallback.
+43. `--append-system-prompt-file` med æøå virker sammen med `--settings`, `--mcp-config`, `--session-id` og den positionelle prompt, og tillægget overlever `/clear`.
+44. Nedlukning: ingen efterladte `mira-mcp.exe` efter `/exit`, Stop af agent eller Afslut; et crash af serveren dræber ikke sessionen, og Diagnostik viser fejlen.
+45. Named pipe fra `mira-mcp.exe` (en forbindelse pr. kald): genforsøg ved optaget pipe, handlen lukkes efter svaret, og en frosset app giver en fejl efter 10 sekunder uden at Claude Code hænger.
+46. Om din Claude Code-version sender `server/discover` før `initialize`; begge forløb skal ende med at `mira-bots` er connected.
+47. `mira_update_status` vises som statuslinje i islanden; et værktøjskald giver "Tænker" med en dansk betegnelse, og en fejl fra et værktøj (fx "Du har ingen ticket i gang") viser ikke rødt.
+48. Første start efter opgradering: `hooks.json` er fjernet, `settings.json`, `mcp.json` og `system-prompt.md` findes i `%APPDATA%\dk.mira.bots\`, og Diagnostik viser stierne.
 ## Licens og inspiration
 
 Koden er MIT-licenseret (se `LICENSE`). Alle ikoner og andre assets er lavet til dette projekt. Idéen er inspireret af [Coucou](https://github.com/Louis-CFM/coucou); ingen af dets assets eller kode er genbrugt.

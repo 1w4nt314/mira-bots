@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage, getDiagnostics, onHookEvent, openLogDir } from "../../lib/ipc";
-import type { Diagnostics, LastHookEvent } from "../../lib/types";
+import type { Diagnostics, LastHookEvent, LastToolCall } from "../../lib/types";
 import { useStore } from "../../state/store";
 
 export const DIAG_REFRESH_MS = 2000;
@@ -13,13 +13,21 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "claudeVersionNote", label: "Versionsnote" },
   { key: "claudeCodeArgsSupported", label: "Hooks med args understøttet" },
   { key: "hookExe", label: "Hook-program" },
-  { key: "hooksJsonPath", label: "hooks.json" },
-  { key: "hooksJsonExists", label: "hooks.json findes" },
+  { key: "settingsPath", label: "settings.json" },
+  { key: "settingsExists", label: "settings.json findes" },
+  { key: "mcpExe", label: "MCP-server (mira-mcp)" },
+  { key: "mcpConfigPath", label: "mcp.json" },
+  { key: "mcpConfigExists", label: "mcp.json findes" },
+  { key: "systemPromptPath", label: "Systemprompt-fil" },
+  { key: "autoReviewOnStop", label: "Stop sender til review automatisk" },
   { key: "pipeName", label: "Pipe" },
   { key: "pipeReady", label: "Pipe lytter" },
   { key: "framesReceived", label: "Hook-events modtaget" },
   { key: "framesUnknownSession", label: "Hook-events uden kendt agent" },
   { key: "lastHookEvent", label: "Sidste hook-event" },
+  { key: "toolCalls", label: "Værktøjskald" },
+  { key: "toolErrors", label: "Værktøjskald med fejl" },
+  { key: "lastToolCall", label: "Sidste værktøjskald" },
   { key: "runningAgents", label: "Kørende agenter" },
   { key: "agentsRoot", label: "Agentmappe" },
   { key: "ticketsPath", label: "Tickets-fil" },
@@ -33,10 +41,14 @@ function formatLast(e: LastHookEvent): string {
   return `${e.name} ${e.sessionId} ${e.agentId ?? "-"} ${new Date(e.at).toISOString()}`;
 }
 
+function formatLastTool(c: LastToolCall): string {
+  return `${c.tool} ${c.agentId ?? "-"} ${c.ok ? "ok" : "fejl"} ${new Date(c.at).toISOString()}`;
+}
+
 function formatValue(v: Diagnostics[keyof Diagnostics]): string {
   if (v === null) return "–";
   if (typeof v === "boolean") return v ? "ja" : "nej";
-  if (typeof v === "object") return formatLast(v);
+  if (typeof v === "object") return "tool" in v ? formatLastTool(v) : formatLast(v);
   return String(v);
 }
 
@@ -54,7 +66,12 @@ function warningsFor(d: Diagnostics): string[] {
     );
   }
   if (!d.pipeReady) out.push("Hook-forbindelsen lytter ikke");
-  if (!d.hooksJsonExists) out.push("hooks.json mangler");
+  if (!d.settingsExists) out.push("settings.json mangler");
+  if (d.mcpExe === null) {
+    out.push("Agentværktøjer utilgængelige: mira-mcp mangler (sæt MIRA_MCP_EXE eller byg den med npm run build:hook)");
+  } else if (!d.mcpConfigExists) {
+    out.push("mcp.json mangler");
+  }
   if (d.ticketsWarning !== null) out.push(d.ticketsWarning);
   if (d.framesReceived === 0 && d.runningAgents > 0) {
     out.push(

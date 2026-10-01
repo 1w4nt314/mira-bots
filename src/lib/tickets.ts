@@ -6,6 +6,7 @@ import type {
   SeatKind,
   TicketActor,
   TicketIssue,
+  TicketSource,
   TicketState,
   TicketSummary,
   WorkplaceTab,
@@ -18,9 +19,15 @@ export const DRAG_DISTANCE_PX = 6;
 /** Mirrors `TICKET_TITLE_MAX_CHARS` / `TICKET_BODY_MAX_CHARS` in Rust; the backend validates. */
 export const TITLE_MAX = 200;
 export const BODY_MAX = 20000;
-/** Mirrors `DELIVERY_FAILED_TEXT` / `TURN_FAILED_TEXT` in Rust (set as the agent's `detail`). */
+/** Mirrors `TICKET_SUMMARY_MAX_CHARS` in Rust (an agent's summary; display only). */
+export const SUMMARY_MAX = 2000;
+/**
+ * Mirrors `DELIVERY_FAILED_TEXT` / `TURN_FAILED_TEXT` / `NOT_SUBMITTED_TEXT` in Rust (set as the
+ * agent's `detail`).
+ */
 export const DELIVERY_FAILED_TEXT = "Kunne ikke aflevere ticket, se terminalen";
 export const TURN_FAILED_TEXT = "Turn fejlede, prøv igen eller skriv i terminalen";
+export const NOT_SUBMITTED_TEXT = "Turn afsluttet uden aflevering";
 
 export const STATE_LABEL: Record<TicketState, string> = {
   backlog: "Backlog",
@@ -44,12 +51,19 @@ export const STATE_BADGE_CLASS: Record<TicketState, string> = {
 export const ISSUE_LABEL: Record<TicketIssue, string> = {
   deliveryFailed: "Levering fejlede",
   turnFailed: "Turn fejlede",
+  notSubmitted: "Ikke afleveret",
 };
 
 /** What the user can do about an issue (shown next to `ISSUE_LABEL`). */
 export const ISSUE_HINT: Record<TicketIssue, string> = {
   deliveryFailed: "se terminalen",
   turnFailed: "prøv Send igen",
+  notSubmitted: "bed om aflevering eller send selv til review",
+};
+
+export const SOURCE_LABEL: Record<TicketSource, string> = {
+  user: "dig",
+  agent: "agent",
 };
 
 export const ACTOR_LABEL: Record<TicketActor, string> = {
@@ -269,8 +283,23 @@ export function canDelete(t: TicketSummary): boolean {
 }
 
 /**
- * Whether "Send igen" makes sense: the ticket has an issue and its agent is running and idle
- * (the dispatcher ignores a redispatch otherwise).
+ * Whether the issue is one "Send igen" can repair. `notSubmitted` is not: the ticket was already
+ * delivered and the agent worked on it, so it gets "Send til review" / "Bed om aflevering".
+ *
+ * | issue          | redispatchable |
+ * |----------------|----------------|
+ * | deliveryFailed | true           |
+ * | turnFailed     | true           |
+ * | notSubmitted   | false          |
+ * | null           | false          |
+ */
+export function hasRedispatchIssue(t: TicketSummary): boolean {
+  return t.issue === "deliveryFailed" || t.issue === "turnFailed";
+}
+
+/**
+ * Whether "Send igen" makes sense: the ticket has a redispatchable issue and its agent is running
+ * and idle (the dispatcher ignores a redispatch otherwise).
  *
  * | issue          | agent status | canRedispatch |
  * |----------------|--------------|---------------|
@@ -279,10 +308,28 @@ export function canDelete(t: TicketSummary): boolean {
  * | turnFailed     | running      | false         |
  * | turnFailed     | exited       | false         |
  * | turnFailed     | (no agent)   | false         |
+ * | notSubmitted   | idle         | false         |
  * | null           | idle         | false         |
  */
 export function canRedispatch(t: TicketSummary, agent: AgentInfo | null): boolean {
-  return t.issue !== null && agent !== null && agent.status.kind === "idle";
+  return hasRedispatchIssue(t) && agent !== null && agent.status.kind === "idle";
+}
+
+/**
+ * Whether "Bed om aflevering" can work: the ticket is in progress and its agent is idle (the
+ * dispatcher only types the line into an idle agent; `request_submission` also needs it running).
+ *
+ * | state      | agent status | canRequestSubmission |
+ * |------------|--------------|----------------------|
+ * | inProgress | idle         | true                 |
+ * | inProgress | running      | false                |
+ * | inProgress | exited       | false                |
+ * | inProgress | (no agent)   | false                |
+ * | review     | idle         | false                |
+ * | assigned   | idle         | false                |
+ */
+export function canRequestSubmission(t: TicketSummary, agent: AgentInfo | null): boolean {
+  return t.state === "inProgress" && isLive(agent) && agent.status.kind === "idle";
 }
 
 /**

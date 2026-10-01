@@ -113,6 +113,14 @@ function NoteFrame(props: FrameProps) {
             uden review
           </span>
         )}
+        {t.source === "agent" && (
+          <span
+            className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 dark:text-sky-200"
+            title="Oprettet af en agent via mira_create_ticket"
+          >
+            fra agent
+          </span>
+        )}
         {t.rejectionNote !== null && (
           <span
             className="ml-auto rounded bg-rose-500/15 px-1 text-[10px] text-rose-700 dark:text-rose-300"
