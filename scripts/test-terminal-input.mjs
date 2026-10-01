@@ -21,7 +21,7 @@ const table = [
   ["\x1b[12;40R", 500, false],
   ["\x1b[I", Infinity, false],
   ["\x1b[O", Infinity, false],
-  ["\x1b[200~", Infinity, false],
+  ["\x1b[200~hej\x1b[201~", Infinity, true],
   ["hello\nworld", Infinity, true],
   ["æ", 1000, true],
 ];
