@@ -96,6 +96,19 @@ pub const TURN_FAILED_TEXT: &str = "Turn fejlede, prøv igen eller skriv i termi
 /// History note when queued/in-progress tickets go back to the backlog at startup.
 pub const RESTART_NOTE: &str = "app genstartet";
 
+// --- Agent tools (step 4; the rest of C4.8 follows with the spawn wiring) ---
+
+/// Successful `mira_create_ticket` calls allowed per agent per rolling window.
+pub const CREATE_TICKET_RATE_LIMIT: usize = 20;
+/// The rate-limit window (ms).
+pub const CREATE_TICKET_RATE_WINDOW_MS: u64 = 3_600_000;
+/// Maximum `mira_submit_for_review` summary (chars).
+pub const TICKET_SUMMARY_MAX_CHARS: usize = 2_000;
+/// Maximum `mira_update_status` note (chars); longer notes are cut.
+pub const AGENT_NOTE_MAX_CHARS: usize = 120;
+/// Agent detail when a turn ended without `mira_submit_for_review`.
+pub const NOT_SUBMITTED_TEXT: &str = "Turn afsluttet uden aflevering";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +154,15 @@ mod tests {
             "Turn fejlede, prøv igen eller skriv i terminalen"
         );
         assert_eq!(RESTART_NOTE, "app genstartet");
+    }
+
+    #[test]
+    fn agent_tool_limits_match_the_plan() {
+        assert_eq!(CREATE_TICKET_RATE_LIMIT, 20);
+        assert_eq!(CREATE_TICKET_RATE_WINDOW_MS, 3_600_000);
+        assert_eq!(TICKET_SUMMARY_MAX_CHARS, 2_000);
+        assert_eq!(AGENT_NOTE_MAX_CHARS, 120);
+        assert_eq!(NOT_SUBMITTED_TEXT, "Turn afsluttet uden aflevering");
     }
 
     #[test]

@@ -18,7 +18,10 @@ use super::model::{
 };
 use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
-use crate::config::{RESTART_NOTE, TICKET_BODY_MAX_CHARS, TICKET_TITLE_MAX_CHARS};
+use super::NOT_SUBMITTED_NOTE;
+use crate::config::{
+    RESTART_NOTE, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS,
+};
 
 /// History note when a turn ended normally (Stop hook).
 pub const TURN_ENDED_NOTE: &str = "auto: turn afsluttet";
@@ -58,6 +61,18 @@ fn validate_body(body: &str) -> Result<(), TicketError> {
         )));
     }
     Ok(())
+}
+
+/// Trimmed summary of 1–[`TICKET_SUMMARY_MAX_CHARS`] chars.
+fn validate_summary(summary: &str) -> Result<String, TicketError> {
+    let s = summary.trim();
+    let n = s.chars().count();
+    if n == 0 || n > TICKET_SUMMARY_MAX_CHARS {
+        return Err(TicketError::Validation(format!(
+            "summary skal være en tekst på 1–{TICKET_SUMMARY_MAX_CHARS} tegn"
+        )));
+    }
+    Ok(s.to_string())
 }
 
 fn find_mut<'a>(doc: &'a mut TicketDoc, id: &str) -> Result<&'a mut Ticket, TicketError> {
@@ -267,6 +282,48 @@ impl TicketService {
         m
     }
 
+    /// A ticket by its full id or its short id (case-insensitive, surrounding spaces ignored).
+    pub fn get_by_any_id(&self, id: &str) -> Option<Ticket> {
+        let q = id.trim().to_lowercase();
+        if q.is_empty() {
+            return None;
+        }
+        self.doc
+            .tickets
+            .iter()
+            .find(|t| t.id.to_lowercase() == q)
+            .or_else(|| self.doc.tickets.iter().find(|t| t.short_id() == q))
+            .cloned()
+    }
+
+    /// The agent's own tickets ("mine"): the one in progress first, then its queue in order.
+    pub fn list_for_agent(&self, agent_id: &str) -> Vec<TicketSummary> {
+        let mut v: Vec<&Ticket> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| {
+                t.assignee_agent_id.as_deref() == Some(agent_id)
+                    && matches!(t.state, TicketState::Assigned | TicketState::InProgress)
+            })
+            .collect();
+        v.sort_by_key(|t| (t.state != TicketState::InProgress, t.queue_position));
+        v.into_iter().map(TicketSummary::from).collect()
+    }
+
+    /// Unassigned tickets, oldest first.
+    pub fn backlog(&self) -> Vec<TicketSummary> {
+        let mut v: Vec<TicketSummary> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| t.state == TicketState::Backlog)
+            .map(TicketSummary::from)
+            .collect();
+        v.sort_by_key(|t| t.created_at);
+        v
+    }
+
     /// The ticket to deliver next: `None` while the agent has one in progress, else the queue
     /// head.
     pub fn next_for_agent(&self, agent_id: &str) -> Option<Ticket> {
@@ -297,18 +354,20 @@ impl TicketService {
             title,
             body,
             skip_review,
+            (TicketSource::User, TicketActor::User),
             now,
         )
     }
 
-    /// `create` with injectable ids (tests force a short-id collision). Ids whose short id is
-    /// already taken are skipped.
+    /// `create` with injectable ids (tests force a short-id collision) and origin (`source`, and
+    /// the creation entry's `by`). Ids whose short id is already taken are skipped.
     pub(crate) fn create_with_id_source(
         &mut self,
         next_id: &mut dyn FnMut() -> String,
         title: &str,
         body: &str,
         skip_review: bool,
+        (source, by): (TicketSource, TicketActor),
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let title = validate_title(title)?;
@@ -328,16 +387,17 @@ impl TicketService {
             assignee_agent_id: None,
             queue_position: None,
             skip_review,
-            source: TicketSource::User,
+            source,
             issue: None,
             rejection_note: None,
+            summary: None,
             created_at: now,
             updated_at: now,
             history: vec![TicketHistoryEntry {
                 at: now,
                 from: None,
                 to: TicketState::Backlog,
-                by: TicketActor::User,
+                by,
                 note: None,
             }],
         };
@@ -655,6 +715,26 @@ impl TicketService {
         self.fetch(id)
     }
 
+    /// The turn ended without `mira_submit_for_review`: the agent's inProgress ticket keeps its
+    /// state and gets `issue: notSubmitted` with [`NOT_SUBMITTED_NOTE`] (by the system).
+    /// `Ok(None)` when the agent has no ticket in progress (nothing saved).
+    pub fn mark_not_submitted(
+        &mut self,
+        agent_id: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let Some(t) = self.current_for_agent(agent_id) else {
+            return Ok(None);
+        };
+        self.set_issue(
+            &t.id,
+            Some(TicketIssue::NotSubmitted),
+            Some(NOT_SUBMITTED_NOTE.to_string()),
+            now,
+        )
+        .map(Some)
+    }
+
     /// Any non-backlog state → backlog by the system (delivery failure etc.).
     pub fn to_backlog(&mut self, id: &str, note: &str, now: u64) -> Result<Ticket, TicketError> {
         let ev = TicketEvent::ToBacklog {
@@ -696,6 +776,93 @@ impl TicketService {
                 .map(|id| apply(doc, id, &ev, TicketActor::System, None, now))
                 .collect::<Result<Vec<_>, _>>()
         })
+    }
+
+    // ---- agent tools API (tickets::tools; the caller has checked that the agent is live) ----
+
+    /// `mira_create_ticket`: like [`Self::create`], but `source: agent` and the creation entry
+    /// by the agent. Never assigned (step 5).
+    pub fn create_by_agent(
+        &mut self,
+        title: &str,
+        body: &str,
+        skip_review: bool,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.create_with_id_source(
+            &mut || uuid::Uuid::new_v4().to_string(),
+            title,
+            body,
+            skip_review,
+            (TicketSource::Agent, TicketActor::Agent),
+            now,
+        )
+    }
+
+    /// `mira_submit_for_review`: the agent's ticket (`ticket_id`, full or short id, or else its
+    /// inProgress ticket) → review (done with skipReview), `summary` stored and noted in the
+    /// history by the agent. Clears `issue` (the Submit transition does).
+    pub fn submit_by_agent(
+        &mut self,
+        agent_id: &str,
+        ticket_id: Option<&str>,
+        summary: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let summary = validate_summary(summary)?;
+        let t = match ticket_id {
+            Some(id) => {
+                let t = self.get_by_any_id(id).ok_or(TicketError::NotFound)?;
+                if t.assignee_agent_id.as_deref() != Some(agent_id) {
+                    return Err(TicketError::NotYours);
+                }
+                if t.state != TicketState::InProgress {
+                    return Err(TicketError::NotInProgress);
+                }
+                t
+            }
+            None => self
+                .current_for_agent(agent_id)
+                .ok_or(TicketError::NoTicketInProgress)?,
+        };
+        self.commit(|doc| {
+            find_mut(doc, &t.id)?.summary = Some(summary.clone());
+            apply(
+                doc,
+                &t.id,
+                &TicketEvent::Submit,
+                TicketActor::Agent,
+                Some(summary),
+                now,
+            )
+        })?;
+        self.fetch(&t.id)
+    }
+
+    /// `mira_update_status`: a history entry (state unchanged, by the agent) with `note` on the
+    /// agent's inProgress ticket. `Ok(None)` when it has none (nothing saved).
+    pub fn note_by_agent(
+        &mut self,
+        agent_id: &str,
+        note: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let Some(t) = self.current_for_agent(agent_id) else {
+            return Ok(None);
+        };
+        self.commit(|doc| {
+            let t = find_mut(doc, &t.id)?;
+            t.updated_at = now;
+            t.history.push(TicketHistoryEntry {
+                at: now,
+                from: Some(t.state),
+                to: t.state,
+                by: TicketActor::Agent,
+                note: Some(note.to_string()),
+            });
+            Ok(())
+        })?;
+        self.fetch(&t.id).map(Some)
     }
 }
 
@@ -793,7 +960,14 @@ mod tests {
         let (mut s, _) = svc();
         let mut ids = vec!["abcdef01-0000-4000-8000-000000000001".to_string()].into_iter();
         let a = s
-            .create_with_id_source(&mut || ids.next().unwrap(), "a", "", false, 1)
+            .create_with_id_source(
+                &mut || ids.next().unwrap(),
+                "a",
+                "",
+                false,
+                (TicketSource::User, TicketActor::User),
+                1,
+            )
             .unwrap();
         let mut ids = vec![
             "ABCDEF01-9999-4000-8000-000000000002".to_string(),
@@ -801,7 +975,14 @@ mod tests {
         ]
         .into_iter();
         let b = s
-            .create_with_id_source(&mut || ids.next().unwrap(), "b", "", false, 2)
+            .create_with_id_source(
+                &mut || ids.next().unwrap(),
+                "b",
+                "",
+                false,
+                (TicketSource::User, TicketActor::User),
+                2,
+            )
             .unwrap();
         assert_eq!(a.short_id(), "abcdef01");
         assert_eq!(b.short_id(), "12345678");
@@ -1257,5 +1438,201 @@ mod tests {
         let titles: Vec<_> = s.list().into_iter().map(|t| t.title).collect();
         assert_eq!(titles, ["b", "c", "a"]);
         assert!(!s.is_empty());
+    }
+
+    // ---- agent tools API ----
+
+    /// A ticket in progress for `agent` (created by the user, assigned, dispatched).
+    fn in_progress(s: &mut TicketService, agent: &str, title: &str, skip: bool) -> Ticket {
+        let t = s.create(title, "b", skip, 1).unwrap();
+        s.assign(&t.id, agent, 2).unwrap();
+        s.mark_dispatched(&t.id, agent, 3).unwrap()
+    }
+
+    #[test]
+    fn submit_by_agent_needs_a_ticket_of_its_own_in_progress() {
+        let (mut s, _) = svc();
+        assert_eq!(
+            s.submit_by_agent("a1", None, "done", 5).unwrap_err(),
+            TicketError::NoTicketInProgress
+        );
+        let other = in_progress(&mut s, "a2", "other", false);
+        assert_eq!(
+            s.submit_by_agent("a1", Some(&other.id), "done", 5)
+                .unwrap_err(),
+            TicketError::NotYours
+        );
+        // Backlog ticket (no assignee) is not the agent's either.
+        let free = mk(&mut s, "free", 4);
+        assert_eq!(
+            s.submit_by_agent("a1", Some(&free.short_id()), "done", 5)
+                .unwrap_err(),
+            TicketError::NotYours
+        );
+        let mine = in_progress(&mut s, "a1", "mine", false);
+        let r = s.submit_by_agent("a1", None, "x", 6).unwrap();
+        assert_eq!(r.id, mine.id);
+        // Now in review: not in progress any more.
+        assert_eq!(
+            s.submit_by_agent("a1", Some(&mine.id), "again", 7)
+                .unwrap_err(),
+            TicketError::NotInProgress
+        );
+        assert_eq!(
+            s.submit_by_agent("a1", Some("ffffffff"), "x", 7)
+                .unwrap_err(),
+            TicketError::NotFound
+        );
+        for bad in ["", "   ", &"x".repeat(2_001)] {
+            assert_eq!(
+                s.submit_by_agent("a2", None, bad, 8)
+                    .unwrap_err()
+                    .to_string(),
+                "summary skal være en tekst på 1–2000 tegn"
+            );
+        }
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn submit_by_agent_moves_to_review_with_summary_and_clears_the_issue() {
+        let (mut s, m) = svc();
+        let t = in_progress(&mut s, "a1", "fix", false);
+        let marked = s.mark_not_submitted("a1", 4).unwrap().unwrap();
+        assert_eq!(marked.state, S::InProgress);
+        assert_eq!(marked.issue, Some(TicketIssue::NotSubmitted));
+        let last = marked.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some(NOT_SUBMITTED_NOTE))
+        );
+        let saves = m.saves();
+        let r = s
+            .submit_by_agent(
+                "a1",
+                Some(&t.short_id().to_uppercase()),
+                "  Rettet; se login.rs ",
+                5,
+            )
+            .unwrap();
+        assert_eq!(m.saves(), saves + 1);
+        assert_eq!(r.state, S::Review);
+        assert_eq!(r.summary.as_deref(), Some("Rettet; se login.rs"));
+        assert_eq!(r.issue, None);
+        let last = r.history.last().unwrap();
+        assert_eq!(
+            (last.from, last.to, last.by, last.note.as_deref()),
+            (
+                Some(S::InProgress),
+                S::Review,
+                TicketActor::Agent,
+                Some("Rettet; se login.rs")
+            )
+        );
+        assert_eq!(s.current_for_agent("a1"), None);
+        assert_eq!(
+            TicketSummary::from(&r).summary.as_deref(),
+            Some("Rettet; se login.rs")
+        );
+        // skipReview → done.
+        let t2 = in_progress(&mut s, "a1", "quick", true);
+        let d = s.submit_by_agent("a1", None, "ok", 6).unwrap();
+        assert_eq!((d.id, d.state), (t2.id, S::Done));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn mark_not_submitted_without_a_ticket_saves_nothing() {
+        let (mut s, m) = svc();
+        mk(&mut s, "x", 1);
+        let saves = m.saves();
+        assert_eq!(s.mark_not_submitted("a1", 2).unwrap(), None);
+        assert_eq!(s.note_by_agent("a1", "hej", 2).unwrap(), None);
+        assert_eq!(m.saves(), saves);
+    }
+
+    #[test]
+    fn create_by_agent_is_marked_as_agent_work() {
+        let (mut s, _) = svc();
+        let t = s.create_by_agent("Følg op", "detaljer", true, 9).unwrap();
+        assert_eq!(t.source, TicketSource::Agent);
+        assert_eq!((t.state, t.skip_review), (S::Backlog, true));
+        assert_eq!(t.assignee_agent_id, None);
+        assert_eq!(t.history.len(), 1);
+        assert_eq!(t.history[0].by, TicketActor::Agent);
+        assert_eq!(
+            s.create_by_agent(" ", "", false, 9)
+                .unwrap_err()
+                .to_string(),
+            "Titel må ikke være tom"
+        );
+        // The user's tickets keep source/by user.
+        let u = mk(&mut s, "u", 10);
+        assert_eq!(
+            (u.source, u.history[0].by),
+            (TicketSource::User, TicketActor::User)
+        );
+    }
+
+    #[test]
+    fn note_by_agent_adds_a_history_entry_on_the_current_ticket() {
+        let (mut s, _) = svc();
+        let t = in_progress(&mut s, "a1", "x", false);
+        let n = s.note_by_agent("a1", "Kører tests", 7).unwrap().unwrap();
+        assert_eq!(n.id, t.id);
+        assert_eq!(n.state, S::InProgress);
+        assert_eq!(n.updated_at, 7);
+        let last = n.history.last().unwrap();
+        assert_eq!(
+            (last.from, last.to, last.by, last.note.as_deref()),
+            (
+                Some(S::InProgress),
+                S::InProgress,
+                TicketActor::Agent,
+                Some("Kører tests")
+            )
+        );
+    }
+
+    #[test]
+    fn list_for_agent_backlog_and_any_id_lookup() {
+        let (mut s, _) = svc();
+        let q1 = mk(&mut s, "q1", 1);
+        let q2 = mk(&mut s, "q2", 2);
+        let cur = mk(&mut s, "cur", 3);
+        let other = mk(&mut s, "other", 4);
+        let free = mk(&mut s, "free", 5);
+        s.assign(&cur.id, "a1", 6).unwrap();
+        s.mark_dispatched(&cur.id, "a1", 7).unwrap();
+        s.assign(&q2.id, "a1", 8).unwrap();
+        s.assign(&q1.id, "a1", 9).unwrap();
+        s.assign(&other.id, "a2", 10).unwrap();
+        let mine: Vec<String> = s
+            .list_for_agent("a1")
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(mine, vec!["cur", "q2", "q1"]);
+        let backlog: Vec<String> = s.backlog().into_iter().map(|t| t.title).collect();
+        assert_eq!(backlog, vec!["free"]);
+        assert!(s.list_for_agent("nobody").is_empty());
+
+        assert_eq!(s.get_by_any_id(&free.id).unwrap().id, free.id);
+        assert_eq!(
+            s.get_by_any_id(&free.id.to_uppercase()).unwrap().id,
+            free.id
+        );
+        assert_eq!(
+            s.get_by_any_id(&format!(" {} ", free.short_id()))
+                .unwrap()
+                .id,
+            free.id
+        );
+        assert_eq!(
+            s.get_by_any_id(&free.short_id().to_uppercase()).unwrap().id,
+            free.id
+        );
+        assert_eq!(s.get_by_any_id("nope"), None);
+        assert_eq!(s.get_by_any_id(""), None);
     }
 }

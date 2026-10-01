@@ -33,8 +33,9 @@ use events::{AgentOutputPayload, EmitFn, StatusEvent, AGENTS_CHANGED, AGENT_OUTP
 use hooks::settings::write_hooks_json;
 use island::IslandState;
 use permissions::PendingPermissions;
-use pipe::handler::{HandlerCtx, StatusObserver};
+use pipe::handler::{HandlerCtx, StatusObserver, ToolHandler};
 use tickets::dispatcher::{self, messages_for, DispatchMsg, Dispatcher, RealTimers};
+use tickets::tools::ToolsCtx;
 use tickets::{ManagerPort, TicketsCtx, AGENT_EXITED_NOTE};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -361,6 +362,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
+    // Tool frames from mira-mcp → the agents' ticket tools (the pipe knows nothing about tickets).
+    let tool_handler: ToolHandler = {
+        let tools = Arc::new(ToolsCtx::new(Arc::clone(&tickets)));
+        Arc::new(move |frame| tools.handle_tool(frame, now_ms()))
+    };
+
     let pipe_ready = Arc::new(AtomicBool::new(false));
     let hook_stats = Arc::new(HookStats::default());
     pipe::server::start(
@@ -371,6 +378,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             emit,
             stats: Arc::clone(&hook_stats),
             observer: Some(observer),
+            tools: Some(tool_handler),
         },
         Arc::clone(&pipe_ready),
     );

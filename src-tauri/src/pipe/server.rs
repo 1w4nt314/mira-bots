@@ -240,6 +240,7 @@ mod tests {
             emit: Arc::new(|_: &str, _| {}),
             stats: Arc::new(crate::diagnostics::HookStats::default()),
             observer: None,
+            tools: None,
         };
         let name = std::env::temp_dir()
             .join(format!("mira-bots-test-{}.sock", uuid::Uuid::new_v4()))
@@ -311,6 +312,7 @@ mod tests {
             emit: Arc::new(|_: &str, _| {}),
             stats: Arc::new(crate::diagnostics::HookStats::default()),
             observer: None,
+            tools: None,
         };
         let name = std::env::temp_dir()
             .join(format!("mira-bots-no-such-dir-{}", uuid::Uuid::new_v4()))

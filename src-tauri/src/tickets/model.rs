@@ -62,11 +62,12 @@ pub enum TicketActor {
     Agent,
 }
 
-/// Where a ticket came from. Step 4 adds `agent` and `coordinator`.
+/// Where a ticket came from: the user (UI) or an agent (`mira_create_ticket`).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TicketSource {
     User,
+    Agent,
 }
 
 /// A problem the UI should show on the ticket.
@@ -77,6 +78,8 @@ pub enum TicketIssue {
     DeliveryFailed,
     /// The turn ended with `StopFailure`.
     TurnFailed,
+    /// The turn ended (Stop) without `mira_submit_for_review`; the ticket stays in progress.
+    NotSubmitted,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -105,6 +108,9 @@ pub struct Ticket {
     pub source: TicketSource,
     pub issue: Option<TicketIssue>,
     pub rejection_note: Option<String>,
+    /// The agent's summary from its last `mira_submit_for_review`. Absent in step-3 files.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Unix ms.
     pub created_at: u64,
     /// Unix ms.
@@ -134,6 +140,8 @@ pub struct TicketSummary {
     pub source: TicketSource,
     pub issue: Option<TicketIssue>,
     pub rejection_note: Option<String>,
+    /// Copy of `Ticket.summary` (the review card shows it without `get_ticket`).
+    pub summary: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
     pub history_len: usize,
@@ -152,6 +160,7 @@ impl From<&Ticket> for TicketSummary {
             source: t.source,
             issue: t.issue,
             rejection_note: t.rejection_note.clone(),
+            summary: t.summary.clone(),
             created_at: t.created_at,
             updated_at: t.updated_at,
             history_len: t.history.len(),
@@ -226,6 +235,15 @@ pub enum TicketError {
     /// `TicketService::load_and_recover`).
     #[error("Tickets-filen kunne ikke læses ved opstart; ændringer er slået fra. Genstart appen.")]
     ReadOnly,
+    /// Agent tools: the ticket belongs to (or is waiting for) someone else.
+    #[error("Ticketen er tildelt en anden agent")]
+    NotYours,
+    #[error("Du har ingen ticket i gang")]
+    NoTicketInProgress,
+    #[error("Ticketen er ikke i gang")]
+    NotInProgress,
+    #[error("For mange tickets oprettet den seneste time (maks 20)")]
+    RateLimited,
 }
 
 impl From<TicketError> for String {
@@ -251,6 +269,7 @@ pub(crate) mod test_support {
             source: TicketSource::User,
             issue: None,
             rejection_note: None,
+            summary: None,
             created_at: 1_000,
             updated_at: 1_000,
             history: vec![TicketHistoryEntry {
@@ -315,6 +334,18 @@ mod tests {
             json!("turnFailed")
         );
         assert_eq!(
+            serde_json::to_value(TicketIssue::NotSubmitted).unwrap(),
+            json!("notSubmitted")
+        );
+        assert_eq!(
+            serde_json::to_value(TicketSource::Agent).unwrap(),
+            json!("agent")
+        );
+        assert_eq!(
+            serde_json::from_value::<TicketIssue>(json!("notSubmitted")).unwrap(),
+            TicketIssue::NotSubmitted
+        );
+        assert_eq!(
             serde_json::to_value(None::<TicketIssue>).unwrap(),
             json!(null)
         );
@@ -341,6 +372,7 @@ mod tests {
             "source",
             "issue",
             "rejectionNote",
+            "summary",
             "createdAt",
             "updatedAt",
             "history",
@@ -361,6 +393,24 @@ mod tests {
         assert!(s.get("body").is_none(), "the body is only in get_ticket");
         assert_eq!(s["queuePosition"], json!(2));
         assert_eq!(s["title"], json!(t.title));
+        assert_eq!(s["summary"], json!(null));
+        assert_eq!(v["summary"], json!(null));
+
+        t.summary = Some("Rettet og testet".into());
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["summary"], json!("Rettet og testet"));
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(s["summary"], json!("Rettet og testet"));
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+    }
+
+    #[test]
+    fn step3_ticket_without_summary_still_reads() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Review)).unwrap();
+        v.as_object_mut().unwrap().remove("summary");
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!(t.summary, None);
+        assert_eq!(t.source, TicketSource::User);
     }
 
     #[test]
@@ -417,6 +467,22 @@ mod tests {
         assert_eq!(
             TicketError::ReadOnly.to_string(),
             "Tickets-filen kunne ikke læses ved opstart; ændringer er slået fra. Genstart appen."
+        );
+        assert_eq!(
+            TicketError::NotYours.to_string(),
+            "Ticketen er tildelt en anden agent"
+        );
+        assert_eq!(
+            TicketError::NoTicketInProgress.to_string(),
+            "Du har ingen ticket i gang"
+        );
+        assert_eq!(
+            TicketError::NotInProgress.to_string(),
+            "Ticketen er ikke i gang"
+        );
+        assert_eq!(
+            TicketError::RateLimited.to_string(),
+            "For mange tickets oprettet den seneste time (maks 20)"
         );
     }
 }

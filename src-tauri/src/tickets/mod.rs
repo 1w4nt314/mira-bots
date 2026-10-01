@@ -1,8 +1,9 @@
 //! Step 3: tickets, per-agent queues, review and the dispatcher that types tickets into idle
 //! agents' terminals.
 //!
-//! Dependency direction: `tickets` → `agent`, `hooks::status`, `events`, `config`. Nothing in
-//! `agent`, `pipe` or `hooks` knows `tickets`.
+//! Dependency direction: `tickets` → `agent`, `hooks::status`, `events`, `config` (and the
+//! tool-frame types of `pipe::protocol`, step 4). Nothing in `agent`, `pipe` or `hooks` knows
+//! `tickets`: the app glue hands the pipe handler a closure over [`tools::ToolsCtx`].
 //!
 //! This file holds the app glue (plan B.8): [`TicketsCtx`] (shared service + manager links +
 //! emits + the dispatcher's channel) and [`ManagerPort`] (the dispatcher's view of the agents).
@@ -16,6 +17,7 @@ pub mod prompt;
 pub mod service;
 pub mod state;
 pub mod store;
+pub mod tools;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -35,6 +37,8 @@ use store::JsonFileStore;
 pub const AGENT_EXITED_NOTE: &str = "agent afsluttet";
 /// History note when the user stopped or removed the agent.
 pub const AGENT_STOPPED_NOTE: &str = "agent stoppet";
+/// History note when a turn ended without `mira_submit_for_review` (step 4).
+pub const NOT_SUBMITTED_NOTE: &str = "turn afsluttet uden aflevering";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())

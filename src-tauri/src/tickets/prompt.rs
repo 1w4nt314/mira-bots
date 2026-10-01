@@ -107,8 +107,9 @@ pub fn line_for(t: &Ticket) -> String {
     render_line(&t.short_id(), &sanitize_title(&t.title))
 }
 
-/// One-line form for headings: CRLF/CR/LF/tab → space, other controls removed.
-fn one_line(s: &str) -> String {
+/// One-line form for headings and agent-supplied titles/notes: CRLF/CR/LF/tab → space, other
+/// controls removed, trimmed.
+pub(crate) fn one_line(s: &str) -> String {
     s.chars()
         .filter_map(|c| match c {
             '\r' | '\n' | '\t' => Some(' '),
@@ -120,7 +121,16 @@ fn one_line(s: &str) -> String {
         .to_string()
 }
 
-/// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6).
+/// Body text from an agent (`mira_create_ticket`): CRLF → LF; C0/C1 controls removed except
+/// `\n`, `\t` and `\r`.
+pub fn clean_body(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t' | '\r'))
+        .collect()
+}
+
+/// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6, rules from plan4 C4.7).
 pub fn render_file(t: &Ticket, now_ms: u64) -> String {
     let short = t.short_id();
     let body = t.body.replace("\r\n", "\n");
@@ -156,8 +166,8 @@ pub fn render_file(t: &Ticket, now_ms: u64) -> String {
     }
     out.push_str(
         "## Regler\n\
-         - Opgaven er en ticket fra mira-bots. Når den er løst, afslut dit svar (turen); appen sender den til review.\n\
-         - Marker ikke selv ticketen som færdig, og opret ikke filer i .mira-bots/.\n",
+         - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
+         - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/.\n",
     );
     out
 }
@@ -348,7 +358,12 @@ mod tests {
         assert!(f.contains("## Opgave\n\nLinje 1\n\n- punkt @x /y\n\n## Regler\n"));
         assert!(!f.contains('\r'));
         assert!(!f.contains("## Afvist:"));
-        assert!(f.ends_with("opret ikke filer i .mira-bots/.\n"));
+        assert!(f.ends_with(
+            "## Regler\n\
+             - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
+             - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/.\n"
+        ));
+        assert!(f.contains("mira_submit_for_review"));
 
         t.skip_review = true;
         t.body = String::new();
@@ -359,6 +374,16 @@ mod tests {
         assert!(f.contains(
             "## Afvist: Mangler test\nRet det ovenstående og afslut dit svar igen, så ticketen kommer til review på ny.\n\n## Regler\n"
         ));
+    }
+
+    #[test]
+    fn clean_body_and_one_line_strip_controls() {
+        assert_eq!(
+            clean_body("a\u{0}b\r\nc\td\re\u{7}\u{9b}f\n"),
+            "ab\nc\td\ref\n"
+        );
+        assert_eq!(clean_body("æøå **md**"), "æøå **md**");
+        assert_eq!(one_line("  Ret\r\nlogin\u{0}\tnu  "), "Ret  login nu");
     }
 
     #[test]

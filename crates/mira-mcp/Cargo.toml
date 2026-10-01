@@ -1,0 +1,20 @@
+[package]
+name = "mira-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server (stdio) for mira-bots: gives Claude Code agents tools for the app's tickets"
+license = "MIT"
+
+# The size-optimised release profile (opt-level "s", lto, panic = "abort", strip) lives in the
+# workspace root Cargo.toml: cargo ignores [profile] sections in workspace members.
+
+[lib]
+name = "mira_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mira-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

@@ -159,14 +159,31 @@ pub struct LastHookEvent {
     pub at: u64,
 }
 
+/// The last tool frame (`mira-mcp`) the pipe handler answered. No arguments, ever.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LastToolCall {
+    pub tool: String,
+    pub agent_id: Option<String>,
+    /// Whether the answer was `ok: true`.
+    pub ok: bool,
+    /// Unix ms.
+    pub at: u64,
+}
+
 /// Counters updated by the pipe handler, shared with `AppState` (one `Arc`).
 #[derive(Debug, Default)]
 pub struct HookStats {
-    /// Every successfully parsed frame.
+    /// Every successfully parsed hook frame.
     pub frames_received: AtomicU64,
-    /// Parsed frames that matched no agent (neither by agent id nor by session id).
+    /// Parsed hook frames that matched no agent (neither by agent id nor by session id).
     pub frames_unknown_session: AtomicU64,
     pub last: Mutex<Option<LastHookEvent>>,
+    /// Every answered tool frame (step 4).
+    pub tool_calls: AtomicU64,
+    /// Tool frames answered with `ok: false`.
+    pub tool_errors: AtomicU64,
+    pub last_tool: Mutex<Option<LastToolCall>>,
 }
 
 impl HookStats {
@@ -189,6 +206,30 @@ impl HookStats {
 
     pub fn last_event(&self) -> Option<LastHookEvent> {
         self.last.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Records one answered tool frame (`last.ok == false` counts as an error).
+    pub fn record_tool(&self, last: LastToolCall) {
+        self.tool_calls.fetch_add(1, Ordering::Relaxed);
+        if !last.ok {
+            self.tool_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        *self.last_tool.lock().unwrap_or_else(|p| p.into_inner()) = Some(last);
+    }
+
+    pub fn tool_calls(&self) -> u64 {
+        self.tool_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn tool_errors(&self) -> u64 {
+        self.tool_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn last_tool_call(&self) -> Option<LastToolCall> {
+        self.last_tool
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -327,6 +368,32 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "timeout efter 100 ms");
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn tool_stats_count_and_remember() {
+        let s = HookStats::default();
+        assert_eq!((s.tool_calls(), s.tool_errors()), (0, 0));
+        assert_eq!(s.last_tool_call(), None);
+        s.record_tool(LastToolCall {
+            tool: "mira_list_tickets".into(),
+            agent_id: Some("a1".into()),
+            ok: true,
+            at: 5,
+        });
+        s.record_tool(LastToolCall {
+            tool: "mira_submit_for_review".into(),
+            agent_id: None,
+            ok: false,
+            at: 6,
+        });
+        assert_eq!((s.tool_calls(), s.tool_errors()), (2, 1));
+        assert_eq!(s.received(), 0, "tool frames are not hook frames");
+        let last = s.last_tool_call().unwrap();
+        assert_eq!(
+            serde_json::to_value(&last).unwrap(),
+            serde_json::json!({"tool":"mira_submit_for_review","agentId":null,"ok":false,"at":6})
+        );
     }
 
     #[test]
