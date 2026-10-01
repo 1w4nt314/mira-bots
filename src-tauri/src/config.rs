@@ -96,7 +96,12 @@ pub const TURN_FAILED_TEXT: &str = "Turn fejlede, prøv igen eller skriv i termi
 /// History note when queued/in-progress tickets go back to the backlog at startup.
 pub const RESTART_NOTE: &str = "app genstartet";
 
-// --- Agent tools (step 4; the rest of C4.8 follows with the spawn wiring) ---
+// --- Agent tools (step 4, C4.8) ---
+
+/// `true` restores step 3: a Stop moves the agent's inProgress ticket to review (done with
+/// skipReview). `false` (step 4): the ticket stays in progress with `issue: notSubmitted` until
+/// the agent calls `mira_submit_for_review` or the user moves it.
+pub const AUTO_REVIEW_ON_STOP: bool = false;
 
 /// Successful `mira_create_ticket` calls allowed per agent per rolling window.
 pub const CREATE_TICKET_RATE_LIMIT: usize = 20;
@@ -108,6 +113,21 @@ pub const TICKET_SUMMARY_MAX_CHARS: usize = 2_000;
 pub const AGENT_NOTE_MAX_CHARS: usize = 120;
 /// Agent detail when a turn ended without `mira_submit_for_review`.
 pub const NOT_SUBMITTED_TEXT: &str = "Turn afsluttet uden aflevering";
+/// Env override for the mira-mcp exe location.
+pub const MCP_EXE_ENV: &str = "MIRA_MCP_EXE";
+/// The MCP server's name in mcp.json (same as `mira_mcp::SERVER_NAME`).
+pub const MCP_SERVER_NAME: &str = "mira-bots";
+/// Claude Code's name prefix for the server's tools (`mcp__<server>__`).
+pub const MCP_TOOL_PREFIX: &str = "mcp__mira-bots__";
+/// The app's own Claude Code settings file in the app data dir (hooks + permissions), passed
+/// with `--settings`.
+pub const SETTINGS_FILE: &str = "settings.json";
+/// Step 1–3 name of that file; removed when settings.json is written.
+pub const LEGACY_HOOKS_FILE: &str = "hooks.json";
+/// MCP config in the app data dir, passed with `--mcp-config`.
+pub const MCP_CONFIG_FILE: &str = "mcp.json";
+/// System prompt addition in the app data dir, passed with `--append-system-prompt-file`.
+pub const SYSTEM_PROMPT_FILE: &str = "system-prompt.md";
 
 #[cfg(test)]
 mod tests {
@@ -163,6 +183,26 @@ mod tests {
         assert_eq!(TICKET_SUMMARY_MAX_CHARS, 2_000);
         assert_eq!(AGENT_NOTE_MAX_CHARS, 120);
         assert_eq!(NOT_SUBMITTED_TEXT, "Turn afsluttet uden aflevering");
+    }
+
+    #[test]
+    fn step4_constants_match_the_plan() {
+        const { assert!(!AUTO_REVIEW_ON_STOP) };
+        assert_eq!(MCP_EXE_ENV, "MIRA_MCP_EXE");
+        assert_eq!(MCP_SERVER_NAME, "mira-bots");
+        assert_eq!(MCP_TOOL_PREFIX, "mcp__mira-bots__");
+        assert_eq!(SETTINGS_FILE, "settings.json");
+        assert_eq!(LEGACY_HOOKS_FILE, "hooks.json");
+        assert_eq!(MCP_CONFIG_FILE, "mcp.json");
+        assert_eq!(SYSTEM_PROMPT_FILE, "system-prompt.md");
+    }
+
+    #[test]
+    fn mcp_names_match_the_mcp_server() {
+        assert_eq!(MCP_TOOL_PREFIX, format!("mcp__{MCP_SERVER_NAME}__"));
+        assert_eq!(mira_mcp::SERVER_NAME, MCP_SERVER_NAME);
+        assert_eq!(mira_mcp::PIPE_ENV, PIPE_ENV);
+        assert_eq!(mira_mcp::AGENT_ID_ENV, AGENT_ID_ENV);
     }
 
     #[test]

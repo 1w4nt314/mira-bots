@@ -18,7 +18,9 @@ use crate::events::{
 };
 use crate::hooks::event::{self, summarize_tool_input, HookEvent};
 use crate::hooks::status::{self, status_for_tool, AgentStatus};
-use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
+use crate::permissions::{
+    auto_allows_own_tool, Decision, PendingPermissions, PermissionRequestInfo,
+};
 
 pub use crate::events::EmitFn;
 
@@ -328,8 +330,8 @@ where
     drain_until_closed(&mut stream).await;
 }
 
-/// Whitelist → allow now; UI not ready → none now; otherwise wait for the UI up to
-/// `PERMISSION_APP_DEADLINE` (108 s), then none.
+/// The app's own MCP tools ([`auto_allows_own_tool`]) or whitelist → allow now; UI not ready →
+/// none now; otherwise wait for the UI up to `PERMISSION_APP_DEADLINE` (108 s), then none.
 ///
 /// While waiting, `client` is read so a hook exe that goes away (EOF or error) is noticed: the
 /// request is then resolved as `none`, `permission-resolved{none}` is emitted and `None` is
@@ -344,6 +346,13 @@ async fn decide_permission<C: AsyncRead + Unpin>(
 ) -> Option<Decision> {
     let tool_name = ev.tool_name.clone().unwrap_or_default();
     let summary = summarize_tool_input(&tool_name, ev.tool_input.as_ref());
+
+    // Normally settings.json's `permissions.allow` means no PermissionRequest for these at all.
+    if auto_allows_own_tool(&tool_name, ev.mcp_server_source.as_deref()) {
+        log::info!("permission: {tool_name} auto-allowed (own MCP tool)");
+        apply_decision_status(ctx, agent_id, &tool_name, &summary, Decision::Allow);
+        return Some(Decision::Allow);
+    }
 
     let (whitelisted, agent_name) = {
         let m = lock(&ctx.manager);
@@ -562,6 +571,50 @@ mod tests {
         assert_eq!(h.status(), AgentStatus::Running);
         assert!(h.emitted(PERMISSION_REQUEST).is_empty());
         assert!(h.ctx.pending.lock().unwrap().list().is_empty());
+    }
+
+    fn own_tool_permission(source: Option<&str>) -> String {
+        let mut ev = json!({"session_id":"sess-1","hook_event_name":"PermissionRequest",
+                            "tool_name":"mcp__mira-bots__mira_submit_for_review",
+                            "tool_input":{"summary":"hemmelig"}});
+        if let Some(s) = source {
+            ev["mcp_server"] = json!({"name":"mira-bots","source":s});
+        }
+        format!("{}\n", json!({"v":1,"kind":"hook","event":ev}))
+    }
+
+    #[tokio::test]
+    async fn b2_own_mcp_tool_from_the_dynamic_server_is_allowed_without_ui() {
+        for source in [Some("dynamic"), None] {
+            let h = harness(true);
+            let out = round_trip(&h, &own_tool_permission(source)).await;
+            assert_eq!(reply_decision(&out), "allow", "source {source:?}");
+            assert_eq!(h.status(), AgentStatus::Thinking);
+            let detail = h.ctx.manager.lock().unwrap().get(&h.agent).unwrap().detail;
+            assert_eq!(detail.as_deref(), Some("Afleverer til review"));
+            assert!(h.emitted(PERMISSION_REQUEST).is_empty());
+            assert!(h.ctx.pending.lock().unwrap().list().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn b3_same_name_from_a_user_server_is_not_auto_allowed() {
+        let h = harness(false);
+        let out = round_trip(&h, &own_tool_permission(Some("user"))).await;
+        assert_eq!(reply_decision(&out), "none");
+        assert_eq!(h.status(), AgentStatus::WaitingPermission);
+
+        let h = harness(true);
+        let (mut client, task) = h.start();
+        client
+            .write_all(own_tool_permission(Some("user")).as_bytes())
+            .await
+            .unwrap();
+        let req = wait_for_request(&h).await;
+        assert_eq!(req["toolName"], "mcp__mira-bots__mira_submit_for_review");
+        assert_eq!(req["summary"], "Afleverer til review");
+        drop(client);
+        task.await.unwrap();
     }
 
     #[tokio::test]

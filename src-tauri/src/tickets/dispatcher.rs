@@ -23,8 +23,9 @@ use super::prompt;
 use super::service::TicketService;
 use crate::agent::now_ms;
 use crate::config::{
-    CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS, ENTER_DELAY_MS, RETRY_TIMEOUT_MS,
-    SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT,
+    AUTO_REVIEW_ON_STOP, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
+    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
+    TURN_FAILED_TEXT,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -37,6 +38,8 @@ pub const TURN_FAILED_NOTE: &str = "StopFailure";
 pub const TERMINAL_GONE_NOTE: &str = "Terminalen er væk";
 /// History note when a different prompt was submitted while the ticket line was being delivered.
 pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
+/// History note after the "Bed om aflevering" line was typed (the ticket is otherwise unchanged).
+pub const SUBMISSION_REQUESTED_NOTE: &str = "bedt om aflevering";
 
 /// No ticket is typed into a terminal the user typed into less than this long ago (their
 /// half-written prompt would be merged with the ticket line); the dispatch waits instead.
@@ -48,8 +51,8 @@ pub struct AgentSnapshot {
     pub name: String,
     pub cwd: PathBuf,
     pub status: AgentStatus,
-    /// Current detail text (to clear [`DELIVERY_FAILED_TEXT`]/[`TURN_FAILED_TEXT`] after a
-    /// successful delivery).
+    /// Current detail text (to clear [`DELIVERY_FAILED_TEXT`]/[`TURN_FAILED_TEXT`]/
+    /// [`NOT_SUBMITTED_TEXT`] after a successful delivery).
     pub detail: Option<String>,
     /// When the user last typed into the terminal ([`Timers::now_ms`] clock); see
     /// [`USER_INPUT_GRACE_MS`].
@@ -91,6 +94,10 @@ pub enum TimerKind {
     DispatchDelay,
     SendEnter,
     Confirm,
+    /// "Bed om aflevering": waiting for the user-input grace before typing the line.
+    NudgeDelay,
+    /// "Bed om aflevering": line typed, Enter pending.
+    NudgeEnter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +121,8 @@ pub enum DispatchMsg {
     SpawnedWithTicket { agent_id: String, ticket_id: String },
     /// "Send igen" from the UI.
     Redispatch { ticket_id: String },
+    /// "Bed om aflevering" from the UI: type the nudge line into the in-progress ticket's agent.
+    RequestSubmission { ticket_id: String },
     Timer {
         agent_id: String,
         token: u64,
@@ -176,6 +185,13 @@ enum Delivery {
         ticket_id: String,
         token: u64,
     },
+    /// Typing the "Bed om aflevering" line (C4.7) for the in-progress `ticket_id`: waiting for
+    /// the grace period (`NudgeDelay`), then for the Enter (`NudgeEnter`). Nothing is confirmed:
+    /// the ticket stays in progress.
+    Nudging {
+        ticket_id: String,
+        token: u64,
+    },
 }
 
 pub struct Dispatcher<H, P, T> {
@@ -184,6 +200,8 @@ pub struct Dispatcher<H, P, T> {
     timers: T,
     deliveries: HashMap<String, Delivery>,
     next_token: u64,
+    /// See [`AUTO_REVIEW_ON_STOP`].
+    auto_review_on_stop: bool,
 }
 
 impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
@@ -194,7 +212,14 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             timers,
             deliveries: HashMap::new(),
             next_token: 0,
+            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
         }
+    }
+
+    /// Overrides [`AUTO_REVIEW_ON_STOP`] (tests).
+    pub fn with_auto_review(mut self, on: bool) -> Self {
+        self.auto_review_on_stop = on;
+        self
     }
 
     fn token(&mut self) -> u64 {
@@ -245,6 +270,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.set(&agent_id, Delivery::AwaitingSession { ticket_id, token });
             }
             DispatchMsg::Redispatch { ticket_id } => self.redispatch(&ticket_id),
+            DispatchMsg::RequestSubmission { ticket_id } => self.on_request_submission(&ticket_id),
             DispatchMsg::Timer {
                 agent_id,
                 token,
@@ -279,10 +305,15 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         (elapsed < USER_INPUT_GRACE_MS).then(|| USER_INPUT_GRACE_MS - elapsed)
     }
 
-    /// The agent (idle, not exited) and its next ticket, if a delivery may start now.
+    /// The agent (idle, not exited) and its next ticket, if a delivery may start now. Never while
+    /// the agent has a ticket in progress: the next one waits until that one is submitted or
+    /// moved (step 4; also covers Esc mid-turn, which gives Idle without Stop).
     fn ready_ticket(&self, agent_id: &str) -> Option<(AgentSnapshot, Ticket)> {
         let snap = self.port.snapshot(agent_id)?;
         if snap.status != AgentStatus::Idle {
+            return None;
+        }
+        if self.host.read(|s| s.current_for_agent(agent_id)).is_some() {
             return None;
         }
         let ticket = self.host.read(|s| s.next_for_agent(agent_id))?;
@@ -366,16 +397,22 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         if snap.is_some_and(|s| {
             matches!(
                 s.detail.as_deref(),
-                Some(DELIVERY_FAILED_TEXT | TURN_FAILED_TEXT)
+                Some(DELIVERY_FAILED_TEXT | TURN_FAILED_TEXT | NOT_SUBMITTED_TEXT)
             )
         }) {
             self.port.set_detail(agent_id, None);
         }
     }
 
-    // TODO(windows-verify): Stop moves the ticket to review (done with skipReview) right after the
-    // answer; Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure shows the
-    // "Turn fejlede" hint and "Send igen" works (plan D.33).
+    /// Stop: with [`AUTO_REVIEW_ON_STOP`] the in-progress ticket goes to review (step 3).
+    /// Otherwise (step 4) a ticket still in progress was not submitted with
+    /// `mira_submit_for_review`: it keeps its state with `issue: notSubmitted` and the agent gets
+    /// [`NOT_SUBMITTED_TEXT`]; no next ticket is considered. Without a ticket in progress (e.g.
+    /// submitted by the tool in this turn) the queue moves on.
+    // TODO(windows-verify): Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure
+    // shows the "Turn fejlede" hint and "Send igen" works (plan D.33). Stop without
+    // `mira_submit_for_review` shows "Ikke afleveret"; with it, the ticket is in review before or
+    // right after the Stop (plan4 D.42).
     fn on_turn_ended(&mut self, agent_id: &str, failed: bool) {
         let now = now_ms();
         if failed {
@@ -395,11 +432,124 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             self.port
                 .set_detail(agent_id, Some(TURN_FAILED_TEXT.to_string()));
-        } else {
+        } else if self.auto_review_on_stop {
             if let Err(e) = self.host.mutate(|s| s.complete_turn(agent_id, now)) {
                 log::warn!("dispatch {agent_id}: completing the turn failed: {e}");
             }
             self.consider(agent_id);
+        } else {
+            match self.host.mutate(|s| s.mark_not_submitted(agent_id, now)) {
+                Ok(Some(t)) => {
+                    log::info!(
+                        "dispatch {agent_id}: turn ended without submitting ticket {}",
+                        t.short_id()
+                    );
+                    self.port
+                        .set_detail(agent_id, Some(NOT_SUBMITTED_TEXT.to_string()));
+                }
+                Ok(None) => self.consider(agent_id),
+                Err(e) => log::warn!("dispatch {agent_id}: marking not submitted failed: {e}"),
+            }
+        }
+    }
+
+    /// "Bed om aflevering": the ticket must be in progress with an agent that is idle and has no
+    /// delivery running; otherwise this only logs. The line goes in after the user-input grace.
+    fn on_request_submission(&mut self, ticket_id: &str) {
+        let Some(t) = self.host.read(|s| s.get(ticket_id)) else {
+            log::info!("request submission: ticket {ticket_id} not found");
+            return;
+        };
+        let agent_id = match (&t.state, &t.assignee_agent_id) {
+            (TicketState::InProgress, Some(a)) => a.clone(),
+            _ => {
+                log::info!(
+                    "request submission: ticket {} is not in progress",
+                    t.short_id()
+                );
+                return;
+            }
+        };
+        let Some(snap) = self.port.snapshot(&agent_id) else {
+            log::info!("request submission: agent {agent_id} is gone");
+            return;
+        };
+        if snap.status != AgentStatus::Idle || *self.state(&agent_id) != Delivery::Free {
+            log::info!(
+                "request submission: agent {agent_id} is busy; ticket {} not nudged",
+                t.short_id()
+            );
+            return;
+        }
+        let delay = self.user_grace_left(&snap).unwrap_or(0);
+        let token = self.token();
+        self.schedule(&agent_id, token, TimerKind::NudgeDelay, delay);
+        self.set(
+            &agent_id,
+            Delivery::Nudging {
+                ticket_id: t.id,
+                token,
+            },
+        );
+    }
+
+    /// `NudgeDelay` came due: type the line if the agent is still idle, the user is not typing
+    /// and the ticket is still its in-progress ticket.
+    fn nudge_type(&mut self, agent_id: &str, ticket_id: &str, token: u64) {
+        let Some(snap) = self.port.snapshot(agent_id) else {
+            self.set(agent_id, Delivery::Free);
+            return;
+        };
+        if let Some(left) = self.user_grace_left(&snap) {
+            log::info!("dispatch {agent_id}: user typed recently; nudging in {left} ms");
+            self.schedule(agent_id, token, TimerKind::NudgeDelay, left);
+            return;
+        }
+        let current = self.host.read(|s| s.current_for_agent(agent_id));
+        let Some(t) = current.filter(|t| t.id == ticket_id) else {
+            log::info!("dispatch {agent_id}: ticket no longer in progress; no nudge");
+            self.set(agent_id, Delivery::Free);
+            return;
+        };
+        if snap.status != AgentStatus::Idle {
+            log::info!("dispatch {agent_id}: agent busy again; no nudge");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        let line = prompt::request_submission_line(&t.short_id());
+        if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
+            log::warn!("dispatch {agent_id}: typing the submission request failed: {e}");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        log::info!(
+            "dispatch {agent_id}: asked to submit ticket {}",
+            t.short_id()
+        );
+        self.schedule(agent_id, token, TimerKind::NudgeEnter, ENTER_DELAY_MS);
+    }
+
+    /// `NudgeEnter` came due: Enter, then the history note. The ticket's state and issue stay.
+    fn nudge_enter(&mut self, agent_id: &str, ticket_id: &str) {
+        self.set(agent_id, Delivery::Free);
+        if let Err(e) = self.port.write_input(agent_id, b"\r") {
+            log::warn!(
+                "dispatch {agent_id}: sending Enter after the submission request failed: {e}"
+            );
+            return;
+        }
+        let now = now_ms();
+        let r = self.host.mutate(|s| {
+            let issue = s.get(ticket_id).ok_or(TicketError::NotFound)?.issue;
+            s.set_issue(
+                ticket_id,
+                issue,
+                Some(SUBMISSION_REQUESTED_NOTE.into()),
+                now,
+            )
+        });
+        if let Err(e) = r {
+            log::warn!("dispatch {agent_id}: noting the submission request failed: {e}");
         }
     }
 
@@ -472,6 +622,20 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     self.delivery_failed(agent_id, &ticket_id, DELIVERY_UNCONFIRMED_NOTE);
                 }
             }
+            (
+                Delivery::Nudging {
+                    ticket_id,
+                    token: t,
+                },
+                TimerKind::NudgeDelay,
+            ) if t == token => self.nudge_type(agent_id, &ticket_id, token),
+            (
+                Delivery::Nudging {
+                    ticket_id,
+                    token: t,
+                },
+                TimerKind::NudgeEnter,
+            ) if t == token => self.nudge_enter(agent_id, &ticket_id),
             _ => log::debug!("dispatch {agent_id}: ignoring stale {kind:?} timer"),
         }
     }
@@ -1124,10 +1288,11 @@ mod tests {
         assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
     }
 
-    // (5)
+    // (5) Step 3 behaviour, kept behind AUTO_REVIEW_ON_STOP = true.
     #[test]
     fn turn_end_moves_the_ticket_to_review_or_done() {
         let mut h = Harness::new();
+        h.d.auto_review_on_stop = true;
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1240,6 +1405,7 @@ mod tests {
     #[test]
     fn rejected_ticket_goes_first_and_its_file_has_the_note() {
         let mut h = Harness::new();
+        h.d.auto_review_on_stop = true;
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1534,6 +1700,285 @@ mod tests {
         });
         h.advance(CONFIRM_TIMEOUT_MS - 1);
         assert_eq!(h.writes(), vec![("a1".into(), line(&a)), enter("a1")]);
+    }
+
+    // ---- step 4: Stop without submit, the in-progress guard, "Bed om aflevering" ----
+
+    fn stop(h: &mut Harness, agent: &str) {
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: agent.into(),
+            failed: false,
+        });
+        h.idle(agent);
+    }
+
+    /// Queues A and B for a1 and delivers A (confirmed, in progress).
+    fn a_in_progress(h: &mut Harness) -> (Ticket, Ticket) {
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        let b = h.queued("a1", "B");
+        deliver_until_enter(h, "a1");
+        h.submitted("a1", &line(&a));
+        assert_eq!(h.ticket(&a.id).state, S::InProgress);
+        (a, b)
+    }
+
+    fn request(h: &mut Harness, t: &Ticket) {
+        h.send(DispatchMsg::RequestSubmission {
+            ticket_id: t.id.clone(),
+        });
+    }
+
+    fn nudge(t: &Ticket) -> (String, String) {
+        ("a1".into(), prompt::request_submission_line(&t.short_id()))
+    }
+
+    #[test]
+    fn auto_review_follows_the_constant() {
+        let h = Harness::new();
+        assert_eq!(h.d.auto_review_on_stop, AUTO_REVIEW_ON_STOP);
+        assert!(!h.d.auto_review_on_stop);
+        let d = Dispatcher::new(h.d.host.clone(), h.port.clone(), h.timers.clone());
+        assert!(d.with_auto_review(true).auto_review_on_stop);
+    }
+
+    #[test]
+    fn stop_without_submit_keeps_the_ticket_in_progress_and_holds_the_queue() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.advance(10_000);
+        let now = h.ticket(&a.id);
+        assert_eq!(
+            (now.state, now.issue),
+            (S::InProgress, Some(TicketIssue::NotSubmitted))
+        );
+        let last = now.history.last().unwrap();
+        assert_eq!(
+            last.note.as_deref(),
+            Some(crate::tickets::NOT_SUBMITTED_NOTE)
+        );
+        assert_eq!(last.by, TicketActor::System);
+        assert_eq!(h.detail("a1").as_deref(), Some(NOT_SUBMITTED_TEXT));
+        // B is not typed although the queue has it.
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.ticket(&b.id).state, S::Assigned);
+        assert_eq!(h.timers.pending(), 0);
+    }
+
+    #[test]
+    fn stop_with_auto_review_moves_on_to_the_next_ticket() {
+        let mut h = Harness::new();
+        h.d.auto_review_on_stop = true;
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        assert_eq!(h.ticket(&a.id).state, S::Review);
+        assert_eq!(h.ticket(&a.id).issue, None);
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    #[test]
+    fn stop_without_a_ticket_in_progress_considers_the_queue() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        // E.g. the user's own prompt ended; nothing in progress.
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: "a1".into(),
+            failed: false,
+        });
+        assert_eq!(h.ticket(&a.id).issue, None);
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&a))]);
+        assert_eq!(h.detail("a1"), None);
+    }
+
+    #[test]
+    fn submit_by_the_tool_before_stop_lets_the_next_ticket_go() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.svc()
+            .submit_by_agent("a1", None, "Rettet login", 50)
+            .unwrap();
+        stop(&mut h, "a1");
+        let a_now = h.ticket(&a.id);
+        assert_eq!((a_now.state, a_now.issue), (S::Review, None));
+        assert_eq!(a_now.summary.as_deref(), Some("Rettet login"));
+        assert_eq!(h.detail("a1"), None);
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        assert_eq!(
+            &h.writes()[2..],
+            &[("a1".into(), line(&b_now)), enter("a1")]
+        );
+    }
+
+    #[test]
+    fn submit_after_a_not_submitted_stop_clears_it_and_the_queue_moves() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        assert_eq!(h.ticket(&a.id).issue, Some(TicketIssue::NotSubmitted));
+        h.svc().submit_by_agent("a1", None, "Færdig", 60).unwrap();
+        assert_eq!(h.ticket(&a.id).issue, None);
+        // tools.rs notifies the dispatcher; the agent is idle.
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    #[test]
+    fn no_ticket_is_typed_while_one_is_in_progress() {
+        let mut h = Harness::new();
+        let (_, b) = a_in_progress(&mut h);
+        // Esc mid-turn: Idle without Stop, then a queue change.
+        h.set_status("a1", AgentStatus::Idle);
+        h.idle("a1");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.ticket(&b.id).state, S::Assigned);
+    }
+
+    #[test]
+    fn confirm_clears_the_not_submitted_detail() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        assert_eq!(h.detail("a1").as_deref(), Some(NOT_SUBMITTED_TEXT));
+        // "Send til review" by the user.
+        h.svc().set_state(&a.id, S::Review, None, true, 70).unwrap();
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        h.submitted("a1", &line(&b_now));
+        assert_eq!(h.ticket(&b.id).state, S::InProgress);
+        assert_eq!(h.detail("a1"), None);
+    }
+
+    #[test]
+    fn request_submission_types_the_line_then_a_separate_enter() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        let before = h.ticket(&a.id);
+        request(&mut h, &a);
+        h.advance(0);
+        assert_eq!(h.writes()[2], nudge(&a));
+        assert!(!h.writes()[2].1.starts_with("Ticket"));
+        assert_eq!(h.writes().len(), 3);
+        h.advance(ENTER_DELAY_MS - 1);
+        assert_eq!(h.writes().len(), 3);
+        h.advance(1);
+        assert_eq!(h.writes()[3], enter("a1"));
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
+        // State and issue unchanged; only a history note.
+        let after = h.ticket(&a.id);
+        assert_eq!((after.state, after.issue), (before.state, before.issue));
+        assert_eq!(after.history.len(), before.history.len() + 1);
+        assert_eq!(
+            after.history.last().unwrap().note.as_deref(),
+            Some(SUBMISSION_REQUESTED_NOTE)
+        );
+        // Nothing else follows (only the stale confirm timer of the delivery is left).
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 4);
+    }
+
+    #[test]
+    fn request_submission_waits_for_the_user_input_grace() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.user_typed("a1");
+        request(&mut h, &a);
+        h.advance(USER_INPUT_GRACE_MS - 1);
+        assert_eq!(h.writes().len(), 2);
+        // Typing again during the wait postpones it once more.
+        h.user_typed("a1");
+        h.advance(1);
+        assert_eq!(h.writes().len(), 2);
+        h.advance(USER_INPUT_GRACE_MS);
+        assert_eq!(h.writes()[2], nudge(&a));
+    }
+
+    #[test]
+    fn request_submission_does_nothing_for_a_busy_agent_or_a_queued_ticket() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.set_status("a1", AgentStatus::Thinking);
+        request(&mut h, &a);
+        h.advance(10_000);
+        // A queued (not in progress) ticket is never nudged either.
+        h.set_status("a1", AgentStatus::Idle);
+        request(&mut h, &b);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.timers.pending(), 0);
+        // Not while a delivery sequence runs for the agent.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let c = h.queued("a1", "C");
+        h.idle("a1");
+        h.svc().mark_dispatched(&c.id, "bot-a1", 5).unwrap();
+        request(&mut h, &c);
+        assert!(matches!(h.d.state("a1"), Delivery::Delaying { .. }));
+    }
+
+    #[test]
+    fn foreign_prompt_or_busy_status_during_a_nudge_changes_nothing() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        request(&mut h, &a);
+        h.advance(0);
+        h.submitted("a1", "noget helt andet");
+        h.send(DispatchMsg::AgentBusy {
+            agent_id: "a1".into(),
+        });
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[3], enter("a1"));
+        let now = h.ticket(&a.id);
+        assert_eq!(
+            (now.state, now.issue),
+            (S::InProgress, Some(TicketIssue::NotSubmitted))
+        );
+        assert_eq!(h.ticket(&b.id).state, S::Assigned);
+    }
+
+    #[test]
+    fn nudge_write_failure_frees_the_agent_and_leaves_the_ticket() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        let before = h.ticket(&a.id);
+        lock(&h.port.0).fail_writes = true;
+        request(&mut h, &a);
+        h.advance(ENTER_DELAY_MS * 2);
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
+        assert_eq!(h.ticket(&a.id), before);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+    }
+
+    #[test]
+    fn nudge_is_dropped_when_the_ticket_moved_meanwhile() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.user_typed("a1");
+        request(&mut h, &a);
+        h.svc().set_state(&a.id, S::Review, None, true, 80).unwrap();
+        h.advance(USER_INPUT_GRACE_MS);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
     }
 
     #[test]

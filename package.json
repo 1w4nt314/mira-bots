@@ -7,8 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri": "tauri",
-    "dev:hook": "cargo build -p mira-hook",
-    "build:hook": "cargo build --release -p mira-hook",
+    "dev:hook": "cargo build -p mira-hook -p mira-mcp",
+    "build:hook": "cargo build --release -p mira-hook -p mira-mcp",
     "copy:hook": "node scripts/copy-hook.mjs"
   },
   "dependencies": {

@@ -2115,6 +2115,7 @@ dependencies = [
  "base64 0.22.1",
  "log",
  "mira-hook",
+ "mira-mcp",
  "portable-pty",
  "serde",
  "serde_json",

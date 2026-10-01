@@ -28,4 +28,5 @@ thiserror = "2"
 
 [dev-dependencies]
 mira-hook = { path = "../crates/mira-hook" }
+mira-mcp = { path = "../crates/mira-mcp" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "test-util"] }

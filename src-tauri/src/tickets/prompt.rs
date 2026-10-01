@@ -102,6 +102,14 @@ pub fn render_line(short: &str, title: &str) -> String {
     )
 }
 
+/// "Bed om aflevering" (C4.7): typed like a ticket line (one write, `\r` separately). It starts
+/// with "Du", never with "Ticket", so the dispatcher can never take it for a ticket delivery.
+pub fn request_submission_line(short: &str) -> String {
+    format!(
+        "Du afsluttede uden at aflevere ticket {short}. Kald mira_submit_for_review med en kort opsummering når opgaven er færdig; ellers fortsæt arbejdet."
+    )
+}
+
 /// The line for a ticket (sanitises the title).
 pub fn line_for(t: &Ticket) -> String {
     render_line(&t.short_id(), &sanitize_title(&t.title))
@@ -340,6 +348,18 @@ mod tests {
         }
         t.title = "z".repeat(300);
         assert!(line_for(&t).chars().count() < 300);
+    }
+
+    #[test]
+    fn request_submission_line_matches_the_contract() {
+        let l = request_submission_line("3f2a9c1e");
+        assert_eq!(
+            l,
+            "Du afsluttede uden at aflevere ticket 3f2a9c1e. Kald mira_submit_for_review med en kort opsummering når opgaven er færdig; ellers fortsæt arbejdet."
+        );
+        assert!(!l.starts_with("Ticket"));
+        assert!(!l.contains(['\r', '\n', '@']));
+        assert!(!FORBIDDEN_FIRST.contains(&l.chars().next().unwrap()));
     }
 
     #[test]

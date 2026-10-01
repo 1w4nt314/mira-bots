@@ -1,7 +1,9 @@
 //! Deserialised hook event as received from `mira-hook` over the pipe.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
+
+use crate::config::MCP_TOOL_PREFIX;
 
 /// Maximum length (chars) of a tool-input summary.
 pub const SUMMARY_MAX_CHARS: usize = 120;
@@ -32,8 +34,18 @@ pub struct HookEvent {
     pub prompt: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// `mcp_server.source` of an MCP tool event (`"dynamic"` for `--mcp-config` servers, e.g.
+    /// `"user"` for the user's own; Claude Code ≥ 2.1.274). `None` when absent or not a string;
+    /// a malformed `mcp_server` never fails the event.
+    #[serde(default, rename = "mcp_server", deserialize_with = "mcp_server_source")]
+    pub mcp_server_source: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn mcp_server_source<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(v.get("source").and_then(Value::as_str).map(str::to_string))
 }
 
 /// Parses the `event` value of a pipe frame.
@@ -66,9 +78,26 @@ fn str_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
+/// Danish label (C4.9) for one of the app's own MCP tools (`mcp__mira-bots__<name>`); `None`
+/// for any other tool.
+pub fn mira_tool_label(tool_name: &str) -> Option<&'static str> {
+    match tool_name.strip_prefix(MCP_TOOL_PREFIX)? {
+        "mira_create_ticket" => Some("Opretter ticket"),
+        "mira_list_tickets" => Some("Læser tickets"),
+        "mira_get_ticket" => Some("Læser ticket"),
+        "mira_submit_for_review" => Some("Afleverer til review"),
+        "mira_update_status" => Some("Opdaterer status"),
+        _ => None,
+    }
+}
+
 /// Short human-readable summary of what a tool call does (max 120 chars).
-/// Empty string when there is nothing sensible to show.
+/// Empty string when there is nothing sensible to show. The app's own MCP tools get their label
+/// instead: their arguments (title, body, summary, note) never reach the status line.
 pub fn summarize_tool_input(tool_name: &str, input: Option<&Value>) -> String {
+    if tool_name.starts_with(MCP_TOOL_PREFIX) {
+        return mira_tool_label(tool_name).unwrap_or_default().to_string();
+    }
     let Some(input) = input else {
         return String::new();
     };
@@ -213,6 +242,56 @@ mod tests {
         assert_eq!(summarize_tool_input("mcp__x__y", Some(&v)), "hello");
         assert_eq!(summarize_tool_input("Mystery", Some(&json!({"n":1}))), "");
         assert_eq!(summarize_tool_input("Bash", None), "");
+    }
+
+    #[test]
+    fn mcp_server_source_is_parsed_leniently() {
+        let base = json!({"hook_event_name":"PreToolUse","session_id":"s",
+                          "tool_name":"mcp__mira-bots__mira_list_tickets"});
+        let with = |server: Value| {
+            let mut v = base.clone();
+            v["mcp_server"] = server;
+            parse(&v).unwrap().mcp_server_source
+        };
+        assert_eq!(
+            with(json!({"name":"mira-bots","source":"dynamic"})).as_deref(),
+            Some("dynamic")
+        );
+        assert_eq!(
+            with(json!({"name":"mira-bots","source":"user"})).as_deref(),
+            Some("user")
+        );
+        assert_eq!(with(json!({"name":"mira-bots"})), None);
+        assert_eq!(with(json!("odd")), None);
+        assert_eq!(with(Value::Null), None);
+        let ev = parse(&base).unwrap();
+        assert_eq!(ev.mcp_server_source, None);
+        assert!(!ev.extra.contains_key("mcp_server"));
+        assert_eq!(parse_fixture(fx::PRE_TOOL_USE).mcp_server_source, None);
+    }
+
+    #[test]
+    fn own_mcp_tools_get_labels_never_their_arguments() {
+        let table = [
+            ("mira_create_ticket", "Opretter ticket"),
+            ("mira_list_tickets", "Læser tickets"),
+            ("mira_get_ticket", "Læser ticket"),
+            ("mira_submit_for_review", "Afleverer til review"),
+            ("mira_update_status", "Opdaterer status"),
+        ];
+        let input = json!({"summary":"hemmelig opsummering","title":"x","note":"y"});
+        for (tool, label) in table {
+            let name = format!("mcp__mira-bots__{tool}");
+            assert_eq!(mira_tool_label(&name), Some(label));
+            assert_eq!(summarize_tool_input(&name, Some(&input)), label);
+        }
+        assert_eq!(mira_tool_label("mcp__mira-bots__other"), None);
+        assert_eq!(
+            summarize_tool_input("mcp__mira-bots__other", Some(&input)),
+            ""
+        );
+        assert_eq!(mira_tool_label("mira_create_ticket"), None);
+        assert_eq!(mira_tool_label("mcp__x__mira_create_ticket"), None);
     }
 
     #[test]

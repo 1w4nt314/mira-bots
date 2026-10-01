@@ -53,6 +53,7 @@ export const COMMANDS = {
   rejectTicket: "reject_ticket",
   redispatchTicket: "redispatch_ticket",
   spawnAgentWithTicket: "spawn_agent_with_ticket",
+  requestSubmission: "request_submission",
 } as const;
 
 export const EVENTS = {
@@ -138,6 +139,10 @@ export const approveTicket = (id: string) =>
 /** `note` must not be blank; the ticket goes first in the agent's queue (or the backlog). */
 export const rejectTicket = (id: string, note: string) =>
   invoke<TicketSummary>(COMMANDS.rejectTicket, { id, note });
+/** "Bed om aflevering": the ticket must be in progress with a running agent; the line is typed
+ *  once the agent is idle. */
+export const requestSubmission = (ticketId: string) =>
+  invoke<void>(COMMANDS.requestSubmission, { ticketId });
 /** "Send igen": the dispatcher decides whether the ticket can be delivered now. */
 export const redispatchTicket = (id: string) => invoke<void>(COMMANDS.redispatchTicket, { id });
 /** Like `spawnAgent`, with the ticket line as the first prompt; the ticket heads the new queue. */

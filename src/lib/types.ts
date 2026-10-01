@@ -59,7 +59,8 @@ export interface PermissionRequestInfo {
 export interface AppInfo {
   claudePath: string | null;
   hookExe: string | null;
-  hooksJson: string;
+  /** The app's settings.json (hooks + permissions), passed with `--settings`. */
+  settingsJson: string;
   pipeName: string;
   maxAgents: number;
   version: string;
@@ -68,6 +69,15 @@ export interface AppInfo {
   maxStaffAgents: number;
   /** Parent of the default agent folders (`<home>/mira-bots/agents`). */
   agentsRoot: string;
+}
+
+/** The last tool call from an agent's MCP server (mira-mcp); arguments are never included. */
+export interface LastToolCall {
+  tool: string;
+  agentId: string | null;
+  ok: boolean;
+  /** Milliseconds since the Unix epoch. */
+  at: number;
 }
 
 export interface LastHookEvent {
@@ -88,8 +98,27 @@ export interface Diagnostics {
   /** Whether hooks.json's exec-form `args` is supported (>= 2.1.139); null when unknown. */
   claudeCodeArgsSupported: boolean | null;
   hookExe: string | null;
-  hooksJsonPath: string;
-  hooksJsonExists: boolean;
+  /**
+   * @deprecated No longer sent by the backend (renamed to `settingsPath`/`settingsExists` in
+   * step 4); still read by DiagnosticsPanel until the step 4 frontend batch replaces them.
+   */
+  hooksJsonPath?: string;
+  /** @deprecated See `hooksJsonPath`. */
+  hooksJsonExists?: boolean;
+  /** `<app_data_dir>/settings.json` (hooks + permissions). */
+  settingsPath: string;
+  settingsExists: boolean;
+  /** The mira-mcp exe; null: not found, agents get no tools. */
+  mcpExe: string | null;
+  mcpConfigPath: string;
+  mcpConfigExists: boolean;
+  systemPromptPath: string;
+  toolCalls: number;
+  toolErrors: number;
+  // TODO(step 4 frontend): `lastToolCall: LastToolCall | null` is sent too; add it together with
+  // DiagnosticsPanel's formatValue, which only knows LastHookEvent objects.
+  /** Whether a Stop moves the in-progress ticket to review (AUTO_REVIEW_ON_STOP). */
+  autoReviewOnStop: boolean;
   pipeName: string;
   pipeReady: boolean;
   framesReceived: number;

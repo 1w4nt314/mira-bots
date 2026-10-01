@@ -20,12 +20,13 @@ use crate::agent::{
     now_ms, AgentError, AgentInfo, AgentManager, AgentRole, EventSink, SeatKind, SpawnContext,
     SpawnRequest,
 };
-use crate::config::{MAX_STAFF_AGENTS, MAX_WORK_AGENTS, STARTING_HINT_AFTER};
+use crate::config::{AUTO_REVIEW_ON_STOP, MAX_STAFF_AGENTS, MAX_WORK_AGENTS, STARTING_HINT_AFTER};
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
-use crate::hooks::settings::write_hooks_json;
+use crate::hooks::settings::write_settings_json;
 use crate::hooks::status::AgentStatus;
 use crate::island::{self, IslandState};
+use crate::mcp;
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 use crate::tickets::dispatcher::DispatchMsg;
 use crate::tickets::model::{Ticket, TicketError, TicketPatch, TicketState, TicketSummary};
@@ -38,8 +39,16 @@ use crate::workplace;
 pub struct AppPaths {
     /// `mira-hook` binary; `None` disables spawning (`AgentError::HookExeNotFound`).
     pub hook_exe: Option<PathBuf>,
-    /// `<data_dir>/hooks.json`, passed to `claude --settings`.
-    pub hooks_json: PathBuf,
+    /// `<data_dir>/settings.json` (hooks + permissions), passed to `claude --settings`.
+    pub settings_json: PathBuf,
+    /// `mira-mcp` binary; `None`: agents are spawned without `--mcp-config` and
+    /// `--append-system-prompt-file` (no tools).
+    pub mcp_exe: Option<PathBuf>,
+    /// `<data_dir>/mcp.json`, passed to `claude --mcp-config` (only with `mcp_exe`).
+    pub mcp_config: PathBuf,
+    /// `<data_dir>/system-prompt.md`, passed to `claude --append-system-prompt-file` (only with
+    /// `mcp_exe`).
+    pub system_prompt: PathBuf,
     /// Named pipe (Windows) or socket path (Linux dev) the hook exe connects to.
     pub pipe_name: String,
     /// App data directory (`%APPDATA%\dk.mira.bots` on Windows).
@@ -83,7 +92,8 @@ pub struct AppState {
 pub struct AppInfo {
     pub claude_path: Option<String>,
     pub hook_exe: Option<String>,
-    pub hooks_json: String,
+    /// The app's settings.json (`hooksJson` up to step 3).
+    pub settings_json: String,
     pub pipe_name: String,
     pub max_agents: usize,
     pub version: String,
@@ -110,7 +120,7 @@ impl AppState {
         AppInfo {
             claude_path: path_string(&find_claude()),
             hook_exe: path_string(&self.paths.hook_exe),
-            hooks_json: self.paths.hooks_json.to_string_lossy().into_owned(),
+            settings_json: self.paths.settings_json.to_string_lossy().into_owned(),
             pipe_name: self.paths.pipe_name.clone(),
             max_agents: MAX_WORK_AGENTS,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -130,8 +140,16 @@ impl AppState {
             claude_version_note,
             claude_code_args_supported,
             hook_exe: path_string(&self.paths.hook_exe),
-            hooks_json_path: self.paths.hooks_json.to_string_lossy().into_owned(),
-            hooks_json_exists: self.paths.hooks_json.is_file(),
+            settings_path: self.paths.settings_json.to_string_lossy().into_owned(),
+            settings_exists: self.paths.settings_json.is_file(),
+            mcp_exe: path_string(&self.paths.mcp_exe),
+            mcp_config_path: self.paths.mcp_config.to_string_lossy().into_owned(),
+            mcp_config_exists: self.paths.mcp_config.is_file(),
+            system_prompt_path: self.paths.system_prompt.to_string_lossy().into_owned(),
+            tool_calls: self.hook_stats.tool_calls(),
+            tool_errors: self.hook_stats.tool_errors(),
+            last_tool_call: self.hook_stats.last_tool_call(),
+            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
             pipe_name: self.paths.pipe_name.clone(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
             frames_received: self.hook_stats.received(),
@@ -359,6 +377,30 @@ pub fn ticket_redispatch(t: &TicketsCtx, id: &str) -> Result<(), String> {
     }
 }
 
+/// "Bed om aflevering": the ticket must be in progress with a live agent; the dispatcher then
+/// types the nudge line (C4.7) once the agent is idle and no delivery runs (otherwise it only
+/// logs).
+pub fn ticket_request_submission(t: &TicketsCtx, id: &str) -> Result<(), String> {
+    let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    if tk.state != TicketState::InProgress {
+        return Err(TicketError::NotInProgress.into());
+    }
+    let live = tk
+        .assignee_agent_id
+        .as_deref()
+        .is_some_and(|a| agent_live(&t.manager, a));
+    if !live {
+        return Err(TicketError::AgentNotLive.into());
+    }
+    if t.send(DispatchMsg::RequestSubmission {
+        ticket_id: tk.id.clone(),
+    }) {
+        Ok(())
+    } else {
+        Err("Ticket-afsendelsen kører ikke — genstart mira-bots".into())
+    }
+}
+
 /// Only backlog tickets and rejected tickets without an agent can start a new agent.
 pub fn ticket_for_spawn(t: &TicketsCtx, id: &str) -> Result<Ticket, String> {
     let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
@@ -412,8 +454,8 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Result<Diagnostics, String
 }
 
 /// Everything a spawn needs that can fail before the agent exists, in this order: hook exe, pipe
-/// ready, claude, hooks.json, then the working folder (so a refused spawn never creates a
-/// default folder).
+/// ready, claude, settings.json (+ mcp.json and system-prompt.md when mira-mcp exists), then the
+/// working folder (so a refused spawn never creates a default folder).
 pub fn prepare_spawn(
     state: &AppState,
     cwd: Option<String>,
@@ -426,11 +468,22 @@ pub fn prepare_spawn(
         .ok_or(AgentError::HookExeNotFound)?;
     check_pipe_ready(&state.pipe_ready)?;
     let claude = find_claude().ok_or(AgentError::ClaudeNotFound)?;
-    // Rewrite hooks.json before every spawn (idempotent) so a moved hook exe is picked up.
-    let hooks_json = write_hooks_json(&state.paths.data_dir, hook_exe).map_err(AgentError::Io)?;
+    // Rewrite the files before every spawn (idempotent) so a moved exe is picked up.
+    let settings_json =
+        write_settings_json(&state.paths.data_dir, hook_exe).map_err(AgentError::Io)?;
+    let (mcp_config, system_prompt) = match &state.paths.mcp_exe {
+        Some(mcp_exe) => (
+            Some(mcp::write_mcp_json(&state.paths.data_dir, mcp_exe).map_err(AgentError::Io)?),
+            Some(mcp::write_system_prompt(&state.paths.data_dir).map_err(AgentError::Io)?),
+        ),
+        // Without the MCP server the system prompt would ask for tools that do not exist.
+        None => (None, None),
+    };
     let ctx = SpawnContext {
         claude,
-        hooks_json,
+        settings_json,
+        mcp_config,
+        system_prompt,
         pipe_name: state.paths.pipe_name.clone(),
     };
     let cwd = resolve_cwd(cwd, &state.paths.agents_root, role, &state.manager)?;
@@ -848,6 +901,11 @@ pub fn redispatch_ticket(state: State<'_, AppState>, id: String) -> Result<(), S
 }
 
 #[tauri::command]
+pub fn request_submission(state: State<'_, AppState>, ticket_id: String) -> Result<(), String> {
+    ticket_request_submission(&state.tickets, &ticket_id)
+}
+
+#[tauri::command]
 pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     lock(&state.manager).kill_all();
     app.exit(0);
@@ -951,7 +1009,7 @@ mod tests {
         let info = AppInfo {
             claude_path: None,
             hook_exe: Some("/h".into()),
-            hooks_json: "/d/hooks.json".into(),
+            settings_json: "/d/settings.json".into(),
             pipe_name: "pipe".into(),
             max_agents: 5,
             version: "0.1.0".into(),
@@ -961,7 +1019,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
-            json!({"claudePath":null,"hookExe":"/h","hooksJson":"/d/hooks.json",
+            json!({"claudePath":null,"hookExe":"/h","settingsJson":"/d/settings.json",
                    "pipeName":"pipe","maxAgents":5,"version":"0.1.0","pipeReady":false,
                    "maxStaffAgents":2,"agentsRoot":"/h/mira-bots/agents"})
         );
@@ -981,7 +1039,10 @@ mod tests {
             pending: Arc::new(Mutex::new(PendingPermissions::new())),
             paths: AppPaths {
                 hook_exe: None,
-                hooks_json: dir.join("hooks.json"),
+                settings_json: dir.join("settings.json"),
+                mcp_exe: None,
+                mcp_config: dir.join("mcp.json"),
+                system_prompt: dir.join("system-prompt.md"),
                 pipe_name: "pipe".into(),
                 data_dir: dir.to_path_buf(),
                 log_file: Some(dir.join("logs").join("mira-bots.log")),
@@ -1017,7 +1078,17 @@ mod tests {
         assert_eq!(d.claude_version.as_deref(), Some("2.1.286 (Claude Code)"));
         assert_eq!(d.claude_version_note, None);
         assert_eq!(d.claude_code_args_supported, Some(true));
-        assert!(!d.hooks_json_exists);
+        assert!(!d.settings_exists);
+        assert!(d.settings_path.ends_with("settings.json"));
+        assert_eq!(d.mcp_exe, None);
+        assert!(d.mcp_config_path.ends_with("mcp.json"));
+        assert!(!d.mcp_config_exists);
+        assert!(d.system_prompt_path.ends_with("system-prompt.md"));
+        assert_eq!(
+            (d.tool_calls, d.tool_errors, d.last_tool_call),
+            (0, 0, None)
+        );
+        assert!(!d.auto_review_on_stop);
         assert!(d.pipe_ready);
         assert_eq!((d.frames_received, d.frames_unknown_session), (1, 1));
         assert_eq!(d.last_hook_event.unwrap().name, "Stop");
@@ -1031,10 +1102,22 @@ mod tests {
             d.tickets_warning.as_deref(),
             Some("tickets.json kunne ikke læses")
         );
-        std::fs::write(dir.join("hooks.json"), "{}").unwrap();
+        std::fs::write(dir.join("settings.json"), "{}").unwrap();
+        std::fs::write(dir.join("mcp.json"), "{}").unwrap();
+        state
+            .hook_stats
+            .record_tool(crate::diagnostics::LastToolCall {
+                tool: "mira_list_tickets".into(),
+                agent_id: Some("a".into()),
+                ok: false,
+                at: 6,
+            });
         *lock(&state.claude_version) = VersionProbe::Pending;
         let d = state.diagnostics();
-        assert!(d.hooks_json_exists);
+        assert!(d.settings_exists);
+        assert!(d.mcp_config_exists);
+        assert_eq!((d.tool_calls, d.tool_errors), (1, 1));
+        assert_eq!(d.last_tool_call.unwrap().tool, "mira_list_tickets");
         assert_eq!(d.claude_version_note.as_deref(), Some("kører stadig"));
         assert_eq!(d.claude_code_args_supported, None);
         let info = state.app_info();
@@ -1266,6 +1349,52 @@ mod tests {
         assert_eq!(got.state, TicketState::Assigned);
         assert_eq!(got.queue_position, Some(0));
         assert_eq!(lock(&t.ctx.manager).get(&live).unwrap().queue_length, 1);
+    }
+
+    #[test]
+    fn request_submission_needs_an_in_progress_ticket_with_a_live_agent() {
+        let (mut t, live, dead) = tickets_setup();
+        let in_progress = |agent: &str| {
+            let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+            t.ctx
+                .mutate(|s| {
+                    s.assign(&tk.id, agent, 2)?;
+                    s.mark_dispatched(&tk.id, "bot", 3)
+                })
+                .unwrap()
+        };
+        let mine = in_progress(&live);
+        let orphan = in_progress(&dead);
+        t.sent();
+        ticket_request_submission(&t.ctx, &mine.id).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::RequestSubmission {
+                ticket_id: mine.id.clone()
+            }]
+        );
+        // The ticket itself is untouched by the command.
+        assert_eq!(t.ctx.read(|s| s.get(&mine.id)).unwrap(), mine);
+        assert_eq!(
+            ticket_request_submission(&t.ctx, &orphan.id).unwrap_err(),
+            "Agenten kører ikke"
+        );
+        // A review ticket is not in progress.
+        t.ctx.mutate(|s| s.complete_turn(&live, 4)).unwrap();
+        assert_eq!(
+            ticket_request_submission(&t.ctx, &mine.id).unwrap_err(),
+            "Ticketen er ikke i gang"
+        );
+        let backlog = ticket_create(&t.ctx, "y", "", false).unwrap();
+        assert_eq!(
+            ticket_request_submission(&t.ctx, &backlog.id).unwrap_err(),
+            "Ticketen er ikke i gang"
+        );
+        assert_eq!(
+            ticket_request_submission(&t.ctx, "nope").unwrap_err(),
+            "Ticketen findes ikke"
+        );
+        assert!(t.sent().is_empty());
     }
 
     #[test]

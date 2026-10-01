@@ -152,7 +152,13 @@ fn prompt_looks_like_flag(prompt: Option<&str>) -> bool {
 #[derive(Clone, Debug)]
 pub struct SpawnContext {
     pub claude: PathBuf,
-    pub hooks_json: PathBuf,
+    /// The app's settings.json (hooks + `permissions.allow`), passed with `--settings`.
+    pub settings_json: PathBuf,
+    /// mcp.json, passed with `--mcp-config`; `None` when mira-mcp was not found.
+    pub mcp_config: Option<PathBuf>,
+    /// system-prompt.md, passed with `--append-system-prompt-file`; `None` without mira-mcp
+    /// (the prompt asks for tools that would not exist).
+    pub system_prompt: Option<PathBuf>,
     pub pipe_name: String,
 }
 
@@ -185,9 +191,15 @@ fn name_for(cwd: &Path) -> String {
         .unwrap_or_else(|| cwd.to_string_lossy().into_owned())
 }
 
-/// Command line for one interactive claude session:
-/// `claude --settings <hooks.json> --session-id <uuid> [prompt]`, env `MIRA_BOTS_PIPE` and
-/// `MIRA_AGENT_ID`. No `-p`, no `--permission-mode`, no `--setting-sources`.
+/// Command line for one interactive claude session (C4.11):
+/// `claude --settings <settings.json> [--mcp-config <mcp.json>]
+/// [--append-system-prompt-file <system-prompt.md>] --session-id <uuid> [prompt]`, env
+/// `MIRA_BOTS_PIPE` and `MIRA_AGENT_ID`. No `-p`, no `--permission-mode`, no
+/// `--setting-sources`, no `--strict-mcp-config` (it would drop the user's own MCP servers).
+///
+/// `--mcp-config` is variadic: a value directly after its path would be read as one more config
+/// file ("MCP config file not found: …/<prompt>", research4 Q2). So its path is always followed
+/// by another flag, and `--session-id` always stands last before the positional prompt.
 pub fn build_spawn_spec(
     req: &SpawnRequest,
     ctx: &SpawnContext,
@@ -196,10 +208,20 @@ pub fn build_spawn_spec(
 ) -> SpawnSpec {
     let mut args = vec![
         "--settings".to_string(),
-        ctx.hooks_json.to_string_lossy().into_owned(),
-        "--session-id".to_string(),
-        session_id.to_string(),
+        ctx.settings_json.to_string_lossy().into_owned(),
     ];
+    // TODO(windows-verify): the order below starts claude with a positional prompt and loads
+    // the MCP server (plan4 D.39, D.43).
+    if let Some(m) = &ctx.mcp_config {
+        args.push("--mcp-config".to_string());
+        args.push(m.to_string_lossy().into_owned());
+    }
+    if let Some(p) = &ctx.system_prompt {
+        args.push("--append-system-prompt-file".to_string());
+        args.push(p.to_string_lossy().into_owned());
+    }
+    args.push("--session-id".to_string());
+    args.push(session_id.to_string());
     if let Some(p) = req.prompt.as_ref().filter(|p| !p.trim().is_empty()) {
         args.push(p.clone());
     }
@@ -687,8 +709,95 @@ mod tests {
     fn ctx(claude: PathBuf) -> SpawnContext {
         SpawnContext {
             claude,
-            hooks_json: PathBuf::from("/data/hooks.json"),
+            settings_json: PathBuf::from("/data/settings.json"),
+            mcp_config: None,
+            system_prompt: None,
             pipe_name: "pipe-x".into(),
+        }
+    }
+
+    fn ctx_with_mcp(claude: PathBuf) -> SpawnContext {
+        SpawnContext {
+            mcp_config: Some(PathBuf::from("/data/mcp.json")),
+            system_prompt: Some(PathBuf::from("/data/system-prompt.md")),
+            ..ctx(claude)
+        }
+    }
+
+    fn work_req(prompt: Option<&str>) -> SpawnRequest {
+        SpawnRequest {
+            cwd: PathBuf::from("/w/demo"),
+            prompt: prompt.map(str::to_string),
+            role: AgentRole::None,
+            seat_kind: SeatKind::Work,
+        }
+    }
+
+    #[test]
+    fn spawn_spec_with_mcp_server_and_system_prompt() {
+        let spec = build_spawn_spec(
+            &work_req(Some("fix it")),
+            &ctx_with_mcp(PathBuf::from("/bin/claude")),
+            "sid",
+            "aid",
+        );
+        assert_eq!(
+            spec.args,
+            [
+                "--settings",
+                "/data/settings.json",
+                "--mcp-config",
+                "/data/mcp.json",
+                "--append-system-prompt-file",
+                "/data/system-prompt.md",
+                "--session-id",
+                "sid",
+                "fix it"
+            ]
+        );
+        assert_eq!(
+            spec.env,
+            vec![
+                ("MIRA_BOTS_PIPE".to_string(), "pipe-x".to_string()),
+                ("MIRA_AGENT_ID".to_string(), "aid".to_string()),
+            ]
+        );
+    }
+
+    /// For every combination: `--mcp-config <path>` is followed by a flag (never the prompt),
+    /// `--session-id <sid>` is the last flag before the prompt, no `--strict-mcp-config`.
+    #[test]
+    fn spawn_spec_never_puts_the_prompt_after_mcp_config() {
+        let claude = PathBuf::from("/bin/claude");
+        for mcp in [false, true] {
+            for prompt_file in [false, true] {
+                for prompt in [None, Some("fix it"), Some("Ticket abc: x")] {
+                    let mut c = ctx(claude.clone());
+                    if mcp {
+                        c.mcp_config = Some(PathBuf::from("/data/mcp.json"));
+                    }
+                    if prompt_file {
+                        c.system_prompt = Some(PathBuf::from("/data/system-prompt.md"));
+                    }
+                    let a = build_spawn_spec(&work_req(prompt), &c, "sid", "aid").args;
+                    assert!(!a.iter().any(|x| x == "--strict-mcp-config" || x == "--"));
+                    if let Some(i) = a.iter().position(|x| x == "--mcp-config") {
+                        assert!(a[i + 2].starts_with("--"), "{a:?}");
+                    }
+                    assert_eq!(a.iter().any(|x| x == "--mcp-config"), mcp);
+                    assert_eq!(
+                        a.iter().any(|x| x == "--append-system-prompt-file"),
+                        prompt_file
+                    );
+                    let flags = if prompt.is_some() { 3 } else { 2 };
+                    assert_eq!(a[a.len() - flags], "--session-id", "{a:?}");
+                    assert_eq!(a[a.len() - flags + 1], "sid");
+                    if let Some(p) = prompt {
+                        assert_eq!(a.last().unwrap(), p);
+                    }
+                    assert_eq!(a[0], "--settings");
+                }
+            }
         }
     }
 
@@ -710,7 +819,7 @@ mod tests {
             spec.args,
             [
                 "--settings",
-                "/data/hooks.json",
+                "/data/settings.json",
                 "--session-id",
                 "sid",
                 "fix it"

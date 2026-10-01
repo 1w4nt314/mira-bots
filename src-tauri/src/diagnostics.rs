@@ -233,7 +233,7 @@ impl HookStats {
     }
 }
 
-/// `get_diagnostics` result (C2.3), camelCase.
+/// `get_diagnostics` result (C2.3 + C4.1), camelCase.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostics {
@@ -242,8 +242,22 @@ pub struct Diagnostics {
     pub claude_version_note: Option<String>,
     pub claude_code_args_supported: Option<bool>,
     pub hook_exe: Option<String>,
-    pub hooks_json_path: String,
-    pub hooks_json_exists: bool,
+    /// `<app_data_dir>/settings.json` (hooks + permissions; `hooks.json` up to step 3).
+    pub settings_path: String,
+    pub settings_exists: bool,
+    /// The mira-mcp exe; `None`: not found, agents get no tools.
+    pub mcp_exe: Option<String>,
+    /// `<app_data_dir>/mcp.json` (written only when mira-mcp was found).
+    pub mcp_config_path: String,
+    pub mcp_config_exists: bool,
+    /// `<app_data_dir>/system-prompt.md`.
+    pub system_prompt_path: String,
+    /// Tool frames answered (all / `ok: false`) and the last one.
+    pub tool_calls: u64,
+    pub tool_errors: u64,
+    pub last_tool_call: Option<LastToolCall>,
+    /// [`crate::config::AUTO_REVIEW_ON_STOP`]: whether a Stop moves the ticket to review.
+    pub auto_review_on_stop: bool,
     pub pipe_name: String,
     pub pipe_ready: bool,
     pub frames_received: u64,
@@ -419,8 +433,21 @@ mod tests {
             claude_version_note: None,
             claude_code_args_supported: Some(true),
             hook_exe: None,
-            hooks_json_path: "/d/hooks.json".into(),
-            hooks_json_exists: true,
+            settings_path: "/d/settings.json".into(),
+            settings_exists: true,
+            mcp_exe: None,
+            mcp_config_path: "/d/mcp.json".into(),
+            mcp_config_exists: false,
+            system_prompt_path: "/d/system-prompt.md".into(),
+            tool_calls: 7,
+            tool_errors: 2,
+            last_tool_call: Some(LastToolCall {
+                tool: "mira_submit_for_review".into(),
+                agent_id: Some("a".into()),
+                ok: false,
+                at: 11,
+            }),
+            auto_review_on_stop: false,
             pipe_name: "p".into(),
             pipe_ready: true,
             frames_received: 3,
@@ -448,8 +475,16 @@ mod tests {
                 "claudeVersionNote": null,
                 "claudeCodeArgsSupported": true,
                 "hookExe": null,
-                "hooksJsonPath": "/d/hooks.json",
-                "hooksJsonExists": true,
+                "settingsPath": "/d/settings.json",
+                "settingsExists": true,
+                "mcpExe": null,
+                "mcpConfigPath": "/d/mcp.json",
+                "mcpConfigExists": false,
+                "systemPromptPath": "/d/system-prompt.md",
+                "toolCalls": 7,
+                "toolErrors": 2,
+                "lastToolCall": {"tool": "mira_submit_for_review", "agentId": "a", "ok": false, "at": 11},
+                "autoReviewOnStop": false,
                 "pipeName": "p",
                 "pipeReady": true,
                 "framesReceived": 3,
