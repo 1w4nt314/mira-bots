@@ -142,6 +142,10 @@ check(
 );
 check({ ...o.COMPACT }, { deskH: 48, fig: 28 }, "COMPACT");
 check(o.TERM_LINE_H, 34, "TERM_LINE_H");
+check(o.PLACEHOLDER_MIN, 56, "PLACEHOLDER_MIN");
+// No agent selected at the minimum window (available 488): the office keeps its default height.
+check(o.clampFloorHeight(360, 488, o.floorMin("discreet"), o.PLACEHOLDER_MIN), 360, "placeholder keeps floor at 820x540");
+check(o.clampFloorHeight(360, 488, o.floorMin("more"), o.PLACEHOLDER_MIN), 360, "placeholder keeps floor at 820x540 (more)");
 check(o.SPLITTER_STEP, 16, "SPLITTER_STEP");
 check(
   [o.FLOOR_DEFAULT, o.FLOOR_MIN, o.TERM_MIN, o.XTERM_MIN, o.SPLITTER_H, o.FLOOR_CHROME, o.WALL_H],

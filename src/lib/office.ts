@@ -54,6 +54,9 @@ export const FLOOR_MIN = SEAT_ROWS * DESK_H_MIN + FLOOR_CHROME;
 export const FLOOR_HARD_MIN = DESK_H_MIN + FLOOR_CHROME;
 
 /** Terminal panel minimum in normal mode for a measured header/queue height (0 = not measured). */
+/** Minimum height of the "Vælg en plads…" placeholder (no terminal, so no rows to protect). */
+export const PLACEHOLDER_MIN = 56;
+
 export function termMinFor(chromeH: number): number {
   const h = Number.isFinite(chromeH) && chromeH > 0 ? chromeH : 0;
   // + 1: the panel's border-top sits outside the measured header/queue block

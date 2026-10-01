@@ -31,6 +31,7 @@ import {
   parseTermMode,
   SPLITTER_H,
   STORAGE_KEYS,
+  PLACEHOLDER_MIN,
   termMinFor,
   type OfficeDetail,
   type TermMode,
@@ -291,7 +292,8 @@ export default function Workplace() {
   // column is too low for both, the terminal wins: the floor shrinks towards one seat row
   // (FLOOR_HARD_MIN) and scrolls (`cramped`), so the xterm's input line stays on screen (W5).
   const minFloor = floorMin(detail);
-  const minTerm = selected === null ? termMinFor(0) : termMinFor(chromeH);
+  // No agent selected: the placeholder line needs no terminal rows, so the office keeps its size.
+  const minTerm = selected === null ? PLACEHOLDER_MIN : termMinFor(chromeH);
   const clampFloor = (h: number) => clampFloorHeight(h, available, minFloor, minTerm);
   const floorStyleHeight = clampFloor(floorHeight);
   const measured = Number.isFinite(available);
