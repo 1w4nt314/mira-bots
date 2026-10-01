@@ -1,4 +1,4 @@
-//! The sixteen tools (plan4 C4.3 + plan5 C5.3 + step 5c's handoff): `tools/list` definitions, the role matrix and
+//! The sixteen tools (plan4 C4.3 + plan5 C5.3 + step 5c's handoff; ten common): `tools/list` definitions, the role matrix and
 //! argument validation before anything is sent to the app. The app validates again (C4.12) and
 //! enforces the role matrix itself (the security boundary); this layer gives the model a quick,
 //! precise error without a pipe round trip and only lists the tools its roles allow.
@@ -26,7 +26,9 @@ pub const GET_REPORT: &str = "mira_get_report";
 pub const HANDOFF_TICKET: &str = "mira_handoff_ticket";
 
 /// Tools every agent has, whatever its roles (plan5 A.2).
-pub const COMMON_TOOLS: [&str; 9] = [
+/// `mira_list_agents` is common since step 5c (read-only): any agent handing a ticket on with
+/// `mira_handoff_ticket` must be able to find a free work agent.
+pub const COMMON_TOOLS: [&str; 10] = [
     CREATE_TICKET,
     LIST_TICKETS,
     GET_TICKET,
@@ -36,16 +38,16 @@ pub const COMMON_TOOLS: [&str; 9] = [
     ADD_REPORT,
     GET_REPORT,
     HANDOFF_TICKET,
+    LIST_AGENTS,
 ];
 
 /// Tools only some roles have (the union of [`ROLE_TOOLS`]).
-pub const ROLE_BOUND_TOOLS: [&str; 7] = [
+pub const ROLE_BOUND_TOOLS: [&str; 6] = [
     APPROVE_TICKET,
     REJECT_TICKET,
     ASSIGN_TICKET,
     UNASSIGN_TICKET,
     SPAWN_AGENT,
-    LIST_AGENTS,
     LIST_PROFILES,
 ];
 
@@ -63,12 +65,12 @@ pub const ALL_TOOL_NAMES: [&str; 16] = [
     ADD_REPORT,
     GET_REPORT,
     HANDOFF_TICKET,
+    LIST_AGENTS,
     APPROVE_TICKET,
     REJECT_TICKET,
     ASSIGN_TICKET,
     UNASSIGN_TICKET,
     SPAWN_AGENT,
-    LIST_AGENTS,
     LIST_PROFILES,
 ];
 
@@ -80,13 +82,7 @@ pub const ROLE_TOOLS: &[(&str, &[&str])] = &[
     ("reviewer", &[APPROVE_TICKET, REJECT_TICKET]),
     (
         "coordinator",
-        &[
-            ASSIGN_TICKET,
-            UNASSIGN_TICKET,
-            SPAWN_AGENT,
-            LIST_AGENTS,
-            LIST_PROFILES,
-        ],
+        &[ASSIGN_TICKET, UNASSIGN_TICKET, SPAWN_AGENT, LIST_PROFILES],
     ),
     ("planner", &[]),
     ("debugger", &[]),
@@ -251,6 +247,12 @@ pub fn definitions() -> Vec<Value> {
             "annotations": annotations(false, false)
         }),
         json!({
+            "name": LIST_AGENTS,
+            "description": "Lister agenterne i appen: id, navn, profil, roller, plads, status, ticket i gang, kølængde og åbne reviews.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": annotations(true, true)
+        }),
+        json!({
             "name": APPROVE_TICKET,
             "description": "Godkender en ticket du er reviewer på: den går til Done. Kun tickets i Review, aldrig dine egne afleveringer. Skriv kort hvad du har tjekket i note.",
             "inputSchema": {
@@ -317,12 +319,6 @@ pub fn definitions() -> Vec<Value> {
                 "additionalProperties": false
             },
             "annotations": annotations(false, false)
-        }),
-        json!({
-            "name": LIST_AGENTS,
-            "description": "Lister agenterne i appen: id, navn, profil, roller, plads, status, ticket i gang, kølængde og åbne reviews.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
-            "annotations": annotations(true, true)
         }),
         json!({
             "name": LIST_PROFILES,
@@ -618,11 +614,18 @@ mod tests {
         for role in ["coder", "researcher", "planner", "debugger", "nobody"] {
             assert_eq!(tools_for_roles(&[role]), COMMON_TOOLS.to_vec(), "{role}");
         }
-        assert_eq!(tools_for_roles(&["reviewer"]).len(), 11);
+        assert_eq!(COMMON_TOOLS.len(), 10);
+        assert_eq!(ALL_TOOL_NAMES.len(), 16);
+        assert_eq!(tools_for_roles(&["reviewer"]).len(), 12);
         assert_eq!(tools_for_roles(&["coordinator"]).len(), 14);
-        // Step 5c: every role may hand its own ticket on.
+        // Step 5c: every role may hand its own ticket on, and find a free agent for it.
         assert!(is_allowed(HANDOFF_TICKET, &["coder"]));
         assert!(is_allowed(HANDOFF_TICKET, &none));
+        for roles in [&[][..], &["coder"][..], &["reviewer"][..], &["planner"][..]] {
+            assert!(is_allowed(LIST_AGENTS, roles), "{roles:?}");
+        }
+        assert!(!is_allowed(LIST_PROFILES, &["reviewer"]));
+        assert!(!is_allowed(ASSIGN_TICKET, &["planner"]));
         let all = [
             "coder",
             "researcher",
@@ -869,15 +872,15 @@ mod tests {
                 .collect()
         };
         for (roles, n) in [
-            (&[][..], 9),
-            (&["coder"][..], 9),
-            (&["researcher"][..], 9),
-            (&["planner"][..], 9),
-            (&["debugger"][..], 9),
-            (&["reviewer"][..], 11),
+            (&[][..], 10),
+            (&["coder"][..], 10),
+            (&["researcher"][..], 10),
+            (&["planner"][..], 10),
+            (&["debugger"][..], 10),
+            (&["reviewer"][..], 12),
             (&["coordinator"][..], 14),
             (&["coder", "reviewer", "coordinator"][..], 16),
-            (&["nobody"][..], 9),
+            (&["nobody"][..], 10),
         ] {
             assert_eq!(names(roles).len(), n, "{roles:?}");
             let want: Vec<String> = tools_for_roles(roles)

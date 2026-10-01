@@ -240,6 +240,35 @@ impl TicketsCtx {
         );
     }
 
+    /// Review 5c W4: `from_agent`'s ticket in progress left it (handed to `to_name`, or back to
+    /// the backlog with `None`). Its detail becomes "Ticket <short> givet videre" (whatever the
+    /// actor; it replaces a stale "ikke afleveret"/"turn fejlede" hint and goes like the other
+    /// hints: with the next status or delivery). `by_someone_else` (the user took it, not the
+    /// agent itself): the dispatcher also types a "Du skal stoppe …" line once the agent is
+    /// idle. Call before [`Self::notify`], so the line goes before the agent's next delivery.
+    pub fn handed_over(
+        &self,
+        from_agent: &str,
+        ticket: &Ticket,
+        to_name: Option<&str>,
+        by_someone_else: bool,
+    ) {
+        if from_agent.is_empty() {
+            return;
+        }
+        let short = ticket.short_id();
+        self.set_agent_detail(from_agent, Some(prompt::handed_over_detail(&short)), |_| {
+            true
+        });
+        if by_someone_else {
+            self.send(DispatchMsg::HandedOver {
+                agent_id: from_agent.to_string(),
+                ticket_id: ticket.id.clone(),
+                to_name: to_name.map(str::to_string),
+            });
+        }
+    }
+
     /// Tells the dispatcher that these agents' queues changed (each id once).
     pub fn notify<I, S>(&self, agent_ids: I)
     where
@@ -948,7 +977,11 @@ mod tests {
                 AgentMeta {
                     id: uuid::Uuid::new_v4().to_string(),
                     session_id: "s".into(),
-                    profile: ProfileSnapshot::default(),
+                    // A work role: the plain ticket line (review 5c W1).
+                    profile: ProfileSnapshot {
+                        roles: vec![Role::Coder],
+                        ..ProfileSnapshot::default()
+                    },
                     seat_kind: SeatKind::Work,
                 },
                 sink,

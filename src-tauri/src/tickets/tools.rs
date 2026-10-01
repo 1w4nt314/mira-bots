@@ -680,7 +680,10 @@ impl ToolsCtx {
                 .tickets
                 .mutate(|s| s.give_back(ticket_id, Some(&agent.id), now))?,
         };
-        self.tickets.clear_stale_detail(&agent.id);
+        // The service only lets the assignee hand its own ticket on, so the sender is the
+        // caller: it gets the detail text, never the "Du skal stoppe …" line (review 5c W4).
+        self.tickets
+            .handed_over(&agent.id, &t, target.map(|a| a.name.as_str()), false);
         self.tickets
             .notify(std::iter::once(agent.id.as_str()).chain(target.map(|a| a.id.as_str())));
         log::info!(
@@ -1411,7 +1414,7 @@ mod tests {
     #[test]
     fn role_tool_matrix_is_enforced() {
         let t = setup();
-        const COMMON: [&str; 9] = [
+        const COMMON: [&str; 10] = [
             "mira_create_ticket",
             "mira_list_tickets",
             "mira_get_ticket",
@@ -1421,6 +1424,7 @@ mod tests {
             "mira_add_report",
             "mira_get_report",
             "mira_handoff_ticket",
+            "mira_list_agents",
         ];
         let table: [(&[Role], &[&str]); 8] = [
             (&[], &[]),
@@ -1438,7 +1442,6 @@ mod tests {
                     "mira_assign_ticket",
                     "mira_unassign_ticket",
                     "mira_spawn_agent",
-                    "mira_list_agents",
                     "mira_list_profiles",
                 ],
             ),
@@ -1450,7 +1453,6 @@ mod tests {
                     "mira_assign_ticket",
                     "mira_unassign_ticket",
                     "mira_spawn_agent",
-                    "mira_list_agents",
                     "mira_list_profiles",
                 ],
             ),
@@ -2056,7 +2058,12 @@ mod tests {
             .starts_with("overdraget fra "));
         // The coordinator has nothing in progress any more; both queues are woken.
         assert_eq!(t.tc.ctx.read(|s| s.current_for_agent(&t.k)), None);
-        assert_eq!(t.detail(&t.k), None, "stale hint cleared");
+        // Review 5c W4: the detail says so; it handed it on itself, so no stop line (below:
+        // only the two QueueChanged).
+        assert_eq!(
+            t.detail(&t.k).as_deref(),
+            Some(format!("Ticket {} givet videre", tk.short_id()).as_str())
+        );
         let mut sent = t.tc.sent();
         sent.sort_by_key(|m| format!("{m:?}"));
         let mut want = vec![

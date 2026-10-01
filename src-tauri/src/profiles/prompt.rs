@@ -27,12 +27,16 @@ pub fn role_text(role: Role) -> &'static str {
     match role {
         Role::Coder => "Du er koder: du implementerer tickets i din arbejdsmappe, kører tests og afleverer med en rapport der beskriver ændringerne.",
         Role::Researcher => "Du er researcher: du undersøger og dokumenterer; dine afleveringer er tekst (rapport), ikke kodeændringer, medmindre ticketen siger andet.",
-        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report. Du ændrer ikke selv kode eller filer.",
-        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Du godkender ikke tickets selv; det gør reviewere eller brugeren. Du udfører aldrig selve arbejdet (ingen kode, ingen filændringer) — det gør arbejdsagenterne; en ticket du får, giver du videre med mira_assign_ticket eller deler op.",
-        Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede tickets med klare acceptkriterier (mira_create_ticket), men tildeler dem ikke. Du ændrer ikke selv kode eller filer.",
+        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report.",
+        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op.",
+        Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede tickets med klare acceptkriterier (mira_create_ticket), men tildeler dem ikke.",
         Role::Debugger => "Du er debugger: du reproducerer fejl, finder årsagen og retter eller dokumenterer den; skriv altid reproduktion og årsag i rapporten.",
     }
 }
+
+/// Added after the role texts when the profile has no work role (coder/researcher/debugger):
+/// the file tools are denied for such a profile (review 5c W1/W3), Bash is not.
+pub const NO_WORK_ROLE_TEXT: &str = "Du udfører aldrig selve arbejdet: du ændrer ikke kode eller filer (filværktøjerne er slået fra for din profil), og du bruger heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i). En arbejdsopgave giver du videre til en arbejdsagent (mira_handoff_ticket) eller deler op i tickets.";
 
 /// Heading of the role section.
 pub const ROLE_HEADING: &str = "## Din rolle";
@@ -73,8 +77,12 @@ pub fn render_profile_prompt(profile: &AgentProfile, rules: &WorkspaceRules) -> 
         out.push('\n');
         out.push_str(ROLE_HEADING);
         out.push('\n');
-        for role in roles {
-            out.push_str(role_text(role));
+        for role in &roles {
+            out.push_str(role_text(*role));
+            out.push('\n');
+        }
+        if !roles::has_work_role(&roles) {
+            out.push_str(NO_WORK_ROLE_TEXT);
             out.push('\n');
         }
     }
@@ -142,24 +150,27 @@ mod tests {
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "Role::ALL order");
     }
 
+    /// Review 5c W1/W3: the "do not do the work" paragraph follows the roles, not the seat, and
+    /// only when the profile has no work role (a specialist with coder may code).
     #[test]
-    fn staff_role_texts_forbid_doing_the_work() {
-        for role in [Role::Reviewer, Role::Planner] {
-            assert!(
-                role_text(role).ends_with("Du ændrer ikke selv kode eller filer."),
-                "{role:?}"
-            );
+    fn no_work_role_paragraph_only_without_a_work_role() {
+        for id in ["reviewer", "planner", "coordinator"] {
+            let text = render_profile_prompt(&builtin_profile(id).unwrap(), &rules());
+            assert_eq!(text.matches(NO_WORK_ROLE_TEXT).count(), 1, "{id}");
+            let r = text.find(ROLE_HEADING).unwrap();
+            let n = text.find(NO_WORK_ROLE_TEXT).unwrap();
+            let rules_at = text.find(RULES_HEADING).unwrap();
+            assert!(r < n && n < rules_at, "{id}");
         }
-        assert!(role_text(Role::Coordinator).ends_with(
-            "Du udfører aldrig selve arbejdet (ingen kode, ingen filændringer) — det gør arbejdsagenterne; en ticket du får, giver du videre med mira_assign_ticket eller deler op."
-        ));
-        for role in [Role::Coder, Role::Researcher, Role::Debugger] {
-            let t = role_text(role);
-            assert!(
-                !t.contains("ændrer ikke") && !t.contains("aldrig selve"),
-                "{role:?}"
-            );
+        for id in ["coder", "researcher", "debugger", "specialist"] {
+            let text = render_profile_prompt(&builtin_profile(id).unwrap(), &rules());
+            assert!(!text.contains(NO_WORK_ROLE_TEXT), "{id}");
+            assert!(!text.contains("ændrer ikke"), "{id}");
         }
+        for role in Role::ALL {
+            assert!(!role_text(role).contains("Bash til at skrive"), "{role:?}");
+        }
+        assert!(role_text(Role::Coordinator).contains("koordineringsopgave, giver du videre"));
     }
 
     #[test]

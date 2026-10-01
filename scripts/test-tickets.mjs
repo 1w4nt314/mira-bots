@@ -87,8 +87,12 @@ const tickets = [
 eq(k.reviewsFor(tickets, "R1").map((t) => t.id), ["a", "d"], "reviewsFor");
 
 // isCoordinationTask
-eq(k.isCoordinationTask({ seatKind: "staff" }), true, "staff");
-eq(k.isCoordinationTask({ seatKind: "work" }), false, "work");
+eq(k.isCoordinationTask({ seatKind: "staff", roles: ["coordinator"] }), true, "staff");
+eq(k.isCoordinationTask({ seatKind: "staff", roles: ["reviewer", "coder"] }), true, "staff + work role");
+eq(k.isCoordinationTask({ seatKind: "work", roles: ["coder"] }), false, "work");
+eq(k.isCoordinationTask({ seatKind: "work", roles: ["reviewer", "debugger"] }), false, "work + work role");
+eq(k.isCoordinationTask({ seatKind: "work", roles: ["reviewer"] }), true, "work, no work role");
+eq(k.isCoordinationTask({ seatKind: "work", roles: [] }), true, "work, no roles");
 eq(k.isCoordinationTask(null), false, "no agent");
 
 // switchBlocked

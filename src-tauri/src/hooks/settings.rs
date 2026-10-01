@@ -331,7 +331,6 @@ mod tests {
                     "deny": [
                         "mcp__mira-bots__mira_approve_ticket",
                         "mcp__mira-bots__mira_assign_ticket",
-                        "mcp__mira-bots__mira_list_agents",
                         "mcp__mira-bots__mira_list_profiles",
                         "mcp__mira-bots__mira_reject_ticket",
                         "mcp__mira-bots__mira_spawn_agent",
@@ -362,7 +361,6 @@ mod tests {
                     ],
                     "deny": [
                         "mcp__mira-bots__mira_assign_ticket",
-                        "mcp__mira-bots__mira_list_agents",
                         "mcp__mira-bots__mira_list_profiles",
                         "mcp__mira-bots__mira_spawn_agent",
                         "mcp__mira-bots__mira_unassign_ticket",

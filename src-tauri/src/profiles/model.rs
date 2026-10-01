@@ -733,7 +733,6 @@ mod tests {
     fn deny_rules_for_each_builtin() {
         let coordinator_set = mira(&[
             "mira_assign_ticket",
-            "mira_list_agents",
             "mira_list_profiles",
             "mira_spawn_agent",
             "mira_unassign_ticket",
@@ -741,7 +740,6 @@ mod tests {
         let all_bound = mira(&[
             "mira_approve_ticket",
             "mira_assign_ticket",
-            "mira_list_agents",
             "mira_list_profiles",
             "mira_reject_ticket",
             "mira_spawn_agent",

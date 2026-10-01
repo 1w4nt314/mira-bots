@@ -358,7 +358,8 @@ pub fn ticket_assign(t: &TicketsCtx, id: &str, agent_id: &str) -> Result<TicketS
         (name(&old), name(agent_id))
     };
     let tk = t.mutate(|s| s.handoff(id, agent_id, None, (&from_name, &to_name), now))?;
-    t.clear_stale_detail(&old);
+    // The user took it from the old agent: tell it to stop (review 5c W4).
+    t.handed_over(&old, &tk, Some(&to_name), true);
     t.notify([old.as_str(), agent_id]);
     Ok(TicketSummary::from(&tk))
 }
@@ -371,7 +372,8 @@ pub fn ticket_unassign(t: &TicketsCtx, id: &str) -> Result<TicketSummary, String
     let tk = t.mutate(|s| s.unassign(id, now))?;
     if before.state == TicketState::InProgress {
         if let Some(agent) = old.as_deref() {
-            t.clear_stale_detail(agent);
+            // Taken from a working agent by the user: tell it to stop (review 5c W4).
+            t.handed_over(agent, &tk, None, true);
         }
     }
     t.notify(old);
@@ -2097,15 +2099,34 @@ mod tests {
             (s.state, s.assignee_agent_id.as_deref(), s.queue_position),
             (TicketState::Assigned, Some(other.as_str()), Some(0))
         );
-        let mut sent = t.sent();
-        sent.sort_by_key(|m| format!("{m:?}"));
+        // Review 5c W4: the user took it from `live`, so the dispatcher is told to stop it
+        // (before the queues are woken), and its detail says so.
+        let sent = t.sent();
+        let other_name = lock(&t.ctx.manager).get(&other).unwrap().name;
+        assert_eq!(
+            sent[0],
+            DispatchMsg::HandedOver {
+                agent_id: live.clone(),
+                ticket_id: tk.id.clone(),
+                to_name: Some(other_name),
+            }
+        );
+        let mut rest = sent[1..].to_vec();
+        rest.sort_by_key(|m| format!("{m:?}"));
         let mut want = vec![queue_changed(&live), queue_changed(&other)];
         want.sort_by_key(|m| format!("{m:?}"));
-        assert_eq!(sent, want);
+        assert_eq!(rest, want);
         {
             let m = lock(&t.ctx.manager);
             assert_eq!(m.get(&live).unwrap().current_ticket_id, None);
-            assert_eq!(m.get(&live).unwrap().detail, None, "stale hint cleared");
+            assert_eq!(
+                m.get(&live).unwrap().detail,
+                Some(format!(
+                    "Ticket {} givet videre",
+                    crate::tickets::model::short_id(&tk.id)
+                )),
+                "the stale hint is replaced"
+            );
             assert_eq!(m.get(&other).unwrap().queue_length, 1);
         }
         let full = t.ctx.read(|s| s.get(&tk.id)).unwrap();
@@ -2116,7 +2137,29 @@ mod tests {
         let _ = t.sent();
         let b = ticket_unassign(&t.ctx, &tk.id).unwrap();
         assert_eq!((b.state, b.assignee_agent_id), (TicketState::Backlog, None));
-        assert_eq!(t.sent(), vec![queue_changed(&other)]);
+        assert_eq!(
+            t.sent(),
+            vec![
+                DispatchMsg::HandedOver {
+                    agent_id: other.clone(),
+                    ticket_id: tk.id.clone(),
+                    to_name: None,
+                },
+                queue_changed(&other)
+            ]
+        );
+        let full = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(
+            full.history.last().unwrap().note.as_deref(),
+            Some("lagt tilbage")
+        );
+        assert_eq!(
+            lock(&t.ctx.manager).get(&other).unwrap().detail,
+            Some(format!(
+                "Ticket {} givet videre",
+                crate::tickets::model::short_id(&tk.id)
+            ))
+        );
     }
 
     #[test]

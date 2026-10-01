@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::model::{Ticket, TicketState};
-use crate::agent::roles::Role;
+use crate::agent::roles::{self, Role};
 use crate::agent::SeatKind;
 use crate::config::{MAX_REVIEW_ROUNDS, REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
 
@@ -104,13 +104,29 @@ pub fn render_line(short: &str, title: &str) -> String {
     )
 }
 
-/// The line for a ticket delivered to an agent on a staff seat (5c C.1): it distributes the
-/// work instead of doing it. Like [`render_line`] one line that never starts with "Du"; the
-/// dispatcher confirms it on the "Koordinér ticket <short>" prefix.
+/// Start of a coordination line: ASCII only (review 5c N1), so the typed line and the hook's
+/// `prompt` stay byte-identical whatever the terminal does to non-ASCII input.
+pub const COORDINATION_LINE_PREFIX: &str = "Koordiner ticket ";
+
+/// The line for a ticket delivered as a coordination task (5c C.1; a staff seat or a profile
+/// without a work role): it distributes the work instead of doing it. Like [`render_line`] one
+/// line that never starts with "Du"; the dispatcher confirms it with
+/// [`is_coordination_line_for`].
 pub fn render_coordination_line(short: &str, title: &str) -> String {
     format!(
-        "Koordinér ticket {short}: {title}. Læs filen {TICKET_DIR}/{short}.md og fordel opgaven; udfør den ikke selv."
+        "{COORDINATION_LINE_PREFIX}{short}: {title}. Læs filen {TICKET_DIR}/{short}.md og fordel opgaven; udfør den ikke selv."
     )
+}
+
+/// Whether `prompt` is the coordination line for the ticket `short`: tolerant of the first
+/// word's spelling ("Koordiner", "Koordinér", a lost or decomposed accent), strict about
+/// "ticket <short>" after it (review 5c N1).
+pub fn is_coordination_line_for(prompt: &str, short: &str) -> bool {
+    prompt.trim_start().starts_with("Koordin")
+        && prompt
+            .trim_start()
+            .split_once(' ')
+            .is_some_and(|(_, rest)| rest.starts_with(&format!("ticket {short}")))
 }
 
 /// What an agent on a staff seat is asked to do with a ticket (5c C.1).
@@ -133,25 +149,29 @@ impl TicketDelivery {
     /// A plain work delivery (unchanged file and line).
     pub const WORK: TicketDelivery = TicketDelivery { coordination: None };
 
-    /// The delivery for an agent on `seat` with `roles`: a work seat gets the work delivery; a
-    /// staff seat a coordination task, [`CoordinationKind::Distribute`] with the coordinator
-    /// role, else [`CoordinationKind::Plan`].
+    /// The delivery for an agent on `seat` with `roles` (review 5c W1: the role decides what
+    /// the agent may do, the seat which tickets it gets). The work delivery only for a work
+    /// seat AND a work role (coder/researcher/debugger); a staff seat, or a profile without a
+    /// work role (it may not edit files), gets a coordination task:
+    /// [`CoordinationKind::Distribute`] with the coordinator role, else
+    /// [`CoordinationKind::Plan`].
     pub fn for_agent(seat: SeatKind, roles: &[Role]) -> TicketDelivery {
-        let coordination = match seat {
-            SeatKind::Work => None,
-            SeatKind::Staff if roles.contains(&Role::Coordinator) => {
-                Some(CoordinationKind::Distribute)
-            }
-            SeatKind::Staff => Some(CoordinationKind::Plan),
+        let coordination = if seat == SeatKind::Work && roles::has_work_role(roles) {
+            None
+        } else if roles.contains(&Role::Coordinator) {
+            Some(CoordinationKind::Distribute)
+        } else {
+            Some(CoordinationKind::Plan)
         };
         TicketDelivery { coordination }
     }
 }
 
 /// `## Koordineringsopgave` text for an agent with the coordinator role.
-pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv (skriv ingen kode og ingen filer). Find en ledig arbejdsagent med mira_list_agents og giv den denne ticket med mira_assign_ticket (ticketen flytter fra dig til den, også selv om den er i gang hos dig; arbejd så ikke videre på den). Er opgaven for stor, opret del-tickets med mira_create_ticket og assignTo, og aflever denne ticket med mira_submit_for_review med en kort plan for fordelingen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers skriv hvorfor med mira_update_status og læg så ticketen tilbage i backlog med mira_unassign_ticket.";
-/// `## Koordineringsopgave` text for a reviewer/planner without the coordinator role.
-pub const COORDINATION_PLAN_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv. Nedbryd den i del-tickets med mira_create_ticket (de lander i backlog, brugeren eller en koordinator tildeler dem) og aflever denne ticket med mira_submit_for_review med planen.";
+pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Find en ledig arbejdsagent med mira_list_agents og giv den denne ticket med mira_assign_ticket (ticketen flytter fra dig til den, også selv om den er i gang hos dig; arbejd så ikke videre på den). Er opgaven for stor, opret del-tickets med mira_create_ticket og assignTo, og aflever denne ticket med mira_submit_for_review med en kort plan for fordelingen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers skriv hvorfor med mira_update_status og læg så ticketen tilbage i backlog med mira_unassign_ticket.";
+/// `## Koordineringsopgave` text for an agent without the coordinator role (reviewer, planner,
+/// no roles): hand the ticket to a free work agent (review 5c W2), else split it up.
+pub const COORDINATION_PLAN_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Find en ledig arbejdsagent (arbejdsplads, rollen koder, researcher eller debugger, ingen ticket i gang) med mira_list_agents og giv ticketen videre med mira_handoff_ticket(ticketId, agentId); arbejd så ikke videre på den. Er der ingen ledig arbejdsagent, så del opgaven op i del-tickets med mira_create_ticket (de lander i backlog) og aflever denne ticket med planen med mira_submit_for_review, eller læg den tilbage i backlog med mira_handoff_ticket uden agentId.";
 
 /// "Bed om aflevering" (C4.7): typed like a ticket line (one write, `\r` separately). It starts
 /// with "Du", never with "Ticket", so the dispatcher can never take it for a ticket delivery.
@@ -159,6 +179,27 @@ pub fn request_submission_line(short: &str) -> String {
     format!(
         "Du afsluttede uden at aflevere ticket {short}. Kald mira_submit_for_review med en kort opsummering når opgaven er færdig; ellers fortsæt arbejdet."
     )
+}
+
+/// "Stop working" (review 5c W4): typed into an idle agent whose ticket in progress someone
+/// else (the user) handed to `to_name` (`None`: put back in the backlog). Starts with "Du",
+/// so the dispatcher never takes it for a ticket delivery; the name is sanitised like a title.
+pub fn handed_over_line(short: &str, to_name: Option<&str>) -> String {
+    let whereto = match to_name {
+        Some(name) => format!("den er givet videre til {}", sanitize_title(name)),
+        None => "den er lagt tilbage i backlog".to_string(),
+    };
+    format!("Du skal stoppe arbejdet på ticket {short}: {whereto}. Afslut dit svar.")
+}
+
+/// Detail text of an agent whose ticket in progress left it (review 5c W4).
+pub fn handed_over_detail(short: &str) -> String {
+    format!("Ticket {short} givet videre")
+}
+
+/// Whether `detail` is a [`handed_over_detail`] text (cleared like the other dispatcher hints).
+pub fn is_handed_over_detail(detail: &str) -> bool {
+    detail.starts_with("Ticket ") && detail.ends_with(" givet videre")
 }
 
 /// The line for a ticket (sanitises the title): [`render_line`], or
@@ -629,10 +670,35 @@ mod tests {
     #[test]
     fn delivery_for_agent_by_seat_and_roles() {
         let d = |seat, roles: &[Role]| TicketDelivery::for_agent(seat, roles).coordination;
-        // A work seat: always the plain delivery, whatever the roles.
-        for roles in [&[][..], &[Role::Coder], &[Role::Coordinator], &Role::ALL] {
+        // Review 5c W1: a work seat gives the plain delivery only with a work role.
+        for roles in [
+            &[Role::Coder][..],
+            &[Role::Researcher],
+            &[Role::Debugger],
+            &[Role::Reviewer, Role::Coder],
+            &Role::ALL,
+        ] {
             assert_eq!(d(SeatKind::Work, roles), None, "{roles:?}");
         }
+        // A work seat without a work role (it may not edit files): a coordination task.
+        assert_eq!(d(SeatKind::Work, &[]), Some(CoordinationKind::Plan));
+        assert_eq!(
+            d(SeatKind::Work, &[Role::Reviewer]),
+            Some(CoordinationKind::Plan)
+        );
+        assert_eq!(
+            d(SeatKind::Work, &[Role::Planner]),
+            Some(CoordinationKind::Plan)
+        );
+        assert_eq!(
+            d(SeatKind::Work, &[Role::Coordinator]),
+            Some(CoordinationKind::Distribute)
+        );
+        // A staff seat: always a coordination task, also with a work role.
+        assert_eq!(
+            d(SeatKind::Staff, &[Role::Reviewer, Role::Coder]),
+            Some(CoordinationKind::Plan)
+        );
         assert_eq!(
             d(SeatKind::Staff, &[Role::Coordinator]),
             Some(CoordinationKind::Distribute)
@@ -678,10 +744,15 @@ mod tests {
             let line = line_for(&t, d);
             assert_eq!(
                 line,
-                "Koordinér ticket abcdef01: Lav (at)en side. Læs filen .mira-bots/tickets/abcdef01.md og fordel opgaven; udfør den ikke selv."
+                "Koordiner ticket abcdef01: Lav (at)en side. Læs filen .mira-bots/tickets/abcdef01.md og fordel opgaven; udfør den ikke selv."
             );
             assert!(!line.starts_with("Du") && !line.starts_with("Ticket"));
             assert!(!line.chars().any(|c| c.is_control()));
+            // Review 5c N1: the prefix is ASCII.
+            assert!(
+                line.starts_with(COORDINATION_LINE_PREFIX) && COORDINATION_LINE_PREFIX.is_ascii()
+            );
+            assert!(is_coordination_line_for(&line, "abcdef01"));
             let f = render_file(&t, 0, d);
             let section = format!("## Koordineringsopgave\n{text}\n\n## Regler\n");
             assert!(f.contains(&section), "{f}");
@@ -701,6 +772,63 @@ mod tests {
         assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_list_agents"));
         assert!(COORDINATION_PLAN_TEXT.contains("mira_create_ticket"));
         assert!(!COORDINATION_PLAN_TEXT.contains("mira_assign_ticket"));
+        // Review 5c W2: without the coordinator role, hand it on with the common tools.
+        assert!(COORDINATION_PLAN_TEXT.contains("mira_list_agents"));
+        assert!(COORDINATION_PLAN_TEXT.contains("mira_handoff_ticket(ticketId, agentId)"));
+        assert!(COORDINATION_PLAN_TEXT.contains("mira_handoff_ticket uden agentId"));
+        assert!(COORDINATION_PLAN_TEXT.contains("mira_submit_for_review"));
+        // Review 5c W3: Bash is not denied, so both texts ask for it.
+        for text in [COORDINATION_DISTRIBUTE_TEXT, COORDINATION_PLAN_TEXT] {
+            assert!(text.contains(
+                "brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)"
+            ));
+        }
+    }
+
+    // Review 5c N1: the confirmation tolerates the first word's spelling, not another ticket.
+    #[test]
+    fn coordination_line_match_is_tolerant() {
+        for p in [
+            "Koordiner ticket abcdef01: x",
+            "Koordinér ticket abcdef01: x",
+            "Koordine\u{301}r ticket abcdef01: x",
+            "  Koordinr ticket abcdef01",
+        ] {
+            assert!(is_coordination_line_for(p, "abcdef01"), "{p}");
+        }
+        for p in [
+            "Koordiner ticket 11111111: x",
+            "Ticket abcdef01: x",
+            "Koordiner abcdef01",
+            "Du skal stoppe arbejdet på ticket abcdef01",
+            "koordiner ticket abcdef01",
+        ] {
+            assert!(!is_coordination_line_for(p, "abcdef01"), "{p}");
+        }
+    }
+
+    // Review 5c W4.
+    #[test]
+    fn handed_over_line_and_detail() {
+        assert_eq!(
+            handed_over_line("abcdef01", Some("Koder 2")),
+            "Du skal stoppe arbejdet på ticket abcdef01: den er givet videre til Koder 2. Afslut dit svar."
+        );
+        assert_eq!(
+            handed_over_line("abcdef01", None),
+            "Du skal stoppe arbejdet på ticket abcdef01: den er lagt tilbage i backlog. Afslut dit svar."
+        );
+        let l = handed_over_line("abcdef01", Some("@bob\n/x"));
+        assert!(
+            l.starts_with("Du ") && !l.contains(['\r', '\n', '@']),
+            "{l}"
+        );
+        assert_eq!(
+            handed_over_detail("abcdef01"),
+            "Ticket abcdef01 givet videre"
+        );
+        assert!(is_handed_over_detail(&handed_over_detail("abcdef01")));
+        assert!(!is_handed_over_detail("Kører tests"));
     }
 
     #[test]

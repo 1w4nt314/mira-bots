@@ -97,3 +97,17 @@ const rankTable = [
 ];
 for (const [roles, want] of rankTable) assert.equal(r.staffRank(roles), want, JSON.stringify(roles));
 console.log(`staffRank: ${rankTable.length} cases ok`);
+// hasWorkRole (mirrors `has_work_role`): without one, every ticket is a coordination task.
+assert.deepEqual([...r.WORK_ROLES], ["coder", "researcher", "debugger"]);
+const workTable = [
+  [[], false],
+  [["reviewer"], false],
+  [["coordinator", "planner"], false],
+  [["coder"], true],
+  [["researcher"], true],
+  [["debugger"], true],
+  [["reviewer", "coder"], true],
+  [[...r.ROLE_ORDER], true],
+];
+for (const [roles, want] of workTable) assert.equal(r.hasWorkRole(roles), want, JSON.stringify(roles));
+console.log(`hasWorkRole: ${workTable.length} cases ok`);

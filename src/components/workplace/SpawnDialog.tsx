@@ -8,7 +8,14 @@ import {
   spawnAgentWithTicket,
 } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
-import { folderPrefix, hasStaffRole, isSpecialist, rolesText, staffRank } from "../../lib/roles";
+import {
+  folderPrefix,
+  hasStaffRole,
+  hasWorkRole,
+  isSpecialist,
+  rolesText,
+  staffRank,
+} from "../../lib/roles";
 import type { AgentProfile, Effort, SeatKind, SpawnOverrides, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
 import BotFigure from "../BotFigure";
@@ -166,6 +173,9 @@ export default function SpawnDialog(props: Props) {
           <div className="grid grid-cols-4 gap-2">
             {profiles.map((p) => {
               const fits = fitsSeat(p, seatKind);
+              // Review 5c W1: on a work seat a profile without a work role may start, but it
+              // gets its tickets as coordination tasks (it may not edit files).
+              const coordinates = fits && seatKind === "work" && !hasWorkRole(p.roles);
               return (
                 <button
                   key={p.id}
@@ -174,7 +184,11 @@ export default function SpawnDialog(props: Props) {
                   disabled={!fits}
                   aria-pressed={profileId === p.id}
                   title={`${rolesText(p.roles)}\nModel: ${modelLabel(p.model)} · Effort: ${effortLabel(p.effort)}${
-                    fits ? "" : "\nKan ikke stå på en stabsplads: profilen har ingen stabsrolle (reviewer, koordinator eller planlægger)"
+                    !fits
+                      ? "\nKan ikke stå på en stabsplads: profilen har ingen stabsrolle (reviewer, koordinator eller planlægger)"
+                      : coordinates
+                        ? "\nIngen arbejdsrolle (koder, researcher eller debugger): agenten redigerer ikke filer og får sine tickets som koordineringsopgaver"
+                        : ""
                   }`}
                   className={`flex flex-col items-center gap-1 rounded-xl border p-2 ${
                     !fits
@@ -193,6 +207,11 @@ export default function SpawnDialog(props: Props) {
                   />
                   <span className="w-full truncate text-center text-[11px]">{p.name}</span>
                   {!fits && <span className="text-[10px] text-[var(--muted)]">Ingen stabsrolle</span>}
+                  {coordinates && (
+                    <span className="text-center text-[10px] leading-tight text-[var(--muted)]">
+                      Ingen arbejdsrolle: får koordineringsopgaver
+                    </span>
+                  )}
                 </button>
               );
             })}

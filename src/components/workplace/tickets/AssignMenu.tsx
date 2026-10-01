@@ -53,10 +53,16 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
   const items: Item[] = [
     ...live.map((a) => ({
       key: a.id,
-      label: `${a.name} · ${a.seatKind === "work" ? "arbejdsplads" : "stab"} · ${a.queueLength} i kø`,
-      title: handOver
-        ? `Giv ticketen videre: den forlader sin agent og sættes bagerst i køen hos ${a.name}`
-        : `Sæt ticketen bagerst i køen hos ${a.name}`,
+      // Review 5c N4: a staff agent gets the ticket as a coordination task, not as work.
+      label:
+        a.seatKind === "work"
+          ? `${a.name} · arbejdsplads · ${a.queueLength} i kø`
+          : `${a.name} (stab: koordineringsopgave) · ${a.queueLength} i kø`,
+      title:
+        (handOver
+          ? `Giv ticketen videre: den forlader sin agent og sættes bagerst i køen hos ${a.name}`
+          : `Sæt ticketen bagerst i køen hos ${a.name}`) +
+        (a.seatKind === "work" ? "" : " som koordineringsopgave (den fordeles, ikke udføres)"),
       disabled: false,
       act: () => void run(() => assignTicket(ticket.id, a.id)),
     })),

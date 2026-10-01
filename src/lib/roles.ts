@@ -29,6 +29,15 @@ export function hasStaffRole(roles: readonly Role[]): boolean {
   return roles.some((r) => STAFF_ROLES.includes(r));
 }
 
+/** Work roles (mirrors `Role::is_work`): without one a profile may not edit files and gets
+ * every ticket as a coordination task, also on a work seat (review 5c W1). */
+export const WORK_ROLES: readonly Role[] = ["coder", "researcher", "debugger"];
+
+/** Whether the roles include a work role (mirrors `has_work_role` in Rust). */
+export function hasWorkRole(roles: readonly Role[]): boolean {
+  return roles.some((r) => WORK_ROLES.includes(r));
+}
+
 /** Staff roles in the order a staff seat prefers them: the coordinator first (it distributes
  * the work), then reviewer and planner. */
 export const STAFF_PREFERENCE: readonly Role[] = ["coordinator", "reviewer", "planner"];

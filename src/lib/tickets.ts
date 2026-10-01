@@ -515,16 +515,21 @@ export function reviewsFor(tickets: readonly TicketSummary[], agentId: string): 
 }
 
 /**
- * A ticket on a staff agent is a "koordineringsopgave" (plan5 A.7).
+ * A ticket on a staff agent, or on an agent without a work role, is a "koordineringsopgave"
+ * (plan5 A.7; review 5c W1, mirrors `TicketDelivery::for_agent` in Rust).
  *
- * | agent seat | isCoordinationTask |
- * |------------|--------------------|
- * | staff      | true               |
- * | work       | false              |
- * | no agent   | false              |
+ * | agent seat | work role (coder/researcher/debugger) | isCoordinationTask |
+ * |------------|---------------------------------------|--------------------|
+ * | staff      | any                                   | true               |
+ * | work       | yes                                   | false              |
+ * | work       | no                                    | true               |
+ * | no agent   | -                                     | false              |
  */
-export function isCoordinationTask(agent: Pick<AgentInfo, "seatKind"> | null): boolean {
-  return agent !== null && agent.seatKind === "staff";
+export function isCoordinationTask(agent: Pick<AgentInfo, "seatKind" | "roles"> | null): boolean {
+  if (agent === null) return false;
+  // Same set as `WORK_ROLES` in roles.ts; kept local so this module transpiles on its own.
+  const hasWorkRole = agent.roles.some((r) => r === "coder" || r === "researcher" || r === "debugger");
+  return agent.seatKind === "staff" || !hasWorkRole;
 }
 
 /** Tooltip on "Skift model"/"Skift effort" while switching is not possible. */
