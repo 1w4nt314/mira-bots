@@ -12,6 +12,7 @@
     "copy:hook": "node scripts/copy-hook.mjs"
   },
   "dependencies": {
+    "@dnd-kit/core": "~6.3.1",
     "@tauri-apps/api": "^2.12.1",
     "@tauri-apps/plugin-dialog": "^2.8.0",
     "@xterm/addon-fit": "~0.11.0",

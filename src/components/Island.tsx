@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useBotStates, useTheme } from "../lib/bots";
 import { errorMessage, openWorkplace, quitApp, resizeIsland } from "../lib/ipc";
 import { DOT_CLASS, worstStatus } from "../lib/status";
+import { reviewCount } from "../lib/tickets";
 import { useStore } from "../state/store";
 import AgentChip from "./AgentChip";
 import NewAgentButton from "./NewAgentButton";
@@ -12,14 +13,20 @@ const COLLAPSED_SIZE = { width: 240, height: 8 } as const;
 const MAX_WIDTH = 960;
 const COLLAPSE_DELAY_MS = 400;
 const MAX_VISIBLE_CARDS = 2;
+/** Extra width while the "n i review" chip is shown. */
+const REVIEW_CHIP_WIDTH = 90;
 
 export default function Island() {
   const { state, dispatch } = useStore();
-  const { agents, pending, expanded, error } = state;
+  const { agents, pending, expanded, error, tickets } = state;
+  const reviews = reviewCount(tickets);
 
-  // Open by hover or by an open permission request.
+  // Open by hover or by an open permission request (reviews do not hold it open).
   const open = expanded || pending.length > 0;
-  const width = Math.min(MAX_WIDTH, 400 + 160 * agents.length);
+  const width = Math.min(
+    MAX_WIDTH,
+    400 + 160 * agents.length + (reviews > 0 ? REVIEW_CHIP_WIDTH : 0),
+  );
   const theme = useTheme();
   const botStates = useBotStates(agents);
 
@@ -81,9 +88,9 @@ export default function Island() {
     leaveTimer.current = setTimeout(() => dispatch({ type: "ui/collapse" }), COLLAPSE_DELAY_MS);
   };
 
-  const workplace = async () => {
+  const workplace = async (tab: "tickets" | null = null) => {
     try {
-      await openWorkplace(null);
+      await openWorkplace(null, tab);
     } catch (e) {
       dispatch({ type: "error/set", error: errorMessage(e) });
     }
@@ -137,6 +144,16 @@ export default function Island() {
               ))
             )}
           </div>
+          {reviews > 0 && (
+            <button
+              type="button"
+              onClick={() => void workplace("tickets")}
+              title="Åbn Tickets i Workplace og se arbejdet der venter på dig"
+              className="shrink-0 rounded-full bg-amber-400/25 px-2.5 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-400/35"
+            >
+              {reviews} i review
+            </button>
+          )}
           <button
             type="button"
             onClick={() => void workplace()}

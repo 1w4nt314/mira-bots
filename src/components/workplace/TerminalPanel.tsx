@@ -6,6 +6,7 @@ import type { AgentInfo, BotState } from "../../lib/types";
 import { useStore } from "../../state/store";
 import AgentTerminal from "../AgentTerminal";
 import BotFigure from "../BotFigure";
+import TicketQueue from "./tickets/TicketQueue";
 
 interface Props {
   agent: AgentInfo;
@@ -112,6 +113,7 @@ export default function TerminalPanel({ agent, botState, theme, onRemoved }: Pro
           Åbn mappe
         </button>
       </div>
+      <TicketQueue agent={agent} />
       {isStartingHint(agent) && (
         <div className="mx-3 mb-2 shrink-0 rounded-lg border border-amber-400/50 bg-amber-300/20 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-200">
           Agenten venter på et svar i terminalen — fx 'Do you trust the files in this folder?'.

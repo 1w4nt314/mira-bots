@@ -1,7 +1,7 @@
 import type { Theme } from "../../lib/bots";
 import { errorMessage, removeAgent } from "../../lib/ipc";
 import type { SeatAssignment } from "../../lib/seats";
-import type { BotState, SeatKind } from "../../lib/types";
+import type { BotState, SeatKind, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
 import Seat from "./Seat";
 
@@ -14,12 +14,17 @@ interface Props {
   spawnDisabled: string | null;
   /** True when the live-agent limit of that row is reached. */
   limits: Record<SeatKind, boolean>;
+  /** All tickets by id (for each agent's `currentTicketId`). */
+  tickets: Map<string, TicketSummary>;
+  /** A ticket note is being dragged. */
+  dragging: boolean;
   onSelect: (agentId: string) => void;
   onSpawn: (seatKind: SeatKind) => void;
 }
 
 export default function SeatGrid(props: Props) {
   const { seats, botStates, theme, selectedId, spawnDisabled, limits, onSelect, onSpawn } = props;
+  const { tickets, dragging } = props;
   const { dispatch } = useStore();
 
   const row = (kind: SeatKind, list: SeatAssignment["work"]) =>
@@ -28,12 +33,17 @@ export default function SeatGrid(props: Props) {
         key={agent?.id ?? `${kind}-${i}`}
         agent={agent}
         seatKind={kind}
+        index={i}
         botState={agent === null ? "idle" : (botStates.get(agent.id) ?? "idle")}
         theme={theme}
         selected={agent !== null && agent.id === selectedId}
         spawnDisabled={
           spawnDisabled ?? (limits[kind] ? "Loftet for denne række er nået" : null)
         }
+        currentTicket={
+          agent?.currentTicketId != null ? (tickets.get(agent.currentTicketId) ?? null) : null
+        }
+        dragging={dragging}
         onSelect={onSelect}
         onSpawn={onSpawn}
       />

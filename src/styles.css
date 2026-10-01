@@ -11,6 +11,11 @@
   --border: #d9dde3;
   --accent: #2f6fdf;
 
+  /* ticket notes (post-it) */
+  --note-bg: #fff4b8;
+  --note-border: #e6d27a;
+  --note-fg: #3b3412;
+
   --term-bg: #fbfbfc;
   --term-fg: #24292f;
   --term-cursor: #24292f;
@@ -41,6 +46,10 @@
     --panel: #1d2025;
     --border: #2d3139;
     --accent: #5b8def;
+
+    --note-bg: #3a3419;
+    --note-border: #5d5428;
+    --note-fg: #f0e7c2;
 
     --term-bg: #101216;
     --term-fg: #d5d8dd;

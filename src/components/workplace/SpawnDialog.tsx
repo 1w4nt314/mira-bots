@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import type { Theme } from "../../lib/bots";
-import { errorMessage, pickFolder, spawnAgent } from "../../lib/ipc";
-import type { AgentRole, SeatKind } from "../../lib/types";
+import { errorMessage, pickFolder, spawnAgent, spawnAgentWithTicket } from "../../lib/ipc";
+import type { AgentRole, SeatKind, TicketSummary } from "../../lib/types";
 import BotFigure from "../BotFigure";
 import { ROLE_LABEL } from "./Seat";
+import StickyNote from "./tickets/StickyNote";
 
 const ROLES: AgentRole[] = ["none", "coder", "researcher", "reviewer", "koord"];
 
@@ -16,11 +17,14 @@ interface Props {
   seatKind: SeatKind;
   theme: Theme;
   agentsRoot: string | null;
+  /** Start the agent with this ticket (its line becomes the first prompt) instead of a prompt. */
+  ticket?: TicketSummary | null;
   onClose: () => void;
   onSpawned: (agentId: string) => void;
 }
 
-export default function SpawnDialog({ seatKind, theme, agentsRoot, onClose, onSpawned }: Props) {
+export default function SpawnDialog(props: Props) {
+  const { seatKind, theme, agentsRoot, ticket = null, onClose, onSpawned } = props;
   const [role, setRole] = useState<AgentRole>("none");
   const [folderMode, setFolderMode] = useState<"default" | "custom">("default");
   const [folder, setFolder] = useState<string | null>(null);
@@ -57,7 +61,10 @@ export default function SpawnDialog({ seatKind, theme, agentsRoot, onClose, onSp
     try {
       const cwd = folderMode === "custom" ? folder : null;
       const text = prompt.trim();
-      const agent = await spawnAgent(cwd, text === "" ? null : text, role, seatKind);
+      const agent =
+        ticket !== null
+          ? await spawnAgentWithTicket(ticket.id, cwd, role, seatKind)
+          : await spawnAgent(cwd, text === "" ? null : text, role, seatKind);
       onSpawned(agent.id);
     } catch (e) {
       setError(errorMessage(e));
@@ -81,8 +88,16 @@ export default function SpawnDialog({ seatKind, theme, agentsRoot, onClose, onSp
         className="w-[560px] max-w-[calc(100vw-32px)] rounded-2xl border border-[var(--border)] bg-[var(--panel)] p-5 text-sm shadow-xl"
       >
         <h2 id="spawn-title" className="text-base font-semibold">
-          Ny agent på {seatKind === "work" ? "en arbejdsplads" : "en stabsplads"}
+          {ticket !== null
+            ? `Ny agent til ticket ${ticket.shortId}`
+            : `Ny agent på ${seatKind === "work" ? "en arbejdsplads" : "en stabsplads"}`}
         </h2>
+        {ticket !== null && (
+          <p className="mt-0.5 text-xs text-[var(--muted)]">
+            {seatKind === "work" ? "Arbejdsplads" : "Stabsplads"} · agenten får ticketen som sin
+            første opgave
+          </p>
+        )}
 
         <fieldset className="mt-4">
           <legend className="mb-2 text-xs font-medium text-[var(--muted)]">Rolle</legend>
@@ -148,16 +163,25 @@ export default function SpawnDialog({ seatKind, theme, agentsRoot, onClose, onSp
           </label>
         </fieldset>
 
-        <label className="mt-4 block">
-          <span className="text-xs font-medium text-[var(--muted)]">Første prompt (valgfri)</span>
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            rows={3}
-            placeholder="Hvad skal agenten starte med? (må ikke begynde med '-')"
-            className="mt-1 block w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--bg)] p-2 text-sm outline-none focus:border-[var(--accent)]"
-          />
-        </label>
+        {ticket !== null ? (
+          <div className="mt-4">
+            <span className="text-xs font-medium text-[var(--muted)]">Ticket</span>
+            <div className="mt-1">
+              <StickyNote ticket={ticket} agent={null} draggable={false} compact interactive={false} />
+            </div>
+          </div>
+        ) : (
+          <label className="mt-4 block">
+            <span className="text-xs font-medium text-[var(--muted)]">Første prompt (valgfri)</span>
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              rows={3}
+              placeholder="Hvad skal agenten starte med? (må ikke begynde med '-')"
+              className="mt-1 block w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--bg)] p-2 text-sm outline-none focus:border-[var(--accent)]"
+            />
+          </label>
+        )}
 
         {error !== null && (
           <p className="mt-3 text-xs text-rose-500" role="alert">
@@ -182,7 +206,7 @@ export default function SpawnDialog({ seatKind, theme, agentsRoot, onClose, onSp
             title="Start agenten"
             className="rounded-md bg-[var(--accent)] px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {busy ? "Starter…" : "Start"}
+            {busy ? "Starter…" : ticket !== null ? "Start med ticket" : "Start"}
           </button>
         </div>
       </div>

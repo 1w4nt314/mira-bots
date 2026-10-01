@@ -22,6 +22,9 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "lastHookEvent", label: "Sidste hook-event" },
   { key: "runningAgents", label: "Kørende agenter" },
   { key: "agentsRoot", label: "Agentmappe" },
+  { key: "ticketsPath", label: "Tickets-fil" },
+  { key: "ticketsTotal", label: "Tickets" },
+  { key: "ticketsWarning", label: "Tickets-advarsel" },
   { key: "logPath", label: "Logfil" },
 ];
 
@@ -51,6 +54,7 @@ function warningsFor(d: Diagnostics): string[] {
   }
   if (!d.pipeReady) out.push("Hook-forbindelsen lytter ikke");
   if (!d.hooksJsonExists) out.push("hooks.json mangler");
+  if (d.ticketsWarning !== null) out.push(d.ticketsWarning);
   if (d.framesReceived === 0 && d.runningAgents > 0) {
     out.push(
       "Ingen hook-events modtaget endnu — hvis en agent står på 'Starter', så svar på trust-spørgsmålet i dens terminal",
