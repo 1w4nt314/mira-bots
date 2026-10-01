@@ -26,9 +26,9 @@ pub fn role_text(role: Role) -> &'static str {
     match role {
         Role::Coder => "Du er koder: du implementerer tickets i din arbejdsmappe, kører tests og afleverer med en rapport der beskriver ændringerne.",
         Role::Researcher => "Du er researcher: du undersøger og dokumenterer; dine afleveringer er tekst (rapport), ikke kodeændringer, medmindre ticketen siger andet.",
-        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report.",
-        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Du godkender ikke tickets selv; det gør reviewere eller brugeren.",
-        Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede tickets med klare acceptkriterier (mira_create_ticket), men tildeler dem ikke.",
+        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report. Du ændrer ikke selv kode eller filer.",
+        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Du godkender ikke tickets selv; det gør reviewere eller brugeren. Du udfører aldrig selve arbejdet (ingen kode, ingen filændringer) — det gør arbejdsagenterne; en ticket du får, giver du videre med mira_assign_ticket eller deler op.",
+        Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede tickets med klare acceptkriterier (mira_create_ticket), men tildeler dem ikke. Du ændrer ikke selv kode eller filer.",
         Role::Debugger => "Du er debugger: du reproducerer fejl, finder årsagen og retter eller dokumenterer den; skriv altid reproduktion og årsag i rapporten.",
     }
 }
@@ -139,6 +139,26 @@ mod tests {
             .map(|r| spec.find(role_text(*r)).unwrap())
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "Role::ALL order");
+    }
+
+    #[test]
+    fn staff_role_texts_forbid_doing_the_work() {
+        for role in [Role::Reviewer, Role::Planner] {
+            assert!(
+                role_text(role).ends_with("Du ændrer ikke selv kode eller filer."),
+                "{role:?}"
+            );
+        }
+        assert!(role_text(Role::Coordinator).ends_with(
+            "Du udfører aldrig selve arbejdet (ingen kode, ingen filændringer) — det gør arbejdsagenterne; en ticket du får, giver du videre med mira_assign_ticket eller deler op."
+        ));
+        for role in [Role::Coder, Role::Researcher, Role::Debugger] {
+            let t = role_text(role);
+            assert!(
+                !t.contains("ændrer ikke") && !t.contains("aldrig selve"),
+                "{role:?}"
+            );
+        }
     }
 
     #[test]

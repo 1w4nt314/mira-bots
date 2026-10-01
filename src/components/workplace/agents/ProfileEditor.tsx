@@ -2,7 +2,7 @@ import { useEffect, useId, useState } from "react";
 import type { Theme } from "../../../lib/bots";
 import { errorMessage, saveProfile } from "../../../lib/ipc";
 import { PROFILE_NAME_MAX, PROMPT_APPEND_MAX } from "../../../lib/models";
-import { isSpecialist, ROLE_LABEL, ROLE_ORDER, sortRoles } from "../../../lib/roles";
+import { hasStaffRole, isSpecialist, ROLE_LABEL, ROLE_ORDER, sortRoles } from "../../../lib/roles";
 import type { AgentProfile, Effort, Role, SeatKind } from "../../../lib/types";
 import BotFigure from "../../BotFigure";
 import ModelPicker, { EffortSelect, modelChoiceValid } from "./ModelPicker";
@@ -201,6 +201,12 @@ export default function ProfileEditor({ profile, theme, onClose, onSaved }: Prop
               </label>
             ))}
           </div>
+          {seat === "staff" && !hasStaffRole(roles) && (
+            <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-300" role="status">
+              En stabsplads kræver en stabsrolle (reviewer, koordinator eller planlægger); agenter fra
+              denne profil kan kun startes på en arbejdsplads.
+            </p>
+          )}
         </fieldset>
 
         <p className="mt-3 text-[11px] text-[var(--muted)]">

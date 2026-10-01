@@ -19,9 +19,9 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::model::{ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState};
-use super::prompt::{self, ReviewSender};
+use super::prompt::{self, ReviewSender, TicketDelivery};
 use super::service::TicketService;
-use crate::agent::now_ms;
+use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
     AUTO_REVIEW_ON_STOP, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
     ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
@@ -57,6 +57,10 @@ pub struct AgentSnapshot {
     /// When the user last typed into the terminal ([`Timers::now_ms`] clock); see
     /// [`USER_INPUT_GRACE_MS`].
     pub last_user_input_at: Option<u64>,
+    /// The agent's seat and roles: a ticket for an agent on a staff seat is delivered as a
+    /// coordination task (5c C.1, [`TicketDelivery::for_agent`]).
+    pub seat_kind: SeatKind,
+    pub roles: Vec<Role>,
 }
 
 /// Access to the agents (implemented by `ManagerPort` over `Arc<Mutex<AgentManager>>`; each call
@@ -177,13 +181,23 @@ pub enum DeliveryKind {
 }
 
 impl DeliveryKind {
-    /// The prefix a submitted prompt must start with to confirm this delivery.
-    fn prefix(self, ticket_id: &str) -> String {
+    /// The prefixes a submitted prompt may start with to confirm this delivery: a ticket goes in
+    /// as "Ticket <short>" or, on a staff seat, as "Koordinér ticket <short>" (5c C.1).
+    fn prefixes(self, ticket_id: &str) -> Vec<String> {
         let short = super::model::short_id(ticket_id);
         match self {
-            DeliveryKind::Work => format!("Ticket {short}"),
-            DeliveryKind::Review => format!("Review af ticket {short}"),
+            DeliveryKind::Work => vec![
+                format!("Ticket {short}"),
+                format!("Koordinér ticket {short}"),
+            ],
+            DeliveryKind::Review => vec![format!("Review af ticket {short}")],
         }
+    }
+
+    /// Whether the submitted `prompt` is this delivery's line.
+    fn confirms(self, ticket_id: &str, prompt: &str) -> bool {
+        let p = prompt.trim_start();
+        self.prefixes(ticket_id).iter().any(|x| p.starts_with(x))
     }
 }
 
@@ -420,11 +434,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             _ => return,
         };
-        let expected = kind.prefix(&ticket_id);
         match prompt {
-            Some(p) if p.trim_start().starts_with(&expected) => {
-                self.confirm(agent_id, &ticket_id, kind)
-            }
+            Some(p) if kind.confirms(&ticket_id, p) => self.confirm(agent_id, &ticket_id, kind),
             Some(_) if typed_by_us => {
                 // Another prompt went in while our line was in the terminal (typically the user's
                 // own text, possibly merged with the line). A busy status that follows belongs
@@ -719,10 +730,12 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
-    /// Writes the ticket file and types the line; Enter follows after `ENTER_DELAY_MS`.
+    /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
+    /// Enter follows after `ENTER_DELAY_MS`.
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
         let now = now_ms();
-        if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now) {
+        let delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles);
+        if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
                 agent_id,
@@ -731,13 +744,17 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             );
             return;
         }
-        let line = prompt::line_for(ticket);
+        let line = prompt::line_for(ticket, delivery);
         if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
             log::warn!("dispatch {agent_id}: typing the ticket line failed: {e}");
             self.send_to_backlog(agent_id, &ticket.id, TERMINAL_GONE_NOTE);
             return;
         }
-        log::info!("dispatch {agent_id}: typed ticket {}", ticket.short_id());
+        log::info!(
+            "dispatch {agent_id}: typed ticket {} (coordination: {:?})",
+            ticket.short_id(),
+            delivery.coordination
+        );
         self.schedule(agent_id, token, TimerKind::SendEnter, ENTER_DELAY_MS);
         self.set(
             agent_id,
@@ -1152,8 +1169,13 @@ mod tests {
             }
         }
 
-        /// A live agent with its own cwd.
+        /// A live agent with its own cwd (work seat, no roles).
         fn agent(&self, id: &str, status: AgentStatus) {
+            self.agent_on(id, status, SeatKind::Work, &[]);
+        }
+
+        /// A live agent on `seat` with `roles`.
+        fn agent_on(&self, id: &str, status: AgentStatus, seat_kind: SeatKind, roles: &[Role]) {
             let cwd = self.root.join(id);
             fs::create_dir_all(&cwd).unwrap();
             lock(&self.port.0).snapshots.insert(
@@ -1164,6 +1186,8 @@ mod tests {
                     status,
                     detail: None,
                     last_user_input_at: None,
+                    seat_kind,
+                    roles: roles.to_vec(),
                 },
             );
         }
@@ -1253,7 +1277,7 @@ mod tests {
     }
 
     fn line(t: &Ticket) -> String {
-        prompt::line_for(t)
+        prompt::line_for(t, TicketDelivery::WORK)
     }
 
     fn enter(agent: &str) -> (String, String) {
@@ -1282,6 +1306,64 @@ mod tests {
         h.advance(ENTER_DELAY_MS);
         assert_eq!(h.writes(), vec![("a1".into(), line(&t)), enter("a1")]);
         assert_eq!(h.ticket(&t.id).state, S::Assigned);
+    }
+
+    // 5c C.1: an agent on a staff seat gets the ticket as a coordination task; the
+    // "Koordinér ticket" line confirms it like a ticket line.
+    #[test]
+    fn staff_seat_gets_coordination_task() {
+        use prompt::{CoordinationKind, COORDINATION_DISTRIBUTE_TEXT, COORDINATION_PLAN_TEXT};
+        let mut h = Harness::new();
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        h.agent_on("r1", AgentStatus::Idle, SeatKind::Staff, &[Role::Reviewer]);
+        h.agent_on(
+            "w1",
+            AgentStatus::Idle,
+            SeatKind::Work,
+            &[Role::Coordinator],
+        );
+        let tk = h.queued("k1", "Lav en side");
+        let tr = h.queued("r1", "Plan noget");
+        let tw = h.queued("w1", "Kod noget");
+        for a in ["k1", "r1", "w1"] {
+            h.idle(a);
+        }
+        h.advance(DISPATCH_DELAY_MS);
+        let distribute = TicketDelivery {
+            coordination: Some(CoordinationKind::Distribute),
+        };
+        let plan = TicketDelivery {
+            coordination: Some(CoordinationKind::Plan),
+        };
+        let writes = h.writes();
+        let typed = |a: &str| writes.iter().find(|(x, _)| x == a).unwrap().1.clone();
+        assert_eq!(typed("k1"), prompt::line_for(&tk, distribute));
+        assert!(typed("k1").starts_with(&format!("Koordinér ticket {}: ", tk.short_id())));
+        assert_eq!(typed("r1"), prompt::line_for(&tr, plan));
+        assert_eq!(typed("w1"), line(&tw));
+        let fk = h.ticket_file("k1", &tk);
+        assert!(fk.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_DISTRIBUTE_TEXT}\n\n## Regler\n"
+        )));
+        let fr = h.ticket_file("r1", &tr);
+        assert!(fr.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_PLAN_TEXT}\n\n## Regler\n"
+        )));
+        assert!(!h.ticket_file("w1", &tw).contains("Koordineringsopgave"));
+        h.advance(ENTER_DELAY_MS);
+        // The coordination line confirms the delivery (UserPromptSubmit prefix).
+        h.submitted("k1", &typed("k1"));
+        assert_eq!(h.ticket(&tk.id).state, S::InProgress);
+        h.submitted("w1", &typed("w1"));
+        assert_eq!(h.ticket(&tw.id).state, S::InProgress);
+        // Another ticket's coordination line does not.
+        h.submitted("r1", &format!("Koordinér ticket {}: x", tk.short_id()));
+        assert_eq!(h.ticket(&tr.id).state, S::Assigned);
     }
 
     // (2) + busy status as confirmation

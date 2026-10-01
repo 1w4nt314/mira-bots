@@ -637,9 +637,12 @@ impl ToolsCtx {
             Some(_) => return Err("seatKind skal være \"work\" eller \"staff\"".into()),
         };
         let first_ticket_id = opt_id(args, "firstTicketId")?.map(str::to_string);
-        if self.profiles.get(profile_id).is_none() {
-            return Err(crate::profiles::ProfileError::NotFound.into());
-        }
+        let profile = self
+            .profiles
+            .get(profile_id)
+            .ok_or(crate::profiles::ProfileError::NotFound)?;
+        // Refused as a tool error before the port (the spawn path checks it again, 5c B).
+        profile.check_seat(seat_kind.unwrap_or(profile.default_seat))?;
         let port = lock(&self.spawn).clone().ok_or(SPAWN_UNAVAILABLE)?;
         let info = port(SpawnByProfile {
             profile_id: profile_id.to_string(),
@@ -1628,6 +1631,16 @@ mod tests {
                 1
             ),
             Err("Profilen findes ikke".into())
+        );
+        // A coder on a staff seat is refused as a tool error, before the port (5c B).
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_spawn_agent",
+                json!({"profileId":"coder","seatKind":"staff"}),
+                1
+            ),
+            Err("Profilen «Koder» har ingen stabsrolle (reviewer, koordinator eller planlægger) og kan ikke stå på en stabsplads".into())
         );
         let seen: Arc<Mutex<Vec<SpawnByProfile>>> = Arc::default();
         let (rec, manager) = (Arc::clone(&seen), Arc::clone(&t.tc.ctx.manager));

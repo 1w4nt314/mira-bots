@@ -33,6 +33,8 @@ Island → Workplace → pladser → terminal:
 4. Terminalpanelet og kontoret deler venstre side. Træk i grebet (splitteren) mellem dem for at ændre højden, eller fokusér det og brug pil op/ned (16 px ad gangen), Home og End; dobbeltklik nulstiller. Knappen ▁ minimerer terminalen til én linje nederst, så kontoret får hele højden; "Gendan" eller et klik på en plads henter den tilbage i den gemte højde. Knappen ⤢ maksimerer terminalen, og kontoret bliver en smal strimmel med alle pladser, hvor du stadig kan skifte agent; ⤡ gendanner den delte visning. Højde og tilstand huskes mellem starter.
 5. En agent startes fra en profil. Profilen bestemmer agentens roller (de vælger figur, mappenavn, systemprompt og hvilke af appens værktøjer agenten får), model, effort og standardplads. Se afsnittet Agentprofiler og roller.
 6. Lofter: højst 5 agenter på arbejdspladser og 3 på stabspladser (kun kørende tæller med).
+7. En stabsplads kræver en profil med mindst én stabsrolle (reviewer, koordinator eller planlægger); en arbejdsplads tager enhver profil (en reviewer på en arbejdsplads må gerne kode). Dialogen "Ny agent" viser profiler uden stabsrolle som deaktiverede ("Ingen stabsrolle") på en stabsplads, og appen afviser dem også via `mira_spawn_agent`.
+8. En ticket på en agent på en stabsplads er en koordineringsopgave: agenten fordeler opgaven (tildeler den til en arbejdsagent eller deler den op i del-tickets) i stedet for at løse den selv. En agent fra en profil uden arbejdsrolle (koder, researcher eller debugger) kan heller ikke redigere filer: profilen afviser Claude Codes fil-værktøjer.
 
 ### Kontor-detaljer
 
@@ -81,7 +83,9 @@ Sådan bruger du dem:
 
 Mens en agent har en ticket i gang, taster appen aldrig den næste ticket ind; først når ticketen er afleveret eller flyttet. Det gælder også, hvis du afbryder turen med Esc (der kommer intet Stop): ticketen står som I gang, indtil agenten afleverer, eller du flytter den. Fejler turen (hooket StopFailure, fx en API-fejl), bliver ticketen i gang med advarslen "Turn fejlede", og du kan bruge "Send igen". Konstanten `AUTO_REVIEW_ON_STOP` i `src-tauri/src/config.rs` (standard `false`) gendanner trin 3-adfærden, hvor Stop selv flytter ticketen til Review; det kræver en ny bygning.
 
-**Roller** påvirker ikke, hvilke tickets en agent får: en ticket kan trækkes på alle agenter. En ticket på en stabsagent (typisk en koordinator) hedder "koordineringsopgave" i Workplace.
+**Roller** påvirker ikke, hvilke tickets en agent får: en ticket kan trækkes på alle agenter. En ticket på en stabsagent (typisk en koordinator) hedder "koordineringsopgave" i Workplace, og den leveres anderledes: linjen begynder med "Koordinér ticket <kort-id>: …" og beder agenten fordele opgaven i stedet for at udføre den, og ticket-filen får et afsnit "Koordineringsopgave" før reglerne. Har agenten rollen koordinator, står der, at den skal finde en ledig arbejdsagent (`mira_list_agents`) og give den ticketen med `mira_assign_ticket`, dele en for stor opgave op i del-tickets med `assignTo`, starte en arbejdsagent med `mira_spawn_agent`, hvis der er en fri arbejdsplads, og ellers lægge ticketen tilbage med `mira_unassign_ticket`. En reviewer eller planlægger uden koordinatorrollen bliver bedt om at nedbryde opgaven i del-tickets i Backlog og aflevere ticketen med planen.
+
+**Beskrivelse på noten.** Folden "Beskrivelse" lige under titlen på en sticky note henter ticketens beskrivelse, når den foldes ud, og viser den som markdown (lange beskrivelser kan rulles); "(ingen beskrivelse)", når den er tom.
 
 **Lagring.** Tickets ligger i `%APPDATA%\dk.mira.bots\tickets.json` og overlever genstart. Filen skrives atomisk (først en midlertidig fil, som så omdøbes). Er filen beskadiget, omdøbes den til `tickets.json.broken-<tidspunkt>`, appen starter med en tom liste, og Diagnostik viser en advarsel. Kan filen slet ikke åbnes (fx låst af antivirus eller backup), starter Tickets skrivebeskyttet med en advarsel i Tickets-fanen, og filen røres ikke, før du genstarter appen. Ved hver start flyttes tickets, der var i kø eller i gang, tilbage til Backlog med noten "app genstartet"; Review, Done og Afvist er urørte. Stopper eller fjerner du en agent, eller afsluttes den, havner dens tickets også i Backlog med en note.
 
@@ -91,6 +95,8 @@ En **profil** er opskriften på en agent: navn, roller, prompt-tillæg, model, e
 
 **De seks roller** er koder, researcher, reviewer, koordinator, planlægger og debugger. Hver rolle giver et kort afsnit i agentens systemprompt ("Din rolle"), en figur og et mappepræfiks, og de styrer, hvilke af appens værktøjer agenten får (tabellen i afsnittet Agentens værktøjer). En profil kan have nul, én eller flere roller.
 
+**Stabsroller og arbejdsroller.** Reviewer, koordinator og planlægger er stabsroller; koder, researcher og debugger er arbejdsroller. En profil skal have mindst én stabsrolle for at stå på en stabsplads (vælger du standardplads "Stabsplads" uden stabsrolle i profil-editoren, vises en advarsel). En profil uden nogen arbejdsrolle får `Edit`, `Write`, `MultiEdit` og `NotebookEdit` i sin `permissions.deny`, så agenten ikke selv kan oprette eller ændre filer; det gælder de indbyggede profiler Reviewer, Koordinator og Planlægger og enhver egen profil uden arbejdsrolle (også en uden roller). Rolleteksterne siger det samme: koordinatoren udfører aldrig selve arbejdet, og reviewer og planlægger ændrer ikke selv kode eller filer.
+
 **Specialist** er en profil, ikke en rolle: profilen "Specialist (alle roller)" har alle seks roller og får en dynamisk figur, der tegnes ud fra rollerne. Din egen profil med flere roller (eller med "Specialist" slået til) er også en specialist og kan have vilkårlige roller, fx kun planlægger og researcher. En profil med netop én rolle får rollens egen figur; en profil uden roller får en neutral figur og kun fællesværktøjerne.
 
 **Indbyggede profiler** (de genskabes, hvis filen mangler, og kan nulstilles, men ikke slettes):
@@ -99,9 +105,9 @@ En **profil** er opskriften på en agent: navn, roller, prompt-tillæg, model, e
 |---|---|---|
 | Koder | coder | arbejdsplads |
 | Researcher | researcher | arbejdsplads |
-| Reviewer | reviewer (må læse git-historik, men ikke committe eller pushe) | stabsplads |
-| Koordinator | coordinator | stabsplads |
-| Planlægger | planner | arbejdsplads |
+| Reviewer | reviewer (må læse git-historik, men ikke committe eller pushe; redigerer ikke filer) | stabsplads |
+| Koordinator | coordinator (redigerer ikke filer) | stabsplads |
+| Planlægger | planner (redigerer ikke filer) | arbejdsplads |
 | Debugger | debugger | arbejdsplads |
 | Specialist (alle roller) | alle seks | arbejdsplads |
 
@@ -129,7 +135,7 @@ Du kan selv tilføje en note under "Rapporter (n)" på ticketen (titel og tekst)
 
 ## Koordinator
 
-Rollen koordinator har ingen egen logik i appen; den får værktøjer og en systemprompt om arbejdsgangen. Koordinatorens ticket-kilde er den samme som din: Backlog (både dine og agenternes tickets), som den læser med `mira_list_tickets` (`all`) og `mira_get_ticket`. Den kan oprette tickets og tildele dem med det samme (`mira_create_ticket` med `assignTo`), tildele og fjerne tildelinger (`mira_assign_ticket`, `mira_unassign_ticket`; kun tickets i Backlog eller Afvist, kun til kørende agenter), se agenter og profiler (`mira_list_agents`, `mira_list_profiles`) og starte nye agenter fra en profil med `mira_spawn_agent`. En startet agent går gennem samme start-kode og samme lofter som i Workplace (5 arbejdspladser og 3 stabspladser; en afvisning kommer som den danske lofttekst). Koordinatoren godkender aldrig tickets; det gør reviewere eller du.
+Rollen koordinator har ingen egen logik i appen; den får værktøjer og en systemprompt om arbejdsgangen. Koordinatorens ticket-kilde er den samme som din: Backlog (både dine og agenternes tickets), som den læser med `mira_list_tickets` (`all`) og `mira_get_ticket`. Den kan oprette tickets og tildele dem med det samme (`mira_create_ticket` med `assignTo`), tildele og fjerne tildelinger (`mira_assign_ticket`, `mira_unassign_ticket`; kun tickets i Backlog eller Afvist, kun til kørende agenter), se agenter og profiler (`mira_list_agents`, `mira_list_profiles`) og starte nye agenter fra en profil med `mira_spawn_agent`. En startet agent går gennem samme start-kode og samme lofter som i Workplace (5 arbejdspladser og 3 stabspladser; en afvisning kommer som den danske lofttekst). Koordinatoren godkender aldrig tickets; det gør reviewere eller du. Den udfører heller aldrig selve arbejdet: den kan ikke redigere filer (deny-reglerne ovenfor), og en ticket, den får, leveres som en koordineringsopgave, som den giver videre med `mira_assign_ticket` eller deler op.
 
 ## Agentens værktøjer
 
@@ -175,7 +181,7 @@ Appen skriver en egen settings-fil pr. profil, `%APPDATA%\dk.mira.bots\profiles\
 
 - `hooks`: 12 hook-events (inkl. `PostModelSwitch`), der peger på `mira-hook.exe`, som sender hændelser til appen over en named pipe og (kun ved tilladelsesanmodninger) venter på dit svar. Er appen ikke startet, gør `mira-hook.exe` ingenting, og Claude Code påvirkes ikke.
 - `permissions.allow`: kun appens egne værktøjer (`mcp__mira-bots__*`) og profilens `extraAllow` (fx git-læseregler hos reviewer).
-- `permissions.deny`: de af appens værktøjer, profilens roller ikke må bruge, og profilens `extraDeny` (fx `git commit` og `git push`, også som `git -C <mappe> commit`/`push`, hos reviewer). Nøglen udelades, når intet skal afvises, som hos en specialist med alle roller.
+- `permissions.deny`: de af appens værktøjer, profilens roller ikke må bruge, `Edit`, `Write`, `MultiEdit` og `NotebookEdit`, når profilen ikke har nogen arbejdsrolle (koder, researcher eller debugger), og profilens `extraDeny` (fx `git commit` og `git push`, også som `git -C <mappe> commit`/`push`, hos reviewer). Nøglen udelades, når intet skal afvises, som hos en specialist med alle roller.
 - `model` og `effortLevel`, når profilen har dem (effort `max` gives kun som flag).
 - `statusLine`: `mira-hook.exe` uden argumenter. Claude Code kalder den ved statusopdateringer med model og effort på stdin, og appen bruger det til at vise den aktuelle model og effort. Programmet skriver intet tilbage, så statuslinjen i selve terminalen er tom. Appen opdaterer kun visningen, når værdierne ændrer sig.
 
@@ -316,6 +322,10 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 68. `prefers-reduced-motion`: med "Animationseffekter" slået fra i Windows (Indstillinger → Tilgængelighed → Visuelle effekter) blinker skærmlinjerne på laptops ikke; uret på væggen går stadig.
 69. Tre stabspladser: en tredje stabsagent kan startes fra en tom stabsplads og via koordinatorens `mira_spawn_agent`; den fjerde afvises med "Loft på 3 stabspladser nået"; headeren viser "n/3 stab".
 70. Vægur viser Windows' lokale tid og opdateres; med "Lidt mere", 8 figurer og én kørende terminal er der ingen mærkbar UI-belastning.
+71. Spawn af Koder på en stabsplads afvises: i dialogen er Koder deaktiveret med "Ingen stabsrolle" (og standardvalget er en profil med stabsrolle), og via koordinatorens `mira_spawn_agent` med `seatKind: "staff"` kommer fejlen "Profilen «Koder» har ingen stabsrolle …" som værktøjsfejl.
+72. En ticket trukket på en koordinator giver linjen "Koordinér ticket <kort-id>: …" i terminalen og afsnittet "Koordineringsopgave" i ticket-filen; linjen bekræfter afleveringen (ticketen går i gang), og koordinatoren tildeler den videre til en ledig arbejdsagent med `mira_assign_ticket`.
+73. Koordinatoren (og reviewer/planlægger) får afslag på `Edit`/`Write` (deny i profilens settings-fil), hvis den alligevel prøver at redigere en fil.
+74. Folden "Beskrivelse" på en sticky note viser ticketens beskrivelse som markdown (rulbar ved lange beskrivelser, "(ingen beskrivelse)" når den er tom) og starter ikke et træk, når man klikker i den.
 
 ## Licens og inspiration
 

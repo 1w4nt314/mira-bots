@@ -8,7 +8,7 @@ import {
   spawnAgentWithTicket,
 } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
-import { folderPrefix, isSpecialist, rolesText } from "../../lib/roles";
+import { folderPrefix, hasStaffRole, isSpecialist, rolesText } from "../../lib/roles";
 import type { AgentProfile, Effort, SeatKind, SpawnOverrides, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
 import BotFigure from "../BotFigure";
@@ -25,6 +25,22 @@ function profilePrefix(p: AgentProfile | undefined): string {
 
 const SEAT_TEXT: Record<SeatKind, string> = { work: "arbejdsplads", staff: "stabsplads" };
 
+/** A staff seat needs a profile with a staff role; a work seat takes any profile (mirrors
+ * `AgentProfile::check_seat` in Rust). */
+function fitsSeat(p: AgentProfile, seatKind: SeatKind): boolean {
+  return seatKind === "work" || hasStaffRole(p.roles);
+}
+
+/**
+ * The preselected profile: `coder` on a work seat; on a staff seat the first profile that
+ * normally stands there and has a staff role, else the first with a staff role.
+ */
+function defaultProfileId(profiles: readonly AgentProfile[], seatKind: SeatKind): string | null {
+  if (seatKind === "work") return DEFAULT_PROFILE;
+  const fits = profiles.filter((p) => fitsSeat(p, seatKind));
+  return (fits.find((p) => p.defaultSeat === "staff") ?? fits[0])?.id ?? null;
+}
+
 interface Props {
   seatKind: SeatKind;
   theme: Theme;
@@ -39,7 +55,8 @@ export default function SpawnDialog(props: Props) {
   const { seatKind, theme, agentsRoot, ticket = null, onClose, onSpawned } = props;
   const { state, dispatch } = useStore();
   const profiles = state.profiles;
-  const [profileId, setProfileId] = useState<string>(DEFAULT_PROFILE);
+  // `null` until the user picks one: the default then follows the loaded profiles.
+  const [chosenId, setProfileId] = useState<string | null>(null);
   const [overrideModel, setOverrideModel] = useState<string | null>(null);
   const [overrideEffort, setOverrideEffort] = useState<Effort | null>(null);
   const [folderMode, setFolderMode] = useState<"default" | "custom">("default");
@@ -66,6 +83,7 @@ export default function SpawnDialog(props: Props) {
   }, [busy, onClose]);
 
   const sep = agentsRoot !== null && agentsRoot.includes("\\") ? "\\" : "/";
+  const profileId = chosenId ?? defaultProfileId(profiles, seatKind);
   const profile = profiles.find((p) => p.id === profileId);
   const defaultPath = `${agentsRoot ?? "…"}${sep}${profilePrefix(profile)}-nn`;
 
@@ -103,7 +121,10 @@ export default function SpawnDialog(props: Props) {
   };
 
   const overridesValid = modelChoiceValid(overrideModel);
-  const canStart = !busy && overridesValid && (folderMode === "default" || folder !== null);
+  // On a staff seat a profile must be chosen and have a staff role (the backend refuses it too).
+  const seatOk = seatKind === "work" || (profile !== undefined && fitsSeat(profile, seatKind));
+  const canStart =
+    !busy && overridesValid && seatOk && (folderMode === "default" || folder !== null);
   // The seat the user clicked wins over the profile's default seat.
   const seatDiffers = profile !== undefined && profile.defaultSeat !== seatKind;
 
@@ -135,30 +156,44 @@ export default function SpawnDialog(props: Props) {
         <fieldset className="mt-4">
           <legend className="mb-2 text-xs font-medium text-[var(--muted)]">Profil</legend>
           <div className="grid grid-cols-4 gap-2">
-            {profiles.map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => setProfileId(p.id)}
-                aria-pressed={profileId === p.id}
-                title={`${rolesText(p.roles)}\nModel: ${modelLabel(p.model)} · Effort: ${effortLabel(p.effort)}`}
-                className={`flex flex-col items-center gap-1 rounded-xl border p-2 ${
-                  profileId === p.id
-                    ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40"
-                    : "border-[var(--border)] hover:border-[var(--accent)]"
-                }`}
-              >
-                <BotFigure
-                  roles={p.roles}
-                  specialist={isSpecialist(p)}
-                  state="idle"
-                  theme={theme}
-                  size={56}
-                />
-                <span className="w-full truncate text-center text-[11px]">{p.name}</span>
-              </button>
-            ))}
+            {profiles.map((p) => {
+              const fits = fitsSeat(p, seatKind);
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => setProfileId(p.id)}
+                  disabled={!fits}
+                  aria-pressed={profileId === p.id}
+                  title={`${rolesText(p.roles)}\nModel: ${modelLabel(p.model)} · Effort: ${effortLabel(p.effort)}${
+                    fits ? "" : "\nKan ikke stå på en stabsplads: profilen har ingen stabsrolle (reviewer, koordinator eller planlægger)"
+                  }`}
+                  className={`flex flex-col items-center gap-1 rounded-xl border p-2 ${
+                    !fits
+                      ? "cursor-not-allowed border-[var(--border)] opacity-50"
+                      : profileId === p.id
+                        ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40"
+                        : "border-[var(--border)] hover:border-[var(--accent)]"
+                  }`}
+                >
+                  <BotFigure
+                    roles={p.roles}
+                    specialist={isSpecialist(p)}
+                    state="idle"
+                    theme={theme}
+                    size={56}
+                  />
+                  <span className="w-full truncate text-center text-[11px]">{p.name}</span>
+                  {!fits && <span className="text-[10px] text-[var(--muted)]">Ingen stabsrolle</span>}
+                </button>
+              );
+            })}
           </div>
+          {seatKind === "staff" && profiles.length > 0 && !profiles.some((p) => fitsSeat(p, seatKind)) && (
+            <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-300">
+              Ingen profil har en stabsrolle (reviewer, koordinator eller planlægger).
+            </p>
+          )}
           {seatDiffers && profile !== undefined && (
             <p className="mt-1.5 text-[11px] text-[var(--muted)]">
               {profile.name} står normalt på en {SEAT_TEXT[profile.defaultSeat]}; agenten starter på

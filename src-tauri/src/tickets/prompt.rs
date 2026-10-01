@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::model::{Ticket, TicketState};
+use crate::agent::roles::Role;
+use crate::agent::SeatKind;
 use crate::config::{MAX_REVIEW_ROUNDS, REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
 
 /// Title used when nothing is left after sanitising.
@@ -102,6 +104,55 @@ pub fn render_line(short: &str, title: &str) -> String {
     )
 }
 
+/// The line for a ticket delivered to an agent on a staff seat (5c C.1): it distributes the
+/// work instead of doing it. Like [`render_line`] one line that never starts with "Du"; the
+/// dispatcher confirms it on the "Koordinér ticket <short>" prefix.
+pub fn render_coordination_line(short: &str, title: &str) -> String {
+    format!(
+        "Koordinér ticket {short}: {title}. Læs filen {TICKET_DIR}/{short}.md og fordel opgaven; udfør den ikke selv."
+    )
+}
+
+/// What an agent on a staff seat is asked to do with a ticket (5c C.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinationKind {
+    /// Has the coordinator role: hand the ticket to a work agent (or split it up).
+    Distribute,
+    /// Reviewer/planner without the coordinator role: split it into backlog tickets.
+    Plan,
+}
+
+/// How a ticket is delivered: as work (the default) or as a coordination task (the assignee sits
+/// on a staff seat).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TicketDelivery {
+    pub coordination: Option<CoordinationKind>,
+}
+
+impl TicketDelivery {
+    /// A plain work delivery (unchanged file and line).
+    pub const WORK: TicketDelivery = TicketDelivery { coordination: None };
+
+    /// The delivery for an agent on `seat` with `roles`: a work seat gets the work delivery; a
+    /// staff seat a coordination task, [`CoordinationKind::Distribute`] with the coordinator
+    /// role, else [`CoordinationKind::Plan`].
+    pub fn for_agent(seat: SeatKind, roles: &[Role]) -> TicketDelivery {
+        let coordination = match seat {
+            SeatKind::Work => None,
+            SeatKind::Staff if roles.contains(&Role::Coordinator) => {
+                Some(CoordinationKind::Distribute)
+            }
+            SeatKind::Staff => Some(CoordinationKind::Plan),
+        };
+        TicketDelivery { coordination }
+    }
+}
+
+/// `## Koordineringsopgave` text for an agent with the coordinator role.
+pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv (skriv ingen kode og ingen filer). Find en ledig arbejdsagent med mira_list_agents og giv den ticketen med mira_assign_ticket (så flytter ticketen til den). Er opgaven for stor, opret del-tickets med mira_create_ticket og assignTo, og aflever denne ticket med mira_submit_for_review med en kort plan for fordelingen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers læg ticketen tilbage med mira_unassign_ticket og skriv hvorfor.";
+/// `## Koordineringsopgave` text for a reviewer/planner without the coordinator role.
+pub const COORDINATION_PLAN_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv. Nedbryd den i del-tickets med mira_create_ticket (de lander i backlog, brugeren eller en koordinator tildeler dem) og aflever denne ticket med mira_submit_for_review med planen.";
+
 /// "Bed om aflevering" (C4.7): typed like a ticket line (one write, `\r` separately). It starts
 /// with "Du", never with "Ticket", so the dispatcher can never take it for a ticket delivery.
 pub fn request_submission_line(short: &str) -> String {
@@ -110,9 +161,14 @@ pub fn request_submission_line(short: &str) -> String {
     )
 }
 
-/// The line for a ticket (sanitises the title).
-pub fn line_for(t: &Ticket) -> String {
-    render_line(&t.short_id(), &sanitize_title(&t.title))
+/// The line for a ticket (sanitises the title): [`render_line`], or
+/// [`render_coordination_line`] for a coordination task.
+pub fn line_for(t: &Ticket, delivery: TicketDelivery) -> String {
+    let (short, title) = (t.short_id(), sanitize_title(&t.title));
+    match delivery.coordination {
+        None => render_line(&short, &title),
+        Some(_) => render_coordination_line(&short, &title),
+    }
 }
 
 /// One-line form for headings and agent-supplied titles/notes: CRLF/CR/LF/tab → space, other
@@ -138,8 +194,9 @@ pub fn clean_body(s: &str) -> String {
         .collect()
 }
 
-/// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6, rules from plan4 C4.7).
-pub fn render_file(t: &Ticket, now_ms: u64) -> String {
+/// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6, rules from plan4 C4.7); a
+/// coordination task gets `## Koordineringsopgave` before `## Regler` (5c C.1).
+pub fn render_file(t: &Ticket, now_ms: u64, delivery: TicketDelivery) -> String {
     let short = t.short_id();
     let body = t.body.replace("\r\n", "\n");
     let body = body.trim_end_matches('\n');
@@ -172,6 +229,13 @@ pub fn render_file(t: &Ticket, now_ms: u64) -> String {
             one_line(note)
         ));
     }
+    if let Some(kind) = delivery.coordination {
+        let text = match kind {
+            CoordinationKind::Distribute => COORDINATION_DISTRIBUTE_TEXT,
+            CoordinationKind::Plan => COORDINATION_PLAN_TEXT,
+        };
+        out.push_str(&format!("## Koordineringsopgave\n{text}\n\n"));
+    }
     out.push_str(
         "## Regler\n\
          - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
@@ -190,7 +254,12 @@ pub fn ticket_dir(cwd: &Path) -> PathBuf {
 
 /// Writes the ticket file (overwriting) and, if missing, `<cwd>/.mira-bots/.gitignore` with `*`.
 /// Returns the file's path.
-pub fn write_ticket_file(cwd: &Path, t: &Ticket, now_ms: u64) -> io::Result<PathBuf> {
+pub fn write_ticket_file(
+    cwd: &Path,
+    t: &Ticket,
+    now_ms: u64,
+    delivery: TicketDelivery,
+) -> io::Result<PathBuf> {
     let dir = ticket_dir(cwd);
     fs::create_dir_all(&dir)?;
     if let Some(root) = dir.parent() {
@@ -200,7 +269,7 @@ pub fn write_ticket_file(cwd: &Path, t: &Ticket, now_ms: u64) -> io::Result<Path
         }
     }
     let path = dir.join(format!("{}.md", t.short_id()));
-    fs::write(&path, render_file(t, now_ms))?;
+    fs::write(&path, render_file(t, now_ms, delivery))?;
     Ok(path)
 }
 
@@ -501,13 +570,13 @@ mod tests {
             &"z".repeat(300),
         ] {
             t.title = raw.to_string();
-            let line = line_for(&t);
+            let line = line_for(&t, TicketDelivery::WORK);
             assert_line_safe(&line);
             assert!(line.starts_with("Ticket abcdef01: "));
             assert!(!line.contains('\u{200B}') && !line.contains('@'));
         }
         t.title = "z".repeat(300);
-        assert!(line_for(&t).chars().count() < 300);
+        assert!(line_for(&t, TicketDelivery::WORK).chars().count() < 300);
     }
 
     #[test]
@@ -527,7 +596,7 @@ mod tests {
         let mut t = ticket(ID, TicketState::Assigned);
         t.title = "Ret\nlogin".into();
         t.body = "Linje 1\r\n\r\n- punkt @x /y\n".into();
-        let f = render_file(&t, 1_700_000_000_000);
+        let f = render_file(&t, 1_700_000_000_000, TicketDelivery::WORK);
         assert!(f.starts_with("# Ticket abcdef01: Ret login\n\n"), "{f}");
         assert!(f.contains(&format!("- id: {ID}\n")));
         assert!(f.contains("- kort-id: abcdef01\n"));
@@ -549,12 +618,86 @@ mod tests {
         t.skip_review = true;
         t.body = String::new();
         t.rejection_note = Some("Mangler\ntest".into());
-        let f = render_file(&t, 0);
+        let f = render_file(&t, 0, TicketDelivery::default());
         assert!(f.contains("- review: springes over\n"));
         assert!(f.contains("## Opgave\n\n(ingen beskrivelse)\n\n"));
         assert!(f.contains(
             "## Afvist: Mangler test\nRet det ovenstående og afslut dit svar igen, så ticketen kommer til review på ny.\n\n## Regler\n"
         ));
+    }
+
+    #[test]
+    fn delivery_for_agent_by_seat_and_roles() {
+        let d = |seat, roles: &[Role]| TicketDelivery::for_agent(seat, roles).coordination;
+        // A work seat: always the plain delivery, whatever the roles.
+        for roles in [&[][..], &[Role::Coder], &[Role::Coordinator], &Role::ALL] {
+            assert_eq!(d(SeatKind::Work, roles), None, "{roles:?}");
+        }
+        assert_eq!(
+            d(SeatKind::Staff, &[Role::Coordinator]),
+            Some(CoordinationKind::Distribute)
+        );
+        assert_eq!(
+            d(SeatKind::Staff, &Role::ALL),
+            Some(CoordinationKind::Distribute)
+        );
+        assert_eq!(
+            d(SeatKind::Staff, &[Role::Reviewer]),
+            Some(CoordinationKind::Plan)
+        );
+        assert_eq!(
+            d(SeatKind::Staff, &[Role::Planner, Role::Reviewer]),
+            Some(CoordinationKind::Plan)
+        );
+        assert_eq!(TicketDelivery::default(), TicketDelivery::WORK);
+    }
+
+    #[test]
+    fn coordination_line_and_file() {
+        let mut t = ticket(ID, TicketState::Assigned);
+        t.title = "Lav @en side".into();
+        t.rejection_note = Some("Prøv igen".into());
+        let work = render_file(&t, 0, TicketDelivery::WORK);
+        let distribute = TicketDelivery {
+            coordination: Some(CoordinationKind::Distribute),
+        };
+        let plan = TicketDelivery {
+            coordination: Some(CoordinationKind::Plan),
+        };
+        // The work delivery is unchanged: no coordination section, the plain line.
+        assert!(!work.contains("Koordineringsopgave"));
+        assert!(line_for(&t, TicketDelivery::WORK).starts_with("Ticket abcdef01: "));
+        for (d, text, other) in [
+            (
+                distribute,
+                COORDINATION_DISTRIBUTE_TEXT,
+                COORDINATION_PLAN_TEXT,
+            ),
+            (plan, COORDINATION_PLAN_TEXT, COORDINATION_DISTRIBUTE_TEXT),
+        ] {
+            let line = line_for(&t, d);
+            assert_eq!(
+                line,
+                "Koordinér ticket abcdef01: Lav (at)en side. Læs filen .mira-bots/tickets/abcdef01.md og fordel opgaven; udfør den ikke selv."
+            );
+            assert!(!line.starts_with("Du") && !line.starts_with("Ticket"));
+            assert!(!line.chars().any(|c| c.is_control()));
+            let f = render_file(&t, 0, d);
+            let section = format!("## Koordineringsopgave\n{text}\n\n## Regler\n");
+            assert!(f.contains(&section), "{f}");
+            assert!(!f.contains(other));
+            // After the rejection note, before the rules; the rest is the work file.
+            let afvist = f.find("## Afvist:").unwrap();
+            assert!(afvist < f.find("## Koordineringsopgave").unwrap());
+            assert_eq!(
+                f.replace(&format!("## Koordineringsopgave\n{text}\n\n"), ""),
+                work
+            );
+        }
+        assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_assign_ticket"));
+        assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_list_agents"));
+        assert!(COORDINATION_PLAN_TEXT.contains("mira_create_ticket"));
+        assert!(!COORDINATION_PLAN_TEXT.contains("mira_assign_ticket"));
     }
 
     #[test]
@@ -572,12 +715,15 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("mira-prompt-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&cwd).unwrap();
         let t = ticket(ID, TicketState::Assigned);
-        let path = write_ticket_file(&cwd, &t, 0).unwrap();
+        let path = write_ticket_file(&cwd, &t, 0, TicketDelivery::WORK).unwrap();
         assert_eq!(
             path,
             cwd.join(".mira-bots").join("tickets").join("abcdef01.md")
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), render_file(&t, 0));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            render_file(&t, 0, TicketDelivery::WORK)
+        );
         let gi = cwd.join(".mira-bots").join(".gitignore");
         assert_eq!(fs::read_to_string(&gi).unwrap(), "*\n");
 
@@ -585,7 +731,7 @@ mod tests {
         fs::write(&gi, "custom\n").unwrap();
         let mut t2 = t.clone();
         t2.title = "Ny titel".into();
-        write_ticket_file(&cwd, &t2, 0).unwrap();
+        write_ticket_file(&cwd, &t2, 0, TicketDelivery::WORK).unwrap();
         assert_eq!(fs::read_to_string(&gi).unwrap(), "custom\n");
         assert!(fs::read_to_string(&path).unwrap().contains("Ny titel"));
         let _ = fs::remove_dir_all(&cwd);

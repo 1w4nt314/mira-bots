@@ -21,6 +21,14 @@ export const ROLE_LABEL: Record<Role, string> = {
   debugger: "Debugger",
 };
 
+/** Staff roles (mirrors `Role::is_staff`): a staff seat needs at least one of them. */
+export const STAFF_ROLES: readonly Role[] = ["reviewer", "coordinator", "planner"];
+
+/** Whether the roles include a staff role (mirrors `has_staff_role` in Rust). */
+export function hasStaffRole(roles: readonly Role[]): boolean {
+  return roles.some((r) => STAFF_ROLES.includes(r));
+}
+
 /** Figure (file and generator) name of a role: the coordinator's is `koord`. */
 export function figureNameFor(role: Role): BotCoreRole {
   return role === "coordinator" ? "koord" : role;

@@ -516,7 +516,8 @@ pub fn resolve_profile(
 }
 
 /// The spawn request for `profile` with `overrides` (validated: `model_is_valid`, effort enum).
-/// `seat_kind` defaults to the profile's `defaultSeat`.
+/// `seat_kind` defaults to the profile's `defaultSeat`; a staff seat needs a profile with a staff
+/// role ([`AgentProfile::check_seat`], 5c B).
 pub fn spawn_request(
     profile: &AgentProfile,
     overrides: Option<SpawnOverrides>,
@@ -525,10 +526,12 @@ pub fn spawn_request(
     seat_kind: Option<SeatKind>,
 ) -> Result<SpawnRequest, String> {
     let overrides = validate_overrides(overrides.unwrap_or_default())?;
+    let seat_kind = seat_kind.unwrap_or(profile.default_seat);
+    profile.check_seat(seat_kind)?;
     Ok(SpawnRequest {
         cwd,
         prompt,
-        seat_kind: seat_kind.unwrap_or(profile.default_seat),
+        seat_kind,
         profile: profile.snapshot(&overrides),
     })
 }
@@ -652,8 +655,9 @@ pub fn spawn_core(
     seat_kind: Option<SeatKind>,
 ) -> Result<AgentInfo, String> {
     let profile = resolve_profile(&state.profiles, profile_id.as_deref())?;
-    // Validate the overrides before anything is written or a folder created.
+    // Validate the overrides and the seat before anything is written or a folder created.
     validate_overrides(overrides.clone().unwrap_or_default())?;
+    profile.check_seat(seat_kind.unwrap_or(profile.default_seat))?;
     let (ctx, cwd) = prepare_spawn(state, &profile, cwd)?;
     let req = spawn_request(&profile, overrides, cwd, prompt, seat_kind)?;
     spawn_prepared(app, state, &ctx, req)
@@ -713,15 +717,19 @@ pub fn spawn_with_ticket_core(
     let ticket = ticket_for_spawn(&state.tickets, ticket_id)?;
     let profile = resolve_profile(&state.profiles, profile_id.as_deref())?;
     validate_overrides(overrides.clone().unwrap_or_default())?;
+    let seat = seat_kind.unwrap_or(profile.default_seat);
+    profile.check_seat(seat)?;
     let (ctx, cwd) = prepare_spawn(state, &profile, cwd)?;
-    let file = prompt::write_ticket_file(&cwd, &ticket, now_ms())
+    // On a staff seat the first ticket is a coordination task (5c C.1).
+    let delivery = prompt::TicketDelivery::for_agent(seat, &profile.roles);
+    let file = prompt::write_ticket_file(&cwd, &ticket, now_ms(), delivery)
         .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
     let req = spawn_request(
         &profile,
         overrides,
         cwd,
-        Some(prompt::line_for(&ticket)),
-        seat_kind,
+        Some(prompt::line_for(&ticket, delivery)),
+        Some(seat),
     )?;
     let info = match spawn_prepared(app, state, &ctx, req) {
         Ok(info) => info,
@@ -1712,6 +1720,49 @@ mod tests {
         assert_eq!(
             resolve_profile(&state.profiles, Some(" ")).unwrap().id,
             "coder"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn spawn_request_refuses_staff_seat_without_staff_role() {
+        let dir = std::env::temp_dir().join(format!("mira-seatp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = app_state(&dir);
+        let coder = resolve_profile(&state.profiles, Some("coder")).unwrap();
+        let err = spawn_request(
+            &coder,
+            None,
+            PathBuf::from("/w/c"),
+            None,
+            Some(SeatKind::Staff),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Profilen «Koder» har ingen stabsrolle (reviewer, koordinator eller planlægger) og kan ikke stå på en stabsplads"
+        );
+        // A work seat takes any profile; a staff role is enough for a staff seat.
+        for id in ["coder", "reviewer", "coordinator", "planner", "specialist"] {
+            let p = resolve_profile(&state.profiles, Some(id)).unwrap();
+            let req = spawn_request(&p, None, PathBuf::from("/w"), None, Some(SeatKind::Work));
+            assert_eq!(req.unwrap().seat_kind, SeatKind::Work, "{id}");
+        }
+        for id in ["reviewer", "coordinator", "planner", "specialist"] {
+            let p = resolve_profile(&state.profiles, Some(id)).unwrap();
+            let req = spawn_request(&p, None, PathBuf::from("/w"), None, Some(SeatKind::Staff));
+            assert_eq!(req.unwrap().seat_kind, SeatKind::Staff, "{id}");
+        }
+        // A custom profile whose default seat is staff, without a staff role, is refused too.
+        let own = AgentProfile {
+            name: "Min koder".into(),
+            default_seat: SeatKind::Staff,
+            ..coder.clone()
+        };
+        let err = spawn_request(&own, None, PathBuf::from("/w"), None, None).unwrap_err();
+        assert!(
+            err.starts_with("Profilen «Min koder» har ingen stabsrolle"),
+            "{err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

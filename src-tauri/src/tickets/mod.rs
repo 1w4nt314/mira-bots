@@ -531,6 +531,8 @@ impl AgentPort for ManagerPort {
             status: a.status,
             detail: a.detail,
             last_user_input_at,
+            seat_kind: a.seat_kind,
+            roles: a.roles,
         })
     }
 
