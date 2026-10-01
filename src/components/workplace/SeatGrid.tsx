@@ -35,7 +35,6 @@ export default function SeatGrid(props: Props) {
   const { seats, botStates, theme, selectedId, spawnDisabled, limits, onSelect, onSpawn } = props;
   const { tickets, dragging, detail, mode, fig } = props;
   const roomy = mode !== "max";
-  const { dispatch } = useStore();
 
   const row = (kind: SeatKind, list: SeatAssignment["work"]) =>
     list.map((agent, i) => (
@@ -62,14 +61,6 @@ export default function SeatGrid(props: Props) {
       />
     ));
 
-  const remove = async (id: string) => {
-    try {
-      await removeAgent(id);
-    } catch (e) {
-      dispatch({ type: "error/set", error: errorMessage(e) });
-    }
-  };
-
   return (
     <>
       {detail === "more" && roomy && <WallDecor />}
@@ -84,28 +75,46 @@ export default function SeatGrid(props: Props) {
           {row("work", seats.work)}
         </div>
       </div>
-      {seats.overflow.length > 0 && (
-        <div className="mx-3 mb-2 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
-          <span>Uden plads:</span>
-          {seats.overflow.map((a) => (
-            <span
-              key={a.id}
-              className="flex items-center gap-1 rounded border border-[var(--border)] px-1.5 py-0.5"
-            >
-              {a.name}
-              <button
-                type="button"
-                onClick={() => void remove(a.id)}
-                title={`Fjern ${a.name} fra listen`}
-                aria-label={`Fjern ${a.name}`}
-                className="rounded px-1 hover:bg-neutral-500/20"
-              >
-                Fjern
-              </button>
-            </span>
-          ))}
-        </div>
-      )}
     </>
+  );
+}
+
+/**
+ * Agents without a seat (more live agents than seats). Rendered by Workplace outside the floor, so
+ * the floor's fixed height and `overflow: hidden` never clip it.
+ */
+export function SeatOverflow({ overflow }: { overflow: SeatAssignment["overflow"] }) {
+  const { dispatch } = useStore();
+
+  const remove = async (id: string) => {
+    try {
+      await removeAgent(id);
+    } catch (e) {
+      dispatch({ type: "error/set", error: errorMessage(e) });
+    }
+  };
+
+  if (overflow.length === 0) return null;
+  return (
+    <div className="mx-3 my-1.5 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
+      <span>Uden plads:</span>
+      {overflow.map((a) => (
+        <span
+          key={a.id}
+          className="flex items-center gap-1 rounded border border-[var(--border)] px-1.5 py-0.5"
+        >
+          {a.name}
+          <button
+            type="button"
+            onClick={() => void remove(a.id)}
+            title={`Fjern ${a.name} fra listen`}
+            aria-label={`Fjern ${a.name}`}
+            className="rounded px-1 hover:bg-neutral-500/20"
+          >
+            Fjern
+          </button>
+        </span>
+      ))}
+    </div>
   );
 }

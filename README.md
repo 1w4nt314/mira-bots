@@ -28,10 +28,17 @@ Det findes ikke endnu: systembakke, autostart, projekter og workspace-fil, chat,
 Island → Workplace → pladser → terminal:
 
 1. Islanden er det lille statusvindue øverst. Den viser agenterne og tilladelsesanmodninger, og har en knap til at åbne Workplace.
-2. Workplace er det store vindue. Hver agent sidder på en plads (arbejdsplads eller stabsplads) med en bot-figur, der viser tilstanden: hviler, arbejder, venter eller færdig.
+2. Workplace er det store vindue, indrettet som et kontor. Hver agent sidder ved sit skrivebord (arbejdsplads eller stabsplads) med en bot-figur, der viser tilstanden: hviler, arbejder, venter eller færdig. På bordet står en laptop, hvis skærm lyser i tilstandens farve (grå klar, blå arbejder, gul venter, grøn færdig), og når agenten arbejder, "skriver" den på skærmen. En post-it på bordet betyder, at agenten har en ticket i gang. Staben sidder øverst i et glaskontor (3 pladser), arbejdspladserne (5) nedenunder. En ledig plads er et tomt bord med en stol.
 3. Vælg en plads, så åbnes agentens terminal i panelet. Det er den rigtige interaktive `claude`-session (via ConPTY), så du kan svare direkte i den.
-4. En agent startes fra en profil. Profilen bestemmer agentens roller (de vælger figur, mappenavn, systemprompt og hvilke af appens værktøjer agenten får), model, effort og standardplads. Se afsnittet Agentprofiler og roller.
-5. Lofter: højst 5 agenter på arbejdspladser og 2 på stabspladser (kun kørende tæller med).
+4. Terminalpanelet og kontoret deler venstre side. Træk i grebet (splitteren) mellem dem for at ændre højden, eller fokusér det og brug pil op/ned (16 px ad gangen), Home og End; dobbeltklik nulstiller. Knappen ▁ minimerer terminalen til én linje nederst, så kontoret får hele højden; "Gendan" eller et klik på en plads henter den tilbage i den gemte højde. Knappen ⤢ maksimerer terminalen, og kontoret bliver en smal strimmel med alle pladser, hvor du stadig kan skifte agent; ⤡ gendanner den delte visning. Højde og tilstand huskes mellem starter.
+5. En agent startes fra en profil. Profilen bestemmer agentens roller (de vælger figur, mappenavn, systemprompt og hvilke af appens værktøjer agenten får), model, effort og standardplads. Se afsnittet Agentprofiler og roller.
+6. Lofter: højst 5 agenter på arbejdspladser og 3 på stabspladser (kun kørende tæller med).
+
+### Kontor-detaljer
+
+Knappen "Kontor: Diskret" / "Kontor: Lidt mere" i Workplace-headeren skifter detaljeniveau. "Lidt mere" sætter et par ting på hvert bord (krus, penne, papirer, plante eller lampe; altid de samme for den samme agent), arkivskab og papirkurv til venstre for glaskontoret og vandkøler og plante til højre, en væg med vinduer, et ur (lokal tid), et billede, en hylde og en whiteboard, og en korkbaggrund bag noterne på fanen Tickets. Valget huskes.
+
+Indstillingerne (kontor-detaljer, terminalens tilstand og splitterens højde) gemmes i WebView2's lokale lager (localStorage) under `%LOCALAPPDATA%\dk.mira.bots`, ikke i `tickets.json`. Appens vinduer deler lageret. `tauri dev` har sit eget lager.
 
 ## Krav
 
@@ -122,7 +129,7 @@ Du kan selv tilføje en note under "Rapporter (n)" på ticketen (titel og tekst)
 
 ## Koordinator
 
-Rollen koordinator har ingen egen logik i appen; den får værktøjer og en systemprompt om arbejdsgangen. Koordinatorens ticket-kilde er den samme som din: Backlog (både dine og agenternes tickets), som den læser med `mira_list_tickets` (`all`) og `mira_get_ticket`. Den kan oprette tickets og tildele dem med det samme (`mira_create_ticket` med `assignTo`), tildele og fjerne tildelinger (`mira_assign_ticket`, `mira_unassign_ticket`; kun tickets i Backlog eller Afvist, kun til kørende agenter), se agenter og profiler (`mira_list_agents`, `mira_list_profiles`) og starte nye agenter fra en profil med `mira_spawn_agent`. En startet agent går gennem samme start-kode og samme lofter som i Workplace (5 arbejdspladser og 2 stabspladser; en afvisning kommer som den danske lofttekst). Koordinatoren godkender aldrig tickets; det gør reviewere eller du.
+Rollen koordinator har ingen egen logik i appen; den får værktøjer og en systemprompt om arbejdsgangen. Koordinatorens ticket-kilde er den samme som din: Backlog (både dine og agenternes tickets), som den læser med `mira_list_tickets` (`all`) og `mira_get_ticket`. Den kan oprette tickets og tildele dem med det samme (`mira_create_ticket` med `assignTo`), tildele og fjerne tildelinger (`mira_assign_ticket`, `mira_unassign_ticket`; kun tickets i Backlog eller Afvist, kun til kørende agenter), se agenter og profiler (`mira_list_agents`, `mira_list_profiles`) og starte nye agenter fra en profil med `mira_spawn_agent`. En startet agent går gennem samme start-kode og samme lofter som i Workplace (5 arbejdspladser og 3 stabspladser; en afvisning kommer som den danske lofttekst). Koordinatoren godkender aldrig tickets; det gør reviewere eller du.
 
 ## Agentens værktøjer
 
@@ -301,6 +308,14 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 60. En profil med et fuldt model-id (`claude-sonnet-5-5`) starter; et ugyldigt id afvises i editoren, før profilen gemmes; en model, kontoen ikke har adgang til, giver fejl ved første forespørgsel i terminalen (ikke i appen).
 61. `mira_submit_for_review` med `report` i ét kald lægger ticketen i Review med rapporten synlig; uden `mira-mcp.exe` starter agenter stadig med profilens settings (uden værktøjer).
 62. Settings med 12 hook-events (`PostModelSwitch`) giver ingen fejl i ældre Claude Code-versioner (fra 2.1.139), der ikke kender eventet; det er uverificeret, om ukendte hook-navne ignoreres stille.
+63. Kontor-look i WebView2: skriveborde, laptops og inventar tegnes med gradienter og blur-filter fra det delte `<defs>`-svg i både lyst og mørkt tema, skifter live ved Windows-temaskift og viser aldrig "hvide" borde (tegn på, at defs-svg'et ikke er tilgængeligt).
+64. Splitteren: træk med mus og touchpad (pointer capture holder også uden for grebet og ved kanten af vinduet), piletaster ±16 px, Home/End, dobbeltklik nulstiller til 384 px; xterm tilpasser sig under trækket uden duplikerede eller forskudte linjer under ConPTY (kendt VS Code-problem microsoft/vscode#247385). Noter samtidig, om `windowsPty` uden `buildNumber` giver manglende reflow på Windows 11.
+65. Minimér → gendan: terminalen får korrekt antal rækker og kolonner uden ekstra klik, PTY'en fik aldrig `rows=1`, og det tidligere output er tilbage (afspilning fra ring-bufferen).
+66. Maksimér: strimlen viser alle 8 pladser (3 stab + 5 arbejde) med små figurer og navne, man kan skifte agent fra strimlen, og terminalen tilpasser sig den nye højde.
+67. Efter lukning og genstart af den installerede app huskes splitter-højde, terminaltilstand (normal/minimeret/maksimeret) og kontor-detaljer (localStorage i WebView2's user data folder under `%LOCALAPPDATA%\dk.mira.bots`); begge vinduer deler lageret.
+68. `prefers-reduced-motion`: med "Animationseffekter" slået fra i Windows (Indstillinger → Tilgængelighed → Visuelle effekter) blinker skærmlinjerne på laptops ikke; uret på væggen går stadig.
+69. Tre stabspladser: en tredje stabsagent kan startes fra en tom stabsplads og via koordinatorens `mira_spawn_agent`; den fjerde afvises med "Loft på 3 stabspladser nået"; headeren viser "n/3 stab".
+70. Vægur viser Windows' lokale tid og opdateres; med "Lidt mere", 8 figurer og én kørende terminal er der ingen mærkbar UI-belastning.
 
 ## Licens og inspiration
 

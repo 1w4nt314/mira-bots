@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { Theme } from "../../lib/bots";
 import { errorMessage, openAgentFolder, removeAgent, stopAgent } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
+import type { TermMode } from "../../lib/office";
 import { rolesText } from "../../lib/roles";
 import { isExited, isStartingHint, statusLabel } from "../../lib/status";
 import type { AgentInfo, BotState } from "../../lib/types";
@@ -16,11 +17,17 @@ interface Props {
   agent: AgentInfo;
   botState: BotState;
   theme: Theme;
+  /** normal = split with the floor, min = one 34 px line (no xterm mounted), max = full height. */
+  mode: TermMode;
+  onMode: (mode: TermMode) => void;
   /** Called after the agent was removed, so the selection is cleared. */
   onRemoved: () => void;
 }
 
-export default function TerminalPanel({ agent, botState, theme, onRemoved }: Props) {
+// The xterm is unmounted in min mode (never mounted at a few px: fit would send rows=1 to the
+// PTY); restoring remounts it and replays the backend's output ring buffer.
+// TODO(windows-verify): D.65, D.66
+export default function TerminalPanel({ agent, botState, theme, mode, onMode, onRemoved }: Props) {
   const { dispatch } = useStore();
   const [confirmStop, setConfirmStop] = useState(false);
   const exited = isExited(agent);
@@ -61,6 +68,50 @@ export default function TerminalPanel({ agent, botState, theme, onRemoved }: Pro
   const label = statusLabel(agent.status);
   const btn =
     "shrink-0 rounded-md border border-[var(--border)] px-2.5 py-1 text-xs hover:border-[var(--accent)]";
+  // Same look as `btn`, square: no px-2.5 to fight with px-0.
+  const ibtn =
+    "w-7 shrink-0 rounded-md border border-[var(--border)] px-0 py-1 text-center text-xs hover:border-[var(--accent)]";
+
+  if (mode === "min") {
+    return (
+      <div className="flex h-[34px] shrink-0 items-center gap-2 border-t border-[var(--border)] px-3 text-xs">
+        <BotFigure
+          roles={agent.roles}
+          specialist={agent.specialist}
+          state={botState}
+          theme={theme}
+          exited={exited}
+          size={24}
+          badge={false}
+        />
+        <span className="shrink-0 font-medium">{agent.name}</span>
+        <span className="min-w-0 truncate text-[var(--muted)]">
+          {label}
+          {agent.detail ? ` · ${agent.detail}` : ""}
+        </span>
+        <span className="ml-auto inline-flex shrink-0 gap-1">
+          <button
+            type="button"
+            onClick={() => onMode("normal")}
+            title="Gendan terminalen (gemt højde)"
+            aria-label="Gendan terminalen"
+            className={btn}
+          >
+            Gendan
+          </button>
+          <button
+            type="button"
+            onClick={() => onMode("max")}
+            title="Maksimér terminalen"
+            aria-label="Maksimér terminalen"
+            className={ibtn}
+          >
+            ⤢
+          </button>
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col border-t border-[var(--border)]">
@@ -126,6 +177,32 @@ export default function TerminalPanel({ agent, botState, theme, onRemoved }: Pro
         >
           Åbn mappe
         </button>
+        <span
+          role="group"
+          aria-label="Terminalvindue"
+          className="ml-1 inline-flex shrink-0 gap-1 border-l border-[var(--border)] pl-2.5"
+        >
+          <button
+            type="button"
+            onClick={() => onMode("min")}
+            title="Minimér terminalen"
+            aria-label="Minimér terminalen"
+            aria-pressed={false}
+            className={ibtn}
+          >
+            ▁
+          </button>
+          <button
+            type="button"
+            onClick={() => onMode(mode === "max" ? "normal" : "max")}
+            title={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}
+            aria-label={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}
+            aria-pressed={mode === "max"}
+            className={`${ibtn} ${mode === "max" ? "office-ibtn-on" : ""}`}
+          >
+            {mode === "max" ? "⤡" : "⤢"}
+          </button>
+        </span>
       </div>
       <TicketQueue agent={agent} />
       <AgentReviews agent={agent} />
@@ -135,6 +212,7 @@ export default function TerminalPanel({ agent, botState, theme, onRemoved }: Pro
           Svar her.
         </div>
       )}
+      {/* Only in normal/max: switching between them keeps it mounted and the RO refits it. */}
       <AgentTerminal key={agent.id} agentId={agent.id} exited={exited} />
     </div>
   );

@@ -22,13 +22,16 @@ import {
 } from "../../lib/ipc";
 import {
   clampFloorHeight,
+  COMPACT,
   deskLayout,
   FLOOR_DEFAULT,
   parseDetail,
   parseFloorHeight,
+  parseTermMode,
   SPLITTER_H,
   STORAGE_KEYS,
   type OfficeDetail,
+  type TermMode,
 } from "../../lib/office";
 import { readLocal, writeLocal } from "../../lib/persist";
 import { assignSeats, STAFF_SEATS, WORK_SEATS } from "../../lib/seats";
@@ -48,7 +51,8 @@ import type {
 } from "../../lib/types";
 import { useStore } from "../../state/store";
 import OfficeDefs from "./office/OfficeDefs";
-import SeatGrid from "./SeatGrid";
+import Splitter from "./office/Splitter";
+import SeatGrid, { SeatOverflow } from "./SeatGrid";
 import Sidebar from "./Sidebar";
 import SpawnDialog from "./SpawnDialog";
 import TerminalPanel from "./TerminalPanel";
@@ -71,14 +75,22 @@ export default function Workplace() {
     null,
   );
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
-  // Office look: detail level and floor height are remembered (localStorage via persist.ts).
+  // Office look: detail level, terminal mode and floor height are remembered (persist.ts).
   const [detail, setDetail] = useState<OfficeDetail>(() => parseDetail(readLocal(STORAGE_KEYS.detail)));
-  const [floorHeight] = useState(() => parseFloorHeight(readLocal(STORAGE_KEYS.floorHeight)));
-  // Measured heights: the left column (`available`) and the floor itself (`floorMeasured`).
-  const [available, setAvailable] = useState(0);
+  const [termMode, setTermMode] = useState<TermMode>(() =>
+    parseTermMode(readLocal(STORAGE_KEYS.termMode)),
+  );
+  const [floorHeight, setFloorHeight] = useState(() =>
+    parseFloorHeight(readLocal(STORAGE_KEYS.floorHeight)),
+  );
+  // Measured heights: the left column, the overflow list below the floor (both make up
+  // `available`) and the floor itself (`floorMeasured`).
+  const [sectionH, setSectionH] = useState(0);
+  const [overflowH, setOverflowH] = useState(0);
   const [floorMeasured, setFloorMeasured] = useState(FLOOR_DEFAULT);
   const sectionRef = useRef<HTMLElement>(null);
   const floorRef = useRef<HTMLDivElement>(null);
+  const overflowRef = useRef<HTMLDivElement>(null);
   const theme = useTheme();
   const botStates = useBotStates(agents);
   const seats = useMemo(() => assignSeats(agents), [agents]);
@@ -88,23 +100,38 @@ export default function Workplace() {
   );
 
   useEffect(() => writeLocal(STORAGE_KEYS.detail, detail), [detail]);
+  useEffect(() => writeLocal(STORAGE_KEYS.termMode, termMode), [termMode]);
+  useEffect(
+    () => writeLocal(STORAGE_KEYS.floorHeight, String(Math.round(floorHeight))),
+    [floorHeight],
+  );
 
-  // One observer for the column and the floor. The desk size only changes the floor's children,
-  // never its own height (that comes from `floorHeight` / flex), so there is no feedback loop.
+  // One observer for the column, the floor and the overflow list. The desk size only changes the
+  // floor's children, never its own height (that comes from `floorHeight` / flex), so there is no
+  // feedback loop. The overflow wrapper is always mounted (empty = 0 px) so it is observed too.
   useEffect(() => {
     const section = sectionRef.current;
     const floor = floorRef.current;
-    if (section === null || floor === null) return;
+    const overflow = overflowRef.current;
+    if (section === null || floor === null || overflow === null) return;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const h = Math.round(entry.contentRect.height);
-        if (entry.target === section) setAvailable(Math.max(0, h - SPLITTER_H));
+        if (entry.target === section) setSectionH(h);
         else if (entry.target === floor) setFloorMeasured(h);
+        else if (entry.target === overflow) setOverflowH(h);
       }
     });
     ro.observe(section);
     ro.observe(floor);
+    ro.observe(overflow);
     return () => ro.disconnect();
+  }, []);
+
+  // Choosing an agent while the terminal is minimised brings the terminal back (stored height).
+  const selectAgent = useCallback((id: string) => {
+    setSelectedId(id);
+    setTermMode((m) => (m === "min" ? "normal" : m));
   }, []);
 
   // Selection handed over by the island: stored for a new window, pushed to an existing one.
@@ -162,11 +189,11 @@ export default function Workplace() {
 
   const ticketActions = useMemo<TicketActions>(
     () => ({
-      selectAgent: setSelectedId,
+      selectAgent,
       spawnWithTicket: (seatKind, ticket) => setSpawnFor({ seatKind, ticket }),
       spawnBlocked: { work: spawnBlockedWork, staff: spawnBlockedStaff },
     }),
-    [spawnBlockedWork, spawnBlockedStaff],
+    [selectAgent, spawnBlockedWork, spawnBlockedStaff],
   );
 
   // --- drag-and-drop: backlog notes (sidebar) onto seats ---------------------------------------
@@ -234,21 +261,36 @@ export default function Workplace() {
 
   const activeTicket = activeTicketId === null ? null : (ticketsById.get(activeTicketId) ?? null);
 
-  // Before the first measurement `available` is 0: skip the upper bound instead of jumping.
-  const floorStyleHeight = clampFloorHeight(floorHeight, available > 0 ? available : Number.NaN);
-  const { deskH, fig } = deskLayout(floorMeasured, detail);
+  // Height for the floor and the terminal in normal mode: the column minus the splitter and the
+  // overflow list. Before the first measurement it is NaN: clampFloorHeight then skips the upper
+  // bound instead of jumping to FLOOR_MIN for one frame.
+  const available = sectionH > 0 ? Math.max(0, sectionH - SPLITTER_H - overflowH) : Number.NaN;
+  const floorStyleHeight = clampFloorHeight(floorHeight, available);
+  // Without a selected agent there is no terminal: lay out as normal, but keep `termMode`.
+  const layoutMode: TermMode = selected === null ? "normal" : termMode;
+  const { deskH, fig } = layoutMode === "max" ? COMPACT : deskLayout(floorMeasured, detail);
+  const floorSize: CSSProperties =
+    layoutMode === "normal"
+      ? { height: floorStyleHeight, flex: "none" }
+      : layoutMode === "min"
+        ? { flex: "1 1 auto", minHeight: 0 }
+        : { flex: "none" };
   const floorStyle = {
-    height: floorStyleHeight,
-    flex: "none",
+    ...floorSize,
     "--desk-h": `${deskH}px`,
     "--fig": `${fig}px`,
   } as CSSProperties;
+  // Splitter values are clamped against the measured column; nothing to clamp against before the
+  // first measurement (the splitter cannot be used before the first layout anyway).
+  const changeFloorHeight = (next: number) => {
+    if (Number.isFinite(available)) setFloorHeight(clampFloorHeight(next, available));
+  };
 
   return (
     <TicketActionsContext.Provider value={ticketActions}>
       <div
         data-detail={detail}
-        data-term="normal"
+        data-term={termMode}
         className="flex h-full flex-col bg-[var(--bg)] text-sm text-[var(--fg)]"
       >
         <header className="flex h-11 shrink-0 items-center gap-4 border-b border-[var(--border)] px-4">
@@ -283,7 +325,7 @@ export default function Workplace() {
           <main className="grid min-h-0 flex-1 grid-cols-[1fr_340px]">
             <section ref={sectionRef} className="relative flex min-h-0 min-w-0 flex-col">
               <OfficeDefs />
-              <div ref={floorRef} className="office-floor" data-term="normal" style={floorStyle}>
+              <div ref={floorRef} className="office-floor" data-term={layoutMode} style={floorStyle}>
                 <SeatGrid
                   seats={seats}
                   botStates={botStates}
@@ -293,13 +335,23 @@ export default function Workplace() {
                   limits={{ work: liveWork >= maxWork, staff: liveStaff >= maxStaff }}
                   tickets={ticketsById}
                   dragging={activeTicket !== null}
-                  onSelect={setSelectedId}
+                  onSelect={selectAgent}
                   onSpawn={(seatKind) => setSpawnFor({ seatKind, ticket: null })}
                   detail={detail}
-                  mode="normal"
+                  mode={layoutMode}
                   fig={fig}
                 />
               </div>
+              {/* Outside the floor: its fixed height and overflow:hidden would clip the list. */}
+              <div ref={overflowRef} className="shrink-0">
+                <SeatOverflow overflow={seats.overflow} />
+              </div>
+              <Splitter
+                value={floorStyleHeight}
+                disabled={layoutMode !== "normal"}
+                onChange={changeFloorHeight}
+                onReset={() => setFloorHeight(FLOOR_DEFAULT)}
+              />
               {selected === null ? (
                 <div className="flex min-h-0 flex-1 items-center justify-center border-t border-[var(--border)] text-[var(--muted)]">
                   Vælg en plads for at se terminalen
@@ -309,6 +361,8 @@ export default function Workplace() {
                   agent={selected}
                   botState={botStates.get(selected.id) ?? "idle"}
                   theme={theme}
+                  mode={termMode}
+                  onMode={setTermMode}
                   onRemoved={() => setSelectedId(null)}
                 />
               )}
@@ -330,7 +384,7 @@ export default function Workplace() {
             onClose={() => setSpawnFor(null)}
             onSpawned={(id) => {
               setSpawnFor(null);
-              setSelectedId(id);
+              selectAgent(id);
             }}
           />
         )}

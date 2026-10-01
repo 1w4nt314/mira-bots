@@ -102,7 +102,12 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
     };
     const disposables: IDisposable[] = [];
     disposables.push(term.onResize(({ cols, rows }) => sendSize(cols, rows)));
-    fit.fit();
+    // A 0 px box would fit to rows=1 and send that to the PTY: skip, the observer refits later.
+    const fitNow = () => {
+      if (el.clientWidth === 0 || el.clientHeight === 0) return;
+      fit.fit();
+    };
+    fitNow();
     // onResize only fires on a change, so send the first size explicitly.
     sendSize(term.cols, term.rows);
 
@@ -111,7 +116,7 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
       if (raf !== null) return;
       raf = requestAnimationFrame(() => {
         raf = null;
-        if (!cancelled) fit.fit();
+        if (!cancelled) fitNow();
       });
     });
     ro.observe(el);
