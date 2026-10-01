@@ -161,6 +161,10 @@ pub struct Agent {
     pty: Option<PtyHandle>,
     pub output: Arc<Mutex<RingBuffer>>,
     pub whitelist: Vec<String>,
+    /// When the user last typed into the terminal (`write_user_input`, ms since epoch). The
+    /// ticket dispatcher waits a grace period after it so it never types into a half-written
+    /// prompt. The dispatcher's own writes (`write_input`) do not touch it.
+    last_user_input_at: Option<u64>,
 }
 
 pub struct AgentManager {
@@ -367,6 +371,7 @@ impl AgentManager {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                last_user_input_at: None,
             },
         );
     }
@@ -449,6 +454,22 @@ impl AgentManager {
             Some(pty) => pty.write(bytes),
             None => Err(AgentError::NotFound),
         }
+    }
+
+    /// Input typed by the user in the terminal panel (`write_agent_input`). Records the time
+    /// first (the attempt counts, even if the write then fails), then writes like `write_input`.
+    pub fn write_user_input(&mut self, id: &str, bytes: &[u8]) -> Result<(), AgentError> {
+        let agent = self.agent_mut(id)?;
+        agent.last_user_input_at = Some(now_ms());
+        match agent.pty.as_mut() {
+            Some(pty) => pty.write(bytes),
+            None => Err(AgentError::NotFound),
+        }
+    }
+
+    /// See [`Agent::last_user_input_at`]; `None` for unknown agents and before any user input.
+    pub fn last_user_input_at(&self, id: &str) -> Option<u64> {
+        self.agents.get(id).and_then(|a| a.last_user_input_at)
     }
 
     pub fn resize(&mut self, id: &str, cols: u16, rows: u16) -> Result<(), AgentError> {
@@ -1095,6 +1116,21 @@ mod tests {
         m.set_ticket_link(&id2, Some("t2".into()), 1);
         let (info, _) = m.mark_exited(&id2, Some(0)).unwrap();
         assert_eq!((info.current_ticket_id, info.queue_length), (None, 0));
+    }
+
+    #[test]
+    fn only_user_input_records_its_time() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("s", "/w/demo");
+        assert_eq!(m.last_user_input_at(&id), None);
+        // The dispatcher's path (no PTY in the fake, so the write itself fails).
+        assert!(m.write_input(&id, b"Ticket x").is_err());
+        assert_eq!(m.last_user_input_at(&id), None);
+        let before = now_ms();
+        assert!(m.write_user_input(&id, b"h").is_err());
+        assert!(m.last_user_input_at(&id).is_some_and(|t| t >= before));
+        assert!(m.write_user_input("nope", b"h").is_err());
+        assert_eq!(m.last_user_input_at("nope"), None);
     }
 
     #[test]

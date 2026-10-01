@@ -86,8 +86,9 @@ export const spawnAgent = (
 ) => invoke<AgentInfo>(COMMANDS.spawnAgent, { cwd, prompt, role, seatKind });
 export const stopAgent = (agentId: string) => invoke<void>(COMMANDS.stopAgent, { agentId });
 export const removeAgent = (agentId: string) => invoke<void>(COMMANDS.removeAgent, { agentId });
-export const writeAgentInput = (agentId: string, data: string) =>
-  invoke<void>(COMMANDS.writeAgentInput, { agentId, data });
+/** `userInitiated` false for the terminal's automatic replies: they do not count as user typing. */
+export const writeAgentInput = (agentId: string, data: string, userInitiated: boolean) =>
+  invoke<void>(COMMANDS.writeAgentInput, { agentId, data, userInitiated });
 export const resizeAgentPty = (agentId: string, cols: number, rows: number) =>
   invoke<void>(COMMANDS.resizeAgentPty, { agentId, cols, rows });
 export const getAgentOutput = (agentId: string) =>

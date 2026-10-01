@@ -64,7 +64,7 @@ Sådan bruger du dem:
 
 **Agenter kan ikke oprette tickets selv i trin 3.** Det kommer med MCP i trin 4. Roller er stadig kun visuelle og påvirker ikke, hvilke tickets en agent får.
 
-**Lagring.** Tickets ligger i `%APPDATA%\dk.mira.bots\tickets.json` og overlever genstart. Filen skrives atomisk (først en midlertidig fil, som så omdøbes). Kan filen ikke læses, omdøbes den til `tickets.json.broken-<tidspunkt>`, appen starter med en tom liste, og Diagnostik viser en advarsel. Ved hver start flyttes tickets, der var i kø eller i gang, tilbage til Backlog med noten "app genstartet"; Review, Done og Afvist er urørte. Stopper eller fjerner du en agent, eller afsluttes den, havner dens tickets også i Backlog med en note.
+**Lagring.** Tickets ligger i `%APPDATA%\dk.mira.bots\tickets.json` og overlever genstart. Filen skrives atomisk (først en midlertidig fil, som så omdøbes). Er filen beskadiget, omdøbes den til `tickets.json.broken-<tidspunkt>`, appen starter med en tom liste, og Diagnostik viser en advarsel. Kan filen slet ikke åbnes (fx låst af antivirus eller backup), starter Tickets skrivebeskyttet med en advarsel i Tickets-fanen, og filen røres ikke, før du genstarter appen. Ved hver start flyttes tickets, der var i kø eller i gang, tilbage til Backlog med noten "app genstartet"; Review, Done og Afvist er urørte. Stopper eller fjerner du en agent, eller afsluttes den, havner dens tickets også i Backlog med en note.
 
 ## Første gang i en mappe
 
@@ -173,6 +173,7 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 35. Efter genstart står tickets, der var i kø eller i gang, i Backlog med noten "app genstartet", og Review/Done er urørte.
 36. Chippen "n i review" i den ikke-fokuserbare island åbner Workplace på fanen Tickets, både når vinduet oprettes og når det allerede er åbent.
 37. Stop/Fjern af en agent med kø: alle dens tickets står i Backlog med note, en igangværende aflevering skriver ikke mere i terminalen, og `queueLength` er 0.
+38. xterms automatiske svar (Device Attributes, cursor- og fokusrapporter) tæller ikke som brugerinput under ConPTY og udsætter ikke ticket-levering, mens tastetryk, piletaster og indsat tekst gør.
 
 ## Licens og inspiration
 

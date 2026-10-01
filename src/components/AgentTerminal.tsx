@@ -9,6 +9,7 @@ import {
   resizeAgentPty,
   writeAgentInput,
 } from "../lib/ipc";
+import { classifyInput } from "../lib/terminalInput";
 import { decodeBase64, planChunk } from "../lib/terminalSeq";
 import type { AgentOutputPayload } from "../lib/types";
 import { useStore } from "../state/store";
@@ -55,6 +56,9 @@ type Phase = "loading" | "live" | "resync" | "dead";
 // TODO(windows-verify): xterm renders the TUI correctly under ConPTY (`windowsPty: conpty`):
 // colours, cursor, reflow on resize, no doubled line feeds (CRLF untouched); Enter, arrows,
 // Ctrl+C, Tab, Esc and æøå reach the agent as UTF-8 (plan D.20).
+// TODO(windows-verify): D.38 xterm's automatic replies (Device Attributes, cursor-position and
+// focus reports, bracketed-paste markers) are classified as not user-initiated under ConPTY, so
+// they do not postpone ticket delivery; real typing, arrows and paste still do.
 // TODO(windows-verify): 5 agents with heavy output and one mounted xterm cause no noticeable UI
 // lag (plan D.27).
 export default function AgentTerminal({ agentId, exited }: { agentId: string; exited: boolean }) {
@@ -120,12 +124,23 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
     mql.addEventListener("change", onScheme);
 
     // --- input: serial queue keeps keystrokes in order ------------------------------------
+    // `onData` also carries the terminal's own replies (device attributes, cursor/focus reports).
+    // Those are ESC-prefixed and come without a keypress; arrows/Esc are ESC-prefixed too but
+    // follow a keydown (`onKey`); pasted text has no keydown but is not ESC-prefixed. Only
+    // user-initiated data may postpone ticket delivery (see `classifyInput`).
+    let lastKeyAt = Number.NEGATIVE_INFINITY;
+    disposables.push(
+      term.onKey(() => {
+        lastKeyAt = performance.now();
+      }),
+    );
     let inputQueue: Promise<void> = Promise.resolve();
     disposables.push(
       term.onData((data) => {
         if (exitedRef.current) return;
+        const userInitiated = classifyInput(data, performance.now() - lastKeyAt);
         inputQueue = inputQueue
-          .then(() => writeAgentInput(agentId, data))
+          .then(() => writeAgentInput(agentId, data, userInitiated))
           .catch((e: unknown) => {
             if (!cancelled) dispatch({ type: "error/set", error: errorMessage(e) });
           });

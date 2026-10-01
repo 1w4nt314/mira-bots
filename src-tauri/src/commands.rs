@@ -143,6 +143,7 @@ impl AppState {
             running_agents: lock(&self.manager).running_count(),
             tickets_path: self.paths.tickets_file.to_string_lossy().into_owned(),
             tickets_warning: self.tickets_warning.clone(),
+            tickets_read_only: self.tickets.read(|s| s.is_read_only()),
             tickets_total: self.tickets.read(|s| s.len()),
         }
     }
@@ -591,10 +592,26 @@ pub fn write_agent_input(
     state: State<'_, AppState>,
     agent_id: String,
     data: String,
+    user_initiated: bool,
 ) -> Result<(), String> {
-    lock(&state.manager)
-        .write_input(&agent_id, data.as_bytes())
-        .map_err(Into::into)
+    write_terminal_input(&state.manager, &agent_id, data.as_bytes(), user_initiated)
+}
+
+/// The user's own typing is recorded so the ticket dispatcher does not type into it; the
+/// terminal's automatic replies (`user_initiated` false) are written without a timestamp.
+fn write_terminal_input(
+    manager: &Mutex<AgentManager>,
+    agent_id: &str,
+    bytes: &[u8],
+    user_initiated: bool,
+) -> Result<(), String> {
+    let mut m = lock(manager);
+    if user_initiated {
+        m.write_user_input(agent_id, bytes)
+    } else {
+        m.write_input(agent_id, bytes)
+    }
+    .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -863,6 +880,16 @@ mod tests {
     }
 
     #[test]
+    fn terminal_replies_do_not_count_as_user_input() {
+        let (m, _, agent) = setup();
+        // The fake agent has no PTY, so the write itself fails; the timestamp is what matters.
+        assert!(write_terminal_input(&m, &agent, b"\x1b[?1;2c", false).is_err());
+        assert_eq!(lock(&m).last_user_input_at(&agent), None);
+        assert!(write_terminal_input(&m, &agent, b"a", true).is_err());
+        assert!(lock(&m).last_user_input_at(&agent).is_some());
+    }
+
+    #[test]
     fn respond_allow_delivers_decision_without_whitelisting() {
         let (m, p, agent) = setup();
         let mut rx = lock(&p).insert(request("r1", &agent));
@@ -999,6 +1026,7 @@ mod tests {
         assert!(d.agents_root.ends_with("agents"));
         assert!(d.tickets_path.ends_with("tickets.json"));
         assert_eq!(d.tickets_total, 2);
+        assert!(!d.tickets_read_only);
         assert_eq!(
             d.tickets_warning.as_deref(),
             Some("tickets.json kunne ikke læses")
