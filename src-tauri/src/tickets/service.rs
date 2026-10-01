@@ -1387,9 +1387,18 @@ impl TicketService {
         self.fetch(&t.id)
     }
 
-    /// `mira_unassign_ticket` (coordinator; any id): assigned → backlog by the agent.
-    pub fn unassign_by_agent(&mut self, ticket_id: &str, now: u64) -> Result<Ticket, TicketError> {
+    /// `mira_unassign_ticket` (coordinator; any id): assigned → backlog by the agent. A ticket in
+    /// progress goes the [`Self::give_back`] way (only the caller's own, step 5c).
+    pub fn unassign_by_agent(
+        &mut self,
+        ticket_id: &str,
+        by_agent: &str,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
         let t = self.get_by_any_id(ticket_id).ok_or(TicketError::NotFound)?;
+        if t.state == TicketState::InProgress {
+            return self.give_back(&t.id, Some(by_agent), now);
+        }
         self.commit(|doc| {
             apply(
                 doc,
@@ -1400,6 +1409,73 @@ impl TicketService {
                 now,
             )
         })?;
+        self.fetch(&t.id)
+    }
+
+    // ---- step 5c: handing a ticket in progress on ----
+
+    /// The ticket in progress (full or short id) that `by_agent` may hand on: `None` = the user
+    /// (any ticket in progress); `Some(agent)` = only the agent's own ticket in progress.
+    fn handoff_source(
+        &self,
+        ticket_id: &str,
+        by_agent: Option<&str>,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.get_by_any_id(ticket_id).ok_or(TicketError::NotFound)?;
+        if let Some(agent) = by_agent {
+            if t.assignee_agent_id.as_deref() != Some(agent) {
+                return Err(TicketError::NotYours);
+            }
+        }
+        if t.state != TicketState::InProgress {
+            return Err(TicketError::NotInProgress);
+        }
+        Ok(t)
+    }
+
+    /// Handoff (step 5c): the ticket in progress → last in `to_agent`'s queue, with the history
+    /// note "overdraget fra <from_name> til <to_name>". `by_agent`: `None` = the user, else the
+    /// agent asking, which must be the current assignee ([`TicketError::NotYours`]). The
+    /// rejection note and review round stay. The old assignee then has no ticket in progress, so
+    /// its next Stop does not mark this one "ikke afleveret" and its queue moves on. The caller
+    /// checked that `to_agent` is live, and notifies both agents.
+    pub fn handoff(
+        &mut self,
+        ticket_id: &str,
+        to_agent: &str,
+        by_agent: Option<&str>,
+        (from_name, to_name): (&str, &str),
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.handoff_source(ticket_id, by_agent)?;
+        let by = if by_agent.is_some() {
+            TicketActor::Agent
+        } else {
+            TicketActor::User
+        };
+        let ev = TicketEvent::Handoff {
+            to_agent_id: to_agent.to_string(),
+        };
+        let note = Some(format!("overdraget fra {from_name} til {to_name}"));
+        self.commit(|doc| apply(doc, &t.id, &ev, by, note, now))?;
+        self.fetch(&t.id)
+    }
+
+    /// The ticket in progress back to the backlog ("lagt tilbage", step 5c); `by_agent` as in
+    /// [`Self::handoff`].
+    pub fn give_back(
+        &mut self,
+        ticket_id: &str,
+        by_agent: Option<&str>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let t = self.handoff_source(ticket_id, by_agent)?;
+        let by = if by_agent.is_some() {
+            TicketActor::Agent
+        } else {
+            TicketActor::User
+        };
+        self.commit(|doc| apply(doc, &t.id, &TicketEvent::Unassign, by, None, now))?;
         self.fetch(&t.id)
     }
 
@@ -2505,7 +2581,7 @@ mod tests {
             matches!(err, TicketError::IllegalTransition { .. }),
             "{err:?}"
         );
-        let u = s.unassign_by_agent(&b.id, 4).unwrap();
+        let u = s.unassign_by_agent(&b.id, "k", 4).unwrap();
         assert_eq!(u.state, S::Backlog);
         let p = in_review(&mut s, "a1", "p");
         assert!(s.assign_by_agent(&p.id, "a2", "k", 5).is_err());
@@ -2586,5 +2662,116 @@ mod tests {
         assert_eq!((t2.state, t2.reviewer_agent_id), (S::Review, None));
         assert_eq!(r.unrouted_reviews().len(), 1);
         assert_eq!(m2.saves(), 1);
+    }
+
+    #[test]
+    fn handoff_moves_the_ticket_in_progress_to_the_end_of_the_target_queue() {
+        let (mut s, m) = svc();
+        let t = in_progress(&mut s, "k", "Lav siden", false);
+        // The coordinator also has a queue; the target already has one ticket queued.
+        let k2 = mk(&mut s, "k2", 3);
+        s.assign(&k2.id, "k", 3).unwrap();
+        let w1 = mk(&mut s, "w1", 3);
+        s.assign(&w1.id, "w", 3).unwrap();
+        s.set_issue(&t.id, Some(TicketIssue::NotSubmitted), None, 4)
+            .unwrap();
+
+        let saves = m.saves();
+        let h = s
+            .handoff(&t.short_id(), "w", Some("k"), ("Koord", "Koder"), 5)
+            .unwrap();
+        assert_eq!(m.saves(), saves + 1, "one save");
+        assert_eq!(h.state, S::Assigned);
+        assert_eq!(h.assignee_agent_id.as_deref(), Some("w"));
+        assert_eq!(h.queue_position, Some(1), "last in the target's queue");
+        assert_eq!(h.issue, None);
+        let last = h.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::Agent, Some("overdraget fra Koord til Koder"))
+        );
+        // The coordinator has nothing in progress: its queue head is next, and a Stop now has
+        // nothing to mark "ikke afleveret".
+        assert_eq!(s.current_for_agent("k"), None);
+        assert_eq!(s.next_for_agent("k").map(|t| t.id), Some(k2.id.clone()));
+        assert_eq!(s.mark_not_submitted("k", 6), Ok(None));
+        assert_eq!(s.complete_turn("k", 6), Ok(None));
+        assert_eq!(s.links().get("k"), Some(&(None, 1)));
+        assert_eq!(s.links().get("w"), Some(&(None, 2)));
+        // The target gets it after its own queue.
+        assert_eq!(s.next_for_agent("w").map(|t| t.id), Some(w1.id.clone()));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn handoff_rules_by_actor_and_state() {
+        let (mut s, m) = svc();
+        let t = in_progress(&mut s, "a1", "x", false);
+        let saves = m.saves();
+        // Another agent may not hand someone else's ticket on.
+        assert_eq!(
+            s.handoff(&t.id, "a3", Some("a2"), ("a", "c"), 4),
+            Err(TicketError::NotYours)
+        );
+        assert_eq!(
+            s.give_back(&t.id, Some("a2"), 4),
+            Err(TicketError::NotYours)
+        );
+        assert_eq!(
+            s.unassign_by_agent(&t.id, "a2", 4),
+            Err(TicketError::NotYours)
+        );
+        // Not to itself.
+        assert_eq!(
+            s.handoff(&t.id, "a1", Some("a1"), ("a", "a"), 4),
+            Err(TicketError::HandoffToSelf)
+        );
+        assert_eq!(
+            s.handoff("nope", "a2", None, ("a", "b"), 4),
+            Err(TicketError::NotFound)
+        );
+        assert_eq!(m.saves(), saves, "refusals save nothing");
+        // Review and done cannot be handed on.
+        let r = in_review(&mut s, "a3", "r");
+        assert_eq!(
+            s.handoff(&r.id, "a2", Some("a3"), ("a", "b"), 5),
+            Err(TicketError::NotInProgress)
+        );
+        assert_eq!(
+            s.handoff(&r.id, "a2", None, ("a", "b"), 5),
+            Err(TicketError::NotInProgress)
+        );
+        // The user may hand on any ticket in progress.
+        let u = s.handoff(&t.id, "a2", None, ("a", "b"), 6).unwrap();
+        assert_eq!(
+            (u.state, u.assignee_agent_id.as_deref()),
+            (S::Assigned, Some("a2"))
+        );
+        assert_eq!(u.history.last().unwrap().by, TicketActor::User);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn give_back_and_unassign_by_agent_of_the_ticket_in_progress() {
+        let (mut s, _) = svc();
+        let t = in_progress(&mut s, "k", "x", false);
+        let b = s.unassign_by_agent(&t.short_id(), "k", 4).unwrap();
+        assert_eq!((b.state, b.assignee_agent_id), (S::Backlog, None));
+        assert_eq!(
+            b.history.last().unwrap().note.as_deref(),
+            Some(crate::tickets::state::RETURNED_NOTE)
+        );
+        assert_eq!(s.current_for_agent("k"), None);
+        // The user puts a ticket in progress back (Fjern tildeling).
+        let t2 = in_progress(&mut s, "k", "y", false);
+        let u = s.unassign(&t2.id, 5).unwrap();
+        assert_eq!(u.state, S::Backlog);
+        assert_eq!(u.history.last().unwrap().by, TicketActor::User);
+        // give_back needs a ticket in progress.
+        assert_eq!(
+            s.give_back(&t2.id, None, 6),
+            Err(TicketError::NotInProgress)
+        );
+        assert_invariants(&s);
     }
 }

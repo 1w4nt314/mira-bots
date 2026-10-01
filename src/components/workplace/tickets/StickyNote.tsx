@@ -15,6 +15,7 @@ import {
   ACTOR_LABEL,
   canDelete,
   canDrag,
+  canHandOver,
   formatAt,
   isCoordinationTask,
   ISSUE_HINT,
@@ -227,7 +228,7 @@ function NoteActions({
   };
 
   const buttons: ReactNode[] = [];
-  if (canDrag(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
+  if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
   if (canDelete(t)) {
     buttons.push(
       <button

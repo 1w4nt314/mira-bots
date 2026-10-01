@@ -2,7 +2,7 @@
 //! `mira-mcp` ends here. This is the security boundary for what an agent can do:
 //!
 //! 1. the frame's `agent_id` must be a live agent (unknown or exited → "Ukendt agent");
-//! 2. the tool must be one of the fifteen ([`mira_mcp::tools::TOOL_NAMES`]);
+//! 2. the tool must be one of the sixteen ([`mira_mcp::tools::TOOL_NAMES`]);
 //! 3. the agent's roles (fixed at spawn, from the manager) must allow it
 //!    ([`mira_mcp::tools::is_allowed`], the one role matrix) → "Din rolle tillader ikke dette
 //!    værktøj", whatever mira-mcp showed;
@@ -10,7 +10,8 @@
 //!    does not rely on that), titles/notes made one-line, bodies cleaned;
 //! 5. ownership: an agent submits and reports only on its own ticket (or, as reviewer, on the
 //!    review it was given); a reviewer approves/rejects only tickets in review it was assigned,
-//!    never its own submission;
+//!    never its own submission; a ticket in progress is handed on (`mira_handoff_ticket`, or
+//!    the coordinator's `mira_assign_ticket`/`mira_unassign_ticket`) only by its assignee;
 //! 6. `mira_create_ticket` is rate-limited per agent (in memory; reset at app restart);
 //! 7. `mira_spawn_agent` goes through the same spawn path and seat limits as the UI
 //!    ([`SpawnPort`]).
@@ -214,7 +215,8 @@ impl ToolsCtx {
             mcp_tools::APPROVE_TICKET => self.approve(&agent, args, now),
             mcp_tools::REJECT_TICKET => self.reject(&agent, args, now),
             mcp_tools::ASSIGN_TICKET => self.assign(&agent, args, now),
-            mcp_tools::UNASSIGN_TICKET => self.unassign(id, args, now),
+            mcp_tools::UNASSIGN_TICKET => self.unassign(&agent, args, now),
+            mcp_tools::HANDOFF_TICKET => self.handoff(&agent, args, now),
             mcp_tools::SPAWN_AGENT => self.spawn_agent(id, args),
             mcp_tools::LIST_AGENTS => Ok(self.list_agents()),
             mcp_tools::LIST_PROFILES => Ok(self.list_profiles()),
@@ -576,6 +578,14 @@ impl ToolsCtx {
     ) -> Result<Value, String> {
         let id = req_id(args, "id")?;
         let target = self.target_agent(req_id(args, "agentId")?)?;
+        // A ticket in progress: only the coordinator's own, handed over (step 5c).
+        if self
+            .tickets
+            .read(|s| s.get_by_any_id(id))
+            .is_some_and(|t| t.state == TicketState::InProgress)
+        {
+            return self.hand_on(agent, id, Some(&target), now);
+        }
         let t = self
             .tickets
             .mutate(|s| s.assign_by_agent(id, &target.id, &agent.name, now))?;
@@ -597,19 +607,96 @@ impl ToolsCtx {
 
     fn unassign(
         &self,
-        agent_id: &str,
+        agent: &AgentInfo,
         args: &Map<String, Value>,
         now: u64,
     ) -> Result<Value, String> {
         let id = req_id(args, "id")?;
-        let old = self
+        let before = self.tickets.read(|s| s.get_by_any_id(id));
+        // A ticket in progress: only the coordinator's own, put back (step 5c).
+        if before
+            .as_ref()
+            .is_some_and(|t| t.state == TicketState::InProgress)
+        {
+            return self.hand_on(agent, id, None, now);
+        }
+        let old = before.and_then(|t| t.assignee_agent_id);
+        let t = self
             .tickets
-            .read(|s| s.get_by_any_id(id))
-            .and_then(|t| t.assignee_agent_id);
-        let t = self.tickets.mutate(|s| s.unassign_by_agent(id, now))?;
+            .mutate(|s| s.unassign_by_agent(id, &agent.id, now))?;
         self.tickets.notify(old);
-        log::info!("agent {agent_id} unassigned ticket {}", t.short_id());
+        log::info!("agent {} unassigned ticket {}", agent.id, t.short_id());
         Ok(json!({"id": t.id, "shortId": t.short_id(), "state": t.state}))
+    }
+
+    // ---- step 5c: handing a ticket in progress on (every role) ----
+
+    /// `mira_handoff_ticket`: the agent's own ticket in progress (`ticketId`, default: the
+    /// current one) to `agentId` (live, not itself) or, without it, back to the backlog.
+    fn handoff(
+        &self,
+        agent: &AgentInfo,
+        args: &Map<String, Value>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let ticket_id = match opt_id(args, "ticketId")? {
+            Some(id) => id.to_string(),
+            None => self
+                .tickets
+                .read(|s| s.current_for_agent(&agent.id))
+                .map(|t| t.id)
+                .ok_or(TicketError::NoTicketInProgress)?,
+        };
+        let target = opt_id(args, "agentId")?
+            .map(|a| self.target_agent(a))
+            .transpose()?;
+        self.hand_on(agent, &ticket_id, target.as_ref(), now)
+    }
+
+    /// Hands `agent`'s own ticket in progress to `target` (last in its queue) or back to the
+    /// backlog. The service refuses someone else's ticket ("tildelt en anden agent"), a ticket
+    /// not in progress and a handoff to the agent itself. Afterwards the agent has no ticket in
+    /// progress: its "ikke afleveret"/"turn fejlede" hint goes, its Stop marks nothing and its
+    /// queue moves on; the target's queue is woken. The ticket file in the agent's folder stays
+    /// (it may still be reading it this turn; the next delivery of that ticket overwrites it).
+    fn hand_on(
+        &self,
+        agent: &AgentInfo,
+        ticket_id: &str,
+        target: Option<&AgentInfo>,
+        now: u64,
+    ) -> Result<Value, String> {
+        let t = match target {
+            Some(to) => self.tickets.mutate(|s| {
+                s.handoff(
+                    ticket_id,
+                    &to.id,
+                    Some(&agent.id),
+                    (&agent.name, &to.name),
+                    now,
+                )
+            })?,
+            None => self
+                .tickets
+                .mutate(|s| s.give_back(ticket_id, Some(&agent.id), now))?,
+        };
+        self.tickets.clear_stale_detail(&agent.id);
+        self.tickets
+            .notify(std::iter::once(agent.id.as_str()).chain(target.map(|a| a.id.as_str())));
+        log::info!(
+            "agent {} handed ticket {} on to {}",
+            agent.id,
+            t.short_id(),
+            target.map_or("the backlog", |a| a.id.as_str())
+        );
+        Ok(json!({
+            "id": t.id,
+            "shortId": t.short_id(),
+            "state": t.state,
+            "assigneeAgentId": t.assignee_agent_id,
+            "queuePosition": t.queue_position,
+            "message": "Ticketen er ikke længere din; arbejd ikke videre på den. Afslut dit svar.",
+        }))
     }
 
     // TODO(windows-verify): mira_spawn_agent respects the limits (a 6th work agent is refused
@@ -1324,7 +1411,7 @@ mod tests {
     #[test]
     fn role_tool_matrix_is_enforced() {
         let t = setup();
-        const COMMON: [&str; 8] = [
+        const COMMON: [&str; 9] = [
             "mira_create_ticket",
             "mira_list_tickets",
             "mira_get_ticket",
@@ -1333,6 +1420,7 @@ mod tests {
             "mira_get_workspace_rules",
             "mira_add_report",
             "mira_get_report",
+            "mira_handoff_ticket",
         ];
         let table: [(&[Role], &[&str]); 8] = [
             (&[], &[]),
@@ -1367,7 +1455,7 @@ mod tests {
                 ],
             ),
         ];
-        assert_eq!(ALL_TOOL_NAMES.len(), 15);
+        assert_eq!(ALL_TOOL_NAMES.len(), 16);
         for (roles, extra) in table {
             let agent = t.agent_with(roles, SeatKind::Work);
             for tool in ALL_TOOL_NAMES {
@@ -1607,7 +1695,8 @@ mod tests {
                 json!({"id": busy.id}),
                 6
             ),
-            Err("Kan ikke flytte en ticket fra I gang til Backlog".into())
+            // Step 5c: only the assignee may put back a ticket in progress.
+            Err("Ticketen er tildelt en anden agent".into())
         );
     }
 
@@ -1929,5 +2018,173 @@ mod tests {
             .call(Some(&t.b), "mira_get_ticket", json!({"id": tk.id}), 3)
             .unwrap();
         assert_eq!(g["reports"][0]["id"], "01");
+    }
+
+    // ---- step 5c: handing a ticket in progress on ----
+
+    #[test]
+    fn coordinator_hands_its_ticket_in_progress_on_with_assign() {
+        let mut t = setup();
+        let tk = t.in_progress(&t.k.clone(), "Lav en HTML-side", false);
+        t.tc.ctx
+            .manager
+            .lock()
+            .unwrap()
+            .set_detail(&t.k, Some(NOT_SUBMITTED_TEXT.into()));
+        t.tc.clear();
+        let _ = t.tc.sent();
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": tk.short_id(), "agentId": t.a}),
+                5,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "assigned");
+        assert_eq!(r["assigneeAgentId"], json!(t.a));
+        assert_eq!(r["queuePosition"], 0);
+        let now = t.ticket(&tk.id);
+        assert_eq!(now.history.last().unwrap().by, TicketActor::Agent);
+        assert!(now
+            .history
+            .last()
+            .unwrap()
+            .note
+            .as_deref()
+            .unwrap()
+            .starts_with("overdraget fra "));
+        // The coordinator has nothing in progress any more; both queues are woken.
+        assert_eq!(t.tc.ctx.read(|s| s.current_for_agent(&t.k)), None);
+        assert_eq!(t.detail(&t.k), None, "stale hint cleared");
+        let mut sent = t.tc.sent();
+        sent.sort_by_key(|m| format!("{m:?}"));
+        let mut want = vec![
+            DispatchMsg::QueueChanged {
+                agent_id: t.k.clone(),
+            },
+            DispatchMsg::QueueChanged {
+                agent_id: t.a.clone(),
+            },
+        ];
+        want.sort_by_key(|m| format!("{m:?}"));
+        assert_eq!(sent, want);
+        let info = t.tc.ctx.manager.lock().unwrap().get(&t.k).unwrap();
+        assert_eq!(info.current_ticket_id, None);
+    }
+
+    #[test]
+    fn coordinator_puts_its_ticket_in_progress_back_with_unassign() {
+        let t = setup();
+        let tk = t.in_progress(&t.k.clone(), "x", false);
+        let r = t
+            .call(Some(&t.k), "mira_unassign_ticket", json!({"id": tk.id}), 5)
+            .unwrap();
+        assert_eq!(r["state"], "backlog");
+        assert_eq!(
+            t.ticket(&tk.id).history.last().unwrap().note.as_deref(),
+            Some(crate::tickets::state::RETURNED_NOTE)
+        );
+        // Someone else's ticket in progress stays where it is.
+        let other = t.in_progress(&t.a.clone(), "y", false);
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_unassign_ticket",
+                json!({"id": other.id}),
+                6
+            ),
+            Err("Ticketen er tildelt en anden agent".into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": other.id, "agentId": t.b}),
+                6
+            ),
+            Err("Ticketen er tildelt en anden agent".into())
+        );
+        assert_eq!(t.ticket(&other.id).state, TicketState::InProgress);
+    }
+
+    #[test]
+    fn handoff_tool_for_every_assignee() {
+        let t = setup();
+        // A coder (no coordinator role) gives its own ticket to another agent.
+        let tk = t.in_progress(&t.a.clone(), "Forkert agent", false);
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"agentId": t.b}),
+                5,
+            )
+            .unwrap();
+        assert_eq!(r["id"], json!(tk.id));
+        assert_eq!(r["state"], "assigned");
+        assert_eq!(r["assigneeAgentId"], json!(t.b));
+        assert!(r["message"].as_str().unwrap().contains("Afslut dit svar"));
+        assert_eq!(t.tc.ctx.read(|s| s.current_for_agent(&t.a)), None);
+        // A Stop of the old assignee marks nothing "ikke afleveret".
+        assert_eq!(
+            t.tc.ctx.mutate(|s| s.mark_not_submitted(&t.a, 6)).unwrap(),
+            None
+        );
+
+        // Refused: someone else's ticket, no ticket in progress, itself, a dead/unknown target.
+        let mine = t.in_progress(&t.b.clone(), "b's", false);
+        let _ = t.tc.ctx.mutate(|s| s.give_back(&tk.id, None, 6));
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"ticketId": mine.short_id(), "agentId": t.a}),
+                7
+            ),
+            Err("Ticketen er tildelt en anden agent".into())
+        );
+        assert_eq!(
+            t.call(Some(&t.a), "mira_handoff_ticket", json!({}), 7),
+            Err("Du har ingen ticket i gang".into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_handoff_ticket",
+                json!({"agentId": t.b}),
+                7
+            ),
+            Err("Ticketen kan ikke gives videre til den agent, der allerede har den".into())
+        );
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_handoff_ticket",
+                json!({"agentId": "nope"}),
+                7
+            ),
+            Err("Agenten kører ikke".into())
+        );
+        assert_eq!(t.ticket(&mine.id).state, TicketState::InProgress);
+
+        // Without agentId: back to the backlog.
+        let r = t
+            .call(Some(&t.b), "mira_handoff_ticket", json!({}), 8)
+            .unwrap();
+        assert_eq!(r["state"], "backlog");
+        assert_eq!(r["assigneeAgentId"], Value::Null);
+
+        // A ticket in review cannot be handed on.
+        let rev = t.review_for_r(&t.a.clone(), "til review");
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"ticketId": rev.id, "agentId": t.b}),
+                9
+            ),
+            Err("Ticketen er ikke i gang".into())
+        );
     }
 }

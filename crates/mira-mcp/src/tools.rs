@@ -1,4 +1,4 @@
-//! The fifteen tools (plan4 C4.3 + plan5 C5.3): `tools/list` definitions, the role matrix and
+//! The sixteen tools (plan4 C4.3 + plan5 C5.3 + step 5c's handoff): `tools/list` definitions, the role matrix and
 //! argument validation before anything is sent to the app. The app validates again (C4.12) and
 //! enforces the role matrix itself (the security boundary); this layer gives the model a quick,
 //! precise error without a pipe round trip and only lists the tools its roles allow.
@@ -22,9 +22,11 @@ pub const LIST_PROFILES: &str = "mira_list_profiles";
 pub const GET_WORKSPACE_RULES: &str = "mira_get_workspace_rules";
 pub const ADD_REPORT: &str = "mira_add_report";
 pub const GET_REPORT: &str = "mira_get_report";
+/// Step 5c: the assignee hands its ticket in progress to another agent, or back to the backlog.
+pub const HANDOFF_TICKET: &str = "mira_handoff_ticket";
 
 /// Tools every agent has, whatever its roles (plan5 A.2).
-pub const COMMON_TOOLS: [&str; 8] = [
+pub const COMMON_TOOLS: [&str; 9] = [
     CREATE_TICKET,
     LIST_TICKETS,
     GET_TICKET,
@@ -33,6 +35,7 @@ pub const COMMON_TOOLS: [&str; 8] = [
     GET_WORKSPACE_RULES,
     ADD_REPORT,
     GET_REPORT,
+    HANDOFF_TICKET,
 ];
 
 /// Tools only some roles have (the union of [`ROLE_TOOLS`]).
@@ -47,10 +50,10 @@ pub const ROLE_BOUND_TOOLS: [&str; 7] = [
 ];
 
 /// Every tool name (plan5 C5.8), common ones first; the order of [`definitions`].
-pub const TOOL_NAMES: [&str; 15] = ALL_TOOL_NAMES;
+pub const TOOL_NAMES: [&str; 16] = ALL_TOOL_NAMES;
 
-/// Every tool name of plan5 C5.3, common ones first.
-pub const ALL_TOOL_NAMES: [&str; 15] = [
+/// Every tool name of plan5 C5.3 (+ step 5c's handoff), common ones first.
+pub const ALL_TOOL_NAMES: [&str; 16] = [
     CREATE_TICKET,
     LIST_TICKETS,
     GET_TICKET,
@@ -59,6 +62,7 @@ pub const ALL_TOOL_NAMES: [&str; 15] = [
     GET_WORKSPACE_RULES,
     ADD_REPORT,
     GET_REPORT,
+    HANDOFF_TICKET,
     APPROVE_TICKET,
     REJECT_TICKET,
     ASSIGN_TICKET,
@@ -234,6 +238,19 @@ pub fn definitions() -> Vec<Value> {
             "annotations": annotations(true, true)
         }),
         json!({
+            "name": HANDOFF_TICKET,
+            "description": "Giver din igangværende ticket videre: med agentId flytter den bagest i den agents kø (agenten skal køre og må ikke være dig selv); uden agentId lægges den tilbage i backlog. Brug den når ticketen ikke er til dig, og skriv evt. hvorfor med mira_update_status først. Kun din egen ticket i gang; tickets i Review eller Done kan ikke gives videre. Uden ticketId bruges din igangværende ticket.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agenten der skal have ticketen; udelad for at lægge den tilbage i backlog"}
+                },
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
             "name": APPROVE_TICKET,
             "description": "Godkender en ticket du er reviewer på: den går til Done. Kun tickets i Review, aldrig dine egne afleveringer. Skriv kort hvad du har tjekket i note.",
             "inputSchema": {
@@ -263,7 +280,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": ASSIGN_TICKET,
-            "description": "Sætter en ticket fra backlog eller afvist bagest i en kørende agents kø (koordinator). Agent-id'er fås med mira_list_agents.",
+            "description": "Sætter en ticket fra backlog eller afvist bagest i en kørende agents kø (koordinator). Din egen igangværende ticket kan du også give videre på den måde (den flytter fra dig til agenten). Agent-id'er fås med mira_list_agents.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -277,7 +294,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": UNASSIGN_TICKET,
-            "description": "Tager en ticket i kø ud af agentens kø og tilbage til backlog (koordinator). Tickets i gang kan ikke tages.",
+            "description": "Tager en ticket i kø ud af agentens kø og tilbage til backlog (koordinator). Af tickets i gang kan kun din egen lægges tilbage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string", "minLength": 1, "maxLength": ID_MAX}},
@@ -413,6 +430,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES => &[],
         ADD_REPORT => &["ticketId", "title", "body"],
         GET_REPORT => &["ticketId", "reportId"],
+        HANDOFF_TICKET => &["ticketId", "agentId"],
         other => return Err(format!("Ukendt værktøj: {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -569,6 +587,10 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             take_str(obj, &mut out, &id_rule("ticketId", true, ID_MAX))?;
             take_str(obj, &mut out, &id_rule("reportId", true, REPORT_ID_MAX))?;
         }
+        HANDOFF_TICKET => {
+            take_str(obj, &mut out, &id_rule("ticketId", false, ID_MAX))?;
+            take_str(obj, &mut out, &id_rule("agentId", false, ID_MAX))?;
+        }
         _ => take_str(
             obj,
             &mut out,
@@ -596,8 +618,11 @@ mod tests {
         for role in ["coder", "researcher", "planner", "debugger", "nobody"] {
             assert_eq!(tools_for_roles(&[role]), COMMON_TOOLS.to_vec(), "{role}");
         }
-        assert_eq!(tools_for_roles(&["reviewer"]).len(), 10);
-        assert_eq!(tools_for_roles(&["coordinator"]).len(), 13);
+        assert_eq!(tools_for_roles(&["reviewer"]).len(), 11);
+        assert_eq!(tools_for_roles(&["coordinator"]).len(), 14);
+        // Step 5c: every role may hand its own ticket on.
+        assert!(is_allowed(HANDOFF_TICKET, &["coder"]));
+        assert!(is_allowed(HANDOFF_TICKET, &none));
         let all = [
             "coder",
             "researcher",
@@ -646,7 +671,7 @@ mod tests {
     #[test]
     fn definitions_are_well_formed() {
         let defs = definitions();
-        assert_eq!(defs.len(), 15);
+        assert_eq!(defs.len(), 16);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert_eq!(names, TOOL_NAMES);
         for d in &defs {
@@ -844,15 +869,15 @@ mod tests {
                 .collect()
         };
         for (roles, n) in [
-            (&[][..], 8),
-            (&["coder"][..], 8),
-            (&["researcher"][..], 8),
-            (&["planner"][..], 8),
-            (&["debugger"][..], 8),
-            (&["reviewer"][..], 10),
-            (&["coordinator"][..], 13),
-            (&["coder", "reviewer", "coordinator"][..], 15),
-            (&["nobody"][..], 8),
+            (&[][..], 9),
+            (&["coder"][..], 9),
+            (&["researcher"][..], 9),
+            (&["planner"][..], 9),
+            (&["debugger"][..], 9),
+            (&["reviewer"][..], 11),
+            (&["coordinator"][..], 14),
+            (&["coder", "reviewer", "coordinator"][..], 16),
+            (&["nobody"][..], 9),
         ] {
             assert_eq!(names(roles).len(), n, "{roles:?}");
             let want: Vec<String> = tools_for_roles(roles)
@@ -960,6 +985,23 @@ mod tests {
         assert_eq!(
             err(UNASSIGN_TICKET, json!({"id":""})),
             "id skal være en tekst på 1–64 tegn"
+        );
+        // Step 5c: both arguments optional.
+        assert_eq!(ok(HANDOFF_TICKET, json!({})), json!({}));
+        assert_eq!(
+            ok(
+                HANDOFF_TICKET,
+                json!({"ticketId":" ab12cd34 ","agentId":"w"})
+            ),
+            json!({"ticketId":"ab12cd34","agentId":"w"})
+        );
+        assert_eq!(
+            err(HANDOFF_TICKET, json!({"agentId":""})),
+            "agentId skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(
+            err(HANDOFF_TICKET, json!({"id":"x"})),
+            "Ukendt argument: id"
         );
         assert_eq!(
             ok(

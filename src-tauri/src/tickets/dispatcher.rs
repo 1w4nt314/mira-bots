@@ -460,7 +460,20 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             .as_ref()
             .map_or_else(|| agent_id.to_string(), |s| s.name.clone());
         let now = now_ms();
+        // The ticket changed hands while its line was on the way (moved back, handed over to
+        // another agent, step 5c): it must not go in progress with the new assignee.
+        let moved = kind == DeliveryKind::Work
+            && self
+                .host
+                .read(|s| s.get(ticket_id))
+                .is_some_and(|t| t.assignee_agent_id.as_deref() != Some(agent_id));
+        if moved {
+            log::info!(
+                "dispatch {agent_id}: ticket {ticket_id} changed hands; not marked dispatched"
+            );
+        }
         let r = match kind {
+            DeliveryKind::Work if moved => Ok(()),
             DeliveryKind::Work => self
                 .host
                 .mutate(|s| s.mark_dispatched(ticket_id, &name, now))
@@ -2108,6 +2121,97 @@ mod tests {
         });
         h.advance(DISPATCH_DELAY_MS);
         assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    /// Step 5c: a coordinator hands its coordination task to a work agent mid-turn. The ticket
+    /// leaves the coordinator, the work agent gets it as an ordinary ticket, the coordinator's
+    /// Stop marks nothing "ikke afleveret" and its own queue moves on.
+    #[test]
+    fn handoff_mid_turn_frees_the_sender_and_delivers_to_the_target() {
+        let mut h = Harness::new();
+        h.agent_on(
+            "k",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        h.agent("w", AgentStatus::Thinking);
+        let a = h.queued("k", "Lav en HTML-side");
+        let b = h.queued("k", "Næste");
+        deliver_until_enter(&mut h, "k");
+        let coord = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator]);
+        let coord_line = prompt::line_for(&a, coord);
+        assert!(coord_line.starts_with("Koordinér ticket "));
+        h.submitted("k", &coord_line);
+        assert_eq!(h.ticket(&a.id).state, S::InProgress);
+        h.set_status("k", AgentStatus::Thinking);
+
+        // mira_assign_ticket / mira_handoff_ticket during the coordinator's turn.
+        h.svc()
+            .handoff(&a.id, "w", Some("k"), ("bot-k", "bot-w"), 50)
+            .unwrap();
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "k".into(),
+        });
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "w".into(),
+        });
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2, "nobody idle yet");
+
+        // The coordinator's turn ends: nothing to mark, its queue head is next.
+        h.set_status("k", AgentStatus::Idle);
+        stop(&mut h, "k");
+        let a_now = h.ticket(&a.id);
+        assert_eq!(
+            (a_now.state, a_now.issue, a_now.assignee_agent_id.as_deref()),
+            (S::Assigned, None, Some("w"))
+        );
+        assert_eq!(h.detail("k"), None);
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        assert_eq!(
+            &h.writes()[2..],
+            &[("k".into(), prompt::line_for(&b_now, coord)), enter("k")]
+        );
+
+        // The work agent becomes idle and gets the handed-over ticket as an ordinary ticket.
+        h.set_status("w", AgentStatus::Idle);
+        deliver_until_enter(&mut h, "w");
+        assert_eq!(&h.writes()[4..], &[("w".into(), line(&a_now)), enter("w")]);
+        assert!(!h.ticket_file("w", &a_now).contains("Koordineringsopgave"));
+        h.submitted("w", &line(&a_now));
+        let a_done = h.ticket(&a.id);
+        assert_eq!(
+            (a_done.state, a_done.assignee_agent_id.as_deref()),
+            (S::InProgress, Some("w"))
+        );
+        assert_eq!(
+            a_done.history.last().unwrap().note.as_deref(),
+            Some("sendt til bot-w")
+        );
+    }
+
+    /// A ticket that changed hands while its line was typed is not marked dispatched to the new
+    /// assignee by the old agent's confirmation.
+    #[test]
+    fn confirmation_after_the_ticket_changed_hands_is_ignored() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("a2", AgentStatus::Thinking);
+        let a = h.queued("a1", "A");
+        deliver_until_enter(&mut h, "a1");
+        {
+            let mut s = h.svc();
+            s.unassign(&a.id, 10).unwrap();
+            s.assign(&a.id, "a2", 11).unwrap();
+        }
+        h.submitted("a1", &line(&a));
+        let now = h.ticket(&a.id);
+        assert_eq!(
+            (now.state, now.assignee_agent_id.as_deref()),
+            (S::Assigned, Some("a2"))
+        );
     }
 
     #[test]

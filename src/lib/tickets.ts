@@ -275,6 +275,24 @@ export function canAssign(t: TicketSummary, agent: AgentInfo | null): boolean {
 }
 
 /**
+ * Whether "Tildel…" may hand a ticket in progress over to another agent (step 5c: the backend's
+ * `assign_ticket` moves it from its agent to the end of the new agent's queue). Dragging stays
+ * as before (`canDrag`). The menu leaves out the current assignee.
+ *
+ * | state      | assignee | canHandOver |
+ * |------------|----------|-------------|
+ * | inProgress | A        | true        |
+ * | inProgress | –        | false       |
+ * | assigned   | A        | false       |
+ * | review     | A        | false       |
+ * | done       | any      | false       |
+ * | backlog    | –        | false       |
+ */
+export function canHandOver(t: TicketSummary): boolean {
+  return t.state === "inProgress" && t.assigneeAgentId !== null;
+}
+
+/**
  * Mirrors the backend rule for `delete_ticket`.
  *
  * | state      | assignee | canDelete |

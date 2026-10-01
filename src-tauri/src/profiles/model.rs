@@ -419,7 +419,8 @@ pub fn builtin_profile(id: &str) -> Option<AgentProfile> {
         "researcher" => ("Researcher", vec![Role::Researcher], SeatKind::Work),
         "reviewer" => ("Reviewer", vec![Role::Reviewer], SeatKind::Staff),
         "coordinator" => ("Koordinator", vec![Role::Coordinator], SeatKind::Staff),
-        "planner" => ("Planlægger", vec![Role::Planner], SeatKind::Work),
+        // A staff role only (5c batch 2): the planner stands on a staff seat by default.
+        "planner" => ("Planlægger", vec![Role::Planner], SeatKind::Staff),
         "debugger" => ("Debugger", vec![Role::Debugger], SeatKind::Work),
         "specialist" => (
             "Specialist (alle roller)",
@@ -520,7 +521,8 @@ mod tests {
         let seat = |id: &str| builtin_profile(id).unwrap().default_seat;
         assert_eq!(seat("reviewer"), SeatKind::Staff);
         assert_eq!(seat("coordinator"), SeatKind::Staff);
-        for id in ["coder", "researcher", "planner", "debugger", "specialist"] {
+        assert_eq!(seat("planner"), SeatKind::Staff);
+        for id in ["coder", "researcher", "debugger", "specialist"] {
             assert_eq!(seat(id), SeatKind::Work, "{id}");
         }
         let names: Vec<String> = all.iter().map(|p| p.name.clone()).collect();

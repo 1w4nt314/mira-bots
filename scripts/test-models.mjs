@@ -84,3 +84,16 @@ const staffTable = [
 ];
 for (const [roles, want] of staffTable) assert.equal(r.hasStaffRole(roles), want, JSON.stringify(roles));
 console.log(`hasStaffRole: ${staffTable.length} cases ok`);
+// staffRank: the coordinator is preferred on a staff seat, then reviewer, then planner.
+const rankTable = [
+  [["coordinator"], 0],
+  [["reviewer"], 1],
+  [["planner"], 2],
+  [["coder"], 3],
+  [[], 3],
+  [["planner", "reviewer"], 1],
+  [["reviewer", "coordinator"], 0],
+  [[...r.ROLE_ORDER], 0],
+];
+for (const [roles, want] of rankTable) assert.equal(r.staffRank(roles), want, JSON.stringify(roles));
+console.log(`staffRank: ${rankTable.length} cases ok`);

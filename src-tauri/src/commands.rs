@@ -338,20 +338,42 @@ pub fn ticket_delete(t: &TicketsCtx, id: &str) -> Result<(), String> {
 }
 
 /// backlog/rejected → the agent's queue (at the end). The agent must exist and not have exited.
+/// A ticket in progress is handed over (step 5c): it leaves its agent ("overdraget fra … til
+/// …") and goes last in the new agent's queue.
 pub fn ticket_assign(t: &TicketsCtx, id: &str, agent_id: &str) -> Result<TicketSummary, String> {
     if !agent_live(&t.manager, agent_id) {
         return Err(TicketError::AgentNotLive.into());
     }
+    let before = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
     let now = now_ms();
-    let tk = t.mutate(|s| s.assign(id, agent_id, now))?;
-    t.notify([agent_id]);
+    if before.state != TicketState::InProgress {
+        let tk = t.mutate(|s| s.assign(id, agent_id, now))?;
+        t.notify([agent_id]);
+        return Ok(TicketSummary::from(&tk));
+    }
+    let old = before.assignee_agent_id.unwrap_or_default();
+    let (from_name, to_name) = {
+        let m = lock(&t.manager);
+        let name = |a: &str| m.get(a).map_or_else(|| a.to_string(), |i| i.name);
+        (name(&old), name(agent_id))
+    };
+    let tk = t.mutate(|s| s.handoff(id, agent_id, None, (&from_name, &to_name), now))?;
+    t.clear_stale_detail(&old);
+    t.notify([old.as_str(), agent_id]);
     Ok(TicketSummary::from(&tk))
 }
 
+/// assigned → backlog; a ticket in progress is put back too ("lagt tilbage", step 5c).
 pub fn ticket_unassign(t: &TicketsCtx, id: &str) -> Result<TicketSummary, String> {
-    let old = assignee_of(t, id)?;
+    let before = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    let old = before.assignee_agent_id;
     let now = now_ms();
     let tk = t.mutate(|s| s.unassign(id, now))?;
+    if before.state == TicketState::InProgress {
+        if let Some(agent) = old.as_deref() {
+            t.clear_stale_detail(agent);
+        }
+    }
     t.notify(old);
     Ok(TicketSummary::from(&tk))
 }
@@ -2044,6 +2066,57 @@ mod tests {
         // Back to the backlog from in-progress clears it too.
         ticket_set_state(&t.ctx, &id, TicketState::Backlog, None).unwrap();
         assert_eq!(detail(&t), None);
+    }
+
+    /// Step 5c: "Tildel…" on a ticket in progress hands it over; "Fjern tildeling" puts it back.
+    #[test]
+    fn user_hands_over_and_puts_back_a_ticket_in_progress() {
+        use crate::config::NOT_SUBMITTED_TEXT;
+        let (mut t, live, dead) = tickets_setup();
+        let other = {
+            let mut m = lock(&t.ctx.manager);
+            let id = m.insert_fake("s3", "/w/other");
+            m.set_status(&id, AgentStatus::Idle, None).unwrap();
+            id
+        };
+        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        ticket_assign(&t.ctx, &tk.id, &live).unwrap();
+        ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
+        lock(&t.ctx.manager).set_detail(&live, Some(NOT_SUBMITTED_TEXT.into()));
+        let _ = t.sent();
+        assert_eq!(
+            ticket_assign(&t.ctx, &tk.id, &dead).unwrap_err(),
+            "Agenten kører ikke"
+        );
+        assert_eq!(
+            ticket_assign(&t.ctx, &tk.id, &live).unwrap_err(),
+            "Ticketen kan ikke gives videre til den agent, der allerede har den"
+        );
+        let s = ticket_assign(&t.ctx, &tk.id, &other).unwrap();
+        assert_eq!(
+            (s.state, s.assignee_agent_id.as_deref(), s.queue_position),
+            (TicketState::Assigned, Some(other.as_str()), Some(0))
+        );
+        let mut sent = t.sent();
+        sent.sort_by_key(|m| format!("{m:?}"));
+        let mut want = vec![queue_changed(&live), queue_changed(&other)];
+        want.sort_by_key(|m| format!("{m:?}"));
+        assert_eq!(sent, want);
+        {
+            let m = lock(&t.ctx.manager);
+            assert_eq!(m.get(&live).unwrap().current_ticket_id, None);
+            assert_eq!(m.get(&live).unwrap().detail, None, "stale hint cleared");
+            assert_eq!(m.get(&other).unwrap().queue_length, 1);
+        }
+        let full = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        let note = full.history.last().unwrap().note.clone().unwrap();
+        assert!(note.starts_with("overdraget fra "), "{note}");
+        // In progress with the other agent, then put back.
+        ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
+        let _ = t.sent();
+        let b = ticket_unassign(&t.ctx, &tk.id).unwrap();
+        assert_eq!((b.state, b.assignee_agent_id), (TicketState::Backlog, None));
+        assert_eq!(t.sent(), vec![queue_changed(&other)]);
     }
 
     #[test]

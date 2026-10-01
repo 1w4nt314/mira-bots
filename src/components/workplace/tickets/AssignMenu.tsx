@@ -16,7 +16,8 @@ interface Item {
 /**
  * Keyboard (and mouse) alternative to dragging: "Tildel…" opens a menu with the running agents
  * and "Ny agent på arbejdsplads/stabsplads". Arrow keys move, Enter picks, Esc closes; focus goes
- * back to the button.
+ * back to the button. For a ticket in progress (step 5c, `canHandOver`) it hands the ticket over:
+ * only the other running agents are offered, no new agent.
  */
 export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
   const { state } = useStore();
@@ -27,29 +28,39 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
-  const live = state.agents.filter((a) => !isExited(a));
+  const handOver = ticket.state === "inProgress";
+  const live = state.agents.filter(
+    (a) => !isExited(a) && !(handOver && a.id === ticket.assigneeAgentId),
+  );
+  const spawnItems: Item[] = handOver
+    ? []
+    : [
+        {
+          key: "new-work",
+          label: "Ny agent på arbejdsplads",
+          title: spawnBlocked.work ?? "Start en ny agent på en arbejdsplads med denne ticket",
+          disabled: spawnBlocked.work !== null,
+          act: () => spawnWithTicket("work", ticket),
+        },
+        {
+          key: "new-staff",
+          label: "Ny agent på stabsplads",
+          title: spawnBlocked.staff ?? "Start en ny agent på en stabsplads med denne ticket",
+          disabled: spawnBlocked.staff !== null,
+          act: () => spawnWithTicket("staff", ticket),
+        },
+      ];
   const items: Item[] = [
     ...live.map((a) => ({
       key: a.id,
       label: `${a.name} · ${a.seatKind === "work" ? "arbejdsplads" : "stab"} · ${a.queueLength} i kø`,
-      title: `Sæt ticketen bagerst i køen hos ${a.name}`,
+      title: handOver
+        ? `Giv ticketen videre: den forlader sin agent og sættes bagerst i køen hos ${a.name}`
+        : `Sæt ticketen bagerst i køen hos ${a.name}`,
       disabled: false,
       act: () => void run(() => assignTicket(ticket.id, a.id)),
     })),
-    {
-      key: "new-work",
-      label: "Ny agent på arbejdsplads",
-      title: spawnBlocked.work ?? "Start en ny agent på en arbejdsplads med denne ticket",
-      disabled: spawnBlocked.work !== null,
-      act: () => spawnWithTicket("work", ticket),
-    },
-    {
-      key: "new-staff",
-      label: "Ny agent på stabsplads",
-      title: spawnBlocked.staff ?? "Start en ny agent på en stabsplads med denne ticket",
-      disabled: spawnBlocked.staff !== null,
-      act: () => spawnWithTicket("staff", ticket),
-    },
+    ...spawnItems,
   ];
 
   const enabledButtons = () =>
@@ -124,7 +135,7 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
             setOpen(true);
           }
         }}
-        title="Tildel ticketen til en agent"
+        title={handOver ? "Giv ticketen videre til en anden agent" : "Tildel ticketen til en agent"}
         className={smallBtn}
       >
         Tildel…
@@ -139,7 +150,9 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
           className="absolute left-0 z-20 mt-1 w-64 rounded-lg border border-[var(--border)] bg-[var(--panel)] py-1 text-xs text-[var(--fg)] shadow-lg"
         >
           {live.length === 0 && (
-            <p className="px-3 py-1 text-[var(--muted)]">Ingen kørende agenter</p>
+            <p className="px-3 py-1 text-[var(--muted)]">
+              {handOver ? "Ingen andre kørende agenter" : "Ingen kørende agenter"}
+            </p>
           )}
           {items.map((it, i) => (
             <button

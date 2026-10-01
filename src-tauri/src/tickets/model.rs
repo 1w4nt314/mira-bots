@@ -311,6 +311,9 @@ pub enum TicketError {
     NeedsNote,
     #[error("Agenten har allerede en ticket i gang")]
     AgentBusy,
+    /// Step 5c handoff to the agent that already has the ticket.
+    #[error("Ticketen kan ikke gives videre til den agent, der allerede har den")]
+    HandoffToSelf,
     #[error("Kun tickets i backlog, done eller afvist uden agent kan slettes")]
     NotDeletable,
     #[error("{0}")]
@@ -734,6 +737,10 @@ mod tests {
             ),
             (TicketError::ReportNotFound, "Rapporten findes ikke"),
             (TicketError::NotAReviewer, "Agenten er ikke reviewer"),
+            (
+                TicketError::HandoffToSelf,
+                "Ticketen kan ikke gives videre til den agent, der allerede har den",
+            ),
             (TicketError::AgentWorking, "Agenten arbejder"),
             (
                 TicketError::SenderCannotReview,

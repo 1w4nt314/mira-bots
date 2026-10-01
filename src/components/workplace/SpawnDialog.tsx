@@ -8,7 +8,7 @@ import {
   spawnAgentWithTicket,
 } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
-import { folderPrefix, hasStaffRole, isSpecialist, rolesText } from "../../lib/roles";
+import { folderPrefix, hasStaffRole, isSpecialist, rolesText, staffRank } from "../../lib/roles";
 import type { AgentProfile, Effort, SeatKind, SpawnOverrides, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
 import BotFigure from "../BotFigure";
@@ -32,13 +32,21 @@ function fitsSeat(p: AgentProfile, seatKind: SeatKind): boolean {
 }
 
 /**
- * The preselected profile: `coder` on a work seat; on a staff seat the first profile that
- * normally stands there and has a staff role, else the first with a staff role.
+ * The preselected profile: `coder` on a work seat; on a staff seat a profile with a staff role,
+ * preferring one that normally stands there, then the best staff role (coordinator before
+ * reviewer before planner, `staffRank`), then the list order.
  */
 function defaultProfileId(profiles: readonly AgentProfile[], seatKind: SeatKind): string | null {
   if (seatKind === "work") return DEFAULT_PROFILE;
-  const fits = profiles.filter((p) => fitsSeat(p, seatKind));
-  return (fits.find((p) => p.defaultSeat === "staff") ?? fits[0])?.id ?? null;
+  const key = (p: AgentProfile) => [p.defaultSeat === "staff" ? 0 : 1, staffRank(p.roles)];
+  const fits = profiles
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => fitsSeat(p, seatKind))
+    .sort((a, b) => {
+      const [ka, kb] = [key(a.p), key(b.p)];
+      return ka[0] - kb[0] || ka[1] - kb[1] || a.i - b.i;
+    });
+  return fits[0]?.p.id ?? null;
 }
 
 interface Props {

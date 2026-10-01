@@ -149,7 +149,7 @@ impl TicketDelivery {
 }
 
 /// `## Koordineringsopgave` text for an agent with the coordinator role.
-pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv (skriv ingen kode og ingen filer). Find en ledig arbejdsagent med mira_list_agents og giv den ticketen med mira_assign_ticket (så flytter ticketen til den). Er opgaven for stor, opret del-tickets med mira_create_ticket og assignTo, og aflever denne ticket med mira_submit_for_review med en kort plan for fordelingen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers læg ticketen tilbage med mira_unassign_ticket og skriv hvorfor.";
+pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv (skriv ingen kode og ingen filer). Find en ledig arbejdsagent med mira_list_agents og giv den denne ticket med mira_assign_ticket (ticketen flytter fra dig til den, også selv om den er i gang hos dig; arbejd så ikke videre på den). Er opgaven for stor, opret del-tickets med mira_create_ticket og assignTo, og aflever denne ticket med mira_submit_for_review med en kort plan for fordelingen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers skriv hvorfor med mira_update_status og læg så ticketen tilbage i backlog med mira_unassign_ticket.";
 /// `## Koordineringsopgave` text for a reviewer/planner without the coordinator role.
 pub const COORDINATION_PLAN_TEXT: &str = "Du sidder på en stabsplads: udfør IKKE opgaven selv. Nedbryd den i del-tickets med mira_create_ticket (de lander i backlog, brugeren eller en koordinator tildeler dem) og aflever denne ticket med mira_submit_for_review med planen.";
 
@@ -695,6 +695,9 @@ mod tests {
             );
         }
         assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_assign_ticket"));
+        // Step 5c: both tools work on the coordinator's own ticket in progress.
+        assert!(COORDINATION_DISTRIBUTE_TEXT.contains("flytter fra dig til den"));
+        assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_unassign_ticket"));
         assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_list_agents"));
         assert!(COORDINATION_PLAN_TEXT.contains("mira_create_ticket"));
         assert!(!COORDINATION_PLAN_TEXT.contains("mira_assign_ticket"));

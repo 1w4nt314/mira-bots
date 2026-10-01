@@ -17,6 +17,7 @@ pub const COMMON_PROMPT: &str = "Du kører som agent i mira-bots. Dine opgaver k
 Regler:
 - Når en ticket er færdig, SKAL du kalde værktøjet mira_submit_for_review med en kort opsummering (hvad du gjorde, hvad brugeren bør kigge på). Afslut først dit svar bagefter. Uden kaldet står ticketen som \"ikke afleveret\".
 - Opdager du opfølgende arbejde, så opret en ny ticket med mira_create_ticket i stedet for at udvide opgaven.
+- Er din igangværende ticket ikke til dig, så giv den videre med mira_handoff_ticket (med agentId til en anden agent; uden agentId tilbage i backlog) og afslut dit svar.
 - mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje; mira_add_report lægger en rapport (markdown) på ticketen, så brugeren og revieweren kan se hvad du har lavet — gør det ved større opgaver, gerne som `report` i mira_submit_for_review; mira_get_workspace_rules viser reglerne.
 - Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den.
 ";
@@ -204,6 +205,7 @@ mod tests {
             "mira_add_report",
             "`report` i mira_submit_for_review",
             "mira_get_workspace_rules",
+            "mira_handoff_ticket",
             "Højst 5 arbejdsagenter og 3 stabsagenter",
             "højst 3 gange",
             "Højst 20 rapporter pr. ticket, hver højst 20000 tegn.",

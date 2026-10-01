@@ -101,4 +101,17 @@ for (const [status, cur, want] of [
 ])
   eq(k.switchBlocked({ status: { kind: status }, currentTicketId: cur }), want, `switchBlocked ${status} ${cur}`);
 
+// canHandOver (step 5c): "Tildel…" on a ticket in progress.
+for (const [state, assignee, want] of [
+  ["inProgress", "A", true],
+  ["inProgress", null, false],
+  ["assigned", "A", false],
+  ["review", "A", false],
+  ["done", "A", false],
+  ["done", null, false],
+  ["backlog", null, false],
+  ["rejected", null, false],
+])
+  eq(k.canHandOver(ticket({ state, assigneeAgentId: assignee })), want, `canHandOver ${state} ${assignee}`);
+
 console.log(`tickets.ts: ${n} cases ok`);

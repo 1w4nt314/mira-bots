@@ -5,12 +5,15 @@ use super::model::{Ticket, TicketActor, TicketError, TicketHistoryEntry, TicketS
 
 /// History note when a done ticket is moved back to the backlog without a note.
 pub const REOPENED_NOTE: &str = "genåbnet";
+/// History note when a ticket in progress is put back in the backlog (`Unassign`) without a note.
+pub const RETURNED_NOTE: &str = "lagt tilbage";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TicketEvent {
     /// backlog → assigned (the service places it in the queue).
     Assign { agent_id: String },
-    /// assigned → backlog.
+    /// assigned → backlog; also inProgress → backlog ("lagt tilbage", step 5c), by the user or
+    /// an agent, never by the system (the service checks that an agent is the assignee).
     Unassign,
     /// assigned → inProgress (delivered to the agent).
     Dispatched,
@@ -26,13 +29,19 @@ pub enum TicketEvent {
     ToBacklog { note: Option<String> },
     /// review → inProgress (same agent continues).
     Reopen,
+    /// inProgress → assigned with another agent (step 5c handoff): by the user or an agent,
+    /// never by the system; the service checks that an agent is the current assignee and that
+    /// the target is live. The rejection note and the review round stay; `issue` is cleared.
+    Handoff { to_agent_id: String },
 }
 
 impl TicketEvent {
     /// The state this event normally leads to (also used in `IllegalTransition`).
     pub fn nominal_target(&self) -> TicketState {
         match self {
-            TicketEvent::Assign { .. } | TicketEvent::Requeue => TicketState::Assigned,
+            TicketEvent::Assign { .. } | TicketEvent::Requeue | TicketEvent::Handoff { .. } => {
+                TicketState::Assigned
+            }
             TicketEvent::Unassign | TicketEvent::ToBacklog { .. } => TicketState::Backlog,
             TicketEvent::Dispatched | TicketEvent::Reopen => TicketState::InProgress,
             TicketEvent::Submit => TicketState::Review,
@@ -83,6 +92,23 @@ pub fn transition_noted(
         (S::Assigned, E::Unassign) => {
             clear_assignment(&mut n);
             S::Backlog
+        }
+        // Step 5c: the assignee (or the user) gives a ticket in progress back or away. The
+        // system never does this; it uses `ToBacklog` with a reason.
+        (S::InProgress, E::Unassign) if by != TicketActor::System => {
+            clear_assignment(&mut n);
+            note = note.or_else(|| Some(RETURNED_NOTE.to_string()));
+            S::Backlog
+        }
+        (S::InProgress, E::Handoff { to_agent_id }) if by != TicketActor::System => {
+            if t.assignee_agent_id.as_deref() == Some(to_agent_id.as_str()) {
+                return Err(TicketError::HandoffToSelf);
+            }
+            n.assignee_agent_id = Some(to_agent_id.clone());
+            // Placed by the service (`normalize_queues`: last, like an ordinary assignment).
+            n.queue_position = None;
+            n.issue = None;
+            S::Assigned
         }
         (S::Assigned, E::Dispatched) => {
             n.queue_position = None;
@@ -196,6 +222,9 @@ mod tests {
             TicketEvent::Requeue,
             TicketEvent::ToBacklog { note: None },
             TicketEvent::Reopen,
+            TicketEvent::Handoff {
+                to_agent_id: "a2".into(),
+            },
         ]
     }
 
@@ -215,11 +244,12 @@ mod tests {
     fn full_transition_table() {
         // Rows: from-state in TicketState::ALL order; columns: events() order.
         // Some(target) = legal, None = IllegalTransition.
-        let table: [(S, [Option<S>; 9]); 6] = [
+        let table: [(S, [Option<S>; 10]); 6] = [
             (
                 S::Backlog,
                 [
                     Some(S::Assigned),
+                    None,
                     None,
                     None,
                     None,
@@ -242,13 +272,14 @@ mod tests {
                     None,
                     Some(S::Backlog),
                     None,
+                    None,
                 ],
             ),
             (
                 S::InProgress,
                 [
                     None,
-                    None,
+                    Some(S::Backlog),
                     None,
                     Some(S::Review),
                     None,
@@ -256,6 +287,7 @@ mod tests {
                     None,
                     Some(S::Backlog),
                     None,
+                    Some(S::Assigned),
                 ],
             ),
             (
@@ -270,6 +302,7 @@ mod tests {
                     None,
                     Some(S::Backlog),
                     Some(S::InProgress),
+                    None,
                 ],
             ),
             (
@@ -284,6 +317,7 @@ mod tests {
                     None,
                     Some(S::Backlog),
                     None,
+                    None,
                 ],
             ),
             (
@@ -297,6 +331,7 @@ mod tests {
                     None,
                     Some(S::Assigned),
                     Some(S::Backlog),
+                    None,
                     None,
                 ],
             ),
@@ -329,7 +364,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases, 54);
+        assert_eq!(cases, 60);
     }
 
     #[test]
@@ -548,5 +583,105 @@ mod tests {
             (s.state, s.reviewer_agent_id, s.review_round),
             (S::Review, None, 2)
         );
+    }
+
+    #[test]
+    fn handoff_from_in_progress_per_actor_and_state() {
+        let ev = TicketEvent::Handoff {
+            to_agent_id: "a2".into(),
+        };
+        // User and agent may; the system never hands off.
+        for by in [TicketActor::User, TicketActor::Agent] {
+            let mut t = in_state(S::InProgress);
+            t.issue = Some(TicketIssue::NotSubmitted);
+            t.rejection_note = Some("mangler test".into());
+            t.review_round = 2;
+            let h = transition_noted(&t, &ev, by, Some("overdraget fra A til B".into()), 7)
+                .unwrap_or_else(|e| panic!("{by:?}: {e}"));
+            assert_eq!(h.state, S::Assigned);
+            assert_eq!(h.assignee_agent_id.as_deref(), Some("a2"));
+            assert_eq!((h.queue_position, h.issue), (None, None));
+            assert_eq!(h.rejection_note.as_deref(), Some("mangler test"));
+            assert_eq!(h.review_round, 2);
+            let last = h.history.last().unwrap();
+            assert_eq!(
+                (last.from, last.to, last.by, last.note.as_deref()),
+                (
+                    Some(S::InProgress),
+                    S::Assigned,
+                    by,
+                    Some("overdraget fra A til B")
+                )
+            );
+        }
+        assert_eq!(
+            transition(&in_state(S::InProgress), &ev, TicketActor::System, 7),
+            Err(TicketError::IllegalTransition {
+                from: S::InProgress,
+                to: S::Assigned
+            })
+        );
+        // Never to the agent that already has it.
+        let same = TicketEvent::Handoff {
+            to_agent_id: "a1".into(),
+        };
+        assert_eq!(
+            transition(&in_state(S::InProgress), &same, TicketActor::Agent, 7),
+            Err(TicketError::HandoffToSelf)
+        );
+        // Only from in progress: review, done, assigned, rejected and backlog refuse it.
+        for from in [S::Backlog, S::Assigned, S::Review, S::Done, S::Rejected] {
+            for by in [TicketActor::User, TicketActor::Agent] {
+                assert_eq!(
+                    transition(&in_state(from), &ev, by, 7),
+                    Err(TicketError::IllegalTransition {
+                        from,
+                        to: S::Assigned
+                    }),
+                    "{from:?} {by:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unassign_from_in_progress_puts_it_back() {
+        for by in [TicketActor::User, TicketActor::Agent] {
+            let mut t = in_state(S::InProgress);
+            t.review_round = 1;
+            let b = transition(&t, &TicketEvent::Unassign, by, 8).unwrap();
+            assert_eq!(b.state, S::Backlog);
+            assert_eq!(b.assignee_agent_id, None);
+            assert_eq!(b.review_round, 0);
+            assert_eq!(
+                b.history.last().unwrap().note.as_deref(),
+                Some(RETURNED_NOTE)
+            );
+            // A given note wins.
+            let n = transition_noted(&t, &TicketEvent::Unassign, by, Some("forkert".into()), 8)
+                .unwrap();
+            assert_eq!(n.history.last().unwrap().note.as_deref(), Some("forkert"));
+        }
+        assert_eq!(
+            transition(
+                &in_state(S::InProgress),
+                &TicketEvent::Unassign,
+                TicketActor::System,
+                8
+            ),
+            Err(TicketError::IllegalTransition {
+                from: S::InProgress,
+                to: S::Backlog
+            })
+        );
+        // An ordinary unassign from the queue keeps having no note.
+        let q = transition(
+            &in_state(S::Assigned),
+            &TicketEvent::Unassign,
+            TicketActor::Agent,
+            8,
+        )
+        .unwrap();
+        assert_eq!(q.history.last().unwrap().note, None);
     }
 }
