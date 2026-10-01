@@ -12,14 +12,19 @@ use crate::agent::{now_ms, AgentManager};
 use crate::config::{MAX_PIPE_LINE, PERMISSION_APP_DEADLINE};
 use crate::diagnostics::{HookStats, LastHookEvent};
 use crate::events::{
-    HookEventPayload, PermissionResolvedPayload, AGENTS_CHANGED, HOOK_EVENT, PERMISSION_REQUEST,
-    PERMISSION_RESOLVED,
+    HookEventPayload, PermissionResolvedPayload, StatusEvent, AGENTS_CHANGED, HOOK_EVENT,
+    PERMISSION_REQUEST, PERMISSION_RESOLVED,
 };
 use crate::hooks::event::{self, summarize_tool_input, HookEvent};
 use crate::hooks::status::{self, status_for_tool, AgentStatus};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 
 pub use crate::events::EmitFn;
+
+/// Told about every hook frame that matched an agent, after its status was applied (the app
+/// glue forwards it to the ticket dispatcher; the handler knows nothing about tickets). Called
+/// without any lock held; must not block.
+pub type StatusObserver = Arc<dyn Fn(StatusEvent) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct HandlerCtx {
@@ -28,6 +33,8 @@ pub struct HandlerCtx {
     pub emit: EmitFn,
     /// Frame counters for `get_diagnostics` (same `Arc` as `AppState::hook_stats`).
     pub stats: Arc<HookStats>,
+    /// See [`StatusObserver`]; `None` in tests that do not care.
+    pub observer: Option<StatusObserver>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -197,6 +204,7 @@ where
             log::info!("agent {} rebound to session {}", f.agent_id, ev.session_id);
         }
         let t = status::apply(&ev);
+        let implied = t.status.clone();
         let emitted = match t.status {
             Some(status) => ctx.set_status(&f.agent_id, status, t.detail),
             None => false,
@@ -204,6 +212,19 @@ where
         // The UI must see the new sessionId / the cleared hint even without a status change.
         if (f.rebound || hint_cleared) && !emitted {
             ctx.emit_agents();
+        }
+        // Also when the status did not change: Stop/StopFailure/UserPromptSubmit matter to the
+        // dispatcher on their own (turn ended, delivery confirmed).
+        if let Some(observe) = &ctx.observer {
+            observe(StatusEvent {
+                agent_id: f.agent_id.clone(),
+                hook_event_name: ev.hook_event_name.clone(),
+                prompt: ev
+                    .prompt
+                    .clone()
+                    .filter(|_| ev.hook_event_name == "UserPromptSubmit"),
+                status: implied,
+            });
         }
     }
     ctx.emit(
@@ -373,6 +394,7 @@ mod tests {
                     sink.lock().unwrap().push((name.to_string(), v))
                 }),
                 stats: Arc::new(HookStats::default()),
+                observer: None,
             },
             events,
             agent,
@@ -819,5 +841,46 @@ mod tests {
         assert_eq!(info.status, AgentStatus::Starting);
         assert_eq!(info.detail, None);
         assert_eq!(h.emitted(AGENTS_CHANGED).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn matched_frames_reach_the_status_observer() {
+        let mut h = harness(true);
+        let seen: Arc<Mutex<Vec<StatusEvent>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        h.ctx.observer = Some(Arc::new(move |ev| sink.lock().unwrap().push(ev)));
+        let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+        round_trip(&h, &frame(fx::STOP)).await;
+        assert_eq!(
+            take(),
+            vec![StatusEvent {
+                agent_id: h.agent.clone(),
+                hook_event_name: "Stop".into(),
+                prompt: None,
+                status: Some(AgentStatus::Idle),
+            }]
+        );
+        // A second Stop leaves the status unchanged but still reaches the observer.
+        round_trip(&h, &frame(fx::STOP)).await;
+        assert_eq!(take().len(), 1);
+
+        round_trip(&h, &frame(fx::USER_PROMPT_SUBMIT)).await;
+        let evs = take();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].hook_event_name, "UserPromptSubmit");
+        assert_eq!(evs[0].prompt.as_deref(), Some("fix the bug"));
+        assert_eq!(evs[0].status, Some(AgentStatus::Thinking));
+
+        // A notification without a status change is reported with `status: None`.
+        round_trip(&h, &frame(fx::NOTIFICATION_OTHER)).await;
+        let evs = take();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].status, None);
+
+        // Unknown session: no agent, no observer call.
+        let ev = fx::STOP.replace("sess-1", "someone-else");
+        round_trip(&h, &frame(&ev)).await;
+        assert!(take().is_empty());
     }
 }

@@ -212,6 +212,12 @@ pub struct Diagnostics {
     pub app_version: String,
     pub agents_root: String,
     pub running_agents: usize,
+    /// `<app_data_dir>/tickets.json`.
+    pub tickets_path: String,
+    /// Set when `tickets.json` could not be read at startup (renamed to `.broken-<ts>`).
+    pub tickets_warning: Option<String>,
+    /// Number of tickets in memory.
+    pub tickets_total: usize,
 }
 
 #[cfg(test)]
@@ -358,6 +364,9 @@ mod tests {
             app_version: "0.1.0".into(),
             agents_root: "/h/mira-bots/agents".into(),
             running_agents: 2,
+            tickets_path: "/d/tickets.json".into(),
+            tickets_warning: None,
+            tickets_total: 4,
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -377,7 +386,10 @@ mod tests {
                 "logPath": null,
                 "appVersion": "0.1.0",
                 "agentsRoot": "/h/mira-bots/agents",
-                "runningAgents": 2
+                "runningAgents": 2,
+                "ticketsPath": "/d/tickets.json",
+                "ticketsWarning": null,
+                "ticketsTotal": 4
             })
         );
     }

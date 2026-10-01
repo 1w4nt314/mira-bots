@@ -24,18 +24,21 @@ export default function Workplace() {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     takeWorkplaceSelection()
-      .then((id) => {
+      .then((sel) => {
         // Deliberately NOT guarded by `cancelled`: the backend slot is take-once, and StrictMode
         // (dev) runs mount -> cleanup -> mount, so the first call takes the id and the second gets
         // null. Dropping the id when the first effect is already cleaned up would lose it. The
         // component instance survives that simulated remount, and a real unmount makes the
         // setState a harmless no-op.
-        if (id !== null) setSelectedId(id);
+        // `sel.tab` (sidebar tab) is not used here yet.
+        if (sel?.agentId) setSelectedId(sel.agentId);
       })
       .catch((e: unknown) => {
         if (!cancelled) dispatch({ type: "error/set", error: errorMessage(e) });
       });
-    onWorkplaceSelect((id) => setSelectedId(id))
+    onWorkplaceSelect((sel) => {
+      if (sel.agentId !== null) setSelectedId(sel.agentId);
+    })
       .then((u) => {
         if (cancelled) u();
         else unlisten = u;

@@ -1,4 +1,4 @@
-//! Tauri commands (contracts C.1 + C2.1) and the managed [`AppState`].
+//! Tauri commands (contracts C.1 + C2.1 + C3.2) and the managed [`AppState`].
 //!
 //! All commands except `open_workplace` (async: window creation) are synchronous and return
 //! `Result<T, String>`; errors are Danish, user-facing text. Locks are held briefly and never
@@ -22,10 +22,14 @@ use crate::agent::{
 };
 use crate::config::{MAX_STAFF_AGENTS, MAX_WORK_AGENTS, STARTING_HINT_AFTER};
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
-use crate::events::{AgentOutputPayload, AGENTS_CHANGED, WORKPLACE_SELECT};
+use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
 use crate::hooks::settings::write_hooks_json;
+use crate::hooks::status::AgentStatus;
 use crate::island::{self, IslandState};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
+use crate::tickets::dispatcher::DispatchMsg;
+use crate::tickets::model::{Ticket, TicketError, TicketPatch, TicketState, TicketSummary};
+use crate::tickets::{prompt, TicketsCtx, AGENT_STOPPED_NOTE};
 use crate::workplace;
 
 /// Locations resolved once in `setup`. The `claude` binary is not cached: it is looked up again
@@ -45,6 +49,8 @@ pub struct AppPaths {
     pub log_file: Option<PathBuf>,
     /// `<home>/mira-bots/agents`: parent of the default agent folders (created on first use).
     pub agents_root: PathBuf,
+    /// `<data_dir>/tickets.json`.
+    pub tickets_file: PathBuf,
 }
 
 /// Managed state shared by commands, the pipe handler and the PTY threads.
@@ -62,8 +68,13 @@ pub struct AppState {
     pub hook_stats: Arc<HookStats>,
     /// Result of the one-shot background `claude --version` probe.
     pub claude_version: Arc<Mutex<VersionProbe>>,
-    /// Agent to select when a newly created workplace window asks (`take_workplace_selection`).
-    pub workplace_select: Mutex<Option<String>>,
+    /// Agent/tab to select when a newly created workplace window asks
+    /// (`take_workplace_selection`).
+    pub workplace_select: Mutex<Option<WorkplaceSelection>>,
+    /// Tickets (service, manager links, emits, dispatcher inbox).
+    pub tickets: Arc<TicketsCtx>,
+    /// Warning from loading `tickets.json` (corrupt file renamed etc.), for Diagnostics.
+    pub tickets_warning: Option<String>,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -130,6 +141,9 @@ impl AppState {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             agents_root: self.paths.agents_root.to_string_lossy().into_owned(),
             running_agents: lock(&self.manager).running_count(),
+            tickets_path: self.paths.tickets_file.to_string_lossy().into_owned(),
+            tickets_warning: self.tickets_warning.clone(),
+            tickets_total: self.tickets.read(|s| s.len()),
         }
     }
 
@@ -167,8 +181,19 @@ pub fn resolve_cwd(
 }
 
 /// Takes (and clears) the pending workplace selection.
-pub fn take_selection(slot: &Mutex<Option<String>>) -> Option<String> {
+pub fn take_selection(slot: &Mutex<Option<WorkplaceSelection>>) -> Option<WorkplaceSelection> {
     lock(slot).take()
+}
+
+/// Sidebar tabs `open_workplace` may select.
+pub const WORKPLACE_TABS: [&str; 3] = ["permissions", "diagnostics", "tickets"];
+
+/// `None` (no tab) or one of [`WORKPLACE_TABS`].
+pub fn check_tab(tab: Option<&str>) -> Result<(), String> {
+    match tab {
+        Some(t) if !WORKPLACE_TABS.contains(&t) => Err(format!("Ukendt fane: {t}")),
+        _ => Ok(()),
+    }
 }
 
 /// Refuses to start agents while the pipe server is not listening.
@@ -217,6 +242,153 @@ pub fn stop(
     Ok(info)
 }
 
+// ---- tickets (C3.2): logic without Tauri types, so it is unit tested ----
+
+/// Whether the agent exists and has not exited.
+pub fn agent_live(manager: &Mutex<AgentManager>, agent_id: &str) -> bool {
+    lock(manager)
+        .get(agent_id)
+        .is_some_and(|a| !matches!(a.status, AgentStatus::Exited { .. }))
+}
+
+/// The ticket's current assignee (if any).
+fn assignee_of(t: &TicketsCtx, id: &str) -> Result<Option<String>, String> {
+    t.read(|s| s.get(id))
+        .map(|tk| tk.assignee_agent_id)
+        .ok_or_else(|| TicketError::NotFound.into())
+}
+
+pub fn ticket_create(
+    t: &TicketsCtx,
+    title: &str,
+    body: &str,
+    skip_review: bool,
+) -> Result<TicketSummary, String> {
+    let now = now_ms();
+    t.mutate(|s| s.create(title, body, skip_review, now))
+        .map(|tk| TicketSummary::from(&tk))
+}
+
+pub fn ticket_update(
+    t: &TicketsCtx,
+    id: &str,
+    patch: TicketPatch,
+) -> Result<TicketSummary, String> {
+    let now = now_ms();
+    t.mutate(|s| s.update(id, patch, now))
+        .map(|tk| TicketSummary::from(&tk))
+}
+
+pub fn ticket_delete(t: &TicketsCtx, id: &str) -> Result<(), String> {
+    t.mutate(|s| s.delete(id))
+}
+
+/// backlog/rejected → the agent's queue (at the end). The agent must exist and not have exited.
+pub fn ticket_assign(t: &TicketsCtx, id: &str, agent_id: &str) -> Result<TicketSummary, String> {
+    if !agent_live(&t.manager, agent_id) {
+        return Err(TicketError::AgentNotLive.into());
+    }
+    let now = now_ms();
+    let tk = t.mutate(|s| s.assign(id, agent_id, now))?;
+    t.notify([agent_id]);
+    Ok(TicketSummary::from(&tk))
+}
+
+pub fn ticket_unassign(t: &TicketsCtx, id: &str) -> Result<TicketSummary, String> {
+    let old = assignee_of(t, id)?;
+    let now = now_ms();
+    let tk = t.mutate(|s| s.unassign(id, now))?;
+    t.notify(old);
+    Ok(TicketSummary::from(&tk))
+}
+
+pub fn ticket_reorder(
+    t: &TicketsCtx,
+    agent_id: &str,
+    ticket_ids: &[String],
+) -> Result<Vec<TicketSummary>, String> {
+    let q = t.mutate(|s| s.reorder(agent_id, ticket_ids))?;
+    t.notify([agent_id]);
+    Ok(q)
+}
+
+/// Manual move (C3.3). `agent_live` refers to the ticket's assignee.
+pub fn ticket_set_state(
+    t: &TicketsCtx,
+    id: &str,
+    target: TicketState,
+    note: Option<String>,
+) -> Result<TicketSummary, String> {
+    let old = assignee_of(t, id)?;
+    let live = old.as_deref().is_some_and(|a| agent_live(&t.manager, a));
+    let now = now_ms();
+    let tk = t.mutate(|s| s.set_state(id, target, note, live, now))?;
+    t.notify(old.into_iter().chain(tk.assignee_agent_id.clone()));
+    Ok(TicketSummary::from(&tk))
+}
+
+pub fn ticket_approve(t: &TicketsCtx, id: &str) -> Result<TicketSummary, String> {
+    let now = now_ms();
+    t.mutate(|s| s.approve(id, now))
+        .map(|tk| TicketSummary::from(&tk))
+}
+
+/// review → rejected → first in the same agent's queue (agent live) or the backlog.
+pub fn ticket_reject(t: &TicketsCtx, id: &str, note: &str) -> Result<TicketSummary, String> {
+    if note.trim().is_empty() {
+        return Err(TicketError::NeedsNote.into());
+    }
+    let old = assignee_of(t, id)?;
+    let live = old.as_deref().is_some_and(|a| agent_live(&t.manager, a));
+    let now = now_ms();
+    let tk = t.mutate(|s| s.reject(id, note.trim(), live, now))?;
+    t.notify(old);
+    Ok(TicketSummary::from(&tk))
+}
+
+/// "Send igen": hands the ticket to the dispatcher, which checks whether it can go now.
+pub fn ticket_redispatch(t: &TicketsCtx, id: &str) -> Result<(), String> {
+    assignee_of(t, id)?;
+    if t.send(DispatchMsg::Redispatch {
+        ticket_id: id.to_string(),
+    }) {
+        Ok(())
+    } else {
+        Err("Ticket-afsendelsen kører ikke — genstart mira-bots".into())
+    }
+}
+
+/// Only backlog tickets and rejected tickets without an agent can start a new agent.
+pub fn ticket_for_spawn(t: &TicketsCtx, id: &str) -> Result<Ticket, String> {
+    let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    match (tk.state, &tk.assignee_agent_id) {
+        (TicketState::Backlog, _) | (TicketState::Rejected, None) => Ok(tk),
+        (from, _) => Err(TicketError::IllegalTransition {
+            from,
+            to: TicketState::Assigned,
+        }
+        .into()),
+    }
+}
+
+/// After a spawn with the ticket line as positional prompt: the dispatcher waits for the session
+/// (`SpawnedWithTicket` first, so a quick `SessionStart` cannot start a second delivery), then the
+/// ticket becomes the new agent's queue head.
+pub fn ticket_attach_spawned(
+    t: &TicketsCtx,
+    ticket_id: &str,
+    agent_id: &str,
+) -> Result<(), String> {
+    t.send(DispatchMsg::SpawnedWithTicket {
+        agent_id: agent_id.to_string(),
+        ticket_id: ticket_id.to_string(),
+    });
+    let now = now_ms();
+    t.mutate(|s| s.assign(ticket_id, agent_id, now))
+        .map(|_| ())
+        .map_err(|e| format!("Agenten startede, men ticketen kunne ikke tildeles: {e}"))
+}
+
 #[tauri::command]
 pub fn ui_ready(state: State<'_, AppState>) -> Result<(), String> {
     lock(&state.pending).set_ui_ready();
@@ -238,19 +410,14 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Result<Diagnostics, String
     Ok(state.diagnostics())
 }
 
-/// `cwd` null/blank → default folder; `role` defaults to `none`, `seat_kind` to `work`.
-/// After [`STARTING_HINT_AFTER`] without a hook event, the agent gets the Starting hint.
-#[tauri::command]
-pub fn spawn_agent(
-    app: AppHandle,
-    state: State<'_, AppState>,
+/// Everything a spawn needs that can fail before the agent exists, in this order: hook exe, pipe
+/// ready, claude, hooks.json, then the working folder (so a refused spawn never creates a
+/// default folder).
+pub fn prepare_spawn(
+    state: &AppState,
     cwd: Option<String>,
-    prompt: Option<String>,
-    role: Option<AgentRole>,
-    seat_kind: Option<SeatKind>,
-) -> Result<AgentInfo, String> {
-    let role = role.unwrap_or_default();
-    let seat_kind = seat_kind.unwrap_or_default();
+    role: AgentRole,
+) -> Result<(SpawnContext, PathBuf), AgentError> {
     let hook_exe = state
         .paths
         .hook_exe
@@ -266,13 +433,18 @@ pub fn spawn_agent(
         pipe_name: state.paths.pipe_name.clone(),
     };
     let cwd = resolve_cwd(cwd, &state.paths.agents_root, role, &state.manager)?;
-    let req = SpawnRequest {
-        cwd,
-        prompt,
-        role,
-        seat_kind,
-    };
-    let info = lock(&state.manager).spawn(req, &ctx, Arc::clone(&state.sink))?;
+    Ok((ctx, cwd))
+}
+
+/// Starts the agent in an already resolved folder, emits `agents-changed` and schedules the
+/// Starting hint.
+fn spawn_prepared(
+    app: &AppHandle,
+    state: &AppState,
+    ctx: &SpawnContext,
+    req: SpawnRequest,
+) -> Result<AgentInfo, String> {
+    let info = lock(&state.manager).spawn(req, ctx, Arc::clone(&state.sink))?;
     log::info!(
         "spawned agent {} ({}) in {} role={:?} seat={:?} session={} pid={:?}",
         info.id,
@@ -283,9 +455,88 @@ pub fn spawn_agent(
         info.session_id,
         info.pid
     );
-    state.emit_agents(&app);
-    schedule_starting_hint(app, Arc::clone(&state.manager), info.id.clone());
+    state.emit_agents(app);
+    schedule_starting_hint(app.clone(), Arc::clone(&state.manager), info.id.clone());
     Ok(info)
+}
+
+/// The shared core of `spawn_agent` and `spawn_agent_with_ticket`.
+pub fn spawn_core(
+    app: &AppHandle,
+    state: &AppState,
+    cwd: Option<String>,
+    prompt: Option<String>,
+    role: Option<AgentRole>,
+    seat_kind: Option<SeatKind>,
+) -> Result<AgentInfo, String> {
+    let role = role.unwrap_or_default();
+    let (ctx, cwd) = prepare_spawn(state, cwd, role)?;
+    let req = SpawnRequest {
+        cwd,
+        prompt,
+        role,
+        seat_kind: seat_kind.unwrap_or_default(),
+    };
+    spawn_prepared(app, state, &ctx, req)
+}
+
+/// `cwd` null/blank → default folder; `role` defaults to `none`, `seat_kind` to `work`.
+/// After [`STARTING_HINT_AFTER`] without a hook event, the agent gets the Starting hint.
+#[tauri::command]
+pub fn spawn_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    cwd: Option<String>,
+    prompt: Option<String>,
+    role: Option<AgentRole>,
+    seat_kind: Option<SeatKind>,
+) -> Result<AgentInfo, String> {
+    spawn_core(&app, &state, cwd, prompt, role, seat_kind)
+}
+
+/// Like `spawn_agent`, with a backlog ticket: the ticket file is written in the agent's folder
+/// first, the ticket line is the positional prompt, and the ticket becomes the agent's queue
+/// head (it goes in progress once the dispatcher sees the prompt submitted). On a failed spawn
+/// the file is removed again and the ticket is untouched.
+// TODO(windows-verify): "Start med ticket" starts the agent with the line as positional prompt and
+// UserPromptSubmit (or a busy status) confirms it within 8 s after SessionStart; with the trust
+// dialog first, the clock only starts at SessionStart (plan D.32).
+#[tauri::command]
+pub fn spawn_agent_with_ticket(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ticket_id: String,
+    cwd: Option<String>,
+    role: Option<AgentRole>,
+    seat_kind: Option<SeatKind>,
+) -> Result<AgentInfo, String> {
+    let ticket = ticket_for_spawn(&state.tickets, &ticket_id)?;
+    let role = role.unwrap_or_default();
+    let (ctx, cwd) = prepare_spawn(&state, cwd, role)?;
+    let file = prompt::write_ticket_file(&cwd, &ticket, now_ms())
+        .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
+    let req = SpawnRequest {
+        cwd,
+        prompt: Some(prompt::line_for(&ticket)),
+        role,
+        seat_kind: seat_kind.unwrap_or_default(),
+    };
+    let info = match spawn_prepared(&app, &state, &ctx, req) {
+        Ok(info) => info,
+        Err(e) => {
+            if let Err(rm) = std::fs::remove_file(&file) {
+                log::debug!("removing {} after a failed spawn: {rm}", file.display());
+            }
+            return Err(e);
+        }
+    };
+    ticket_attach_spawned(&state.tickets, &ticket.id, &info.id)?;
+    log::info!(
+        "agent {} started with ticket {}",
+        info.id,
+        ticket.short_id()
+    );
+    Ok(lock(&state.manager).get(&info.id).unwrap_or(info))
 }
 
 /// After [`STARTING_HINT_AFTER`], sets the Starting hint if the agent is still waiting for its
@@ -311,6 +562,9 @@ pub fn stop_agent(
 ) -> Result<(), String> {
     stop(&state.manager, &state.pending, &agent_id)?;
     log::info!("stopped agent {agent_id}");
+    if let Err(e) = state.tickets.release_agent(&agent_id, AGENT_STOPPED_NOTE) {
+        log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+    }
     state.emit_agents(&app);
     Ok(())
 }
@@ -324,6 +578,10 @@ pub fn remove_agent(
     let pty = lock(&state.manager).remove(&agent_id)?;
     // Close the pseudo terminal only after the manager lock is released (it may block).
     drop(pty);
+    // Usually a no-op (released when it exited); covers a remove racing the exit report.
+    if let Err(e) = state.tickets.release_agent(&agent_id, AGENT_STOPPED_NOTE) {
+        log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+    }
     state.emit_agents(&app);
     Ok(())
 }
@@ -399,35 +657,43 @@ pub fn resize_island(
     island::place(&window, w, h).map_err(|e| format!("Kunne ikke placere islanden: {e}"))
 }
 
-/// Opens (or focuses) the workplace window and selects `agent_id` in it. Async on purpose:
-/// creating a window from a synchronous command deadlocks on Windows (research2 §5).
+/// Opens (or focuses) the workplace window and selects `agent_id` and/or the sidebar `tab`
+/// ("permissions" | "diagnostics" | "tickets") in it. Async on purpose: creating a window from a
+/// synchronous command deadlocks on Windows (research2 §5).
+// TODO(windows-verify): the "n i review" chip in the non-focusable island opens the workplace on
+// the Tickets tab, both when the window is created and when it is already open (plan D.36).
 #[tauri::command]
 pub async fn open_workplace(
     app: AppHandle,
     state: State<'_, AppState>,
     agent_id: Option<String>,
+    tab: Option<String>,
 ) -> Result<(), String> {
-    *lock(&state.workplace_select) = agent_id.clone();
+    check_tab(tab.as_deref())?;
+    let selection = WorkplaceSelection { agent_id, tab };
+    *lock(&state.workplace_select) = Some(selection.clone());
     let created =
         workplace::open_or_focus(&app).map_err(|e| format!("Kunne ikke åbne Workplace: {e}"))?;
     log::info!(
-        "workplace {} (select {agent_id:?})",
-        if created { "created" } else { "focused" }
+        "workplace {} (select {:?}, tab {:?})",
+        if created { "created" } else { "focused" },
+        selection.agent_id,
+        selection.tab
     );
-    if !created {
+    if !created && (selection.agent_id.is_some() || selection.tab.is_some()) {
         // A new window fetches the selection itself via take_workplace_selection. The slot is
         // kept here too, in case the existing window is still loading and misses the event.
-        if let Some(id) = agent_id {
-            if let Err(e) = app.emit_to(workplace::LABEL, WORKPLACE_SELECT, id) {
-                log::debug!("emit {WORKPLACE_SELECT}: {e}");
-            }
+        if let Err(e) = app.emit_to(workplace::LABEL, WORKPLACE_SELECT, &selection) {
+            log::debug!("emit {WORKPLACE_SELECT}: {e}");
         }
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn take_workplace_selection(state: State<'_, AppState>) -> Result<Option<String>, String> {
+pub fn take_workplace_selection(
+    state: State<'_, AppState>,
+) -> Result<Option<WorkplaceSelection>, String> {
     Ok(take_selection(&state.workplace_select))
 }
 
@@ -471,6 +737,99 @@ pub fn open_log_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
         .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
 }
 
+// ---- ticket commands (C3.2) ----
+
+#[tauri::command]
+pub fn list_tickets(state: State<'_, AppState>) -> Result<Vec<TicketSummary>, String> {
+    Ok(state.tickets.read(|s| s.list()))
+}
+
+#[tauri::command]
+pub fn get_ticket(state: State<'_, AppState>, id: String) -> Result<Ticket, String> {
+    state
+        .tickets
+        .read(|s| s.get(&id))
+        .ok_or_else(|| TicketError::NotFound.into())
+}
+
+#[tauri::command]
+pub fn create_ticket(
+    state: State<'_, AppState>,
+    title: String,
+    body: String,
+    skip_review: bool,
+) -> Result<TicketSummary, String> {
+    ticket_create(&state.tickets, &title, &body, skip_review)
+}
+
+#[tauri::command]
+pub fn update_ticket(
+    state: State<'_, AppState>,
+    id: String,
+    patch: TicketPatch,
+) -> Result<TicketSummary, String> {
+    ticket_update(&state.tickets, &id, patch)
+}
+
+#[tauri::command]
+pub fn delete_ticket(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    ticket_delete(&state.tickets, &id)
+}
+
+#[tauri::command]
+pub fn assign_ticket(
+    state: State<'_, AppState>,
+    id: String,
+    agent_id: String,
+) -> Result<TicketSummary, String> {
+    ticket_assign(&state.tickets, &id, &agent_id)
+}
+
+#[tauri::command]
+pub fn unassign_ticket(state: State<'_, AppState>, id: String) -> Result<TicketSummary, String> {
+    ticket_unassign(&state.tickets, &id)
+}
+
+#[tauri::command]
+pub fn reorder_queue(
+    state: State<'_, AppState>,
+    agent_id: String,
+    ticket_ids: Vec<String>,
+) -> Result<Vec<TicketSummary>, String> {
+    ticket_reorder(&state.tickets, &agent_id, &ticket_ids)
+}
+
+#[tauri::command]
+pub fn set_ticket_state(
+    // Named `app` here because the contract's argument is called `state` (C3.2); Tauri resolves
+    // `State<…>` by type, not by name.
+    app: State<'_, AppState>,
+    id: String,
+    state: TicketState,
+    note: Option<String>,
+) -> Result<TicketSummary, String> {
+    ticket_set_state(&app.tickets, &id, state, note)
+}
+
+#[tauri::command]
+pub fn approve_ticket(state: State<'_, AppState>, id: String) -> Result<TicketSummary, String> {
+    ticket_approve(&state.tickets, &id)
+}
+
+#[tauri::command]
+pub fn reject_ticket(
+    state: State<'_, AppState>,
+    id: String,
+    note: String,
+) -> Result<TicketSummary, String> {
+    ticket_reject(&state.tickets, &id, &note)
+}
+
+#[tauri::command]
+pub fn redispatch_ticket(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    ticket_redispatch(&state.tickets, &id)
+}
+
 #[tauri::command]
 pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     lock(&state.manager).kill_all();
@@ -481,6 +840,7 @@ pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tickets::test_support::{test_ctx, TestCtx};
     use serde_json::json;
 
     fn request(id: &str, agent: &str) -> PermissionRequestInfo {
@@ -585,8 +945,12 @@ mod tests {
         m.insert_fake("sess", "/w/demo");
         let stopped = m.insert_fake("sess-2", "/w/demo2");
         m.stop(&stopped).unwrap();
+        let manager = Arc::new(Mutex::new(m));
+        let t = test_ctx(Arc::clone(&manager));
+        t.ctx.mutate(|s| s.create("a", "", false, 1)).unwrap();
+        t.ctx.mutate(|s| s.create("b", "", false, 1)).unwrap();
         AppState {
-            manager: Arc::new(Mutex::new(m)),
+            manager,
             pending: Arc::new(Mutex::new(PendingPermissions::new())),
             paths: AppPaths {
                 hook_exe: None,
@@ -595,6 +959,7 @@ mod tests {
                 data_dir: dir.to_path_buf(),
                 log_file: Some(dir.join("logs").join("mira-bots.log")),
                 agents_root: dir.join("agents"),
+                tickets_file: dir.join("tickets.json"),
             },
             island: IslandState::default(),
             pipe_ready: Arc::new(AtomicBool::new(true)),
@@ -602,6 +967,8 @@ mod tests {
             hook_stats: Arc::new(HookStats::default()),
             claude_version: Arc::new(Mutex::new(VersionProbe::Ok("2.1.286 (Claude Code)".into()))),
             workplace_select: Mutex::new(None),
+            tickets: t.ctx,
+            tickets_warning: Some("tickets.json kunne ikke læses".into()),
         }
     }
 
@@ -630,6 +997,12 @@ mod tests {
         assert!(d.log_path.unwrap().ends_with("mira-bots.log"));
         assert_eq!(d.running_agents, 1, "the stopped agent does not count");
         assert!(d.agents_root.ends_with("agents"));
+        assert!(d.tickets_path.ends_with("tickets.json"));
+        assert_eq!(d.tickets_total, 2);
+        assert_eq!(
+            d.tickets_warning.as_deref(),
+            Some("tickets.json kunne ikke læses")
+        );
         std::fs::write(dir.join("hooks.json"), "{}").unwrap();
         *lock(&state.claude_version) = VersionProbe::Pending;
         let d = state.diagnostics();
@@ -644,9 +1017,227 @@ mod tests {
 
     #[test]
     fn workplace_selection_is_taken_once() {
-        let slot = Mutex::new(Some("a1".to_string()));
-        assert_eq!(take_selection(&slot), Some("a1".into()));
+        let sel = WorkplaceSelection {
+            agent_id: Some("a1".into()),
+            tab: Some("tickets".into()),
+        };
+        let slot = Mutex::new(Some(sel.clone()));
+        assert_eq!(take_selection(&slot), Some(sel));
         assert_eq!(take_selection(&slot), None);
+    }
+
+    #[test]
+    fn only_known_workplace_tabs_are_accepted() {
+        for tab in [
+            None,
+            Some("permissions"),
+            Some("diagnostics"),
+            Some("tickets"),
+        ] {
+            assert_eq!(check_tab(tab), Ok(()));
+        }
+        assert_eq!(check_tab(Some("x")).unwrap_err(), "Ukendt fane: x");
+    }
+
+    // ---- tickets ----
+
+    /// A manager with one idle agent and one exited agent, and a ticket context over it.
+    fn tickets_setup() -> (TestCtx, String, String) {
+        let mut m = AgentManager::new(5);
+        let live = m.insert_fake("s1", "/w/live");
+        m.set_status(&live, AgentStatus::Idle, None).unwrap();
+        let dead = m.insert_fake("s2", "/w/dead");
+        m.stop(&dead).unwrap();
+        (test_ctx(Arc::new(Mutex::new(m))), live, dead)
+    }
+
+    fn queue_changed(id: &str) -> DispatchMsg {
+        DispatchMsg::QueueChanged {
+            agent_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn assign_needs_a_live_agent_and_notifies_the_dispatcher() {
+        let (mut t, live, dead) = tickets_setup();
+        let tk = ticket_create(&t.ctx, "  Opgave  ", "", false).unwrap();
+        assert_eq!(tk.title, "Opgave");
+        for agent in [dead.as_str(), "nope"] {
+            assert_eq!(
+                ticket_assign(&t.ctx, &tk.id, agent).unwrap_err(),
+                "Agenten kører ikke"
+            );
+        }
+        assert!(t.sent().is_empty());
+        let s = ticket_assign(&t.ctx, &tk.id, &live).unwrap();
+        assert_eq!(
+            (s.state, s.queue_position),
+            (TicketState::Assigned, Some(0))
+        );
+        assert_eq!(t.sent(), vec![queue_changed(&live)]);
+        assert_eq!(lock(&t.ctx.manager).get(&live).unwrap().queue_length, 1);
+        // Assigned tickets cannot be deleted; unassigning notifies the old agent.
+        assert_eq!(
+            ticket_delete(&t.ctx, &tk.id).unwrap_err(),
+            "Kun tickets i backlog, done eller afvist uden agent kan slettes"
+        );
+        assert_eq!(
+            ticket_unassign(&t.ctx, &tk.id).unwrap().state,
+            TicketState::Backlog
+        );
+        assert_eq!(t.sent(), vec![queue_changed(&live)]);
+        ticket_delete(&t.ctx, &tk.id).unwrap();
+        assert_eq!(
+            ticket_unassign(&t.ctx, &tk.id).unwrap_err(),
+            "Ticketen findes ikke"
+        );
+    }
+
+    #[test]
+    fn set_ticket_state_maps_errors_to_danish_text() {
+        let (mut t, live, _) = tickets_setup();
+        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        assert_eq!(
+            ticket_set_state(&t.ctx, &tk.id, TicketState::Done, None).unwrap_err(),
+            "Kan ikke flytte en ticket fra Backlog til Done"
+        );
+        assert_eq!(
+            ticket_set_state(&t.ctx, &tk.id, TicketState::Assigned, None).unwrap_err(),
+            "Brug Tildel for at sætte en ticket i kø"
+        );
+        assert_eq!(
+            ticket_set_state(&t.ctx, &tk.id, TicketState::Rejected, None).unwrap_err(),
+            "Brug Afvis med note"
+        );
+        assert_eq!(
+            ticket_set_state(&t.ctx, "nope", TicketState::Backlog, None).unwrap_err(),
+            "Ticketen findes ikke"
+        );
+        // assigned → inProgress by hand ("the user gave the task himself"), then → review.
+        ticket_assign(&t.ctx, &tk.id, &live).unwrap();
+        t.sent();
+        let s = ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
+        assert_eq!(s.state, TicketState::InProgress);
+        assert_eq!(t.sent(), vec![queue_changed(&live)]);
+        assert_eq!(
+            ticket_set_state(&t.ctx, &tk.id, TicketState::Done, None).unwrap_err(),
+            "Done kræver review (eller skipReview på ticketen)"
+        );
+        let s = ticket_set_state(&t.ctx, &tk.id, TicketState::Review, None).unwrap();
+        assert_eq!(s.state, TicketState::Review);
+        // review → rejected through set_ticket_state needs a note, like reject_ticket.
+        assert_eq!(
+            ticket_set_state(&t.ctx, &tk.id, TicketState::Rejected, None).unwrap_err(),
+            "Afvisning kræver en note"
+        );
+    }
+
+    #[test]
+    fn reject_requeues_for_a_live_agent_and_approve_finishes() {
+        let (mut t, live, dead) = tickets_setup();
+        let mk = |t: &TestCtx, agent: &str| {
+            let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+            t.ctx
+                .mutate(|s| {
+                    s.assign(&tk.id, agent, 1)?;
+                    s.mark_dispatched(&tk.id, "bot", 2)?;
+                    s.complete_turn(agent, 3)
+                })
+                .unwrap();
+            tk.id
+        };
+        let a = mk(&t, &live);
+        assert_eq!(
+            ticket_reject(&t.ctx, &a, "   ").unwrap_err(),
+            "Afvisning kræver en note"
+        );
+        t.sent();
+        let s = ticket_reject(&t.ctx, &a, " Mangler test ").unwrap();
+        assert_eq!(
+            (s.state, s.queue_position),
+            (TicketState::Assigned, Some(0))
+        );
+        assert_eq!(s.rejection_note.as_deref(), Some("Mangler test"));
+        assert_eq!(t.sent(), vec![queue_changed(&live)]);
+        // The exited agent's ticket goes to the backlog instead.
+        let b = mk(&t, &dead);
+        assert_eq!(
+            ticket_reject(&t.ctx, &b, "nej").unwrap().state,
+            TicketState::Backlog
+        );
+        let c = mk(&t, &live);
+        assert_eq!(ticket_approve(&t.ctx, &c).unwrap().state, TicketState::Done);
+        assert_eq!(
+            ticket_approve(&t.ctx, &c).unwrap_err(),
+            "Kan ikke flytte en ticket fra Done til Done"
+        );
+    }
+
+    #[test]
+    fn reorder_update_redispatch_and_spawn_checks() {
+        let (mut t, live, _) = tickets_setup();
+        let ids: Vec<String> = (0..2)
+            .map(|i| {
+                let tk = ticket_create(&t.ctx, &format!("t{i}"), "", false).unwrap();
+                ticket_assign(&t.ctx, &tk.id, &live).unwrap();
+                tk.id
+            })
+            .collect();
+        t.sent();
+        let rev: Vec<String> = ids.iter().rev().cloned().collect();
+        let q = ticket_reorder(&t.ctx, &live, &rev).unwrap();
+        assert_eq!(q.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), rev);
+        assert_eq!(t.sent(), vec![queue_changed(&live)]);
+        assert_eq!(
+            ticket_reorder(&t.ctx, &live, &ids[..1]).unwrap_err(),
+            "Køen passer ikke"
+        );
+        let patch = TicketPatch {
+            title: Some(String::new()),
+            ..TicketPatch::default()
+        };
+        assert_eq!(
+            ticket_update(&t.ctx, &ids[0], patch).unwrap_err(),
+            "Titel må ikke være tom"
+        );
+        ticket_redispatch(&t.ctx, &ids[0]).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::Redispatch {
+                ticket_id: ids[0].clone()
+            }]
+        );
+        assert_eq!(
+            ticket_redispatch(&t.ctx, "nope").unwrap_err(),
+            "Ticketen findes ikke"
+        );
+        // Only backlog (or agent-less rejected) tickets can start a new agent.
+        let queued = TicketState::Assigned.label_da();
+        assert_eq!(
+            ticket_for_spawn(&t.ctx, &ids[0]).unwrap_err(),
+            format!("Kan ikke flytte en ticket fra {queued} til {queued}")
+        );
+        let fresh = ticket_create(&t.ctx, "ny", "", false).unwrap();
+        assert_eq!(ticket_for_spawn(&t.ctx, &fresh.id).unwrap().id, fresh.id);
+    }
+
+    #[test]
+    fn a_spawned_ticket_waits_for_the_session_and_heads_the_queue() {
+        let (mut t, live, _) = tickets_setup();
+        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        ticket_attach_spawned(&t.ctx, &tk.id, &live).unwrap();
+        // The dispatcher hears about the spawn before the ticket shows up in the queue.
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::SpawnedWithTicket {
+                agent_id: live.clone(),
+                ticket_id: tk.id.clone()
+            }]
+        );
+        let got = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(got.state, TicketState::Assigned);
+        assert_eq!(got.queue_position, Some(0));
+        assert_eq!(lock(&t.ctx.manager).get(&live).unwrap().queue_length, 1);
     }
 
     #[test]

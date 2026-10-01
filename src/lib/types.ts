@@ -1,4 +1,5 @@
-// Mirrors the IPC contract (commands C.1 + C2.1, events C.2 + C2.2, types C.3 + C2.3).
+// Mirrors the IPC contract (commands C.1 + C2.1 + C3.2, events C.2 + C2.2 + C3.4, types C.3 +
+// C2.3 + C3.1).
 // All fields camelCase.
 
 export type AgentStatus =
@@ -36,6 +37,10 @@ export interface AgentInfo {
   lastEventAt: number;
   role: AgentRole;
   seatKind: SeatKind;
+  /** The agent's ticket in progress (set by the backend's ticket links only). */
+  currentTicketId: string | null;
+  /** Number of queued (`assigned`) tickets. */
+  queueLength: number;
 }
 
 export interface PermissionRequestInfo {
@@ -94,6 +99,11 @@ export interface Diagnostics {
   appVersion: string;
   agentsRoot: string;
   runningAgents: number;
+  /** `<app_data_dir>/tickets.json`. */
+  ticketsPath: string;
+  /** Set when tickets.json could not be read at startup (renamed to `.broken-<ts>`). */
+  ticketsWarning: string | null;
+  ticketsTotal: number;
 }
 
 export interface AgentOutputPayload {
@@ -119,4 +129,62 @@ export interface HookEventPayload {
   hookEventName: string;
   toolName: string | null;
   receivedAt: number;
+}
+
+// --- tickets (C3.1) ---------------------------------------------------------------------------
+
+export type TicketState = "backlog" | "assigned" | "inProgress" | "review" | "done" | "rejected";
+export type TicketActor = "user" | "system" | "agent";
+export type TicketSource = "user";
+export type TicketIssue = "deliveryFailed" | "turnFailed";
+
+export interface TicketHistoryEntry {
+  /** Milliseconds since the Unix epoch. */
+  at: number;
+  from: TicketState | null;
+  to: TicketState;
+  by: TicketActor;
+  note: string | null;
+}
+
+/** A ticket without its history (`list_tickets`, `tickets-changed`). */
+export interface TicketSummary {
+  id: string;
+  shortId: string;
+  title: string;
+  body: string;
+  state: TicketState;
+  assigneeAgentId: string | null;
+  /** 0-based position in the assignee's queue; only while `assigned`. */
+  queuePosition: number | null;
+  skipReview: boolean;
+  source: TicketSource;
+  issue: TicketIssue | null;
+  rejectionNote: string | null;
+  /** Milliseconds since the Unix epoch. */
+  createdAt: number;
+  /** Milliseconds since the Unix epoch. */
+  updatedAt: number;
+  historyLen: number;
+}
+
+/** `get_ticket` result: with history. */
+export interface Ticket extends Omit<TicketSummary, "historyLen"> {
+  history: TicketHistoryEntry[];
+}
+
+/** `update_ticket` patch; absent fields stay unchanged. */
+export interface TicketPatch {
+  title?: string;
+  body?: string;
+  skipReview?: boolean;
+}
+
+/** Sidebar tabs `openWorkplace` may select. */
+export type WorkplaceTab = "permissions" | "diagnostics" | "tickets";
+
+/** Payload of `workplace-select` and result of `take_workplace_selection`. */
+export interface WorkplaceSelection {
+  agentId: string | null;
+  tab: string | null;
 }

@@ -242,6 +242,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     /// Starts a delivery sequence if the agent is free, idle and has a queued ticket.
+    // TODO(windows-verify): 750 ms after Stop the input field is ready, and the extra Enter on
+    // retry neither sends an empty prompt nor closes a dialog (plan D.29).
     fn consider(&mut self, agent_id: &str) {
         if *self.state(agent_id) != Delivery::Free || self.ready_ticket(agent_id).is_none() {
             return;
@@ -337,6 +339,9 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
+    // TODO(windows-verify): Stop moves the ticket to review (done with skipReview) right after the
+    // answer; Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure shows the
+    // "Turn fejlede" hint and "Send igen" works (plan D.33).
     fn on_turn_ended(&mut self, agent_id: &str, failed: bool) {
         let now = now_ms();
         if failed {

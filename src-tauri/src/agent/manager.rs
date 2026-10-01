@@ -106,6 +106,11 @@ pub struct AgentInfo {
     pub last_event_at: u64,
     pub role: AgentRole,
     pub seat_kind: SeatKind,
+    /// The agent's `inProgress` ticket. Only set through [`AgentManager::set_ticket_link`]
+    /// (from the tickets glue); the manager knows nothing else about tickets.
+    pub current_ticket_id: Option<String>,
+    /// Number of queued (`assigned`) tickets; see `current_ticket_id`.
+    pub queue_length: usize,
 }
 
 /// What the manager reports from its PTY threads.
@@ -342,6 +347,8 @@ impl AgentManager {
             last_event_at: now,
             role,
             seat_kind,
+            current_ticket_id: None,
+            queue_length: 0,
         };
         self.insert(info.clone(), Some(handle), output);
         Ok(info)
@@ -383,6 +390,9 @@ impl AgentManager {
             agent.info.detail = None;
             agent.info.last_event_at = now_ms();
         }
+        // The tickets glue releases the agent's tickets right after; never show a stale queue.
+        agent.info.current_ticket_id = None;
+        agent.info.queue_length = 0;
         Ok(agent.info.clone())
     }
 
@@ -404,6 +414,8 @@ impl AgentManager {
         }
         agent.info.detail = None;
         agent.info.last_event_at = now_ms();
+        agent.info.current_ticket_id = None;
+        agent.info.queue_length = 0;
         let pty = agent.pty.take();
         Some((agent.info.clone(), pty))
     }
@@ -469,6 +481,37 @@ impl AgentManager {
         agent.info.detail = detail;
         agent.info.last_event_at = now_ms();
         Some(agent.info.clone())
+    }
+
+    /// Sets the detail text alone (dispatcher hints such as "Kunne ikke aflevere ticket");
+    /// status is unchanged. Refused (`false`) for unknown and exited agents.
+    pub fn set_detail(&mut self, id: &str, detail: Option<String>) -> bool {
+        match self.agents.get_mut(id) {
+            Some(a) if !is_exited(&a.info.status) => {
+                a.info.detail = detail;
+                a.info.last_event_at = now_ms();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Sets the agent's ticket link (`currentTicketId`, `queueLength`). Returns whether anything
+    /// changed (unknown agent: `false`). Exited agents are accepted so a release can zero them.
+    pub fn set_ticket_link(&mut self, id: &str, current: Option<String>, len: usize) -> bool {
+        match self.agents.get_mut(id) {
+            Some(a) if a.info.current_ticket_id != current || a.info.queue_length != len => {
+                a.info.current_ticket_id = current;
+                a.info.queue_length = len;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ids of every known agent (exited included).
+    pub fn ids(&self) -> Vec<AgentId> {
+        self.agents.keys().cloned().collect()
     }
 
     /// Case-insensitive.
@@ -599,6 +642,8 @@ impl AgentManager {
             last_event_at: now,
             role,
             seat_kind,
+            current_ticket_id: None,
+            queue_length: 0,
         };
         self.insert(info, None, Arc::new(Mutex::new(RingBuffer::new(1024))));
         id
@@ -616,7 +661,7 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn ctx(claude: PathBuf) -> SpawnContext {
         SpawnContext {
@@ -1009,9 +1054,19 @@ mod tests {
             "lastEventAt",
             "role",
             "seatKind",
+            "currentTicketId",
+            "queueLength",
         ] {
             assert!(v.get(key).is_some(), "{key}");
         }
+        assert_eq!(v["currentTicketId"], Value::Null);
+        assert_eq!(v["queueLength"], 0);
+        m.set_ticket_link(&id, Some("t1".into()), 2);
+        let v = serde_json::to_value(m.get(&id).unwrap()).unwrap();
+        assert_eq!(
+            (v["currentTicketId"].clone(), v["queueLength"].clone()),
+            (json!("t1"), json!(2))
+        );
         assert_eq!(v["status"], json!({"kind":"starting"}));
         assert_eq!(v["role"], "none");
         assert_eq!(v["seatKind"], "work");
@@ -1021,6 +1076,44 @@ mod tests {
             (v["role"].clone(), v["seatKind"].clone()),
             (json!("researcher"), json!("staff"))
         );
+    }
+
+    #[test]
+    fn set_ticket_link_reports_changes_and_stop_clears_it() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("s", "/w/demo");
+        assert!(m.set_ticket_link(&id, Some("t1".into()), 2));
+        assert!(!m.set_ticket_link(&id, Some("t1".into()), 2), "unchanged");
+        assert!(m.set_ticket_link(&id, None, 2));
+        assert!(!m.set_ticket_link("nope", None, 1));
+        assert_eq!(m.ids(), vec![id.clone()]);
+        let stopped = m.stop(&id).unwrap();
+        assert_eq!((stopped.current_ticket_id, stopped.queue_length), (None, 0));
+        // An exited agent can still be zeroed (no-op here) and set (harmless).
+        assert!(!m.set_ticket_link(&id, None, 0));
+        let id2 = m.insert_fake("s2", "/w/b");
+        m.set_ticket_link(&id2, Some("t2".into()), 1);
+        let (info, _) = m.mark_exited(&id2, Some(0)).unwrap();
+        assert_eq!((info.current_ticket_id, info.queue_length), (None, 0));
+    }
+
+    #[test]
+    fn set_detail_is_refused_for_exited_and_unknown_agents() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("s", "/w/demo");
+        m.set_status(&id, AgentStatus::Idle, None).unwrap();
+        assert!(m.set_detail(&id, Some("hint".into())));
+        let a = m.get(&id).unwrap();
+        assert_eq!(
+            (a.status, a.detail.as_deref()),
+            (AgentStatus::Idle, Some("hint"))
+        );
+        assert!(m.set_detail(&id, None));
+        assert_eq!(m.get(&id).unwrap().detail, None);
+        assert!(!m.set_detail("nope", Some("x".into())));
+        m.stop(&id).unwrap();
+        assert!(!m.set_detail(&id, Some("x".into())));
+        assert_eq!(m.get(&id).unwrap().detail, None);
     }
 
     #[cfg(unix)]

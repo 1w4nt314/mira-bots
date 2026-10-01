@@ -22,18 +22,20 @@ use tauri_plugin_log::{FileOpenStrategy, RotationStrategy, Target, TargetKind, T
 
 use agent::claude_path::find_claude;
 use agent::workdir::agents_root;
-use agent::{AgentManager, EventSink, SinkEvent};
+use agent::{now_ms, AgentManager, EventSink, SinkEvent};
 use commands::{AppPaths, AppState};
 use config::{
     CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
-    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS,
+    LOG_MAX_FILE_SIZE, MAX_WORK_AGENTS, TICKETS_FILE,
 };
 use diagnostics::{log_level_from_env, probe_claude_version, HookStats, VersionProbe};
-use events::{AgentOutputPayload, AGENTS_CHANGED, AGENT_OUTPUT};
+use events::{AgentOutputPayload, EmitFn, StatusEvent, AGENTS_CHANGED, AGENT_OUTPUT};
 use hooks::settings::write_hooks_json;
 use island::IslandState;
 use permissions::PendingPermissions;
-use pipe::handler::HandlerCtx;
+use pipe::handler::{HandlerCtx, StatusObserver};
+use tickets::dispatcher::{self, messages_for, DispatchMsg, Dispatcher, RealTimers};
+use tickets::{ManagerPort, TicketsCtx, AGENT_EXITED_NOTE};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -88,11 +90,13 @@ pub fn find_hook_exe(app: &AppHandle) -> Option<PathBuf> {
 
 /// Binds the manager's PTY thread events to Tauri: output becomes `agent-output` (base64, only to
 /// the workplace window; the island never shows terminal output) and an exit marks the agent
-/// exited, releases its pending permission requests and emits `agents-changed`.
+/// exited, releases its pending permission requests and its tickets (back to the backlog, any
+/// delivery cancelled) and emits `agents-changed`.
 pub fn tauri_sink(
     app: AppHandle,
     manager: Arc<Mutex<AgentManager>>,
     pending: Arc<Mutex<PendingPermissions>>,
+    tickets: Arc<TicketsCtx>,
 ) -> EventSink {
     Arc::new(move |event| match event {
         SinkEvent::Output {
@@ -124,6 +128,9 @@ pub fn tauri_sink(
             lock(&pending).remove_for_agent(&agent_id);
             if known {
                 log::info!("agent {agent_id} exited (code {code:?})");
+                if let Err(e) = tickets.release_agent(&agent_id, AGENT_EXITED_NOTE) {
+                    log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+                }
                 let list = lock(&manager).list();
                 if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
                     log::error!("emit {AGENTS_CHANGED}: {e}");
@@ -312,22 +319,58 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = Arc::new(Mutex::new(AgentManager::new(MAX_WORK_AGENTS)));
     let pending = Arc::new(Mutex::new(PendingPermissions::new()));
-    let sink = tauri_sink(handle.clone(), Arc::clone(&manager), Arc::clone(&pending));
+    let emit_handle = handle.clone();
+    let emit: EmitFn = Arc::new(move |name: &str, payload: Value| {
+        if let Err(e) = emit_handle.emit(name, payload) {
+            log::debug!("emit {name}: {e}");
+        }
+    });
+
+    let tickets_file = data_dir.join(TICKETS_FILE);
+    let (service, tickets_warning) = tickets::load_tickets(tickets_file.clone(), now_ms());
+    let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMsg>();
+    let tickets = Arc::new(TicketsCtx::new(
+        service,
+        Arc::clone(&manager),
+        dispatch_tx.clone(),
+        Arc::clone(&emit),
+    ));
+    let sink = tauri_sink(
+        handle.clone(),
+        Arc::clone(&manager),
+        Arc::clone(&pending),
+        Arc::clone(&tickets),
+    );
+    // Hook frames → dispatcher messages. Frames that arrive before the dispatcher task runs wait
+    // in the channel.
+    let observer: StatusObserver = {
+        let tx = dispatch_tx.clone();
+        Arc::new(move |ev: StatusEvent| {
+            for m in messages_for(&ev) {
+                // Fails only at shutdown, when the dispatcher is gone.
+                let _ = tx.send(m);
+            }
+        })
+    };
+    tauri::async_runtime::spawn(dispatcher::run(
+        dispatch_rx,
+        Dispatcher::new(
+            Arc::clone(&tickets),
+            ManagerPort::new(Arc::clone(&manager), Arc::clone(&emit)),
+            RealTimers::new(dispatch_tx),
+        ),
+    ));
 
     let pipe_ready = Arc::new(AtomicBool::new(false));
     let hook_stats = Arc::new(HookStats::default());
-    let emit_handle = handle.clone();
     pipe::server::start(
         pipe_name.clone(),
         HandlerCtx {
             manager: Arc::clone(&manager),
             pending: Arc::clone(&pending),
-            emit: Arc::new(move |name: &str, payload: Value| {
-                if let Err(e) = emit_handle.emit(name, payload) {
-                    log::debug!("emit {name}: {e}");
-                }
-            }),
+            emit,
             stats: Arc::clone(&hook_stats),
+            observer: Some(observer),
         },
         Arc::clone(&pipe_ready),
     );
@@ -342,6 +385,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             data_dir,
             log_file,
             agents_root,
+            tickets_file,
         },
         island: IslandState::default(),
         pipe_ready,
@@ -349,6 +393,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         hook_stats,
         claude_version,
         workplace_select: Mutex::new(None),
+        tickets,
+        tickets_warning,
     });
 
     if let Some(window) = app.get_webview_window(island::LABEL) {
@@ -411,6 +457,19 @@ pub fn run() {
             commands::take_workplace_selection,
             commands::open_agent_folder,
             commands::open_log_dir,
+            commands::list_tickets,
+            commands::get_ticket,
+            commands::create_ticket,
+            commands::update_ticket,
+            commands::delete_ticket,
+            commands::assign_ticket,
+            commands::unassign_ticket,
+            commands::reorder_queue,
+            commands::set_ticket_state,
+            commands::approve_ticket,
+            commands::reject_ticket,
+            commands::redispatch_ticket,
+            commands::spawn_agent_with_ticket,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
