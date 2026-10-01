@@ -23,10 +23,10 @@ for (const [w, a, want] of [
   [360, 668, 360],
   [100, 668, 312],
   [900, 668, 392],
-  [360, 300, 312],
+  [360, 300, 180], // too low for both: one seat row, the floor scrolls
   [360, Number.NaN, 360],
   [Number.NaN, 668, 360],
-  [360, 0, 312],
+  [360, 0, 180],
   [380.4, 668, 380],
   [380.6, 668, 381],
 ]) {
@@ -35,16 +35,45 @@ for (const [w, a, want] of [
 for (const [w, a, minF, minT, want] of [
   [100, 668, 348, 276, 348], // "more": the wall row too
   [900, 668, 348, 300, 368], // measured queue raises the terminal minimum
-  [900, 560, 348, 276, 348], // both cannot fit: the floor minimum wins
+  [900, 560, 348, 276, 284], // both cannot fit: the terminal wins, the floor scrolls
+  [100, 560, 348, 276, 284], // ... whatever was wanted (min = max: splitter hidden)
+  [900, 300, 312, 276, 180], // hard bottom: one seat row (discreet)
+  [900, 300, 348, 276, 180], // ... also with "more" (the wall scrolls away)
+  [100, 588, 312, 276, 312], // exactly enough for both: two rows, terminal at its minimum
+  [900, 588, 312, 276, 312],
+  [900, 587, 312, 276, 311], // 1 px short: cramped
   [Number.MAX_SAFE_INTEGER, 668, 312, 276, 392], // splitter's aria-valuemax / End
 ]) {
   check(o.clampFloorHeight(w, a, minF, minT), want, `clampFloorHeight(${w}, ${a}, ${minF}, ${minT})`);
+}
+check(o.clampFloorHeight(900, 300, 312, 276, 200), 200, "clampFloorHeight with an explicit hardMin");
+// clampFloorHeight as Workplace calls it: floorMin(detail), termMinFor(measured header/queue)
+for (const [w, a, d, chrome, want] of [
+  [360, 668, "discreet", 150, 360], // 1100x720, a running + a queued ticket: unchanged
+  [360, 668, "more", 150, 360],
+  [360, 668, "more", 250, 293], // 1100x720 + 100 px queue/reviews: terminal keeps XTERM_MIN
+  [360, 668, "more", 290, 253], // + 140 px (starting hint too)
+  [360, 668, "discreet", 290, 253],
+  [360, 488, "more", 168, 195], // 820x540 "Lidt mere": 488 - 293 = 195, terminal keeps its minimum
+  [360, 450, "more", 168, 180], // lower than the window minimum: hard bottom
+  [360, 488, "discreet", 168, 195], // 820x540 "Diskret": terminal minimum met exactly
+  [360, Number.NaN, "more", 168, 360], // not measured yet
+]) {
+  const minT = o.termMinFor(chrome);
+  check(
+    o.clampFloorHeight(w, a, o.floorMin(d), minT),
+    want,
+    `clampFloorHeight(${w}, ${a}, floorMin(${d}), termMinFor(${chrome}))`,
+  );
 }
 
 // floorMin(detail): both seat rows unclipped at DESK_H_MIN
 check(o.floorMin("discreet"), 2 * 132 + 48, "floorMin(discreet)");
 check(o.floorMin("more"), 2 * 132 + 48 + 36, "floorMin(more)");
 check(o.FLOOR_MIN, o.floorMin("discreet"), "FLOOR_MIN = floorMin(discreet)");
+check(o.floorMin("discreet", 1), 132 + 48, "floorMin(discreet, 1)");
+check(o.floorMin("more", 1), 132 + 48 + 36, "floorMin(more, 1)");
+check(o.FLOOR_HARD_MIN, o.floorMin("discreet", 1), "FLOOR_HARD_MIN = floorMin(discreet, 1)");
 for (const d of ["discreet", "more"]) {
   check(o.deskLayout(o.floorMin(d), d).deskH, o.DESK_H_MIN, `deskLayout(floorMin(${d})) = DESK_H_MIN`);
 }

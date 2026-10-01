@@ -205,6 +205,10 @@ html[data-window="workplace"] #root {
     repeating-linear-gradient(0deg, transparent 0 35px, var(--floor-line) 35px 36px),
     repeating-linear-gradient(114deg, transparent 0 130px, var(--floor-line) 130px 131px);
 }
+/* Too low for both seat rows and the terminal: the terminal wins, the floor scrolls (W5). */
+.office-floor[data-cramped] {
+  overflow-y: auto;
+}
 .office-wall {
   height: 36px;
   flex: none;

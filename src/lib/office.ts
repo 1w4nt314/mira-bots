@@ -20,7 +20,8 @@ export const WALL_H = 36; // px, wall strip ("more")
 // seats padding 10+8 + row gap 10 + staff padding 12+6 + staff border 1+1
 export const FLOOR_CHROME = 48; // px
 // Smallest xterm box (wrapper incl. its 2x8 px padding): 6 rows at ~17-18 px. AgentTerminal's
-// wrapper has this as min-height, so a crowded panel overflows instead of squeezing the PTY.
+// wrapper has this as min-height; Workplace shrinks (and scrolls) the floor before the panel
+// would have to overflow.
 export const XTERM_MIN = 124; // px
 // Static lower bound for the terminal panel in normal mode: border 1 + header ~119 + a running
 // and a queued ticket ~31 + XTERM_MIN = 275. Workplace raises it with the measured header/queue
@@ -35,12 +36,22 @@ export const FIG_RATIO = 0.56;
 export const COMPACT = { deskH: 48, fig: 28 } as const; // max mode
 export const SPLITTER_STEP = 16; // px per arrow key
 
-/** Smallest floor that shows both seat rows unclipped: rows * DESK_H_MIN + FLOOR_CHROME (+ WALL_H with "more"). */
-export function floorMin(detail: OfficeDetail): number {
-  return SEAT_ROWS * DESK_H_MIN + FLOOR_CHROME + (detail === "more" ? WALL_H : 0);
+/**
+ * Smallest floor that shows `rows` seat rows unclipped: rows * DESK_H_MIN + FLOOR_CHROME (+ WALL_H
+ * with "more"). Both rows (default) is the normal minimum; one row is the hard bottom when the
+ * window is too low for both the floor and the terminal (the floor then scrolls).
+ */
+export function floorMin(detail: OfficeDetail, rows: number = SEAT_ROWS): number {
+  return rows * DESK_H_MIN + FLOOR_CHROME + (detail === "more" ? WALL_H : 0);
 }
 /** discreet */
 export const FLOOR_MIN = SEAT_ROWS * DESK_H_MIN + FLOOR_CHROME;
+/**
+ * Hard bottom when the window is too low for both seat rows and the terminal: one seat row
+ * (floorMin("discreet", 1) = 180), also with "more" (the wall scrolls away with the floor). With
+ * floorMin("more", 1) = 216 the xterm's last row fell 13 px below the window at 820x540.
+ */
+export const FLOOR_HARD_MIN = DESK_H_MIN + FLOOR_CHROME;
 
 /** Terminal panel minimum in normal mode for a measured header/queue height (0 = not measured). */
 export function termMinFor(chromeH: number): number {
@@ -76,8 +87,9 @@ export function itemsFor(key: string): OfficeItem[] {
 }
 
 /**
- * max(minFloor, min(wanted, available - minTerm)), rounded. The floor minimum wins when both
- * cannot be met (then the xterm box keeps XTERM_MIN and the panel overflows instead).
+ * Normally max(minFloor, min(wanted, available - minTerm)), rounded. When both minimums cannot be
+ * met (available - minTerm < minFloor) the terminal wins: the floor gets available - minTerm, but
+ * never less than `hardMin` (one seat row; the floor scrolls then), and `wanted` is ignored.
  * Non-finite wanted gives FLOOR_DEFAULT; non-finite available skips the upper bound.
  */
 export function clampFloorHeight(
@@ -85,9 +97,11 @@ export function clampFloorHeight(
   available: number,
   minFloor: number = FLOOR_MIN,
   minTerm: number = TERM_MIN,
+  hardMin: number = FLOOR_HARD_MIN,
 ): number {
   const w = Number.isFinite(wanted) ? wanted : FLOOR_DEFAULT;
   const upper = Number.isFinite(available) ? available - minTerm : Number.POSITIVE_INFINITY;
+  if (upper < minFloor) return Math.max(Math.min(hardMin, minFloor), Math.round(upper));
   return Math.max(minFloor, Math.round(Math.min(w, upper)));
 }
 

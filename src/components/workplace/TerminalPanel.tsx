@@ -36,6 +36,16 @@ export default function TerminalPanel(props: Props) {
   const exited = isExited(agent);
   const chromeRef = useRef<HTMLDivElement>(null);
   const isMin = mode === "min";
+  // Keyboard focus across min <-> normal/max: the clicked button is unmounted, so focus moves to
+  // its counterpart instead of falling back to <body>. Only for changes made with these buttons.
+  const restoreRef = useRef<HTMLButtonElement>(null);
+  const minRef = useRef<HTMLButtonElement>(null);
+  const maxRef = useRef<HTMLButtonElement>(null);
+  const focusNext = useRef<"restore" | "min" | "max" | null>(null);
+  const setMode = (next: TermMode, focus: "restore" | "min" | "max") => {
+    focusNext.current = focus;
+    onMode(next);
+  };
 
   // The block above the xterm varies (queue, reviews, starting hint): report its height so the
   // splitter clamp keeps XTERM_MIN for the xterm itself (C1: never a 1-row PTY).
@@ -44,8 +54,25 @@ export default function TerminalPanel(props: Props) {
     if (isMin || el === null || onChromeHeight === undefined) return;
     const ro = new ResizeObserver(() => onChromeHeight(Math.ceil(el.getBoundingClientRect().height)));
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      // Unmounted or minimised: no stale height for the next panel's first layout.
+      onChromeHeight(0);
+    };
   }, [isMin, onChromeHeight]);
+
+  // Runs after AgentTerminal's mount effect, which focuses the xterm on the way back: only when
+  // nothing has focus (exited agent) does the minimise/maximise button get it.
+  useEffect(() => {
+    const target = focusNext.current;
+    focusNext.current = null;
+    if (target === null) return;
+    const active = document.activeElement;
+    if (target === "restore") restoreRef.current?.focus();
+    else if (active === null || active === document.body) {
+      (target === "min" ? minRef : maxRef).current?.focus();
+    }
+  }, [isMin]);
 
   // The stop confirmation falls back after a moment (like the island's quit button).
   useEffect(() => {
@@ -106,8 +133,9 @@ export default function TerminalPanel(props: Props) {
         </span>
         <span className="ml-auto inline-flex shrink-0 gap-1">
           <button
+            ref={restoreRef}
             type="button"
-            onClick={() => onMode("normal")}
+            onClick={() => setMode("normal", "min")}
             title="Gendan terminalen (gemt højde)"
             aria-label="Gendan terminalen"
             className={btn}
@@ -116,7 +144,7 @@ export default function TerminalPanel(props: Props) {
           </button>
           <button
             type="button"
-            onClick={() => onMode("max")}
+            onClick={() => setMode("max", "max")}
             title="Maksimér terminalen"
             aria-label="Maksimér terminalen"
             className={ibtn}
@@ -199,8 +227,9 @@ export default function TerminalPanel(props: Props) {
             className="ml-1 inline-flex shrink-0 gap-1 border-l border-[var(--border)] pl-2.5"
           >
             <button
+              ref={minRef}
               type="button"
-              onClick={() => onMode("min")}
+              onClick={() => setMode("min", "restore")}
               title="Minimér terminalen"
               aria-label="Minimér terminalen"
               className={ibtn}
@@ -208,6 +237,7 @@ export default function TerminalPanel(props: Props) {
               ▁
             </button>
             <button
+              ref={maxRef}
               type="button"
               onClick={() => onMode(mode === "max" ? "normal" : "max")}
               title={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}

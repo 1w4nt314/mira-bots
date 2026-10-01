@@ -106,13 +106,25 @@ export default function Workplace() {
   useEffect(() => writeLocal(STORAGE_KEYS.detail, detail), [detail]);
   useEffect(() => writeLocal(STORAGE_KEYS.termMode, termMode), [termMode]);
   // Dragging changes the height every frame: store it once the splitter has rested for a moment.
+  // A value still waiting when the window goes away (unmount, reload, close) is written at once.
+  const pendingFloor = useRef<number | null>(null);
+  const flushFloor = useCallback(() => {
+    if (pendingFloor.current === null) return;
+    writeLocal(STORAGE_KEYS.floorHeight, String(Math.round(pendingFloor.current)));
+    pendingFloor.current = null;
+  }, []);
   useEffect(() => {
-    const t = setTimeout(
-      () => writeLocal(STORAGE_KEYS.floorHeight, String(Math.round(floorHeight))),
-      150,
-    );
+    pendingFloor.current = floorHeight;
+    const t = setTimeout(flushFloor, 150);
     return () => clearTimeout(t);
-  }, [floorHeight]);
+  }, [floorHeight, flushFloor]);
+  useEffect(() => {
+    window.addEventListener("pagehide", flushFloor);
+    return () => {
+      window.removeEventListener("pagehide", flushFloor);
+      flushFloor();
+    };
+  }, [flushFloor]);
 
   // One observer for the column, the floor and the overflow list. The desk size only changes the
   // floor's children, never its own height (that comes from `floorHeight` / flex), so there is no
@@ -271,17 +283,22 @@ export default function Workplace() {
 
   // Height for the floor and the terminal in normal mode: the column minus the splitter and the
   // overflow list. Before the first measurement it is NaN: clampFloorHeight then skips the upper
-  // bound instead of jumping to FLOOR_MIN for one frame.
+  // bound instead of jumping to the floor minimum for one frame.
   const available = sectionH > 0 ? Math.max(0, sectionH - SPLITTER_H - overflowH) : Number.NaN;
   // Without a selected agent there is no terminal: lay out as normal, but keep `termMode`.
   const layoutMode: TermMode = selected === null ? "normal" : termMode;
-  // Both seat rows always fit (W1); the terminal keeps its header/queue plus XTERM_MIN (C1).
+  // Both seat rows fit (W1) and the terminal keeps its header/queue plus XTERM_MIN (C1). When the
+  // column is too low for both, the terminal wins: the floor shrinks towards one seat row
+  // (FLOOR_HARD_MIN) and scrolls (`cramped`), so the xterm's input line stays on screen (W5).
   const minFloor = floorMin(detail);
   const minTerm = selected === null ? termMinFor(0) : termMinFor(chromeH);
-  const floorStyleHeight = clampFloorHeight(floorHeight, available, minFloor, minTerm);
-  const maxFloor = Number.isFinite(available)
-    ? clampFloorHeight(Number.MAX_SAFE_INTEGER, available, minFloor, minTerm)
-    : undefined;
+  const clampFloor = (h: number) => clampFloorHeight(h, available, minFloor, minTerm);
+  const floorStyleHeight = clampFloor(floorHeight);
+  const measured = Number.isFinite(available);
+  // Effective splitter range (Home/End, aria-valuemin/max); equal when the floor is cramped.
+  const lowFloor = measured ? clampFloor(0) : minFloor;
+  const maxFloor = measured ? clampFloor(Number.MAX_SAFE_INTEGER) : undefined;
+  const cramped = layoutMode === "normal" && floorStyleHeight < minFloor;
   const { deskH, fig } = layoutMode === "max" ? COMPACT : deskLayout(floorMeasured, detail);
   const floorSize: CSSProperties =
     layoutMode === "normal"
@@ -297,9 +314,7 @@ export default function Workplace() {
   // Splitter values are clamped against the measured column; nothing to clamp against before the
   // first measurement (the splitter cannot be used before the first layout anyway).
   const changeFloorHeight = (next: number) => {
-    if (Number.isFinite(available)) {
-      setFloorHeight(clampFloorHeight(next, available, minFloor, minTerm));
-    }
+    if (measured) setFloorHeight(clampFloor(next));
   };
 
   return (
@@ -341,7 +356,13 @@ export default function Workplace() {
           <main className="grid min-h-0 flex-1 grid-cols-[1fr_340px]">
             <section ref={sectionRef} className="relative flex min-h-0 min-w-0 flex-col">
               <OfficeDefs />
-              <div ref={floorRef} className="office-floor" data-term={layoutMode} style={floorStyle}>
+              <div
+                ref={floorRef}
+                className="office-floor"
+                data-term={layoutMode}
+                data-cramped={cramped ? "true" : undefined}
+                style={floorStyle}
+              >
                 <SeatGrid
                   seats={seats}
                   botStates={botStates}
@@ -364,9 +385,10 @@ export default function Workplace() {
               </div>
               <Splitter
                 value={floorStyleHeight}
-                min={minFloor}
+                min={lowFloor}
                 max={maxFloor}
-                disabled={layoutMode !== "normal"}
+                // Nothing to move when the floor is cramped (min = max): hidden like in min/max.
+                disabled={layoutMode !== "normal" || (maxFloor !== undefined && maxFloor <= lowFloor)}
                 onChange={changeFloorHeight}
                 onReset={() => setFloorHeight(FLOOR_DEFAULT)}
               />

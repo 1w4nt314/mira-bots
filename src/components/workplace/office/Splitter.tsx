@@ -4,11 +4,11 @@ import { SPLITTER_STEP } from "../../../lib/office";
 interface Props {
   /** Current floor height in px (the clamped height actually shown). */
   value: number;
-  /** Smallest floor height (Home); both seat rows stay visible. */
+  /** Smallest floor height (Home): both seat rows, or less when the window is too low (the floor scrolls). */
   min: number;
   /** Largest floor height (End), or undefined before the column has been measured. */
   max: number | undefined;
-  /** True when the terminal is minimised or maximised: no dragging, not focusable. */
+  /** True when the terminal is minimised or maximised, or min = max: hidden, no dragging. */
   disabled: boolean;
   /** Wanted floor height in px; the caller clamps it. */
   onChange: (next: number) => void;
@@ -80,7 +80,7 @@ export default function Splitter({ value, min, max, disabled, onChange, onReset 
       onDoubleClick={() => {
         if (!disabled) onReset();
       }}
-      // Disabled (min/max): no band and no second border line, and out of the a11y tree.
+      // Disabled (min/max, or nothing to move): no band, no second border line, out of the a11y tree.
       className={`office-splitter h-2 shrink-0 touch-none border-t border-[var(--border)] bg-[var(--bg)] ${
         disabled ? "hidden" : "cursor-row-resize"
       }`}
