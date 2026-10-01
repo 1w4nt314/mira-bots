@@ -25,11 +25,13 @@ import {
   COMPACT,
   deskLayout,
   FLOOR_DEFAULT,
+  floorMin,
   parseDetail,
   parseFloorHeight,
   parseTermMode,
   SPLITTER_H,
   STORAGE_KEYS,
+  termMinFor,
   type OfficeDetail,
   type TermMode,
 } from "../../lib/office";
@@ -88,6 +90,8 @@ export default function Workplace() {
   const [sectionH, setSectionH] = useState(0);
   const [overflowH, setOverflowH] = useState(0);
   const [floorMeasured, setFloorMeasured] = useState(FLOOR_DEFAULT);
+  // Header/queue block above the xterm, reported by TerminalPanel (normal/max mode).
+  const [chromeH, setChromeH] = useState(0);
   const sectionRef = useRef<HTMLElement>(null);
   const floorRef = useRef<HTMLDivElement>(null);
   const overflowRef = useRef<HTMLDivElement>(null);
@@ -101,10 +105,14 @@ export default function Workplace() {
 
   useEffect(() => writeLocal(STORAGE_KEYS.detail, detail), [detail]);
   useEffect(() => writeLocal(STORAGE_KEYS.termMode, termMode), [termMode]);
-  useEffect(
-    () => writeLocal(STORAGE_KEYS.floorHeight, String(Math.round(floorHeight))),
-    [floorHeight],
-  );
+  // Dragging changes the height every frame: store it once the splitter has rested for a moment.
+  useEffect(() => {
+    const t = setTimeout(
+      () => writeLocal(STORAGE_KEYS.floorHeight, String(Math.round(floorHeight))),
+      150,
+    );
+    return () => clearTimeout(t);
+  }, [floorHeight]);
 
   // One observer for the column, the floor and the overflow list. The desk size only changes the
   // floor's children, never its own height (that comes from `floorHeight` / flex), so there is no
@@ -139,7 +147,7 @@ export default function Workplace() {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     const apply = (sel: WorkplaceSelection) => {
-      if (sel.agentId !== null) setSelectedId(sel.agentId);
+      if (sel.agentId !== null) selectAgent(sel.agentId);
       const tab = parseWorkplaceTab(sel.tab);
       if (tab !== null) setRequestedTab((prev) => ({ tab, nonce: (prev?.nonce ?? 0) + 1 }));
     };
@@ -167,7 +175,7 @@ export default function Workplace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [dispatch]);
+  }, [dispatch, selectAgent]);
 
   // A selected agent that disappears (removed) simply shows no panel; ids are never reused.
   const selected = agents.find((a) => a.id === selectedId) ?? null;
@@ -265,9 +273,15 @@ export default function Workplace() {
   // overflow list. Before the first measurement it is NaN: clampFloorHeight then skips the upper
   // bound instead of jumping to FLOOR_MIN for one frame.
   const available = sectionH > 0 ? Math.max(0, sectionH - SPLITTER_H - overflowH) : Number.NaN;
-  const floorStyleHeight = clampFloorHeight(floorHeight, available);
   // Without a selected agent there is no terminal: lay out as normal, but keep `termMode`.
   const layoutMode: TermMode = selected === null ? "normal" : termMode;
+  // Both seat rows always fit (W1); the terminal keeps its header/queue plus XTERM_MIN (C1).
+  const minFloor = floorMin(detail);
+  const minTerm = selected === null ? termMinFor(0) : termMinFor(chromeH);
+  const floorStyleHeight = clampFloorHeight(floorHeight, available, minFloor, minTerm);
+  const maxFloor = Number.isFinite(available)
+    ? clampFloorHeight(Number.MAX_SAFE_INTEGER, available, minFloor, minTerm)
+    : undefined;
   const { deskH, fig } = layoutMode === "max" ? COMPACT : deskLayout(floorMeasured, detail);
   const floorSize: CSSProperties =
     layoutMode === "normal"
@@ -283,14 +297,16 @@ export default function Workplace() {
   // Splitter values are clamped against the measured column; nothing to clamp against before the
   // first measurement (the splitter cannot be used before the first layout anyway).
   const changeFloorHeight = (next: number) => {
-    if (Number.isFinite(available)) setFloorHeight(clampFloorHeight(next, available));
+    if (Number.isFinite(available)) {
+      setFloorHeight(clampFloorHeight(next, available, minFloor, minTerm));
+    }
   };
 
   return (
     <TicketActionsContext.Provider value={ticketActions}>
       <div
         data-detail={detail}
-        data-term={termMode}
+        data-term={layoutMode}
         className="flex h-full flex-col bg-[var(--bg)] text-sm text-[var(--fg)]"
       >
         <header className="flex h-11 shrink-0 items-center gap-4 border-b border-[var(--border)] px-4">
@@ -348,6 +364,8 @@ export default function Workplace() {
               </div>
               <Splitter
                 value={floorStyleHeight}
+                min={minFloor}
+                max={maxFloor}
                 disabled={layoutMode !== "normal"}
                 onChange={changeFloorHeight}
                 onReset={() => setFloorHeight(FLOOR_DEFAULT)}
@@ -364,6 +382,7 @@ export default function Workplace() {
                   mode={termMode}
                   onMode={setTermMode}
                   onRemoved={() => setSelectedId(null)}
+                  onChromeHeight={setChromeH}
                 />
               )}
             </section>

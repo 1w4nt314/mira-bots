@@ -84,7 +84,6 @@
   /* derived from --accent / --glass-edge, so they follow the theme automatically */
   --accent-12: color-mix(in srgb, var(--accent) 12%, transparent);
   --accent-14: color-mix(in srgb, var(--accent) 14%, transparent);
-  --accent-35: color-mix(in srgb, var(--accent) 35%, transparent);
   --glass-edge-55: color-mix(in srgb, var(--glass-edge) 55%, transparent);
 }
 
@@ -435,11 +434,11 @@ html[data-window="workplace"] #root {
 }
 .office-floor[data-term="max"] .office-row3 {
   width: 100%;
-  gap: 4px;
+  gap: 2px;
 }
 .office-floor[data-term="max"] .office-row5 {
   flex: 5;
-  gap: 4px;
+  gap: 2px;
 }
 .office-floor[data-term="max"] .office-seat {
   height: 46px;

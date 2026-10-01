@@ -58,8 +58,10 @@ export default function Seat(props: Props) {
       : isOver
         ? "ring-4 ring-[var(--accent)] bg-[var(--accent)]/10"
         : "outline-2 outline-dashed outline-offset-2 outline-[var(--accent)]/60";
+  // Compact (max strip): small figure above the name, so the name gets the seat's full width
+  // (~75 px at 1100 px); the status is in the title.
   const base = compact
-    ? "office-seat relative flex min-w-0 flex-row items-center justify-start gap-1.5 rounded-xl border px-1.5 py-[3px] text-left"
+    ? "office-seat relative flex min-w-0 flex-col items-center justify-center gap-0 rounded-xl border px-1 py-0.5 text-center"
     : "office-seat relative flex min-w-0 flex-col items-center justify-end rounded-xl border p-1 pb-0.5";
 
   if (agent === null) {
@@ -82,7 +84,7 @@ export default function Seat(props: Props) {
         {compact ? (
           <>
             <span className="shrink-0 text-lg leading-none">+</span>
-            <span className="min-w-0 flex-1 truncate text-[11px] font-medium">Ledig</span>
+            <span className="max-w-full truncate text-[11px] font-medium leading-3">Ledig</span>
           </>
         ) : (
           <>
@@ -95,9 +97,6 @@ export default function Seat(props: Props) {
             )}
             <span className="office-desk office-desk-empty">
               <DeskArt laptop={false} postit={false} chair items={[]} />
-              <span className="office-plate-wrap">
-                <span className="office-plate">Ledig</span>
-              </span>
             </span>
             <span className="office-below">
               <span className="office-ticketline">{" "}</span>
@@ -140,10 +139,7 @@ export default function Seat(props: Props) {
             size={COMPACT.fig}
             badge={false}
           />
-          <span className="grid min-w-0 flex-1">
-            <span className="truncate text-[11px] font-medium">{agent.name}</span>
-            <span className="truncate text-[9px] text-[var(--muted)]">{statusText}</span>
-          </span>
+          <span className="max-w-full truncate text-[11px] font-medium leading-3">{agent.name}</span>
         </>
       ) : (
         <>

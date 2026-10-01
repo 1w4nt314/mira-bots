@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Theme } from "../../lib/bots";
 import { errorMessage, openAgentFolder, removeAgent, stopAgent } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
@@ -22,15 +22,30 @@ interface Props {
   onMode: (mode: TermMode) => void;
   /** Called after the agent was removed, so the selection is cleared. */
   onRemoved: () => void;
+  /** Height of everything above the xterm (header, queue, reviews, hint) in normal/max mode. */
+  onChromeHeight?: (h: number) => void;
 }
 
 // The xterm is unmounted in min mode (never mounted at a few px: fit would send rows=1 to the
 // PTY); restoring remounts it and replays the backend's output ring buffer.
 // TODO(windows-verify): D.65, D.66
-export default function TerminalPanel({ agent, botState, theme, mode, onMode, onRemoved }: Props) {
+export default function TerminalPanel(props: Props) {
+  const { agent, botState, theme, mode, onMode, onRemoved, onChromeHeight } = props;
   const { dispatch } = useStore();
   const [confirmStop, setConfirmStop] = useState(false);
   const exited = isExited(agent);
+  const chromeRef = useRef<HTMLDivElement>(null);
+  const isMin = mode === "min";
+
+  // The block above the xterm varies (queue, reviews, starting hint): report its height so the
+  // splitter clamp keeps XTERM_MIN for the xterm itself (C1: never a 1-row PTY).
+  useEffect(() => {
+    const el = chromeRef.current;
+    if (isMin || el === null || onChromeHeight === undefined) return;
+    const ro = new ResizeObserver(() => onChromeHeight(Math.ceil(el.getBoundingClientRect().height)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [isMin, onChromeHeight]);
 
   // The stop confirmation falls back after a moment (like the island's quit button).
   useEffect(() => {
@@ -72,7 +87,7 @@ export default function TerminalPanel({ agent, botState, theme, mode, onMode, on
   const ibtn =
     "w-7 shrink-0 rounded-md border border-[var(--border)] px-0 py-1 text-center text-xs hover:border-[var(--accent)]";
 
-  if (mode === "min") {
+  if (isMin) {
     return (
       <div className="flex h-[34px] shrink-0 items-center gap-2 border-t border-[var(--border)] px-3 text-xs">
         <BotFigure
@@ -115,103 +130,104 @@ export default function TerminalPanel({ agent, botState, theme, mode, onMode, on
 
   return (
     <div className="flex min-h-0 flex-1 flex-col border-t border-[var(--border)]">
-      <div className="flex shrink-0 items-center gap-3 px-3 py-2">
-        <BotFigure
-          roles={agent.roles}
-          specialist={agent.specialist}
-          state={botState}
-          theme={theme}
-          exited={exited}
-          size={28}
-          badge={false}
-        />
-        <div className="min-w-0 flex-1 leading-tight">
-          <div className="flex items-baseline gap-2">
-            <span className="font-medium">{agent.name}</span>
-            <span className="truncate text-xs text-[var(--muted)]">
-              {label}
-              {agent.detail ? ` · ${agent.detail}` : ""}
-            </span>
+      <div ref={chromeRef} className="flex shrink-0 flex-col">
+        <div className="flex shrink-0 items-center gap-3 px-3 py-2">
+          <BotFigure
+            roles={agent.roles}
+            specialist={agent.specialist}
+            state={botState}
+            theme={theme}
+            exited={exited}
+            size={28}
+            badge={false}
+          />
+          <div className="min-w-0 flex-1 leading-tight">
+            <div className="flex items-baseline gap-2">
+              <span className="font-medium">{agent.name}</span>
+              <span className="truncate text-xs text-[var(--muted)]">
+                {label}
+                {agent.detail ? ` · ${agent.detail}` : ""}
+              </span>
+            </div>
+            <div className="truncate text-[11px] text-[var(--muted)]">
+              {agent.profileName} · {rolesText(agent.roles)}
+              <span title={agent.modelObserved ? "Rapporteret af Claude Code (statuslinje)" : "Som startet"}>
+                {" "}
+                · Model: {modelLabel(agent.model)} · Effort: {effortLabel(agent.effort)}
+                {agent.modelObserved && " (observeret)"}
+              </span>
+            </div>
+            <div className="truncate font-mono text-[11px] text-[var(--muted)]" title={agent.cwd}>
+              {agent.cwd}
+            </div>
           </div>
-          <div className="truncate text-[11px] text-[var(--muted)]">
-            {agent.profileName} · {rolesText(agent.roles)}
-            <span title={agent.modelObserved ? "Rapporteret af Claude Code (statuslinje)" : "Som startet"}>
-              {" "}
-              · Model: {modelLabel(agent.model)} · Effort: {effortLabel(agent.effort)}
-              {agent.modelObserved && " (observeret)"}
-            </span>
-          </div>
-          <div className="truncate font-mono text-[11px] text-[var(--muted)]" title={agent.cwd}>
-            {agent.cwd}
-          </div>
-        </div>
-        {!exited && <AgentSwitch agent={agent} />}
-        {!exited && (
+          {!exited && <AgentSwitch agent={agent} />}
+          {!exited && (
+            <button
+              type="button"
+              onClick={stop}
+              title="Stop agenten (klik igen for at bekræfte)"
+              aria-label={`Stop ${agent.name}`}
+              className={`${btn} ${confirmStop ? "border-rose-500 text-rose-500" : ""}`}
+            >
+              {confirmStop ? "Sikker?" : "Stop"}
+            </button>
+          )}
+          {exited && (
+            <button
+              type="button"
+              onClick={remove}
+              title="Fjern agenten fra listen"
+              aria-label={`Fjern ${agent.name}`}
+              className={btn}
+            >
+              Fjern
+            </button>
+          )}
           <button
             type="button"
-            onClick={stop}
-            title="Stop agenten (klik igen for at bekræfte)"
-            aria-label={`Stop ${agent.name}`}
-            className={`${btn} ${confirmStop ? "border-rose-500 text-rose-500" : ""}`}
-          >
-            {confirmStop ? "Sikker?" : "Stop"}
-          </button>
-        )}
-        {exited && (
-          <button
-            type="button"
-            onClick={remove}
-            title="Fjern agenten fra listen"
-            aria-label={`Fjern ${agent.name}`}
+            onClick={() => void run(() => openAgentFolder(agent.id))}
+            title="Åbn agentens mappe i Stifinder"
+            aria-label={`Åbn mappen for ${agent.name}`}
             className={btn}
           >
-            Fjern
+            Åbn mappe
           </button>
-        )}
-        <button
-          type="button"
-          onClick={() => void run(() => openAgentFolder(agent.id))}
-          title="Åbn agentens mappe i Stifinder"
-          aria-label={`Åbn mappen for ${agent.name}`}
-          className={btn}
-        >
-          Åbn mappe
-        </button>
-        <span
-          role="group"
-          aria-label="Terminalvindue"
-          className="ml-1 inline-flex shrink-0 gap-1 border-l border-[var(--border)] pl-2.5"
-        >
-          <button
-            type="button"
-            onClick={() => onMode("min")}
-            title="Minimér terminalen"
-            aria-label="Minimér terminalen"
-            aria-pressed={false}
-            className={ibtn}
+          <span
+            role="group"
+            aria-label="Terminalvindue"
+            className="ml-1 inline-flex shrink-0 gap-1 border-l border-[var(--border)] pl-2.5"
           >
-            ▁
-          </button>
-          <button
-            type="button"
-            onClick={() => onMode(mode === "max" ? "normal" : "max")}
-            title={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}
-            aria-label={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}
-            aria-pressed={mode === "max"}
-            className={`${ibtn} ${mode === "max" ? "office-ibtn-on" : ""}`}
-          >
-            {mode === "max" ? "⤡" : "⤢"}
-          </button>
-        </span>
-      </div>
-      <TicketQueue agent={agent} />
-      <AgentReviews agent={agent} />
-      {isStartingHint(agent) && (
-        <div className="mx-3 mb-2 shrink-0 rounded-lg border border-amber-400/50 bg-amber-300/20 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-200">
-          Agenten venter på et svar i terminalen — fx 'Do you trust the files in this folder?'.
-          Svar her.
+            <button
+              type="button"
+              onClick={() => onMode("min")}
+              title="Minimér terminalen"
+              aria-label="Minimér terminalen"
+              className={ibtn}
+            >
+              ▁
+            </button>
+            <button
+              type="button"
+              onClick={() => onMode(mode === "max" ? "normal" : "max")}
+              title={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}
+              aria-label={mode === "max" ? "Gendan delt visning" : "Maksimér terminalen"}
+              aria-pressed={mode === "max"}
+              className={`${ibtn} ${mode === "max" ? "office-ibtn-on" : ""}`}
+            >
+              {mode === "max" ? "⤡" : "⤢"}
+            </button>
+          </span>
         </div>
-      )}
+        <TicketQueue agent={agent} />
+        <AgentReviews agent={agent} />
+        {isStartingHint(agent) && (
+          <div className="mx-3 mb-2 shrink-0 rounded-lg border border-amber-400/50 bg-amber-300/20 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-200">
+            Agenten venter på et svar i terminalen — fx 'Do you trust the files in this folder?'.
+            Svar her.
+          </div>
+        )}
+      </div>
       {/* Only in normal/max: switching between them keeps it mounted and the RO refits it. */}
       <AgentTerminal key={agent.id} agentId={agent.id} exited={exited} />
     </div>

@@ -18,25 +18,55 @@ const check = (actual, want, msg) => {
   n++;
 };
 
-// clampFloorHeight(wanted, available)
+// clampFloorHeight(wanted, available, minFloor?, minTerm?) — defaults FLOOR_MIN 312, TERM_MIN 276
 for (const [w, a, want] of [
-  [384, 668, 384],
-  [100, 668, 250],
-  [900, 668, 528],
-  [384, 300, 250],
-  [384, Number.NaN, 384],
-  [Number.NaN, 668, 384],
-  [384, 0, 250],
-  [400.4, 668, 400],
-  [400.6, 668, 401],
+  [360, 668, 360],
+  [100, 668, 312],
+  [900, 668, 392],
+  [360, 300, 312],
+  [360, Number.NaN, 360],
+  [Number.NaN, 668, 360],
+  [360, 0, 312],
+  [380.4, 668, 380],
+  [380.6, 668, 381],
 ]) {
   check(o.clampFloorHeight(w, a), want, `clampFloorHeight(${w}, ${a})`);
+}
+for (const [w, a, minF, minT, want] of [
+  [100, 668, 348, 276, 348], // "more": the wall row too
+  [900, 668, 348, 300, 368], // measured queue raises the terminal minimum
+  [900, 560, 348, 276, 348], // both cannot fit: the floor minimum wins
+  [Number.MAX_SAFE_INTEGER, 668, 312, 276, 392], // splitter's aria-valuemax / End
+]) {
+  check(o.clampFloorHeight(w, a, minF, minT), want, `clampFloorHeight(${w}, ${a}, ${minF}, ${minT})`);
+}
+
+// floorMin(detail): both seat rows unclipped at DESK_H_MIN
+check(o.floorMin("discreet"), 2 * 132 + 48, "floorMin(discreet)");
+check(o.floorMin("more"), 2 * 132 + 48 + 36, "floorMin(more)");
+check(o.FLOOR_MIN, o.floorMin("discreet"), "FLOOR_MIN = floorMin(discreet)");
+for (const d of ["discreet", "more"]) {
+  check(o.deskLayout(o.floorMin(d), d).deskH, o.DESK_H_MIN, `deskLayout(floorMin(${d})) = DESK_H_MIN`);
+}
+
+// termMinFor(chromeH): header/queue + border 1 + XTERM_MIN, never below TERM_MIN
+for (const [c, want] of [
+  [0, 276],
+  [Number.NaN, 276],
+  [119, 276],
+  [151, 276],
+  [152, 277],
+  [200.2, 326],
+]) {
+  check(o.termMinFor(c), want, `termMinFor(${c})`);
 }
 
 // deskLayout(floorHeight, detail, rows?)
 for (const [h, d, rows, want] of [
-  [384, "discreet", undefined, { deskH: 169, fig: 95 }],
-  [384, "more", undefined, { deskH: 151, fig: 85 }],
+  [360, "discreet", undefined, { deskH: 156, fig: 87 }],
+  [360, "more", undefined, { deskH: 138, fig: 77 }],
+  [384, "discreet", undefined, { deskH: 168, fig: 94 }],
+  [384, "more", undefined, { deskH: 150, fig: 84 }],
   [200, "discreet", undefined, { deskH: 132, fig: 74 }],
   [900, "discreet", undefined, { deskH: 240, fig: 134 }],
   [Number.NaN, "discreet", undefined, { deskH: 132, fig: 74 }],
@@ -67,7 +97,7 @@ for (const [s, want] of [["min", "min"], ["max", "max"], ["normal", "normal"], [
 for (const [s, want] of [["more", "more"], ["discreet", "discreet"], [null, "discreet"], ["x", "discreet"]]) {
   check(o.parseDetail(s), want, `parseDetail(${JSON.stringify(s)})`);
 }
-for (const [s, want] of [["420", 420], ["420.6", 421], ["abc", 384], [null, 384], ["-5", 384], ["0", 384], ["1e9", 1e9]]) {
+for (const [s, want] of [["420", 420], ["420.6", 421], ["abc", 360], [null, 360], ["-5", 360], ["0", 360], ["1e9", 1e9]]) {
   check(o.parseFloorHeight(s), want, `parseFloorHeight(${JSON.stringify(s)})`);
 }
 
@@ -81,9 +111,13 @@ check(
   },
   "STORAGE_KEYS",
 );
-check({ ...o.COMPACT }, { deskH: 48, fig: 40 }, "COMPACT");
+check({ ...o.COMPACT }, { deskH: 48, fig: 28 }, "COMPACT");
 check(o.TERM_LINE_H, 34, "TERM_LINE_H");
 check(o.SPLITTER_STEP, 16, "SPLITTER_STEP");
-check([o.FLOOR_DEFAULT, o.FLOOR_MIN, o.TERM_MIN, o.SPLITTER_H], [384, 250, 140, 8], "floor constants");
+check(
+  [o.FLOOR_DEFAULT, o.FLOOR_MIN, o.TERM_MIN, o.XTERM_MIN, o.SPLITTER_H, o.FLOOR_CHROME, o.WALL_H],
+  [360, 312, 276, 124, 8, 48, 36],
+  "floor constants",
+);
 
 console.log(`office.ts: ${n} cases ok`);

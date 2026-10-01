@@ -9,10 +9,15 @@ import {
   resizeAgentPty,
   writeAgentInput,
 } from "../lib/ipc";
+import { XTERM_MIN } from "../lib/office";
 import { classifyInput } from "../lib/terminalInput";
 import { decodeBase64, planChunk } from "../lib/terminalSeq";
 import type { AgentOutputPayload } from "../lib/types";
 import { useStore } from "../state/store";
+
+// Smallest size ever sent to the PTY; smaller boxes keep the last good size (see fitNow).
+const MIN_PTY_ROWS = 2;
+const MIN_PTY_COLS = 20;
 
 const isWindows = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
@@ -91,6 +96,8 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
     let sentCols = 0;
     let sentRows = 0;
     const sendSize = (cols: number, rows: number) => {
+      // Never hand a degenerate size to the PTY (a 1-row TUI redraw is what ConPTY garbles).
+      if (rows < MIN_PTY_ROWS || cols < MIN_PTY_COLS) return;
       if (exitedRef.current || (cols === sentCols && rows === sentRows)) return;
       sentCols = cols;
       sentRows = rows;
@@ -102,9 +109,11 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
     };
     const disposables: IDisposable[] = [];
     disposables.push(term.onResize(({ cols, rows }) => sendSize(cols, rows)));
-    // A 0 px box would fit to rows=1 and send that to the PTY: skip, the observer refits later.
+    // A box of (almost) 0 px would fit to rows=1 and send that to the PTY: skip it and keep the
+    // last good size; the observer refits once the box is big enough again.
     const fitNow = () => {
-      if (el.clientWidth === 0 || el.clientHeight === 0) return;
+      const d = fit.proposeDimensions();
+      if (d === undefined || d.rows < MIN_PTY_ROWS || d.cols < MIN_PTY_COLS) return;
       fit.fit();
     };
     fitNow();
@@ -230,7 +239,10 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
 
   // FitAddon measures this element's parent box: padding lives on the wrapper, not on .xterm.
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-[var(--term-bg)] p-2">
+    <div
+      className="flex flex-1 flex-col bg-[var(--term-bg)] p-2"
+      style={{ minHeight: XTERM_MIN }}
+    >
       <div ref={containerRef} className="min-h-0 w-full flex-1 overflow-hidden" />
     </div>
   );

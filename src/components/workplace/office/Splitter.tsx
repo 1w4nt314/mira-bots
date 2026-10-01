@@ -1,9 +1,13 @@
 import { useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
-import { FLOOR_MIN, SPLITTER_STEP } from "../../../lib/office";
+import { SPLITTER_STEP } from "../../../lib/office";
 
 interface Props {
   /** Current floor height in px (the clamped height actually shown). */
   value: number;
+  /** Smallest floor height (Home); both seat rows stay visible. */
+  min: number;
+  /** Largest floor height (End), or undefined before the column has been measured. */
+  max: number | undefined;
   /** True when the terminal is minimised or maximised: no dragging, not focusable. */
   disabled: boolean;
   /** Wanted floor height in px; the caller clamps it. */
@@ -15,7 +19,7 @@ interface Props {
 // Horizontal splitter between the office floor and the terminal. Not a dnd-kit draggable, so the
 // PointerSensor never sees it; pointer capture keeps the drag alive outside the grip.
 // TODO(windows-verify): D.64
-export default function Splitter({ value, disabled, onChange, onReset }: Props) {
+export default function Splitter({ value, min, max, disabled, onChange, onReset }: Props) {
   const drag = useRef<{ startY: number; startValue: number } | null>(null);
   const [active, setActive] = useState(false);
 
@@ -44,8 +48,8 @@ export default function Splitter({ value, disabled, onChange, onReset }: Props) 
     let next: number;
     if (e.key === "ArrowUp") next = value - SPLITTER_STEP;
     else if (e.key === "ArrowDown") next = value + SPLITTER_STEP;
-    else if (e.key === "Home") next = FLOOR_MIN;
-    else if (e.key === "End") next = Number.MAX_SAFE_INTEGER;
+    else if (e.key === "Home") next = min;
+    else if (e.key === "End") next = max ?? Number.MAX_SAFE_INTEGER;
     else return;
     e.preventDefault();
     onChange(next);
@@ -57,7 +61,8 @@ export default function Splitter({ value, disabled, onChange, onReset }: Props) 
       aria-orientation="horizontal"
       aria-label="Træk for at ændre terminalens højde"
       aria-valuenow={Math.round(value)}
-      aria-valuemin={FLOOR_MIN}
+      aria-valuemin={min}
+      aria-valuemax={max}
       aria-disabled={disabled}
       tabIndex={disabled ? -1 : 0}
       title={
@@ -75,8 +80,9 @@ export default function Splitter({ value, disabled, onChange, onReset }: Props) 
       onDoubleClick={() => {
         if (!disabled) onReset();
       }}
+      // Disabled (min/max): no band and no second border line, and out of the a11y tree.
       className={`office-splitter h-2 shrink-0 touch-none border-t border-[var(--border)] bg-[var(--bg)] ${
-        disabled ? "" : "cursor-row-resize"
+        disabled ? "hidden" : "cursor-row-resize"
       }`}
     />
   );
