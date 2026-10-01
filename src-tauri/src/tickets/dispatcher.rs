@@ -35,6 +35,12 @@ pub const DELIVERY_UNCONFIRMED_NOTE: &str = "levering ikke bekræftet";
 pub const TURN_FAILED_NOTE: &str = "StopFailure";
 /// History note when the terminal could not be written.
 pub const TERMINAL_GONE_NOTE: &str = "Terminalen er væk";
+/// History note when a different prompt was submitted while the ticket line was being delivered.
+pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
+
+/// No ticket is typed into a terminal the user typed into less than this long ago (their
+/// half-written prompt would be merged with the ticket line); the dispatch waits instead.
+pub const USER_INPUT_GRACE_MS: u64 = 5000;
 
 /// What the dispatcher needs to know about an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +51,9 @@ pub struct AgentSnapshot {
     /// Current detail text (to clear [`DELIVERY_FAILED_TEXT`]/[`TURN_FAILED_TEXT`] after a
     /// successful delivery).
     pub detail: Option<String>,
+    /// When the user last typed into the terminal ([`Timers::now_ms`] clock); see
+    /// [`USER_INPUT_GRACE_MS`].
+    pub last_user_input_at: Option<u64>,
 }
 
 /// Access to the agents (implemented by `ManagerPort` over `Arc<Mutex<AgentManager>>`; each call
@@ -69,9 +78,12 @@ pub trait TicketsHost: Send {
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T;
 }
 
-/// Schedules `msg` to be fed back into the dispatcher after `delay_ms`.
+/// Schedules `msg` to be fed back into the dispatcher after `delay_ms`, and tells the time the
+/// delays are measured on (wall clock in the app, the fake clock in tests).
 pub trait Timers: Send {
     fn schedule(&mut self, delay_ms: u64, msg: DispatchMsg);
+    /// Milliseconds since the epoch (compared with [`AgentSnapshot::last_user_input_at`]).
+    fn now_ms(&self) -> u64;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,12 +257,26 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     // TODO(windows-verify): 750 ms after Stop the input field is ready, and the extra Enter on
     // retry neither sends an empty prompt nor closes a dialog (plan D.29).
     fn consider(&mut self, agent_id: &str) {
-        if *self.state(agent_id) != Delivery::Free || self.ready_ticket(agent_id).is_none() {
+        if *self.state(agent_id) != Delivery::Free {
             return;
         }
+        let Some((snap, _)) = self.ready_ticket(agent_id) else {
+            return;
+        };
+        // The user typed recently: wait until the grace period is over (at least the usual delay).
+        let delay = self
+            .user_grace_left(&snap)
+            .map_or(DISPATCH_DELAY_MS, |left| left.max(DISPATCH_DELAY_MS));
         let token = self.token();
-        self.schedule(agent_id, token, TimerKind::DispatchDelay, DISPATCH_DELAY_MS);
+        self.schedule(agent_id, token, TimerKind::DispatchDelay, delay);
         self.set(agent_id, Delivery::Delaying { token });
+    }
+
+    /// Milliseconds left of [`USER_INPUT_GRACE_MS`] since the user last typed, if any.
+    fn user_grace_left(&self, snap: &AgentSnapshot) -> Option<u64> {
+        let at = snap.last_user_input_at?;
+        let elapsed = self.timers.now_ms().saturating_sub(at);
+        (elapsed < USER_INPUT_GRACE_MS).then(|| USER_INPUT_GRACE_MS - elapsed)
     }
 
     /// The agent (idle, not exited) and its next ticket, if a delivery may start now.
@@ -298,15 +324,23 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     fn on_prompt(&mut self, agent_id: &str, prompt: Option<&str>) {
-        let ticket_id = match self.state(agent_id) {
-            Delivery::Waiting { ticket_id, .. }
-            | Delivery::AwaitingSession { ticket_id, .. }
-            | Delivery::Typed { ticket_id, .. } => ticket_id.clone(),
+        let (ticket_id, typed_by_us) = match self.state(agent_id) {
+            Delivery::Waiting { ticket_id, .. } | Delivery::Typed { ticket_id, .. } => {
+                (ticket_id.clone(), true)
+            }
+            Delivery::AwaitingSession { ticket_id, .. } => (ticket_id.clone(), false),
             _ => return,
         };
         let expected = format!("Ticket {}", super::model::short_id(&ticket_id));
         match prompt {
             Some(p) if p.trim_start().starts_with(&expected) => self.confirm(agent_id, &ticket_id),
+            Some(_) if typed_by_us => {
+                // Another prompt went in while our line was in the terminal (typically the user's
+                // own text, possibly merged with the line). A busy status that follows belongs
+                // to that prompt, so it must not confirm the ticket: give up this delivery.
+                log::info!("dispatch {agent_id}: a different prompt was submitted; aborting");
+                self.delivery_failed(agent_id, &ticket_id, USER_TYPED_NOTE);
+            }
             Some(_) => log::debug!("dispatch {agent_id}: submitted prompt is not the ticket line"),
             None => {
                 log::warn!("dispatch {agent_id}: UserPromptSubmit without prompt; counting it as delivered");
@@ -375,7 +409,14 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             (Delivery::Delaying { token: t }, TimerKind::DispatchDelay) if t == token => {
                 self.set(agent_id, Delivery::Free);
                 if let Some((snap, ticket)) = self.ready_ticket(agent_id) {
-                    self.type_ticket(agent_id, &snap, &ticket, token);
+                    if let Some(left) = self.user_grace_left(&snap) {
+                        // The user typed during the delay: try again when the grace is over.
+                        log::info!("dispatch {agent_id}: user typed recently; waiting {left} ms");
+                        self.schedule(agent_id, token, TimerKind::DispatchDelay, left);
+                        self.set(agent_id, Delivery::Delaying { token });
+                    } else {
+                        self.type_ticket(agent_id, &snap, &ticket, token);
+                    }
                 }
             }
             (
@@ -428,7 +469,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     self.set(agent_id, Delivery::Free);
                     self.consider(agent_id);
                 } else {
-                    self.delivery_failed(agent_id, &ticket_id);
+                    self.delivery_failed(agent_id, &ticket_id, DELIVERY_UNCONFIRMED_NOTE);
                 }
             }
             _ => log::debug!("dispatch {agent_id}: ignoring stale {kind:?} timer"),
@@ -485,16 +526,17 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
-    /// No confirmation after the retry: the ticket stays first in the queue with an issue.
-    fn delivery_failed(&mut self, agent_id: &str, ticket_id: &str) {
+    /// No confirmation after the retry, or another prompt went in: the ticket stays first in
+    /// the queue with an issue and `note` in its history.
+    fn delivery_failed(&mut self, agent_id: &str, ticket_id: &str, note: &str) {
         self.set(agent_id, Delivery::Free);
-        log::warn!("dispatch {agent_id}: delivery of ticket {ticket_id} not confirmed");
+        log::warn!("dispatch {agent_id}: delivery of ticket {ticket_id} failed ({note})");
         let now = now_ms();
         let r = self.host.mutate(|s| {
             s.set_issue(
                 ticket_id,
                 Some(TicketIssue::DeliveryFailed),
-                Some(DELIVERY_UNCONFIRMED_NOTE.into()),
+                Some(note.into()),
                 now,
             )
         });
@@ -580,6 +622,10 @@ impl Timers for RealTimers {
             let _ = tx.send(msg);
         });
     }
+
+    fn now_ms(&self) -> u64 {
+        now_ms()
+    }
 }
 
 /// Manual clock for tests: `advance` returns what came due, in (time, schedule order).
@@ -648,6 +694,10 @@ impl Timers for FakeTimers {
         c.seq += 1;
         let entry = (c.now + delay_ms, c.seq, msg);
         c.due.push(entry);
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now()
     }
 }
 
@@ -773,8 +823,19 @@ mod tests {
                     cwd,
                     status,
                     detail: None,
+                    last_user_input_at: None,
                 },
             );
+        }
+
+        /// The user typed into `id`'s terminal now (fake clock).
+        fn user_typed(&self, id: &str) {
+            let now = self.timers.now();
+            lock(&self.port.0)
+                .snapshots
+                .get_mut(id)
+                .unwrap()
+                .last_user_input_at = Some(now);
         }
 
         fn set_status(&self, id: &str, status: AgentStatus) {
@@ -890,9 +951,6 @@ mod tests {
         h.agent("a1", AgentStatus::Idle);
         let t = h.queued("a1", "Ret login");
         deliver_until_enter(&mut h, "a1");
-        // A different prompt (the user typed something) is no confirmation.
-        h.submitted("a1", "noget andet");
-        assert_eq!(h.ticket(&t.id).state, S::Assigned);
         h.submitted("a1", &format!("Ticket {}: Ret login. Læs …", t.short_id()));
         let now = h.ticket(&t.id);
         assert_eq!(now.state, S::InProgress);
@@ -914,6 +972,100 @@ mod tests {
             agent_id: "a2".into(),
         });
         assert_eq!(h.ticket(&t2.id).state, S::InProgress);
+    }
+
+    // review3 F2: the user typed shortly before the agent became idle.
+    #[test]
+    fn recent_user_input_postpones_the_dispatch() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        h.advance(1000);
+        h.user_typed("a1");
+        h.advance(2000);
+        h.idle("a1");
+        // 3000 ms of the grace are left (more than the usual delay).
+        h.advance(USER_INPUT_GRACE_MS - 2000 - 1);
+        assert!(h.writes().is_empty());
+        h.advance(1);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 2);
+
+        // Typing during the usual delay pushes the dispatch to the end of the grace period.
+        h.agent("a2", AgentStatus::Idle);
+        let t2 = h.queued("a2", "Andet");
+        h.idle("a2");
+        h.advance(DISPATCH_DELAY_MS - 250);
+        h.user_typed("a2");
+        h.advance(250);
+        let a2_writes = |h: &Harness| h.writes().into_iter().filter(|(a, _)| a == "a2").count();
+        assert_eq!(a2_writes(&h), 0);
+        h.advance(USER_INPUT_GRACE_MS - 250 - 1);
+        assert_eq!(a2_writes(&h), 0);
+        h.advance(1);
+        assert_eq!(h.writes().last(), Some(&("a2".to_string(), line(&t2))));
+        // No double sequence was started on the way.
+        h.idle("a2");
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(a2_writes(&h), 2);
+
+        // Input older than the grace period does not delay anything.
+        h.agent("a3", AgentStatus::Idle);
+        h.user_typed("a3");
+        h.advance(USER_INPUT_GRACE_MS);
+        let t3 = h.queued("a3", "Tredje");
+        h.idle("a3");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().last(), Some(&("a3".to_string(), line(&t3))));
+    }
+
+    // review3 F2: a different prompt while our line is in the terminal aborts the delivery, and
+    // a busy status after it does not confirm the ticket.
+    #[test]
+    fn foreign_prompt_while_delivering_aborts() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        h.queued("a1", "Næste");
+        deliver_until_enter(&mut h, "a1");
+        h.submitted("a1", "mit eget udkastTicket abc: Ret login");
+        h.send(DispatchMsg::AgentBusy {
+            agent_id: "a1".into(),
+        });
+        let now = h.ticket(&t.id);
+        assert_eq!((now.state, now.queue_position), (S::Assigned, Some(0)));
+        assert_eq!(now.issue, Some(TicketIssue::DeliveryFailed));
+        assert_eq!(
+            now.history.last().unwrap().note.as_deref(),
+            Some(USER_TYPED_NOTE)
+        );
+        assert_eq!(h.detail("a1").as_deref(), Some(DELIVERY_FAILED_TEXT));
+        // No retry Enter: the confirm timer is stale.
+        h.advance(CONFIRM_TIMEOUT_MS + RETRY_TIMEOUT_MS);
+        assert_eq!(h.writes().len(), 2);
+
+        // Same while the line is typed but Enter not yet sent: the Enter is never sent.
+        h.agent("a2", AgentStatus::Idle);
+        let t2 = h.queued("a2", "Andet");
+        h.idle("a2");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().last(), Some(&("a2".to_string(), line(&t2))));
+        h.submitted("a2", "noget andet");
+        h.advance(ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS + RETRY_TIMEOUT_MS);
+        assert_eq!(h.writes().last(), Some(&("a2".to_string(), line(&t2))));
+        let now = h.ticket(&t2.id);
+        assert_eq!(
+            (now.state, now.issue),
+            (S::Assigned, Some(TicketIssue::DeliveryFailed))
+        );
+
+        // A matching prompt still confirms (see also prompt_submit_or_busy_status_confirms_…).
+        h.agent("a3", AgentStatus::Idle);
+        let t3 = h.queued("a3", "Tredje");
+        deliver_until_enter(&mut h, "a3");
+        h.submitted("a3", &format!("  Ticket {}: Tredje.", t3.short_id()));
+        assert_eq!(h.ticket(&t3.id).state, S::InProgress);
     }
 
     // (3)

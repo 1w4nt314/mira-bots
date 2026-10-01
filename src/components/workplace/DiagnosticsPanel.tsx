@@ -25,6 +25,7 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "ticketsPath", label: "Tickets-fil" },
   { key: "ticketsTotal", label: "Tickets" },
   { key: "ticketsWarning", label: "Tickets-advarsel" },
+  { key: "ticketsReadOnly", label: "Tickets skrivebeskyttet" },
   { key: "logPath", label: "Logfil" },
 ];
 

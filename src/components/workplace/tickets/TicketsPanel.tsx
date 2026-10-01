@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { getDiagnostics } from "../../../lib/ipc";
 import { DONE_VISIBLE, groupTickets } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
@@ -37,6 +38,23 @@ export default function TicketsPanel() {
   );
   const [showForm, setShowForm] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // The startup warning for tickets.json (unreadable → read-only, or renamed as broken). It
+  // cannot change while the app runs, so one read on mount is enough.
+  const [fileWarning, setFileWarning] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    getDiagnostics()
+      .then((d) => {
+        if (alive && d.ticketsWarning !== null) setFileWarning(d.ticketsWarning);
+      })
+      .catch(() => {
+        // Diagnostics shows the same warning; nothing more to do here.
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (notice === null) return;
@@ -55,6 +73,14 @@ export default function TicketsPanel() {
 
   return (
     <div className="space-y-4 p-3">
+      {fileWarning !== null && (
+        <p
+          className="rounded-lg border border-amber-400/50 bg-amber-300/20 px-2 py-1 text-xs text-amber-800 dark:text-amber-200"
+          role="alert"
+        >
+          {fileWarning}
+        </p>
+      )}
       {notice !== null && (
         <p
           className="rounded-lg border border-emerald-500/40 bg-emerald-400/15 px-2 py-1 text-xs text-emerald-800 dark:text-emerald-200"

@@ -32,11 +32,18 @@ pub trait TicketStore: Send {
 #[derive(Clone, Debug)]
 pub struct JsonFileStore {
     path: PathBuf,
+    /// Set once this store knows what is at `path`: a successful `load` (read, missing or moved
+    /// aside as `.broken-*`) or its own successful `save`. Until then `save` refuses to replace
+    /// an existing file, so a file that was never read can never be overwritten.
+    known: Arc<AtomicBool>,
 }
 
 impl JsonFileStore {
     pub fn new(path: PathBuf) -> Self {
-        JsonFileStore { path }
+        JsonFileStore {
+            path,
+            known: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -112,13 +119,17 @@ impl TicketStore for JsonFileStore {
         let bytes = match fs::read(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.known.store(true, Ordering::SeqCst);
                 return Ok(LoadResult {
                     doc: TicketDoc::default(),
                     warning: None,
-                })
+                });
             }
+            // Locked, no permission, a directory, …: the file may hold tickets we could not see.
+            // `known` stays false, so `save` will not replace it.
             Err(e) => return Err(e),
         };
+        self.known.store(true, Ordering::SeqCst);
         let parsed = serde_json::from_slice::<Value>(&bytes)
             .map_err(|e| e.to_string())
             .and_then(migrate);
@@ -135,6 +146,11 @@ impl TicketStore for JsonFileStore {
     // TODO(windows-verify): std::fs::rename replaces an existing tickets.json on Windows
     // (MoveFileExW with MOVEFILE_REPLACE_EXISTING) and no .tmp is left behind (plan D.34).
     fn save(&self, doc: &TicketDoc) -> io::Result<()> {
+        if !self.known.load(Ordering::SeqCst) && !matches!(self.path.try_exists(), Ok(false)) {
+            return Err(io::Error::other(
+                "tickets.json findes, men blev ikke indlæst; gemmer ikke oven i den",
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -145,7 +161,9 @@ impl TicketStore for JsonFileStore {
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp, &self.path)
+        fs::rename(&tmp, &self.path)?;
+        self.known.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -162,6 +180,7 @@ struct MemoryInner {
     doc: Mutex<Option<TicketDoc>>,
     saves: AtomicUsize,
     fail_next_save: AtomicBool,
+    fail_load: AtomicBool,
 }
 
 impl MemoryStore {
@@ -189,6 +208,11 @@ impl MemoryStore {
         self.lock().clone()
     }
 
+    /// Makes every `load` fail with an I/O error (an unreadable file).
+    pub fn fail_load(&self) {
+        self.inner.fail_load.store(true, Ordering::SeqCst);
+    }
+
     /// Makes the next `save` fail with an I/O error.
     pub fn fail_next_save(&self) {
         self.inner.fail_next_save.store(true, Ordering::SeqCst);
@@ -197,6 +221,12 @@ impl MemoryStore {
 
 impl TicketStore for MemoryStore {
     fn load(&self) -> io::Result<LoadResult> {
+        if self.inner.fail_load.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated read failure",
+            ));
+        }
         Ok(LoadResult {
             doc: self.doc().unwrap_or_default(),
             warning: None,
@@ -332,6 +362,37 @@ mod tests {
         let r = JsonFileStore::new(path).load().unwrap();
         assert_eq!(r.warning, None);
         assert_eq!(r.doc, sample_doc());
+    }
+
+    #[test]
+    fn unreadable_path_is_an_error_and_never_overwritten() {
+        // A directory where the file should be: reading fails with something other than NotFound.
+        let dir = TempDir::new();
+        let path = dir.0.join("tickets.json");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep.txt"), "x").unwrap();
+        let store = JsonFileStore::new(path.clone());
+        assert!(store.load().is_err());
+        assert!(store.save(&sample_doc()).is_err());
+        assert!(path.is_dir());
+        assert_eq!(entries(&path), vec!["keep.txt"]);
+        assert_eq!(entries(&dir.0), vec!["tickets.json"]);
+    }
+
+    #[test]
+    fn save_refuses_to_replace_a_file_it_never_read() {
+        let dir = TempDir::new();
+        let path = dir.0.join("tickets.json");
+        fs::write(&path, "precious").unwrap();
+        let store = JsonFileStore::new(path.clone());
+        let e = store.save(&sample_doc()).unwrap_err();
+        assert!(e.to_string().contains("blev ikke indlæst"), "{e}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "precious");
+        assert_eq!(entries(&dir.0), vec!["tickets.json"]);
+        // After a load (here: corrupt → moved aside) saving is allowed again.
+        assert!(store.load().unwrap().warning.is_some());
+        store.save(&sample_doc()).unwrap();
+        assert_eq!(store.load().unwrap().doc, sample_doc());
     }
 
     #[test]

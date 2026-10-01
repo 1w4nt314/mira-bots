@@ -101,8 +101,10 @@ export interface Diagnostics {
   runningAgents: number;
   /** `<app_data_dir>/tickets.json`. */
   ticketsPath: string;
-  /** Set when tickets.json could not be read at startup (renamed to `.broken-<ts>`). */
+  /** Set when tickets.json could not be read at startup (renamed to `.broken-<ts>`, or unreadable). */
   ticketsWarning: string | null;
+  /** tickets.json could not be read at startup: ticket changes are disabled until restart. */
+  ticketsReadOnly: boolean;
   ticketsTotal: number;
 }
 
@@ -147,12 +149,11 @@ export interface TicketHistoryEntry {
   note: string | null;
 }
 
-/** A ticket without its history (`list_tickets`, `tickets-changed`). */
+/** A ticket without its history and body (`list_tickets`, `tickets-changed`); `getTicket` has both. */
 export interface TicketSummary {
   id: string;
   shortId: string;
   title: string;
-  body: string;
   state: TicketState;
   assigneeAgentId: string | null;
   /** 0-based position in the assignee's queue; only while `assigned`. */
@@ -173,6 +174,7 @@ export interface TicketSummary {
  * so it is omitted here; use `shortId(id)` from `lib/tickets` if it is needed.
  */
 export interface Ticket extends Omit<TicketSummary, "historyLen" | "shortId"> {
+  body: string;
   history: TicketHistoryEntry[];
 }
 

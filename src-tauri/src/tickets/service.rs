@@ -32,6 +32,10 @@ pub type TicketLinks = HashMap<String, (Option<TicketId>, usize)>;
 pub struct TicketService {
     store: Box<dyn TicketStore>,
     doc: TicketDoc,
+    /// Set when the store could not be read at startup (I/O error, not a missing or corrupt
+    /// file). Every mutation then fails with [`TicketError::ReadOnly`] and nothing is saved, so
+    /// the unread file is never replaced. Lasts until the app restarts.
+    read_only: bool,
 }
 
 fn validate_title(title: &str) -> Result<String, TicketError> {
@@ -106,7 +110,11 @@ fn normalize_queues(doc: &mut TicketDoc) {
 
 impl TicketService {
     pub fn new(store: Box<dyn TicketStore>, doc: TicketDoc) -> Self {
-        let mut s = TicketService { store, doc };
+        let mut s = TicketService {
+            store,
+            doc,
+            read_only: false,
+        };
         normalize_queues(&mut s.doc);
         s
     }
@@ -114,15 +122,23 @@ impl TicketService {
     /// Loads the store and moves `assigned`/`inProgress` tickets (whose agents no longer exist
     /// after a restart) to the backlog with [`RESTART_NOTE`]. Saves only if something changed.
     /// Returns the load warning (corrupt file etc.) for Diagnostics.
+    ///
+    /// A missing file is an empty list; a corrupt or unknown-version file has already been moved
+    /// aside by the store (warning, empty list). Any other read error (locked file, no
+    /// permission, …) starts the service read-only with an empty list: the file may hold tickets
+    /// we could not see, so nothing may be saved over it.
     pub fn load_and_recover(store: Box<dyn TicketStore>, now: u64) -> (Self, Option<String>) {
         let (doc, mut warning) = match store.load() {
             Ok(r) => (r.doc, r.warning),
             Err(e) => {
-                log::error!("tickets: load failed: {e}");
-                (
-                    TicketDoc::default(),
-                    Some(format!("tickets.json kunne ikke læses: {e}")),
-                )
+                log::error!("tickets: load failed, starting read-only: {e}");
+                let mut svc = TicketService::new(store, TicketDoc::default());
+                svc.read_only = true;
+                let warning = format!(
+                    "tickets.json kunne ikke læses ved opstart ({e}); ændringer er slået fra. \
+                     Genstart appen."
+                );
+                return (svc, Some(warning));
             }
         };
         let mut svc = TicketService::new(store, doc);
@@ -163,6 +179,9 @@ impl TicketService {
         &mut self,
         f: impl FnOnce(&mut TicketDoc) -> Result<T, TicketError>,
     ) -> Result<T, TicketError> {
+        if self.read_only {
+            return Err(TicketError::ReadOnly);
+        }
         let before = self.doc.clone();
         let result = f(&mut self.doc).and_then(|v| {
             normalize_queues(&mut self.doc);
@@ -193,6 +212,11 @@ impl TicketService {
         let mut v: Vec<TicketSummary> = self.doc.tickets.iter().map(TicketSummary::from).collect();
         v.sort_by_key(|t| t.created_at);
         v
+    }
+
+    /// Whether mutations are disabled because the file could not be read at startup.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn get(&self, id: &str) -> Option<Ticket> {
@@ -1149,6 +1173,54 @@ mod tests {
         let m2 = MemoryStore::with_doc(m.doc().unwrap());
         let (_r2, _) = TicketService::load_and_recover(Box::new(m2.clone()), 200);
         assert_eq!(m2.saves(), 0);
+    }
+
+    #[test]
+    fn unreadable_store_starts_read_only_and_never_saves() {
+        let m = MemoryStore::with_doc(TicketDoc {
+            schema_version: 1,
+            tickets: vec![crate::tickets::model::test_support::ticket(
+                "11111111-0000-4000-8000-000000000000",
+                S::Assigned,
+            )],
+        });
+        let on_disk = m.doc();
+        m.fail_load();
+        let (mut r, warning) = TicketService::load_and_recover(Box::new(m.clone()), 100);
+        assert!(r.is_read_only());
+        let w = warning.expect("warning");
+        assert!(w.contains("ændringer er slået fra"), "{w}");
+        assert!(r.is_empty());
+        assert_eq!(
+            r.create("ny", "", false, 101).unwrap_err().to_string(),
+            "Tickets-filen kunne ikke læses ved opstart; ændringer er slået fra. Genstart appen."
+        );
+        // Nothing to release (empty list) stays a silent no-op, also read-only.
+        assert_eq!(r.release_agent("a1", "x", 102), Ok(Vec::new()));
+        assert_eq!(m.saves(), 0);
+        assert_eq!(m.doc(), on_disk);
+        assert!(r.is_empty());
+
+        // A readable store is not read-only.
+        let (ok, _) = TicketService::load_and_recover(Box::new(MemoryStore::new()), 1);
+        assert!(!ok.is_read_only());
+    }
+
+    #[test]
+    fn unreadable_file_on_disk_is_left_untouched() {
+        let dir = std::env::temp_dir().join(format!("mira-ro-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("tickets.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let (mut r, warning) = TicketService::load_and_recover(
+            Box::new(crate::tickets::store::JsonFileStore::new(path.clone())),
+            1,
+        );
+        assert!(r.is_read_only());
+        assert!(warning.is_some());
+        assert_eq!(r.create("ny", "", false, 2), Err(TicketError::ReadOnly));
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

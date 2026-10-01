@@ -227,12 +227,16 @@ impl ManagerPort {
 
 impl AgentPort for ManagerPort {
     fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
-        let a = lock(&self.manager).get(id)?;
+        let (a, last_user_input_at) = {
+            let m = lock(&self.manager);
+            (m.get(id)?, m.last_user_input_at(id))
+        };
         Some(AgentSnapshot {
             name: a.name,
             cwd: a.cwd.into(),
             status: a.status,
             detail: a.detail,
+            last_user_input_at,
         })
     }
 

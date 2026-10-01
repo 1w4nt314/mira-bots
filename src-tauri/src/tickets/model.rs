@@ -118,14 +118,15 @@ impl Ticket {
     }
 }
 
-/// A ticket without its history (payload of `tickets-changed` / `list_tickets`).
+/// A ticket without its history and without its body (payload of `tickets-changed` /
+/// `list_tickets`). The body can be up to `TICKET_BODY_MAX_CHARS` and is not needed for the
+/// lists; `get_ticket` returns it (review3 F3).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TicketSummary {
     pub id: TicketId,
     pub short_id: String,
     pub title: String,
-    pub body: String,
     pub state: TicketState,
     pub assignee_agent_id: Option<String>,
     pub queue_position: Option<usize>,
@@ -144,7 +145,6 @@ impl From<&Ticket> for TicketSummary {
             id: t.id.clone(),
             short_id: t.short_id(),
             title: t.title.clone(),
-            body: t.body.clone(),
             state: t.state,
             assignee_agent_id: t.assignee_agent_id.clone(),
             queue_position: t.queue_position,
@@ -222,6 +222,10 @@ pub enum TicketError {
     AgentNotLive,
     #[error("Kunne ikke gemme tickets: {0}")]
     Io(String),
+    /// The service started read-only because `tickets.json` could not be read (see
+    /// `TicketService::load_and_recover`).
+    #[error("Tickets-filen kunne ikke læses ved opstart; ændringer er slået fra. Genstart appen.")]
+    ReadOnly,
 }
 
 impl From<TicketError> for String {
@@ -354,7 +358,9 @@ mod tests {
         assert_eq!(s["shortId"], json!("0a1b2c3d"));
         assert_eq!(s["historyLen"], json!(1));
         assert!(s.get("history").is_none());
+        assert!(s.get("body").is_none(), "the body is only in get_ticket");
         assert_eq!(s["queuePosition"], json!(2));
+        assert_eq!(s["title"], json!(t.title));
     }
 
     #[test]
@@ -407,6 +413,10 @@ mod tests {
         assert_eq!(
             TicketError::DoneNeedsReview.to_string(),
             "Done kræver review (eller skipReview på ticketen)"
+        );
+        assert_eq!(
+            TicketError::ReadOnly.to_string(),
+            "Tickets-filen kunne ikke læses ved opstart; ændringer er slået fra. Genstart appen."
         );
     }
 }

@@ -214,8 +214,12 @@ pub struct Diagnostics {
     pub running_agents: usize,
     /// `<app_data_dir>/tickets.json`.
     pub tickets_path: String,
-    /// Set when `tickets.json` could not be read at startup (renamed to `.broken-<ts>`).
+    /// Set when `tickets.json` could not be read at startup (renamed to `.broken-<ts>`, or
+    /// unreadable → read-only).
     pub tickets_warning: Option<String>,
+    /// `tickets.json` could not be read at startup (I/O error): ticket changes are disabled
+    /// until the app restarts.
+    pub tickets_read_only: bool,
     /// Number of tickets in memory.
     pub tickets_total: usize,
 }
@@ -366,6 +370,7 @@ mod tests {
             running_agents: 2,
             tickets_path: "/d/tickets.json".into(),
             tickets_warning: None,
+            tickets_read_only: false,
             tickets_total: 4,
         };
         assert_eq!(
@@ -389,6 +394,7 @@ mod tests {
                 "runningAgents": 2,
                 "ticketsPath": "/d/tickets.json",
                 "ticketsWarning": null,
+                "ticketsReadOnly": false,
                 "ticketsTotal": 4
             })
         );
