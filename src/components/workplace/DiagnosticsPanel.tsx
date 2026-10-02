@@ -17,6 +17,7 @@ import {
   PROJECT_NAME_MAX,
   validateProjectName,
 } from "../../lib/projects";
+import { openFolderTitle } from "../../lib/platform";
 import type { Diagnostics, LastHookEvent, LastToolCall } from "../../lib/types";
 import { useStore } from "../../state/store";
 
@@ -25,6 +26,7 @@ export const DIAG_REFRESH_MS = 2000;
 /** Danish labels in display order; keys are the raw field names (used in the copied text). */
 const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "appVersion", label: "App-version" },
+  { key: "platform", label: "Platform" },
   { key: "claudePath", label: "Claude Code-sti" },
   { key: "claudeVersion", label: "Claude Code-version" },
   { key: "claudeVersionNote", label: "Versionsnote" },
@@ -38,8 +40,9 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "mcpConfigExists", label: "mcp.json findes" },
   { key: "systemPromptPath", label: "Systemprompt-fil" },
   { key: "autoReviewOnStop", label: "Stop sender til review automatisk" },
-  { key: "pipeName", label: "Pipe" },
+  { key: "pipeName", label: "Pipe/socket" },
   { key: "pipeReady", label: "Pipe lytter" },
+  { key: "pipeNote", label: "Pipe-note" },
   { key: "framesReceived", label: "Hook-events modtaget" },
   { key: "framesUnknownSession", label: "Hook-events uden kendt agent" },
   { key: "lastHookEvent", label: "Sidste hook-event" },
@@ -100,6 +103,7 @@ function warningsFor(d: Diagnostics): string[] {
     );
   }
   if (!d.pipeReady) out.push("Hook-forbindelsen lytter ikke");
+  if (d.pipeNote) out.push(d.pipeNote);
   if (!d.settingsExists) out.push("settings.json mangler");
   if (d.mcpExe === null) {
     out.push("Agentværktøjer utilgængelige: mira-mcp mangler (sæt MIRA_MCP_EXE eller byg den med npm run build:hook)");
@@ -222,7 +226,7 @@ export default function DiagnosticsPanel() {
         <button
           type="button"
           onClick={() => void openLogs()}
-          title="Åbn mappen med logfilen i Stifinder"
+          title={openFolderTitle("mappen med logfilen")}
           className={btn}
         >
           Åbn logmappe
@@ -350,7 +354,7 @@ function ProjectsSection(props: {
         <button
           type="button"
           onClick={() => void run(() => openProjectFolder(null))}
-          title="Åbn projektroden i Stifinder"
+          title={openFolderTitle("projektroden")}
           className={btn}
         >
           Åbn projektroden
@@ -438,7 +442,7 @@ function ProjectsSection(props: {
                 <button
                   type="button"
                   onClick={() => void run(() => openProjectFolder(p.id))}
-                  title={`Åbn ${p.path} i Stifinder`}
+                  title={openFolderTitle(p.path)}
                   aria-label={`Åbn mappen for projektet ${p.id}`}
                   className={btn}
                 >

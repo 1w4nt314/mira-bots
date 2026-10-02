@@ -44,6 +44,7 @@ export const COMMANDS = {
   quitApp: "quit_app",
   getDiagnostics: "get_diagnostics",
   openWorkplace: "open_workplace",
+  closeWorkplace: "close_workplace",
   takeWorkplaceSelection: "take_workplace_selection",
   openAgentFolder: "open_agent_folder",
   openLogDir: "open_log_dir",
@@ -138,6 +139,8 @@ export const openWorkplace = (
   tab: WorkplaceTab | null = null,
   spawn: SeatKind | null = null,
 ) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn });
+/** Closes the workplace window (Cmd+W on macOS); `true` when a window was open. */
+export const closeWorkplace = () => invoke<boolean>(COMMANDS.closeWorkplace);
 /** Takes the selection stored by `openWorkplace` for a newly created window (once). */
 export const takeWorkplaceSelection = () =>
   invoke<WorkplaceSelection | null>(COMMANDS.takeWorkplaceSelection);
@@ -224,7 +227,7 @@ export const addReport = (ticketId: string, title: string, body: string) =>
   invoke<TicketReport>(COMMANDS.addReport, { ticketId, title, body });
 export const getReport = (ticketId: string, reportId: string) =>
   invoke<ReportContent>(COMMANDS.getReport, { ticketId, reportId });
-/** Opens the ticket's report folder in Explorer (created first if needed). */
+/** Opens the ticket's report folder in the file manager (created first if needed). */
 export const openReportDir = (ticketId: string) =>
   invoke<void>(COMMANDS.openReportDir, { ticketId });
 /** Picks the reviewer of a ticket in review; `null` removes it and routes the ticket again. */
@@ -239,7 +242,7 @@ export const listProjects = () => invoke<Project[]>(COMMANDS.listProjects);
 /** Creates a project folder (Windows folder-name rules; existing names are refused). */
 export const createProject = (name: string) =>
   invoke<Project>(COMMANDS.createProject, { name });
-/** Opens a project folder (`null` = the projects root) in Explorer. */
+/** Opens a project folder (`null` = the projects root) in the file manager. */
 export const openProjectFolder = (project: string | null) =>
   invoke<void>(COMMANDS.openProjectFolder, { project });
 /** Stores a new projects root; it applies after a restart of mira-bots. Returns the path. */

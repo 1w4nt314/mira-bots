@@ -13,13 +13,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `macos-private-api` must match `app.macOSPrivateApi` in tauri.conf.json (tauri-build checks it;
+# plan7 A.5). It only changes macOS builds (transparent island).
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+# `signal`: SIGTERM/SIGINT/SIGHUP on Unix (platform::signals, review7 W5); pulls only
+# signal-hook-registry, already in Cargo.lock.
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros", "signal"] }
 portable-pty = "0.9"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
@@ -27,6 +31,11 @@ log = "0.4"
 thiserror = "2"
 # Workspace crate (serde_json only): the role matrix `mira_mcp::tools::ROLE_TOOLS` lives there once.
 mira-mcp = { path = "../crates/mira-mcp" }
+
+# Unix only (plan7 A.10): killpg/getuid for agent process groups and the private socket dir.
+# Already in Cargo.lock via portable-pty, so no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 mira-hook = { path = "../crates/mira-hook" }

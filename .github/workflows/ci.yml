@@ -49,13 +49,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Install Tauri Linux dependencies
         run: |
           sudo apt-get update
           # llvm provides llvm-rc, which tauri-winres needs for the cross cargo check against the MSVC target.
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf llvm
+          # clang compiles objc2-exception-helper for the cross cargo check against aarch64-apple-darwin
+          # (through scripts/mac-cc.sh, research7 section 5).
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf llvm clang
       - run: npm ci
       - run: npm run build
       - run: cargo fmt --all --check
@@ -64,6 +66,53 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      # Type-check (no linking) of all macOS code from Linux:
+      # CC_aarch64_apple_darwin="$PWD/scripts/mac-cc.sh" cargo check/clippy --workspace --all-targets
+      # --target aarch64-apple-darwin (package.json).
+      - run: npm run check:mac
+      - run: npm run clippy:mac
+
+  # macos-latest = macOS 26 arm64 (research7 section 6). UNVERIFIED on a real runner until the
+  # first push. Runs the same checks as check-windows, including the unix-only tests (process
+  # groups, unix socket, login shell PATH) on a real Mac, then builds the .app and starts it
+  # (scripts/mac-smoke.sh): nobody on the team has a Mac, so this is the only runtime test.
+  check-macos:
+    needs: check-linux
+    runs-on: macos-latest
+    # The release build (lto, codegen-units 1) dominates; a cold cache needs the most.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run build
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Only the .app (no .dmg here; build-installer-macos makes that on main/tags).
+      # beforeBuildCommand builds, copies and ad-hoc signs mira-hook/mira-mcp and the frontend.
+      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles app
+      # Runtime smoke test without user interaction and without claude: start, log file, socket
+      # (0600/0700), quit via Apple Event (SIGTERM if TCC refuses it), socket removed; screenshots
+      # are best effort.
+      - name: Smoke test the .app
+        run: bash scripts/mac-smoke.sh
+      - name: Upload the smoke test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-smoke
+          path: smoke/
+          if-no-files-found: warn
 
   build-installer:
     # Installers are built for main and version tags only; nothing is published or signed.
@@ -97,4 +146,57 @@ jobs:
         with:
           name: mira-bots-windows-msi
           path: target/release/bundle/msi/*.msi
+          if-no-files-found: warn
+
+  # Apple Silicon .dmg, ad-hoc signed (bundle.macOS.signingIdentity "-" in tauri.macos.conf.json),
+  # not notarised. UNVERIFIED on a real runner until the first push.
+  # TODO(macos-verify): the .dmg from mira-bots-macos-dmg opens after "Åbn alligevel" (macOS 15/26),
+  # ctrl-click -> Open (macOS 14) or `xattr -dr com.apple.quarantine`; no "damaged" error on
+  # Apple Silicon; codesign --verify passes and spctl says "rejected" (plan7 M.1).
+  build-installer-macos:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: check-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      # beforeBuildCommand builds mira-hook/mira-mcp for the host (arm64, target/release), copies
+      # them to src-tauri/resources/, chmods and ad-hoc signs them (scripts/copy-hook.mjs) and
+      # builds the frontend. The app itself goes to target/aarch64-apple-darwin/release.
+      - run: npm run tauri -- build --target aarch64-apple-darwin
+      - name: Verify the signature
+        run: codesign --verify --deep --strict --verbose=2 target/aarch64-apple-darwin/release/bundle/macos/mira-bots.app
+      # Expected to print "rejected": ad-hoc signed apps are not notarised. Informational only.
+      - name: Gatekeeper assessment (informational)
+        run: spctl -a -vv target/aarch64-apple-darwin/release/bundle/macos/mira-bots.app || true
+      - name: Zip the .app
+        run: ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/mira-bots.app target/aarch64-apple-darwin/release/bundle/macos/mira-bots-macos-aarch64.app.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mira-bots-macos-dmg
+          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mira-bots-macos-app
+          path: target/aarch64-apple-darwin/release/bundle/macos/*.app.zip
+          if-no-files-found: warn
+      # The same smoke test on the bundle that is shipped (after the uploads, so a failing smoke
+      # test still leaves the .dmg to look at, but turns the job red).
+      - name: Smoke test the .app
+        run: bash scripts/mac-smoke.sh
+      - name: Upload the smoke test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-smoke-release
+          path: smoke/
           if-no-files-found: warn

@@ -4,7 +4,9 @@ Et lille statusvindue ("island") øverst på skærmen, der viser dine Claude Cod
 
 ## Status: trin 4b — stadig tidligt, ikke brugbart endnu
 
-Trin 4b er bygget: agenterne arbejder i projekter (mapper under en projektrod), tickets har et projekt, og en valgfri workspace-fil kan sætte lofter og regler (se afsnittet Projekter). Før det kom trin 5: agenter startes fra profiler med roller (koder, researcher, reviewer, koordinator, planlægger, debugger og specialist), hver rolle har sine egne værktøjer, review kan gå til en reviewer-agent, agenter kan lægge rapporter på tickets, og model og effort kan vælges pr. profil og skiftes undervejs. Det ligger oven på trin 4 (agentens værktøjer via en lokal MCP-server, `mira-mcp.exe`), trin 3 (tickets med kø pr. agent, review og drag-and-drop) og trin 2 (Workplace-vindue, terminal pr. agent og diagnostik). Det er stadig et tidligt trin, og intet af det er afprøvet på Windows endnu (se listen nederst).
+Trin 4b er bygget: agenterne arbejder i projekter (mapper under en projektrod), tickets har et projekt, og en valgfri workspace-fil kan sætte lofter og regler (se afsnittet Projekter). Før det kom trin 5: agenter startes fra profiler med roller (koder, researcher, reviewer, koordinator, planlægger, debugger og specialist), hver rolle har sine egne værktøjer, review kan gå til en reviewer-agent, agenter kan lægge rapporter på tickets, og model og effort kan vælges pr. profil og skiftes undervejs. Det ligger oven på trin 4 (agentens værktøjer via en lokal MCP-server, `mira-mcp.exe`), trin 3 (tickets med kø pr. agent, review og drag-and-drop) og trin 2 (Workplace-vindue, terminal pr. agent og diagnostik). Det er stadig et tidligt trin, og intet af det er afprøvet på Windows eller macOS endnu (se listerne nederst).
+
+Trin 7 tilføjer macOS (Apple Silicon): samme funktioner, bygget som `.dmg` af GitHub Actions; se afsnittet macOS.
 
 Det virker (når det er testet på Windows, se nedenfor):
 
@@ -45,11 +47,11 @@ Indstillingerne (kontor-detaljer, terminalens tilstand og splitterens højde) ge
 
 ## Krav
 
-- Windows 10 version 1809 eller nyere.
-- Nyeste Claude Code installeret og logget ind. `claude` skal kunne findes som `%USERPROFILE%\.local\bin\claude.exe` eller i `PATH`. Ellers sæt miljøvariablen `MIRA_CLAUDE_PATH` til den fulde sti.
+- Windows 10 version 1809 eller nyere, **eller** macOS 13.0 eller nyere på Apple Silicon (13.3+ anbefales, helst 14+, fordi appens CSS kræver WebKit fra Safari 16.4; Intel-Macs bygges ikke).
+- Nyeste Claude Code installeret og logget ind. `claude` skal kunne findes som `%USERPROFILE%\.local\bin\claude.exe` eller i `PATH`; på macOS `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`, npm/volta/fnm/nvm-stier eller login-shellens `PATH`. Ellers sæt miljøvariablen `MIRA_CLAUDE_PATH` til den fulde sti.
 - Claude Code version 2.1.274 eller nyere for agentens værktøjer (trin 4: `mira-mcp` og tilladelser via `mcp_server.source`). Trin 1–3 (hooks med exec-form `command` + `args`, tickets) virker fra 2.1.139, men uden værktøjerne. Alt er verificeret mod 2.1.286. Trin 5 tilføjer hook-eventet `PostModelSwitch` og en `statusLine` i profilernes settings-fil; om ældre versioner stille ignorerer et ukendt hook-navn er ikke afprøvet (punkt 62 nederst). Fanen Diagnostik viser den fundne version, om `args` understøttes (≥ 2.1.139) og om agentværktøjerne er understøttet (≥ 2.1.274).
-- `mira-mcp.exe` (agentens værktøjer) skal ligge ved siden af `mira-hook.exe`; installeren lægger dem begge i `resources`. Findes den ikke, kører agenterne uden værktøjer, og Diagnostik viser en advarsel.
-- WebView2 (følger med Windows 11; installeren henter den på Windows 10).
+- `mira-mcp.exe` (agentens værktøjer) skal ligge ved siden af `mira-hook.exe`; installeren lægger dem begge i `resources` (`mira-mcp`/`mira-hook` uden `.exe` på macOS, i appens `Contents/Resources/resources/`). Findes den ikke, kører agenterne uden værktøjer, og Diagnostik viser en advarsel.
+- WebView2 (følger med Windows 11; installeren henter den på Windows 10). macOS: WKWebView følger med systemet.
 
 ## Sådan starter du en agent
 
@@ -255,9 +257,9 @@ Din egen `~/.claude/settings.json` røres aldrig. Dine eksisterende globale hook
 
 ## Diagnostik og log
 
-Fanen Diagnostik i Workplace viser blandt andet Claude Code-sti og -version, om hooks med `args` understøttes, `settings.json`, `mcp.json` og systemprompt-filens stier, om `mira-mcp.exe` er fundet, profilmappens sti og antal indlæste profiler (med en advarsel, hvis en profilfil var ødelagt), projektroden, workspace-filens sti og om den findes (med "Workspace-advarsel", hvis den ikke kunne læses), antal projekter og "Profiler kopieret ved start", pipen, antal modtagne hook-events og det sidste event samt antal værktøjskald, antal værktøjskald med fejl og det sidste værktøjskald (kun værktøjets navn, agenten og om det lykkedes, aldrig indholdet). Diagnostik advarer, når `mira-mcp.exe` eller `settings.json` mangler. Under "Projekter" står projektlisten med antal kørende arbejdsagenter og tickets pr. projekt, "⚠ n agenter, ingen koordinator" hvor det gælder, og knapperne "Åbn mappe" (pr. projekt), "Nyt projekt…", "Åbn projektroden" og "Vælg projektrod…" (se Projektroden). Knappen Kopiér lægger det hele på udklipsholderen som tekst til en fejlrapport, og Åbn logmappe åbner mappen med loggen.
+Fanen Diagnostik i Workplace viser blandt andet Claude Code-sti og -version, om hooks med `args` understøttes, `settings.json`, `mcp.json` og systemprompt-filens stier, om `mira-mcp.exe` er fundet, profilmappens sti og antal indlæste profiler (med en advarsel, hvis en profilfil var ødelagt), projektroden, workspace-filens sti og om den findes (med "Workspace-advarsel", hvis den ikke kunne læses), antal projekter og "Profiler kopieret ved start", platform (`windows`/`macos`/`linux`), pipen (på macOS socket-stien, med "Pipe-note", hvis socket-mappen ikke kunne bruges, stien var for lang, eller reservestien under `/tmp` bruges), antal modtagne hook-events og det sidste event samt antal værktøjskald, antal værktøjskald med fejl og det sidste værktøjskald (kun værktøjets navn, agenten og om det lykkedes, aldrig indholdet). Diagnostik advarer, når `mira-mcp.exe` eller `settings.json` mangler. Under "Projekter" står projektlisten med antal kørende arbejdsagenter og tickets pr. projekt, "⚠ n agenter, ingen koordinator" hvor det gælder, og knapperne "Åbn mappe" (pr. projekt), "Nyt projekt…", "Åbn projektroden" og "Vælg projektrod…" (se Projektroden). Knappen Kopiér lægger det hele på udklipsholderen som tekst til en fejlrapport, og Åbn logmappe åbner mappen med loggen i Stifinder (Windows), Finder (macOS) eller filhåndteringen.
 
-Loggen ligger i `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log`. Den roteres ved hver start, og de seneste tre gamle filer gemmes. Sæt `MIRA_LOG=debug` (eller `trace`, `info`, `warn`, `error`) for mere detaljeret log; standard er `info`, og debug giver bl.a. én linje pr. hook-event.
+Loggen ligger i `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log` (macOS: `~/Library/Logs/dk.mira.bots/mira-bots.log`). Den roteres ved hver start, og de seneste tre gamle filer gemmes. Sæt `MIRA_LOG=debug` (eller `trace`, `info`, `warn`, `error`) for mere detaljeret log; standard er `info`, og debug giver bl.a. én linje pr. hook-event.
 
 ## Compliance og ansvar
 
@@ -273,12 +275,95 @@ Der er endnu ingen udgivelser. En installer bygges af GitHub Actions:
 1. Åbn fanen **Actions** i repoet.
 2. Vælg den seneste kørsel af workflowet `ci` på `main` (eller et `v*`-tag).
 3. Hent artifact `mira-bots-windows-installers` (NSIS-installer, `.exe`). Hvis MSI kunne bygges, ligger den i `mira-bots-windows-msi`.
+   macOS: `mira-bots-macos-dmg` (`.dmg`, Apple Silicon) og `mira-bots-macos-app` (den zippede `.app`). Se afsnittet macOS.
 
-Kendt risiko: installeren er ikke kodesigneret. Windows SmartScreen og Defender kan advare eller blokere den, og en uunderskrevet Tauri-app kan udløse falske positiver i Defender (det er set hos Coucou). Kør den kun, hvis du har bygget den selv via Actions fra denne kode.
+Kendt risiko: installeren er ikke kodesigneret. Windows SmartScreen og Defender kan advare eller blokere den, og en uunderskrevet Tauri-app kan udløse falske positiver i Defender (det er set hos Coucou). Kør den kun, hvis du har bygget den selv via Actions fra denne kode. På macOS er appen ad-hoc-signeret og ikke notariseret (se afsnittet macOS).
+
+## macOS
+
+> **UVERIFICERET på en rigtig Mac.** Udviklerne har ingen Mac. Koden er typetjekket mod `aarch64-apple-darwin`, og tests og `.dmg` bygges af GitHub Actions på macOS, men bortset fra røgtesten i CI (se "Røgtest i CI") er intet kørt som app på en Mac endnu. Alt i listen "Skal testes på macOS" nederst er åbent. Kun Apple Silicon (arm64) bygges; Intel-Macs og universal-builds er ikke med i trin 7.
+
+### Installation
+
+1. Hent artifact `mira-bots-macos-dmg` fra Actions (se "Hent en installer"), eller `mira-bots-macos-app` hvis du hellere vil have den zippede `.app`.
+2. Åbn `.dmg`'en og træk mira-bots til Programmer.
+3. Appen er ad-hoc-signeret, ikke notariseret (ingen Developer ID). Første start giver derfor en besked om, at appen ikke kan åbnes eller ikke kan bekræftes. Ad-hoc-signaturen fjerner fejlen "er beskadiget" på Apple Silicon, men ikke selve advarslen. Sådan får du appen i gang:
+   - macOS 15 og 26: start appen (den afvises), åbn Systemindstillinger, Anonymitet & sikkerhed, og vælg "Åbn alligevel" ved mira-bots.
+   - macOS 14: ctrl-klik på appen og vælg Åbn.
+   - Altid muligt: `xattr -dr com.apple.quarantine /Applications/mira-bots.app`.
+
+### Hvor filerne ligger
+
+Resten af denne README skriver stierne på Windows-form; brug tabellen.
+
+| Windows | macOS |
+| --- | --- |
+| `%APPDATA%\dk.mira.bots\` | `~/Library/Application Support/dk.mira.bots/` |
+| `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log` | `~/Library/Logs/dk.mira.bots/mira-bots.log` |
+| `%USERPROFILE%\mira-bots\projects\` | `~/mira-bots/projects/` |
+| `%LOCALAPPDATA%\dk.mira.bots` (WebView2's localStorage) | WKWebView's lager under `~/Library/` (origin `tauri://localhost`; den præcise sti er UVERIFICERET; nøglerne er pr. platform, og der migreres intet) |
+| `\\.\pipe\mira-bots-<pid>` | `$TMPDIR/mira-bots-<uid>/mira-bots-<pid>.sock` (mappen 0700, filen 0600, slettes ved afslutning; `/tmp/mira-bots-<uid>/<pid>.sock` bruges, hvis stien under `$TMPDIR` ville blive over 100 tegn) |
+| `resources\mira-hook.exe` | `mira-bots.app/Contents/Resources/resources/mira-hook` |
+| `%TEMP%` | `$TMPDIR` |
+
+Når reservestien under `/tmp` bruges, siger "Pipe-note" det. Er også den for lang (over 100 tegn), eller kan socket-mappen ikke bruges (ejet af en anden bruger, ikke privat), starter hook-forbindelsen ikke: Diagnostik viser "Pipe lytter: nej" og forklaringen i "Pipe-note", og der kan ikke startes agenter, før `TMPDIR` er sat til en kortere mappe.
+
+### Sådan findes `claude`
+
+Appen leder i denne rækkefølge: `MIRA_CLAUDE_PATH` (hvis den peger på en fil); så `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`, `~/.npm-global/bin/claude`, `~/.volta/bin/claude`, fnm (`~/Library/Application Support/fnm/aliases/default/bin/claude` og `~/.local/share/fnm/aliases/default/bin/claude`) og nvm (`~/.nvm/versions/node/<version>/bin/claude`, nyeste først); til sidst første `claude` i `PATH`.
+
+Fordi en app, der startes fra Finder, Dock eller Launchpad, ikke arver terminalens `PATH`, læser appen login-shellens `PATH` én gang ved start (`$SHELL -ilc` med `printenv PATH`, så også fish virker; uden `$SHELL` bruges `/bin/zsh`; højst 5 sekunder, flettet med appens egen `PATH`) og bruger den både til opslaget og til agentens miljø. Fejler eller overskrider shellen tiden, bruges appens egen `PATH`, og loggen siger det. Native installer (`curl … install.sh`), Homebrew cask `claude-code` og npm bliver alle fundet; ellers sæt `MIRA_CLAUDE_PATH`. Appen kalder aldrig `npm prefix -g`.
+
+### Kendte forskelle
+
+- Ingen Dock-ikon, ingen menulinje og ikke i Cmd+Tab (appen kører som "Accessory"; øen er indgangen). Tauris standardmenu er ikke slået fra.
+- Cmd+Q afslutter appen fra Workplace (uden øens bekræftelsestrin), og Cmd+W lukker Workplace. Genvejene findes kun på macOS; den røde lukkeknap lukker Workplace uden at afslutte.
+- Øen ligger lige under menulinjen og dækkes ikke af notch'en, men vises ikke over fuldskærms-apps (almindeligt flydende vindueniveau).
+- Det første klik på øen rammer knappen (`acceptFirstMouse`).
+- Option er ikke Meta i terminalen (dansk tastatur skriver `{ } [ ] |` med Option).
+- Scrollbars er overlay-scrollbars (systemets).
+- SIGTERM, SIGINT og SIGHUP (fx `kill <pid>`, Ctrl+C i `npm run tauri dev` eller en lukket terminal) afslutter appen ad samme vej som Afslut: alle agentgrupper stoppes, og socket-filen fjernes (exit 0). Et signal mere under nedlukningen afbryder straks med exit 1. Gælder kun macOS og Linux; Windows er uændret.
+- Stop af en agent sender SIGTERM til hele procesgruppen (claude, Bash-værktøjets shells og MCP-servere) og SIGKILL efter 2 sekunder til de processer i gruppen, der stadig lever, også når `claude` selv allerede er afsluttet; ved afslut venter appen op til 1,5 sekund. Børn der selv løsriver sig fra gruppen (`setsid`) overlever og overtages af launchd; dem rydder appen ikke op efter.
+- Appen startes fra Finder uden `TERM`, så den sætter `TERM=xterm-256color` og `COLORTERM=truecolor` for agenten, hvis de mangler.
+- `mira-hook` og `mira-mcp` er ad-hoc-signerede (`codesign -s -`); `MIRA_SKIP_CODESIGN=1` springer signeringen over ved lokale bygninger.
+- Appens CSS bruger `@property`, `oklch()`, `@layer` og `color-mix()` (WebKit fra Safari 16.4). Derfor: macOS 13.3+ anbefales, helst 14+.
+- Diagnostik viser feltet "Platform" og kalder pipen "Pipe/socket".
+
+### Krydstjek til macOS fra Linux
+
+```
+rustup target add aarch64-apple-darwin
+apt install clang
+npm run check:mac
+npm run clippy:mac
+```
+
+Wrapperen `scripts/mac-cc.sh` fjerner de Apple-flag (`-arch`, `-mmacosx-version-min`), som Linux-clang ikke kender. Linking og tests mod macOS kræver CI (jobbet `check-macos`).
+
+### Røgtest i CI
+
+macOS-buildet er eksperimentelt, indtil en bruger med en Mac har gennemgået listen "Skal testes på macOS". Indtil da er røgtesten det eneste sted, hvor den rigtige app startes. Jobbet `check-macos` bygger `.app`'en (`npm run tauri -- build --target aarch64-apple-darwin --bundles app`, ingen `.dmg`) og kører `scripts/mac-smoke.sh`, der starter binæren i bundlen direkte med `MIRA_LOG=debug`. `build-installer-macos` kører samme test på den bundle, der bliver leveret. Testen kræver ingen brugerhandling og ingen `claude`; appen starter også uden `claude` og logger blot "claude not found". Det er netop sådan testen kører på runneren.
+
+Testen fejler jobbet, hvis et af disse krav ikke er opfyldt:
+
+- Opstart: processen kører stadig efter opstart (der ventes højst 30 sekunder).
+- Logfil: `~/Library/Logs/dk.mira.bots/mira-bots.log` findes og indeholder `pipe server listening on <sti>` for processens pid.
+- Socket: filen ligger under `$TMPDIR/mira-bots-<uid>/` eller under reservestien `/tmp/mira-bots-<uid>/`, har rettighederne 0600 i en mappe med 0700 og ejes af brugeren.
+- Ingen panic: `$TMPDIR/mira-bots-panic.log` får intet nyt indhold, og loggen har ingen `panic:`-linje, heller ikke under nedlukningen.
+- Nedlukning: appen afslutter med exit 0 inden for 10 sekunder, når den får quit-Apple-Eventet (det samme, som log ud og "Afslut" i Aktivitetsovervågning sender; Cmd+Q i Workplace går i stedet via frontenden til kommandoen `quitApp`). Afviser TCC Apple-Eventet på runneren (`-1743`/"Not authorized" i `quit.txt`), er det kun en ADVARSEL, og så skal SIGTERM i stedet afslutte appen med exit 0 inden for 10 sekunder.
+- Oprydning: socket-filen er væk efter afslutningen.
+
+Apple-Eventet prøves først, fordi det er det, macOS selv sender. Appen håndterer også SIGTERM (samme nedlukning som Afslut), så SIGTERM er den TCC-uafhængige reservevej. Blev Apple-Eventet leveret, uden at appen afsluttede, fejler testen, også selvom SIGTERM bagefter får den til at afslutte; SIGKILL bruges kun som sidste udvej og giver altid FEJL.
+
+Disse punkter bliver kun rapporteret og får ikke jobbet til at fejle: processens vinduer (antal, placering og om de er på skærmen, fra CGWindowList), et screenshot af skærmen og af hvert synligt vindue, om `mira-hook` og `mira-mcp` blev fundet, ERROR-linjer i loggen og om socket-mappen er fjernet. Screenshots kræver rettigheden Skærmoptagelse og kan være sorte eller kun vise skrivebordsbaggrunden.
+
+Resultatet ligger i artifact `macos-smoke`, og `macos-smoke-release` på main og tags. Det indeholder `summary.txt` med OK, FEJL, ADVARSEL eller INFO for hvert punkt, loggen, appens output, vindueslisten og screenshots.
+
+Testen dækker ikke trust-dialogen i `claude`, fokus og tastatur (øen, Workplace, Cmd-genveje og Option-tegn), Gatekeeper og karantæne (CI-bundlen er bygget lokalt og har ingen quarantine-attribut), hooks fra en rigtig agent, Dock og menulinje, flere skærme og fuldskærm. Alt det står stadig i "Skal testes på macOS".
 
 ## Udvikling
 
-Kræver Rust (stable), Node 22 og, på Linux, Tauris systembiblioteker (`libwebkit2gtk-4.1-dev` m.fl.) samt `llvm` (giver `llvm-rc`, som krydstjekket mod Windows-target skal bruge). `npm run tauri dev` kræver Windows.
+Kræver Rust (stable), Node 22 og, på Linux, Tauris systembiblioteker (`libwebkit2gtk-4.1-dev` m.fl.) samt `llvm` (giver `llvm-rc`, som krydstjekket mod Windows-target skal bruge). `npm run tauri dev` kræver Windows (på macOS er `tauri dev` ikke afprøvet).
 
 ```
 npm ci
@@ -292,6 +377,8 @@ Trin 3 tilføjede én npm-afhængighed, `@dnd-kit/core` (6.3), til drag-and-drop
 Trin 4 tilføjede crate'en `crates/mira-mcp` (binæren `mira-mcp`): en håndskrevet JSON-RPC 2.0-server over stdin/stdout, der kun afhænger af `serde_json` (som `mira-hook`). Den officielle Rust-SDK (`rmcp`) blev fravalgt, fordi den trækker `tokio` og omkring 63 crates med, til fem simple værktøjer (fra trin 5 femten, fra trin 5c seksten, fra trin 4b sytten). Den transport, der er fælles med `mira-hook`, er kopieret i stedet for at flyttes til en delt crate, så den Windows-verificerede hook-exe ikke røres; en test holder konstanterne ens. Ingen nye npm-afhængigheder. `cargo test -p mira-mcp` kører serverens egne tests (inkl. en test, der starter den rigtige binær). `npm run build:hook` bygger både `mira-hook` og `mira-mcp`, og `npm run copy:hook` lægger begge i `src-tauri/resources/`.
 
 Trin 5 tilføjede ingen nye npm-pakker og ingen nye eksterne Rust-crates. `src-tauri` bruger nu `mira-mcp` som almindelig afhængighed (rollematrixen `ROLE_TOOLS` bor kun dér), `mira-hook` fik en afgrænset ændring til `statusLine`, og figurerne for planlægger, debugger og specialist, markdown-visningen af rapporter og model-valideringen er håndskrevet. Frontendens node-tests (`npm run test:node`) kører syv scripts: `test-terminal-input.mjs`, `test-bot-core.mjs` (figur-porten mod referencen), `test-markdown.mjs`, `test-models.mjs`, `test-tickets.mjs`, `test-office.mjs` og (fra trin 4b) `test-projects.mjs`.
+
+Trin 7 (macOS) tilføjede én Rust-afhængighed, `libc` (kun unix, allerede i `Cargo.lock` via `portable-pty`), og ingen npm-pakker. `scripts/test-platform.mjs` (platformsdetektion, tekster og Cmd-genveje) er det ottende node-test-script.
 
 Trin 4b tilføjede ingen nye npm-pakker eller Rust-crates og ingen fil-overvågning (workspace-filen læses ved behov), og `--add-dir` bruges ikke.
 
@@ -308,9 +395,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 npm run build
 npm run test:node
+npm run check:mac         # krydstjek mod aarch64-apple-darwin (Linux/macOS, kræver clang)
+npm run clippy:mac        # som check:mac, med clippy -D warnings
 ```
 
-Miljøvariabler: `MIRA_CLAUDE_PATH` (sti til `claude`), `MIRA_HOOK_EXE` (sti til `mira-hook`), `MIRA_MCP_EXE` (sti til `mira-mcp`), `MIRA_HOOK_DEBUG=1` (hook-logning på stderr), `MIRA_MCP_DEBUG=1` (logning fra `mira-mcp` på stderr), `MIRA_MCP_TIMEOUT_MS` (kun til test og fejlsøgning: hvor længe `mira-mcp` venter på appen, standard 10000), `MIRA_LOG` (logniveau for appen, standard `info`). `MIRA_BOTS_PIPE`, `MIRA_AGENT_ID` og `MIRA_AGENT_ROLES` sættes af appen selv.
+`check:mac` og `clippy:mac` bruger `scripts/mac-cc.sh` som C-compiler til darwin-targetet. CI-jobbet `check-macos` (macos-latest) kører build, fmt, check, test og clippy på en rigtig macOS-runner, og `check-linux` krydstjekker mod mac-targetet.
+
+Miljøvariabler: `MIRA_CLAUDE_PATH` (sti til `claude`), `MIRA_HOOK_EXE` (sti til `mira-hook`), `MIRA_MCP_EXE` (sti til `mira-mcp`), `MIRA_HOOK_DEBUG=1` (hook-logning på stderr), `MIRA_MCP_DEBUG=1` (logning fra `mira-mcp` på stderr), `MIRA_MCP_TIMEOUT_MS` (kun til test og fejlsøgning: hvor længe `mira-mcp` venter på appen, standard 10000), `MIRA_LOG` (logniveau for appen, standard `info`), `MIRA_SKIP_CODESIGN=1` (macOS: `npm run copy:hook` springer ad-hoc-signeringen af `mira-hook`/`mira-mcp` over). `MIRA_BOTS_PIPE`, `MIRA_AGENT_ID` og `MIRA_AGENT_ROLES` sættes af appen selv.
 
 ## Skal testes på Windows
 
@@ -404,6 +495,31 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 86. "Vælg projektrod…" åbner mappevælgeren foran Workplace, gemmer stien i `%APPDATA%\dk.mira.bots\app-settings.json` (med backslashes), og først efter genstart ligger profiler, workspace-fil og nye agenter under den nye rod; den gamle rod røres ikke.
 87. Lange stier: et projekt med 64 tegn under en rod på ca. 60 tegn giver `<rod>\<projekt>\.mira-bots\tickets\<id>.md` under 260 tegn, og Claude Code starter; to projekter `a_b` og `a-b` kan begge bruges (deres transskripter deler mappe i `~\.claude\projects\`; kun `claude --continue` i en almindelig terminal blander dem).
 88. Øens knap "+ Ny agent": et klik åbner Workplace (eller sætter det åbne vindue i front) med dialogen "Ny agent på en arbejdsplads" åben; profil og projekt vælges dér, og knappen starter ingen agent selv. Ved loftet (fx "Loft på 2 arbejdspladser nået") er knappen deaktiveret; tooltippet er "Åbn Workplace og start en agent på en arbejdsplads (vælg profil og projekt)". Virker også, når Workplace allerede er åbent.
+
+## Skal testes på macOS
+
+Intet af dette er kørt på en Mac; hvert punkt står som `TODO(macos-verify)` i koden.
+
+1. `.dmg` fra artifact `mira-bots-macos-dmg`: appen starter efter "Åbn alligevel" (macOS 15/26) eller ctrl-klik, Åbn (macOS 14) eller `xattr -dr com.apple.quarantine`; ingen "beskadiget"-fejl på Apple Silicon (ad-hoc-signatur); `codesign --verify --deep --strict` og CI's `spctl`-linje (forventet "rejected").
+2. Accessory-politik: intet Dock-ikon, ikke i Cmd+Tab, ingen menulinje; øen vises top-centreret lige under menulinjen og dækkes ikke af notch'en; med automatisk skjult menulinje ligger øen øverst og menulinjen glider ind over den.
+3. Øen holder sig over andre vinduer i normale spaces; i en fuldskærms-app er den væk (forventet, NSFloatingWindowLevel); ved skærmskift/ny opløsning genplaceres den (ScaleFactorChanged).
+4. Klik på Tillad/Afvis i øen: første klik rammer knappen (`acceptFirstMouse`); notér om appen aktiveres og Workplace hæves over editoren (hvis ja: NSPanel er næste skridt).
+5. Ingen hvidt flash og ingen hvid baggrund på den gennemsigtige ø ved start (`macOSPrivateApi`).
+6. Workplace får tastaturfokus ved "Åbn Workplace"; Cmd+Q afslutter appen (alle agenter væk), Cmd+W lukker Workplace, og Cmd+C/Cmd+V virker i terminalen og i tekstfelter trods skjult menulinje; den røde lukkeknap lukker uden at afslutte appen.
+7. `claude` findes, når appen startes fra Finder/Dock/Launchpad (login-shellens PATH): Diagnostik viser stien for native installer (`~/.local/bin/claude`), Homebrew (`/opt/homebrew/bin/claude`) og npm (`$(npm prefix -g)/bin/claude`); loggen viser "login shell PATH: login-shell"; en langsom `.zshrc` (sleep 10) giver "process" efter 5 s, og appen starter stadig.
+8. Agentens terminal: Claude Codes TUI vises med farver (TERM/COLORTERM sat), Enter/pile/Esc/Ctrl+C virker, Option+7/8/9 giver `{ [ ]` på dansk tastatur (ingen Meta), æøå når frem.
+9. Socket: Diagnostik viser `/var/folders/…/T/mira-bots-<uid>/mira-bots-<pid>.sock`, mappen er `drwx------`, filen `srw-------`; hooks virker (status skifter ved et værktøjskald); filen og mappen er væk efter Afslut og efter et crash (panic-hook).
+10. `mira-hook` og `mira-mcp` ligger i `mira-bots.app/Contents/Resources/resources/`, er eksekverbare og ad-hoc-signerede (`codesign -dv`); `/mcp` i agentens terminal viser `mira-bots` forbundet; statuslinjen giver model/effort i appen.
+11. Stop af en agent: hele gruppen dør (ingen `claude`, `node`, `mira-mcp` eller Bash-tool-børn i `ps -o pid,pgid,comm`), også mens Bash-tool kører `sleep 60`; en proces der ignorerer SIGTERM får SIGKILL efter 2 s.
+12. Afslut (ø-knappen eller Cmd+Q): alle agenter væk inden for ca. 2 s; ingen efterladte processer; ingen zombier.
+13. Stier: profiler i `~/mira-bots/projects/.mira-bots/profiles/`, app-data i `~/Library/Application Support/dk.mira.bots/` (settings.json, mcp.json, tickets.json, profiles/), log i `~/Library/Logs/dk.mira.bots/mira-bots.log`; "Åbn logmappe"/"Åbn mappe" åbner Finder.
+14. WKWebView: kontoret, figurerne og SVG-gradienterne tegnes; dark/light følger systemet live; ingen layoutfejl; overlay-scrollbars; ingen tekst kan markeres i øen (`-webkit-user-select`).
+15. Lang `$TMPDIR` (eksporter en 110 tegn lang sti og start appen fra terminalen): Diagnostik viser `/tmp/mira-bots-<uid>/<pid>.sock`, "Pipe lytter: ja" og en Pipe-note om reservestien; hooks virker.
+16. Mappevælgeren ("Vælg projektrod…") åbner foran Workplace og giver en sti; projektroden med mellemrum i navnet virker (hooks exec-form, statusLine med citationstegn).
+17. "Flyt til projekt…" og "Skift model" (genstart med `--resume`) virker: den gamle procesgruppe dør, den nye starter, samtalen er bevaret; trust-dialogen vises i et git-projekt.
+18. Signaler: `kill -TERM <pid>` på appen (og Ctrl+C i `npm run tauri dev`, og at lukke terminalen, appen er startet fra) afslutter med exit 0, socket-filen er væk, og agentgrupperne er stoppet (`ps -o pid,pgid,comm`); et andet `kill -TERM` under en hængende nedlukning afslutter med exit 1.
+
+Windows-regression efter trin 7 (bør køres igen på Windows, fordi koden er rørt): appen starter og agenter kan startes og stoppes (ConPTY, `killer.kill()` som før), Diagnostik viser "Platform: windows" og pipen `\\.\pipe\mira-bots-<pid>` uden Pipe-note, knapperne hedder stadig "Åbn … i Stifinder", og Ctrl+Q/Ctrl+W og Windows-tasten giver ingen ny adfærd (Cmd-genvejene er kun på macOS).
 
 ## Licens og inspiration
 

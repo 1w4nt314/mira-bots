@@ -16,8 +16,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { useBotStates, useTheme } from "../../lib/bots";
 import {
   assignTicket,
+  closeWorkplace,
   errorMessage,
   onWorkplaceSelect,
+  quitApp,
   takeWorkplaceSelection,
 } from "../../lib/ipc";
 import {
@@ -37,6 +39,7 @@ import {
   type TermMode,
 } from "../../lib/office";
 import { readLocal, writeLocal } from "../../lib/persist";
+import { isMacShortcut } from "../../lib/platform";
 import { assignmentIssue, coordinatorHint, projectIdOf } from "../../lib/projects";
 import { assignSeats, STAFF_SEATS, WORK_SEATS } from "../../lib/seats";
 import { isExited } from "../../lib/status";
@@ -240,6 +243,29 @@ export default function Workplace() {
       unlisten?.();
     };
   }, [dispatch, selectAgent, openSpawn]);
+
+  // Cmd+Q / Cmd+W on macOS only (the app runs as an Accessory app without a menu bar, so the
+  // keys are handled here; isMacShortcut is false on every other platform). Cmd+Q quits at once,
+  // without the island's confirmation step.
+  // TODO(macos-verify): Cmd+Q ends the app (all agents gone), Cmd+W closes the workplace, and
+  // Cmd+C/Cmd+V still work in the terminal and text fields (plan7 M.6)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (isMacShortcut(e, "q")) {
+        e.preventDefault();
+        void quitApp().catch((err: unknown) =>
+          dispatch({ type: "error/set", error: errorMessage(err) }),
+        );
+      } else if (isMacShortcut(e, "w")) {
+        e.preventDefault();
+        void closeWorkplace().catch((err: unknown) =>
+          dispatch({ type: "error/set", error: errorMessage(err) }),
+        );
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dispatch]);
 
   // A selected agent that disappears (removed) simply shows no panel; ids are never reused.
   const selected = agents.find((a) => a.id === selectedId) ?? null;

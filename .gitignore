@@ -18,3 +18,9 @@ src-tauri/gen/schemas/
 
 # hook exe copied into the bundle resources by beforeBuildCommand
 src-tauri/resources/*.exe
+# the same binaries without a suffix (macOS/Linux)
+src-tauri/resources/mira-hook
+src-tauri/resources/mira-mcp
+
+# macOS smoke test output (scripts/mac-smoke.sh)
+smoke/

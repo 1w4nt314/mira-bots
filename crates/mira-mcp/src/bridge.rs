@@ -322,7 +322,8 @@ mod tests {
     #[cfg(unix)]
     mod unix_socket {
         use super::*;
-        use std::os::unix::net::UnixListener;
+        use std::net::Shutdown;
+        use std::os::unix::net::{UnixListener, UnixStream};
         use std::path::PathBuf;
         use std::thread::JoinHandle;
 
@@ -340,6 +341,9 @@ mod tests {
             Silent(Duration),
         }
 
+        /// How long the fake app waits for the client to close after the reply.
+        const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
         /// Accepts one connection; returns the received frame and whether the client closed its
         /// end after the reply (EOF seen within 2 s).
         fn serve_once(path: &PathBuf, reply: Reply) -> JoinHandle<(Value, bool)> {
@@ -347,40 +351,58 @@ mod tests {
             let listener = UnixListener::bind(path).unwrap();
             std::thread::spawn(move || {
                 let (s, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(s.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let frame: Value = serde_json::from_str(&line).unwrap();
-                let mut w = s.try_clone().unwrap();
-                match reply {
-                    Reply::Echo(outcome) => {
-                        let rid = frame["request_id"].clone();
-                        let v = match outcome {
-                            Ok(r) => {
-                                json!({"v":1,"kind":"tool_result","request_id":rid,"ok":true,"result":r})
-                            }
-                            Err(e) => {
-                                json!({"v":1,"kind":"tool_result","request_id":rid,"ok":false,"error":e})
-                            }
-                        };
-                        writeln!(w, "{v}").unwrap();
-                    }
-                    // Empty: hang up without answering.
-                    Reply::Raw(l) if l.is_empty() => return (frame, false),
-                    // The client may hang up before the end (e.g. an over-long reply).
-                    Reply::Raw(l) => {
-                        let _ = w.write_all(l.as_bytes());
-                    }
-                    Reply::Silent(hold) => {
-                        std::thread::sleep(hold);
-                        return (frame, false);
-                    }
-                }
-                s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut rest = Vec::new();
-                let closed = reader.read_to_end(&mut rest).is_ok();
-                (frame, closed)
+                handle(s, reply, CLOSE_WAIT)
             })
+        }
+
+        /// The fake app's side of one connection. The read timeout is armed right after accept,
+        /// before anything is written: XNU refuses every setsockopt with EINVAL once the peer has
+        /// closed and our last write failed (both directions shut down), which made
+        /// `oversized_reply_is_reported_as_too_large` flaky on macOS. A failing socket option or
+        /// a peer that is already gone counts as "client closed" (`(Value::Null, true)`), never a
+        /// panic.
+        fn handle(s: UnixStream, reply: Reply, read_timeout: Duration) -> (Value, bool) {
+            if s.set_read_timeout(Some(read_timeout)).is_err() {
+                return (Value::Null, true);
+            }
+            let Ok(r) = s.try_clone() else {
+                return (Value::Null, true);
+            };
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {}
+                _ => return (Value::Null, true),
+            }
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let mut w = s.try_clone().unwrap();
+            match reply {
+                Reply::Echo(outcome) => {
+                    let rid = frame["request_id"].clone();
+                    let v = match outcome {
+                        Ok(r) => {
+                            json!({"v":1,"kind":"tool_result","request_id":rid,"ok":true,"result":r})
+                        }
+                        Err(e) => {
+                            json!({"v":1,"kind":"tool_result","request_id":rid,"ok":false,"error":e})
+                        }
+                    };
+                    writeln!(w, "{v}").unwrap();
+                }
+                // Empty: hang up without answering.
+                Reply::Raw(l) if l.is_empty() => return (frame, false),
+                // The client may hang up before the end (e.g. an over-long reply).
+                Reply::Raw(l) => {
+                    let _ = w.write_all(l.as_bytes());
+                }
+                Reply::Silent(hold) => {
+                    std::thread::sleep(hold);
+                    return (frame, false);
+                }
+            }
+            let mut rest = Vec::new();
+            let closed = reader.read_to_end(&mut rest).is_ok();
+            (frame, closed)
         }
 
         fn backend(path: &std::path::Path, timeout: Duration) -> PipeBackend {
@@ -472,6 +494,35 @@ mod tests {
             assert_eq!(r, Err(ERR_BAD_REPLY.into()));
             server.join().unwrap();
             let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn client_gone_before_the_timeout_is_armed_is_not_a_panic() {
+            // C2: the client connects and shuts both directions down before the fake app arms
+            // its read timeout (on macOS that setsockopt fails with EINVAL; Linux allows it).
+            let path = sock_path("gone");
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).unwrap();
+            let client = UnixStream::connect(&path).unwrap();
+            client.shutdown(Shutdown::Both).unwrap();
+            let (s, _) = listener.accept().unwrap();
+            let _ = s.shutdown(Shutdown::Write);
+            let (frame, closed) = handle(s, Reply::Raw("late\n".into()), CLOSE_WAIT);
+            assert_eq!(frame, Value::Null);
+            assert!(closed);
+            drop(client);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn failing_socket_option_counts_as_closed() {
+            // std rejects a zero timeout with InvalidInput, the same kind as XNU's EINVAL: the
+            // error path must end the connection quietly instead of panicking.
+            let (s, client) = UnixStream::pair().unwrap();
+            let (frame, closed) = handle(s, Reply::Raw("x\n".into()), Duration::ZERO);
+            assert_eq!(frame, Value::Null);
+            assert!(closed);
+            drop(client);
         }
     }
 }

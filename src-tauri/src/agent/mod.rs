@@ -1,7 +1,9 @@
 //! Work agents: one interactive `claude` per agent, running in a PTY.
 
 pub mod claude_path;
+pub mod login_env;
 pub mod manager;
+pub mod process;
 pub mod pty;
 pub mod ring_buffer;
 pub mod roles;

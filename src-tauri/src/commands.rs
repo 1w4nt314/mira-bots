@@ -1,8 +1,8 @@
 //! Tauri commands (contracts C.1 + C2.1 + C3.2) and the managed [`AppState`].
 //!
-//! All commands except `open_workplace` (async: window creation) are synchronous and return
-//! `Result<T, String>`; errors are Danish, user-facing text. Locks are held briefly and never
-//! while emitting.
+//! All commands except `open_workplace`/`close_workplace` (async: window operations) are
+//! synchronous and return `Result<T, String>`; errors are Danish, user-facing text. Locks are
+//! held briefly and never while emitting.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,6 +98,9 @@ pub struct AppState {
     /// Set by the pipe server once the pipe/socket exists; cleared if the server stops for good.
     /// While false, `spawn_agent` refuses to start agents (their hooks would reach nothing).
     pub pipe_ready: Arc<AtomicBool>,
+    /// The pipe server's error once it stopped (e.g. the socket directory is not private);
+    /// Diagnostik's Pipe-note on unix.
+    pub pipe_error: Arc<Mutex<Option<String>>>,
     /// Receives PTY output/exit from the manager's threads (see `lib.rs::tauri_sink`).
     pub sink: EventSink,
     /// Hook frame counters, shared with the pipe handler.
@@ -197,11 +200,13 @@ impl AppState {
             auto_review_on_stop: ws.rules.auto_review_on_stop,
             pipe_name: self.paths.pipe_name.clone(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
+            pipe_note: pipe_note(&self.paths.pipe_name, lock(&self.pipe_error).as_deref()),
             frames_received: self.hook_stats.received(),
             frames_unknown_session: self.hook_stats.unknown(),
             last_hook_event: self.hook_stats.last_event(),
             log_path: path_string(&self.paths.log_file),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: crate::platform::name().into(),
             projects_root: self.paths.projects_root.to_string_lossy().into_owned(),
             running_agents: lock(&self.manager).running_count(),
             tickets_path: self.paths.tickets_file.to_string_lossy().into_owned(),
@@ -329,6 +334,29 @@ pub fn check_spawn(spawn: Option<&str>) -> Result<(), String> {
     match spawn {
         Some(s) if !WORKPLACE_SPAWN_KINDS.contains(&s) => Err(format!("Ukendt pladstype: {s}")),
         _ => Ok(()),
+    }
+}
+
+/// Diagnostik's `pipeNote`. Unix: the server's error (`error`, e.g. "Socket-mappen … er ikke
+/// privat"), else the too-long-socket-path text, plus a note when the `/tmp` fallback is in use
+/// (joined with "; "). Windows: `None`.
+fn pipe_note(name: &str, error: Option<&str>) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use crate::pipe::unix_socket;
+        let path = std::path::Path::new(name);
+        let problem = error
+            .map(str::to_string)
+            .or_else(|| unix_socket::check_length(path).err());
+        match (problem, unix_socket::fallback_note(path)) {
+            (Some(p), Some(f)) => Some(format!("{p}; {f}")),
+            (p, f) => p.or(f),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = (name, error);
+        None
     }
 }
 
@@ -1308,6 +1336,9 @@ pub fn move_gate(
 // TODO(windows-verify): the agent restarts with --resume in the new folder, the conversation is
 // kept, the trust dialog comes for a git project, and the next ticket file lands in the new
 // folder (plan4b D.81).
+// TODO(macos-verify): "Flyt til projekt…" and "Skift model" restart with --resume: the old process
+// group dies, the new one starts, the conversation is kept, the trust dialog shows in a git project
+// (plan7 M.17).
 #[tauri::command]
 pub fn move_agent_to_project(
     app: AppHandle,
@@ -1399,6 +1430,9 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
 
 // TODO(windows-verify): the path is stored in %APPDATA%\dk.mira.bots\app-settings.json and
 // only used after a restart (plan4b D.86).
+// TODO(macos-verify): the folder picker ("Vælg projektrod…") opens in front of the workplace and
+// returns a path; a project root with spaces in its name works (hooks exec form, quoted statusLine)
+// (plan7 M.16).
 #[tauri::command]
 pub fn set_projects_root(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let stored = store_projects_root(&state.paths.data_dir, &path)?;
@@ -1654,6 +1688,15 @@ pub async fn open_workplace(
     Ok(())
 }
 
+/// Closes the workplace window (Cmd+W on macOS). `true` when a window was open. Async like
+/// `open_workplace`: window operations from a synchronous command can deadlock on Windows.
+#[tauri::command]
+pub async fn close_workplace(app: AppHandle) -> Result<bool, String> {
+    let closed = workplace::close(&app).map_err(|e| format!("Kunne ikke lukke Workplace: {e}"))?;
+    log::info!("workplace close requested (window open: {closed})");
+    Ok(closed)
+}
+
 #[tauri::command]
 pub fn take_workplace_selection(
     state: State<'_, AppState>,
@@ -1664,6 +1707,7 @@ pub fn take_workplace_selection(
 /// Opens the agent's working folder in the file manager (opener plugin, called from Rust: no JS
 /// capability needed).
 // TODO(windows-verify): opens Explorer on the right folder (plan D.22).
+// TODO(macos-verify): "Åbn mappe" opens Finder on the folder (plan7 M.13).
 #[tauri::command]
 pub fn open_agent_folder(
     app: AppHandle,
@@ -1681,6 +1725,7 @@ pub fn open_agent_folder(
 
 /// Opens the log folder (created first if needed).
 // TODO(windows-verify): opens Explorer on %LOCALAPPDATA%\dk.mira.bots\logs (plan D.18/D.22).
+// TODO(macos-verify): "Åbn logmappe" opens Finder on ~/Library/Logs/dk.mira.bots (plan7 M.13).
 #[tauri::command]
 pub fn open_log_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let dir = match state
@@ -2034,6 +2079,7 @@ mod tests {
             },
             island: IslandState::default(),
             pipe_ready: Arc::new(AtomicBool::new(true)),
+            pipe_error: Arc::new(Mutex::new(None)),
             sink: Arc::new(|_| {}),
             hook_stats: Arc::new(HookStats::default()),
             claude_version: Arc::new(Mutex::new(VersionProbe::Ok("2.1.286 (Claude Code)".into()))),
@@ -2082,6 +2128,8 @@ mod tests {
         );
         assert!(!d.auto_review_on_stop);
         assert!(d.pipe_ready);
+        assert_eq!(d.platform, std::env::consts::OS);
+        assert_eq!(d.pipe_note, pipe_note(&d.pipe_name, None));
         assert_eq!((d.frames_received, d.frames_unknown_session), (1, 1));
         assert_eq!(d.last_hook_event.unwrap().name, "Stop");
         assert!(d.log_path.unwrap().ends_with("mira-bots.log"));
@@ -3378,6 +3426,29 @@ mod tests {
         assert!(String::from(err).starts_with("Hook-forbindelsen"));
         ready.store(true, Ordering::Release);
         assert!(check_pipe_ready(&ready).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_note_covers_errors_length_and_the_fallback() {
+        let normal = "/var/folders/ab/T/mira-bots-501/mira-bots-42.sock";
+        assert_eq!(pipe_note(normal, None), None);
+        // A prepare failure stored by the server.
+        let err = "Socket-mappen /x er ikke privat (rettigheder 755); slet den og start appen igen";
+        assert_eq!(pipe_note(normal, Some(err)).as_deref(), Some(err));
+        // Too long (both too long; nothing stored yet): the length text.
+        let long = format!("/{}/mira-bots-42.sock", "l".repeat(100));
+        assert!(pipe_note(&long, None)
+            .unwrap()
+            .starts_with("Socket-stien er for lang ("));
+        // The /tmp fallback is named, alone or after an error.
+        let fb = "/tmp/mira-bots-501/42.sock";
+        assert_eq!(
+            pipe_note(fb, None).as_deref(),
+            Some("Socket-stien under TMPDIR ville være over 100 tegn; bruger /tmp/mira-bots-501 i stedet")
+        );
+        let both = pipe_note(fb, Some(err)).unwrap();
+        assert!(both.starts_with(err) && both.ends_with("bruger /tmp/mira-bots-501 i stedet"));
     }
 
     // ---- step 5: review routing from the commands, report folder on delete ----

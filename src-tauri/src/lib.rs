@@ -9,6 +9,7 @@ pub mod island;
 pub mod mcp;
 pub mod permissions;
 pub mod pipe;
+pub mod platform;
 pub mod profiles;
 pub mod projects;
 pub mod tickets;
@@ -258,6 +259,9 @@ fn install_panic_hook() {
         log::error!("panic: {info}");
         log::logger().flush();
         emergency_log(&format!("panic: {info}"));
+        // Release builds abort right after this hook, so the socket would stay behind.
+        #[cfg(unix)]
+        pipe::unix_socket::cleanup_registered();
     }));
 }
 
@@ -278,6 +282,9 @@ fn resolve_home(app: &AppHandle, fallback: &Path) -> PathBuf {
 
 /// The projects root (plan4b A.1): the app setting when set and not blank, otherwise
 /// `<home>/mira-bots/projects`. Created if missing (a failure is only logged).
+// TODO(macos-verify): profiles in ~/mira-bots/projects/.mira-bots/profiles/, app data in
+// ~/Library/Application Support/dk.mira.bots/ (settings.json, mcp.json, tickets.json, profiles/)
+// and the log in ~/Library/Logs/dk.mira.bots/mira-bots.log (plan7 M.13)
 fn resolve_projects_root(home: &Path, settings: &AppSettings) -> PathBuf {
     let root = settings
         .projects_root()
@@ -341,6 +348,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => log::info!("mcp exe: {}", p.display()),
         None => log::warn!("mira-mcp not found; agents get no tools (set MIRA_MCP_EXE)"),
     }
+    // The login shell's PATH (unix; at most LOGIN_SHELL_TIMEOUT) before the first claude lookup
+    // and before the version probe; children get it through process::spawn_env_extra.
+    agent::login_env::init();
     // Only logged: the lookup is repeated on every get_app_info/spawn_agent.
     match find_claude() {
         Some(p) => log::info!("claude: {}", p.display()),
@@ -523,6 +533,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pipe_ready = Arc::new(AtomicBool::new(false));
+    let pipe_error = Arc::new(Mutex::new(None));
     let hook_stats = Arc::new(HookStats::default());
     pipe::server::start(
         pipe_name.clone(),
@@ -535,6 +546,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             tools: Some(tool_handler),
         },
         Arc::clone(&pipe_ready),
+        Arc::clone(&pipe_error),
     );
 
     let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
@@ -559,6 +571,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         },
         island: IslandState::default(),
         pipe_ready,
+        pipe_error,
         sink,
         hook_stats,
         claude_version,
@@ -569,6 +582,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         workspace,
         profiles_migrated,
     });
+
+    // After `manage`: the exit handler's `kill_all` needs `AppState` (review7 W5).
+    #[cfg(unix)]
+    platform::signals::install(app.handle().clone());
 
     if let Some(window) = app.get_webview_window(island::LABEL) {
         let (w, h) = island::COLLAPSED;
@@ -627,6 +644,7 @@ pub fn run() {
             commands::quit_app,
             commands::get_diagnostics,
             commands::open_workplace,
+            commands::close_workplace,
             commands::take_workplace_selection,
             commands::open_agent_folder,
             commands::open_log_dir,
@@ -666,7 +684,7 @@ pub fn run() {
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
     // inside build(). The Builder is consumed on failure and cannot be retried without the log
     // plugin, so report to the emergency file and exit with a non-zero code: never silently.
-    let app = match built {
+    let mut app = match built {
         Ok(app) => app,
         Err(e) => {
             let message = format!("error while building mira-bots: {e}");
@@ -676,11 +694,20 @@ pub fn run() {
         }
     };
 
+    // After build (the windows exist but the event loop has not started) and before run: the
+    // runtime is still owned by `App`, so the policy is set on the event loop before launch and
+    // the app never starts as a Regular app (no Dock flash, no focus steal; plan7 A.5).
+    platform::apply_activation_policy(&mut app);
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 lock(&state.manager).kill_all();
             }
+        }
+        // The process exits without dropping the pipe server task (and its SocketGuard).
+        #[cfg(unix)]
+        if matches!(event, RunEvent::Exit) {
+            pipe::unix_socket::cleanup_registered();
         }
     });
 }
@@ -742,10 +769,10 @@ mod tests {
         }
     }
 
-    /// The Tauri command list (plan4b punkt 9: 44 → 49). Counted from the source so a command
-    /// added without a handler (or the other way round) is noticed.
+    /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50). Counted from the
+    /// source so a command added without a handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_49_commands() {
+    fn generate_handler_lists_50_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -754,8 +781,9 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 49, "{names:?}");
+        assert_eq!(names.len(), 50, "{names:?}");
         for n in [
+            "close_workplace",
             "list_projects",
             "create_project",
             "open_project_folder",
@@ -768,6 +796,34 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "duplicates");
+    }
+
+    /// plan7 punkt 8: the macOS keys in tauri.conf.json and the platform file merged on macOS.
+    #[test]
+    fn tauri_configs_carry_the_macos_settings() {
+        let main: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let island = main["app"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["label"] == island::LABEL)
+            .expect("island window");
+        assert_eq!(island["acceptFirstMouse"], true);
+        assert_eq!(main["app"]["macOSPrivateApi"], true);
+        // The Windows bundle targets stay as they were.
+        assert_eq!(
+            main["bundle"]["targets"],
+            serde_json::json!(["nsis", "msi"])
+        );
+
+        let mac: serde_json::Value = serde_json::from_str(include_str!("../tauri.macos.conf.json"))
+            .expect("tauri.macos.conf.json");
+        assert_eq!(mac["bundle"]["targets"], serde_json::json!(["app", "dmg"]));
+        let mac_bundle = &mac["bundle"]["macOS"];
+        assert_eq!(mac_bundle["minimumSystemVersion"], "13.0");
+        assert_eq!(mac_bundle["signingIdentity"], "-");
+        assert_eq!(mac_bundle["hardenedRuntime"], false);
     }
 
     #[test]

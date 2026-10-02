@@ -287,11 +287,15 @@ pub struct Diagnostics {
     pub auto_review_on_stop: bool,
     pub pipe_name: String,
     pub pipe_ready: bool,
+    /// Unix: why the socket path cannot work (too long, plan7 A.4); `None` otherwise/Windows.
+    pub pipe_note: Option<String>,
     pub frames_received: u64,
     pub frames_unknown_session: u64,
     pub last_hook_event: Option<LastHookEvent>,
     pub log_path: Option<String>,
     pub app_version: String,
+    /// `std::env::consts::OS`: "windows" | "macos" | "linux".
+    pub platform: String,
     /// The projects root in use (plan4b A.1; a changed setting applies after a restart).
     pub projects_root: String,
     pub running_agents: usize,
@@ -333,7 +337,7 @@ pub struct Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn log_level_from_env_values() {
@@ -517,6 +521,7 @@ mod tests {
             auto_review_on_stop: false,
             pipe_name: "p".into(),
             pipe_ready: true,
+            pipe_note: None,
             frames_received: 3,
             frames_unknown_session: 1,
             last_hook_event: Some(LastHookEvent {
@@ -527,6 +532,7 @@ mod tests {
             }),
             log_path: None,
             app_version: "0.1.0".into(),
+            platform: "linux".into(),
             projects_root: "/h/mira-bots/projects".into(),
             running_agents: 2,
             tickets_path: "/d/tickets.json".into(),
@@ -545,8 +551,18 @@ mod tests {
             projects_total: 3,
             profiles_migrated: 7,
         };
+        // Step 7 fields, checked apart (the json! below is at the macro recursion limit),
+        // including the serde order: platform after appVersion, pipeNote after pipeReady.
+        let text = serde_json::to_string(&d).unwrap();
+        let at = |k: &str| text.find(&format!("\"{k}\":")).unwrap();
+        assert!(at("appVersion") < at("platform") && at("platform") < at("projectsRoot"));
+        assert!(at("pipeReady") < at("pipeNote") && at("pipeNote") < at("framesReceived"));
+        let mut value = serde_json::to_value(&d).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        assert_eq!(obj.remove("platform"), Some(json!("linux")));
+        assert_eq!(obj.remove("pipeNote"), Some(Value::Null));
         assert_eq!(
-            serde_json::to_value(&d).unwrap(),
+            value,
             json!({
                 "claudePath": "/c",
                 "claudeVersion": "2.1.200 (Claude Code)",

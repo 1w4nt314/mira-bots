@@ -221,6 +221,25 @@ pub const REVIEW_BY_DEFAULT: bool = true;
 /// Default of `agentsMayCreateProjects`.
 pub const AGENTS_MAY_CREATE_PROJECTS: bool = false;
 
+// --- macOS / unix (step 7) ---
+
+/// Unix: time between SIGTERM and SIGKILL to an agent's process group.
+pub const PROCESS_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Unix: how long quitting the app waits for every agent group to end before SIGKILL.
+pub const QUIT_KILL_BUDGET: Duration = Duration::from_millis(1500);
+/// Longest socket path accepted (`sun_path` is 104 bytes on macOS, 108 on Linux; margin).
+pub const SOCKET_PATH_MAX: usize = 100;
+/// Prefix of the private per-user socket directory (`mira-bots-<uid>`).
+pub const SOCKET_DIR_PREFIX: &str = "mira-bots-";
+/// Unix: how long the login shell may take to print its PATH.
+pub const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Marks the PATH in the login shell's output (banners and prompts around it are ignored).
+pub const LOGIN_PATH_DELIMITER: &str = "_MIRA_PATH_DELIMITER_";
+/// `TERM` for the agent's child when the app's own environment has none (Finder/Dock start).
+pub const TERM_DEFAULT: &str = "xterm-256color";
+/// `COLORTERM` for the agent's child when the app's own environment has none.
+pub const COLORTERM_DEFAULT: &str = "truecolor";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +360,18 @@ mod tests {
         assert_eq!(MAX_AGENTS_PER_PROJECT, 0);
         const { assert!(REVIEW_BY_DEFAULT) };
         const { assert!(!AGENTS_MAY_CREATE_PROJECTS) };
+    }
+
+    #[test]
+    fn step7_constants_match_the_plan() {
+        assert_eq!(PROCESS_KILL_GRACE, Duration::from_secs(2));
+        assert_eq!(QUIT_KILL_BUDGET, Duration::from_millis(1500));
+        assert_eq!(SOCKET_PATH_MAX, 100);
+        assert_eq!(SOCKET_DIR_PREFIX, "mira-bots-");
+        assert_eq!(LOGIN_SHELL_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(LOGIN_PATH_DELIMITER, "_MIRA_PATH_DELIMITER_");
+        assert_eq!(TERM_DEFAULT, "xterm-256color");
+        assert_eq!(COLORTERM_DEFAULT, "truecolor");
     }
 
     #[test]
