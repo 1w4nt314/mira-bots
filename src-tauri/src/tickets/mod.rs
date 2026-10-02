@@ -249,13 +249,17 @@ impl TicketsCtx {
         let m = lock(&self.manager);
         match m.get(sender) {
             Some(a) if !matches!(a.status, AgentStatus::Exited { .. }) => {
-                let ok = crate::projects::assignment_target(
-                    tk.project.as_ref(),
-                    a.seat_kind,
-                    a.project.as_deref(),
-                    &a.name,
-                )
-                .is_ok();
+                // Review 4b R2-N1: a ticket without a project (older tickets.json) was never
+                // moved away from its sender, so it goes back to it like before step 4b.
+                let ok = matches!(
+                    crate::projects::assignment_target(
+                        tk.project.as_ref(),
+                        a.seat_kind,
+                        a.project.as_deref(),
+                        &a.name,
+                    ),
+                    Ok(_) | Err(TicketError::ProjectRequired)
+                );
                 if ok {
                     RejectReturn::Sender
                 } else {
