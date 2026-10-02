@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useReducer,
@@ -13,6 +14,7 @@ import {
   listAgents,
   listPendingPermissions,
   listProfiles,
+  listProjects,
   listTickets,
   onAgentsChanged,
   onPermissionRequest,
@@ -26,6 +28,7 @@ import type {
   AgentProfile,
   AppInfo,
   PermissionRequestInfo,
+  Project,
   TicketSummary,
 } from "../lib/types";
 
@@ -40,6 +43,8 @@ export interface State {
   tickets: TicketSummary[];
   /** All agent profiles, built-in first (`profiles-changed` replaces the whole list). */
   profiles: AgentProfile[];
+  /** The project folders under the projects root (`listProjects`; refreshed on demand). */
+  projects: Project[];
 }
 
 export type Action =
@@ -51,7 +56,8 @@ export type Action =
   | { type: "error/set"; error: string | null }
   | { type: "appInfo/set"; appInfo: AppInfo }
   | { type: "tickets/set"; tickets: TicketSummary[] }
-  | { type: "profiles/set"; profiles: AgentProfile[] };
+  | { type: "profiles/set"; profiles: AgentProfile[] }
+  | { type: "projects/set"; projects: Project[] };
 
 export const initialState: State = {
   agents: [],
@@ -61,6 +67,7 @@ export const initialState: State = {
   appInfo: null,
   tickets: [],
   profiles: [],
+  projects: [],
 };
 
 export function reducer(state: State, action: Action): State {
@@ -84,6 +91,8 @@ export function reducer(state: State, action: Action): State {
       return { ...state, tickets: action.tickets };
     case "profiles/set":
       return { ...state, profiles: action.profiles };
+    case "projects/set":
+      return { ...state, projects: action.projects };
   }
 }
 
@@ -95,6 +104,8 @@ interface Store {
 const StoreContext = createContext<Store | null>(null);
 
 const ERROR_VISIBLE_MS = 5000;
+/** Pause before the trailing app-info refresh when changes came in during a call (W4). */
+const APP_INFO_REFRESH_GAP_MS = 500;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -106,11 +117,42 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let ticketsFromEvent = false;
     let profilesFromEvent = false;
 
+    // W4: the limits and reviewByDefault come from the workspace file, which may change while
+    // the app runs (no file watcher). Fetch the app info again after agent/ticket changes and
+    // when the window gets focus. Coalesced: one call in flight, at most one more after it.
+    let infoBusy = false;
+    let infoAgain = false;
+    const refreshAppInfo = () => {
+      if (cancelled) return;
+      if (infoBusy) {
+        infoAgain = true;
+        return;
+      }
+      infoBusy = true;
+      getAppInfo()
+        .then((appInfo) => {
+          if (!cancelled) dispatch({ type: "appInfo/set", appInfo });
+        })
+        // Keeps the last known info; the backend checks the limits on every spawn anyway.
+        .catch(() => {})
+        .finally(() => {
+          infoBusy = false;
+          if (infoAgain) {
+            infoAgain = false;
+            setTimeout(refreshAppInfo, APP_INFO_REFRESH_GAP_MS);
+          }
+        });
+    };
+    window.addEventListener("focus", refreshAppInfo);
+
     (async () => {
       try {
         // `agent-output` is consumed by AgentTerminal itself (workplace only).
         const subs = await Promise.all([
-          onAgentsChanged((agents) => dispatch({ type: "agents/set", agents })),
+          onAgentsChanged((agents) => {
+            dispatch({ type: "agents/set", agents });
+            refreshAppInfo();
+          }),
           onPermissionRequest((request) => dispatch({ type: "permission/add", request })),
           onPermissionResolved((p) =>
             dispatch({ type: "permission/remove", requestId: p.requestId }),
@@ -118,6 +160,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           onTicketsChanged((tickets) => {
             ticketsFromEvent = true;
             dispatch({ type: "tickets/set", tickets });
+            refreshAppInfo();
           }),
           onProfilesChanged((profiles) => {
             profilesFromEvent = true;
@@ -133,12 +176,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         await uiReady();
         // Both windows load the tickets; the island only uses the review count.
         // Profiles feed the spawn dialog and the "Agenter" tab (both windows keep them current).
-        const [agents, pending, appInfo, tickets, profiles] = await Promise.all([
+        // Projects are optional for the start: a failure gives an empty list, no error.
+        const [agents, pending, appInfo, tickets, profiles, projects] = await Promise.all([
           listAgents(),
           listPendingPermissions(),
           getAppInfo(),
           listTickets(),
           listProfiles(),
+          listProjects().catch(() => [] as Project[]),
         ]);
         if (cancelled) return;
         dispatch({ type: "agents/set", agents });
@@ -146,6 +191,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (!profilesFromEvent) dispatch({ type: "profiles/set", profiles });
         for (const request of pending) dispatch({ type: "permission/add", request });
         dispatch({ type: "appInfo/set", appInfo });
+        dispatch({ type: "projects/set", projects });
       } catch (e) {
         if (!cancelled) dispatch({ type: "error/set", error: errorMessage(e) });
       }
@@ -153,6 +199,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
     return () => {
       cancelled = true;
+      window.removeEventListener("focus", refreshAppInfo);
       for (const u of unlisteners) u();
     };
   }, []);
@@ -171,4 +218,20 @@ export function useStore(): Store {
   const store = useContext(StoreContext);
   if (store === null) throw new Error("useStore must be used inside <StoreProvider>");
   return store;
+}
+
+/**
+ * Reloads the project list into the store (a failure keeps the old list). Called by the project
+ * picker when it mounts and after anything that may create a project (spawn, assignment,
+ * "Nyt projekt…", moving an agent).
+ */
+export function useRefreshProjects(): () => Promise<void> {
+  const { dispatch } = useStore();
+  return useCallback(
+    () =>
+      listProjects()
+        .then((projects) => dispatch({ type: "projects/set", projects }))
+        .catch(() => {}),
+    [dispatch],
+  );
 }

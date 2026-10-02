@@ -58,3 +58,56 @@ assert.equal(m.effortLabel("xhigh"), "xhigh");
 assert.equal(m.REPORT_BODY_MAX, 20000);
 assert.equal(m.PROMPT_APPEND_MAX, 4000);
 console.log(`isValidModel: ${table.length} cases ok (+ effort/labels)`);
+
+// src/lib/roles.ts: staff roles (mirrors `Role::is_staff` / `has_staff_role` in Rust, test
+// `staff_and_work_roles`). The module only has type imports, so it transpiles on its own.
+const rolesSrc = readFileSync(new URL("../src/lib/roles.ts", import.meta.url), "utf8");
+const rolesOut = ts.transpileModule(rolesSrc, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+});
+const rolesFile = join(mkdtempSync(join(tmpdir(), "roles-")), "roles.mjs");
+writeFileSync(rolesFile, rolesOut.outputText);
+const r = await import(pathToFileURL(rolesFile).href);
+assert.deepEqual([...r.STAFF_ROLES], ["reviewer", "coordinator", "planner"]);
+const staffTable = [
+  [[], false],
+  [["coder"], false],
+  [["researcher"], false],
+  [["debugger"], false],
+  [["coder", "researcher", "debugger"], false],
+  [["reviewer"], true],
+  [["coordinator"], true],
+  [["planner"], true],
+  [["coder", "reviewer"], true],
+  [["debugger", "planner"], true],
+  [[...r.ROLE_ORDER], true],
+];
+for (const [roles, want] of staffTable) assert.equal(r.hasStaffRole(roles), want, JSON.stringify(roles));
+console.log(`hasStaffRole: ${staffTable.length} cases ok`);
+// staffRank: the coordinator is preferred on a staff seat, then reviewer, then planner.
+const rankTable = [
+  [["coordinator"], 0],
+  [["reviewer"], 1],
+  [["planner"], 2],
+  [["coder"], 3],
+  [[], 3],
+  [["planner", "reviewer"], 1],
+  [["reviewer", "coordinator"], 0],
+  [[...r.ROLE_ORDER], 0],
+];
+for (const [roles, want] of rankTable) assert.equal(r.staffRank(roles), want, JSON.stringify(roles));
+console.log(`staffRank: ${rankTable.length} cases ok`);
+// hasWorkRole (mirrors `has_work_role`): without one, every ticket is a coordination task.
+assert.deepEqual([...r.WORK_ROLES], ["coder", "researcher", "debugger"]);
+const workTable = [
+  [[], false],
+  [["reviewer"], false],
+  [["coordinator", "planner"], false],
+  [["coder"], true],
+  [["researcher"], true],
+  [["debugger"], true],
+  [["reviewer", "coder"], true],
+  [[...r.ROLE_ORDER], true],
+];
+for (const [roles, want] of workTable) assert.equal(r.hasWorkRole(roles), want, JSON.stringify(roles));
+console.log(`hasWorkRole: ${workTable.length} cases ok`);

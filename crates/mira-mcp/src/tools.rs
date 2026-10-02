@@ -1,4 +1,5 @@
-//! The fifteen tools (plan4 C4.3 + plan5 C5.3): `tools/list` definitions, the role matrix and
+//! The seventeen tools (plan4 C4.3 + plan5 C5.3 + step 5c's handoff + step 4b's project list;
+//! eleven common): `tools/list` definitions, the role matrix and
 //! argument validation before anything is sent to the app. The app validates again (C4.12) and
 //! enforces the role matrix itself (the security boundary); this layer gives the model a quick,
 //! precise error without a pipe round trip and only lists the tools its roles allow.
@@ -22,9 +23,16 @@ pub const LIST_PROFILES: &str = "mira_list_profiles";
 pub const GET_WORKSPACE_RULES: &str = "mira_get_workspace_rules";
 pub const ADD_REPORT: &str = "mira_add_report";
 pub const GET_REPORT: &str = "mira_get_report";
+/// Step 5c: the assignee hands its ticket in progress to another agent, or back to the backlog.
+pub const HANDOFF_TICKET: &str = "mira_handoff_ticket";
+/// Step 4b: the project folders under the projects root (plan4b C4b.5).
+pub const LIST_PROJECTS: &str = "mira_list_projects";
 
 /// Tools every agent has, whatever its roles (plan5 A.2).
-pub const COMMON_TOOLS: [&str; 8] = [
+/// `mira_list_agents` is common since step 5c (read-only): any agent handing a ticket on with
+/// `mira_handoff_ticket` must be able to find a free work agent.
+/// `mira_list_projects` is common since step 4b (read-only): every ticket needs a project.
+pub const COMMON_TOOLS: [&str; 11] = [
     CREATE_TICKET,
     LIST_TICKETS,
     GET_TICKET,
@@ -33,24 +41,27 @@ pub const COMMON_TOOLS: [&str; 8] = [
     GET_WORKSPACE_RULES,
     ADD_REPORT,
     GET_REPORT,
+    HANDOFF_TICKET,
+    LIST_AGENTS,
+    LIST_PROJECTS,
 ];
 
 /// Tools only some roles have (the union of [`ROLE_TOOLS`]).
-pub const ROLE_BOUND_TOOLS: [&str; 7] = [
+pub const ROLE_BOUND_TOOLS: [&str; 6] = [
     APPROVE_TICKET,
     REJECT_TICKET,
     ASSIGN_TICKET,
     UNASSIGN_TICKET,
     SPAWN_AGENT,
-    LIST_AGENTS,
     LIST_PROFILES,
 ];
 
 /// Every tool name (plan5 C5.8), common ones first; the order of [`definitions`].
-pub const TOOL_NAMES: [&str; 15] = ALL_TOOL_NAMES;
+pub const TOOL_NAMES: [&str; 17] = ALL_TOOL_NAMES;
 
-/// Every tool name of plan5 C5.3, common ones first.
-pub const ALL_TOOL_NAMES: [&str; 15] = [
+/// Every tool name of plan5 C5.3 (+ step 5c's handoff, step 4b's project list), common ones
+/// first.
+pub const ALL_TOOL_NAMES: [&str; 17] = [
     CREATE_TICKET,
     LIST_TICKETS,
     GET_TICKET,
@@ -59,12 +70,14 @@ pub const ALL_TOOL_NAMES: [&str; 15] = [
     GET_WORKSPACE_RULES,
     ADD_REPORT,
     GET_REPORT,
+    HANDOFF_TICKET,
+    LIST_AGENTS,
+    LIST_PROJECTS,
     APPROVE_TICKET,
     REJECT_TICKET,
     ASSIGN_TICKET,
     UNASSIGN_TICKET,
     SPAWN_AGENT,
-    LIST_AGENTS,
     LIST_PROFILES,
 ];
 
@@ -76,13 +89,7 @@ pub const ROLE_TOOLS: &[(&str, &[&str])] = &[
     ("reviewer", &[APPROVE_TICKET, REJECT_TICKET]),
     (
         "coordinator",
-        &[
-            ASSIGN_TICKET,
-            UNASSIGN_TICKET,
-            SPAWN_AGENT,
-            LIST_AGENTS,
-            LIST_PROFILES,
-        ],
+        &[ASSIGN_TICKET, UNASSIGN_TICKET, SPAWN_AGENT, LIST_PROFILES],
     ),
     ("planner", &[]),
     ("debugger", &[]),
@@ -122,6 +129,23 @@ pub const REPORT_TITLE_MAX: usize = 120;
 pub const REPORT_BODY_MAX: usize = 20_000;
 pub const REPORT_ID_MAX: usize = 8;
 pub const SEAT_KINDS: [&str; 2] = ["work", "staff"];
+/// Error for a malformed `project` argument (step 4b).
+pub const PROJECT_ERROR: &str =
+    "project skal være et projekt-id (1–64 tegn) eller {\"new\": \"<navn>\"}";
+
+/// The `project` schema of `mira_create_ticket` and `mira_spawn_agent` (plan4b C4b.5).
+/// `project` on `mira_assign_ticket`/`mira_handoff_ticket`: only for a ticket without a project.
+pub const PROJECT_ON_ASSIGN: &str = "Kun når ticketen mangler et projekt: projektet den skal have (et id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} hvis workspacet tillader det). En arbejdsagent tager kun tickets fra sit eget projekt.";
+
+fn project_ref_schema(description: &str) -> Value {
+    json!({
+        "description": description,
+        "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+            {"type": "object", "properties": {"new": {"type": "string", "minLength": 1, "maxLength": ID_MAX}}, "required": ["new"], "additionalProperties": false}
+        ]
+    })
+}
 
 fn annotations(read_only: bool, idempotent: bool) -> Value {
     json!({
@@ -144,7 +168,8 @@ pub fn definitions() -> Vec<Value> {
                     "title": {"type": "string", "minLength": 1, "maxLength": TITLE_MAX, "description": "Kort titel (én linje)"},
                     "body": {"type": "string", "maxLength": BODY_MAX, "description": "Beskrivelse (markdown)"},
                     "skipReview": {"type": "boolean", "description": "true: ticketen går direkte til Done når den afleveres"},
-                    "assignTo": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agent-id (kun koordinator): ticketen sættes bagest i agentens kø"}
+                    "assignTo": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agent-id (kun koordinator): ticketen sættes bagest i agentens kø"},
+                    "project": project_ref_schema("Projektet ticketen hører til: et projekt-id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} for et nyt projekt (kun hvis workspacet tillader det). Udelades: dit eget projekt (arbejdsagent) eller assignTo-agentens.")
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -156,7 +181,10 @@ pub fn definitions() -> Vec<Value> {
             "description": "Lister tickets uden beskrivelse og historik. filter: \"mine\" (dine i kø og i gang, standard), \"backlog\" (ikke tildelte) eller \"all\".",
             "inputSchema": {
                 "type": "object",
-                "properties": {"filter": {"type": "string", "enum": FILTERS}},
+                "properties": {
+                    "filter": {"type": "string", "enum": FILTERS},
+                    "project": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Kun tickets i dette projekt (id); \"none\" = tickets uden projekt"}
+                },
                 "additionalProperties": false
             },
             "annotations": annotations(true, true)
@@ -200,7 +228,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": GET_WORKSPACE_RULES,
-            "description": "Reglerne i dette workspace: lofter for agenter, maks review-runder, om Stop automatisk sender til review, grænser for tickets og rapporter.",
+            "description": "Reglerne i dette workspace (mira-bots.workspace.json): lofter for agenter, maks review-runder, om Stop automatisk sender til review, grænser for tickets og rapporter, om agenter må oprette projekter, samt projektroden og projektlisten.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "annotations": annotations(true, true)
         }),
@@ -234,6 +262,32 @@ pub fn definitions() -> Vec<Value> {
             "annotations": annotations(true, true)
         }),
         json!({
+            "name": HANDOFF_TICKET,
+            "description": "Giver din igangværende ticket videre: med agentId flytter den bagest i den agents kø (agenten skal køre og må ikke være dig selv); uden agentId lægges den tilbage i backlog. Brug den når ticketen ikke er til dig, og skriv evt. hvorfor med mira_update_status først. Kun din egen ticket i gang; tickets i Review eller Done kan ikke gives videre. Uden ticketId bruges din igangværende ticket.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agenten der skal have ticketen; udelad for at lægge den tilbage i backlog"},
+                    "project": project_ref_schema(PROJECT_ON_ASSIGN)
+                },
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
+        json!({
+            "name": LIST_AGENTS,
+            "description": "Lister agenterne i appen: id, navn, profil, roller, plads, projekt, status, ticket i gang, kølængde og åbne reviews.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": annotations(true, true)
+        }),
+        json!({
+            "name": LIST_PROJECTS,
+            "description": "Lister projekterne (mapperne under projektroden) med sti og antal arbejdsagenter i hvert. Brug id'et som project på tickets og ved start af agenter.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": annotations(true, true)
+        }),
+        json!({
             "name": APPROVE_TICKET,
             "description": "Godkender en ticket du er reviewer på: den går til Done. Kun tickets i Review, aldrig dine egne afleveringer. Skriv kort hvad du har tjekket i note.",
             "inputSchema": {
@@ -263,12 +317,13 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": ASSIGN_TICKET,
-            "description": "Sætter en ticket fra backlog eller afvist bagest i en kørende agents kø (koordinator). Agent-id'er fås med mira_list_agents.",
+            "description": "Sætter en ticket fra backlog eller afvist bagest i en kørende agents kø (koordinator). Din egen igangværende ticket kan du også give videre på den måde (den flytter fra dig til agenten). Agent-id'er fås med mira_list_agents.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
-                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX}
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "project": project_ref_schema(PROJECT_ON_ASSIGN)
                 },
                 "required": ["id", "agentId"],
                 "additionalProperties": false
@@ -277,7 +332,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": UNASSIGN_TICKET,
-            "description": "Tager en ticket i kø ud af agentens kø og tilbage til backlog (koordinator). Tickets i gang kan ikke tages.",
+            "description": "Tager en ticket i kø ud af agentens kø og tilbage til backlog (koordinator). Af tickets i gang kan kun din egen lægges tilbage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string", "minLength": 1, "maxLength": ID_MAX}},
@@ -288,24 +343,19 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": SPAWN_AGENT,
-            "description": "Starter en ny agent fra en profil (koordinator). Samme lofter som i appen (5 arbejdspladser, 3 stabspladser). Med firstTicketId får agenten den ticket som første opgave.",
+            "description": "Starter en ny agent fra en profil (koordinator). Samme lofter som i appen; en stabsplads kræver en profil med en stabsrolle (reviewer, koordinator eller planlægger). Med firstTicketId får agenten den ticket som første opgave. En arbejdsplads kræver et projekt (project, eller ticketens projekt når firstTicketId er med).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "profileId": {"type": "string", "minLength": 1, "maxLength": PROFILE_ID_MAX},
                     "seatKind": {"type": "string", "enum": SEAT_KINDS},
-                    "firstTicketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX}
+                    "firstTicketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "project": project_ref_schema("Projektet agenten arbejder i (arbejdsplads): et projekt-id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} (kun hvis workspacet tillader det). Ticketens projekt vinder.")
                 },
                 "required": ["profileId"],
                 "additionalProperties": false
             },
             "annotations": annotations(false, false)
-        }),
-        json!({
-            "name": LIST_AGENTS,
-            "description": "Lister agenterne i appen: id, navn, profil, roller, plads, status, ticket i gang, kølængde og åbne reviews.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
-            "annotations": annotations(true, true)
         }),
         json!({
             "name": LIST_PROFILES,
@@ -347,6 +397,29 @@ struct StrRule {
     error: &'static str,
     /// Separate error for "too long" (C4.4 texts for title/body); `None` = `error`.
     too_long: Option<&'static str>,
+}
+
+/// `project`: a project id (1–64 chars, trimmed) or `{"new": "<name>"}` (1–64 chars); `null`
+/// counts as absent. The app validates the folder-name rules again.
+fn take_project(args: &Map<String, Value>, out: &mut Map<String, Value>) -> Result<(), String> {
+    let id = |v: &Value| -> Result<String, String> {
+        let s = v.as_str().ok_or(PROJECT_ERROR)?.trim();
+        if s.is_empty() || s.chars().count() > ID_MAX {
+            return Err(PROJECT_ERROR.into());
+        }
+        Ok(s.to_string())
+    };
+    let v = match args.get("project") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(v @ Value::String(_)) => Value::String(id(v)?),
+        Some(Value::Object(m)) if m.len() == 1 => {
+            let new = m.get("new").ok_or(PROJECT_ERROR)?;
+            json!({ "new": id(new)? })
+        }
+        Some(_) => return Err(PROJECT_ERROR.into()),
+    };
+    out.insert("project".into(), v);
+    Ok(())
 }
 
 fn take_str(
@@ -401,18 +474,19 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         .as_object()
         .ok_or_else(|| "Argumenterne skal være et objekt".to_string())?;
     let allowed: &[&str] = match name {
-        CREATE_TICKET => &["title", "body", "skipReview", "assignTo"],
-        LIST_TICKETS => &["filter"],
+        CREATE_TICKET => &["title", "body", "skipReview", "assignTo", "project"],
+        LIST_TICKETS => &["filter", "project"],
         GET_TICKET => &["id"],
         SUBMIT_FOR_REVIEW => &["summary", "ticketId", "report"],
         UPDATE_STATUS => &["note"],
         APPROVE_TICKET | REJECT_TICKET => &["id", "note"],
-        ASSIGN_TICKET => &["id", "agentId"],
+        ASSIGN_TICKET => &["id", "agentId", "project"],
         UNASSIGN_TICKET => &["id"],
-        SPAWN_AGENT => &["profileId", "seatKind", "firstTicketId"],
-        LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES => &[],
+        SPAWN_AGENT => &["profileId", "seatKind", "firstTicketId", "project"],
+        LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES | LIST_PROJECTS => &[],
         ADD_REPORT => &["ticketId", "title", "body"],
         GET_REPORT => &["ticketId", "reportId"],
+        HANDOFF_TICKET => &["ticketId", "agentId", "project"],
         other => return Err(format!("Ukendt værktøj: {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -452,6 +526,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
                 out.insert("skipReview".into(), Value::Bool(b));
             }
             take_str(obj, &mut out, &id_rule("assignTo", false, ID_MAX))?;
+            take_project(obj, &mut out)?;
         }
         LIST_TICKETS => {
             if let Some(v) = obj.get("filter") {
@@ -461,6 +536,18 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
                 }
                 out.insert("filter".into(), Value::String(f.to_string()));
             }
+            take_str(
+                obj,
+                &mut out,
+                &StrRule {
+                    key: "project",
+                    required: false,
+                    min: 1,
+                    max: ID_MAX,
+                    error: "project skal være en tekst på 1–64 tegn",
+                    too_long: None,
+                },
+            )?;
         }
         GET_TICKET => take_str(
             obj,
@@ -524,6 +611,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         ASSIGN_TICKET => {
             take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?;
             take_str(obj, &mut out, &id_rule("agentId", true, ID_MAX))?;
+            take_project(obj, &mut out)?;
         }
         UNASSIGN_TICKET => take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?,
         SPAWN_AGENT => {
@@ -536,8 +624,9 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
                 out.insert("seatKind".into(), Value::String(k.to_string()));
             }
             take_str(obj, &mut out, &id_rule("firstTicketId", false, ID_MAX))?;
+            take_project(obj, &mut out)?;
         }
-        LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES => {}
+        LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES | LIST_PROJECTS => {}
         ADD_REPORT => {
             take_str(obj, &mut out, &id_rule("ticketId", false, ID_MAX))?;
             take_str(
@@ -569,6 +658,11 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             take_str(obj, &mut out, &id_rule("ticketId", true, ID_MAX))?;
             take_str(obj, &mut out, &id_rule("reportId", true, REPORT_ID_MAX))?;
         }
+        HANDOFF_TICKET => {
+            take_str(obj, &mut out, &id_rule("ticketId", false, ID_MAX))?;
+            take_str(obj, &mut out, &id_rule("agentId", false, ID_MAX))?;
+            take_project(obj, &mut out)?;
+        }
         _ => take_str(
             obj,
             &mut out,
@@ -596,8 +690,21 @@ mod tests {
         for role in ["coder", "researcher", "planner", "debugger", "nobody"] {
             assert_eq!(tools_for_roles(&[role]), COMMON_TOOLS.to_vec(), "{role}");
         }
-        assert_eq!(tools_for_roles(&["reviewer"]).len(), 10);
-        assert_eq!(tools_for_roles(&["coordinator"]).len(), 13);
+        assert_eq!(COMMON_TOOLS.len(), 11);
+        assert_eq!(ALL_TOOL_NAMES.len(), 17);
+        assert_eq!(tools_for_roles(&["reviewer"]).len(), 13);
+        assert_eq!(tools_for_roles(&["coordinator"]).len(), 15);
+        // Step 4b: every role sees the projects.
+        assert!(is_allowed(LIST_PROJECTS, &none));
+        assert!(is_allowed(LIST_PROJECTS, &["coder"]));
+        // Step 5c: every role may hand its own ticket on, and find a free agent for it.
+        assert!(is_allowed(HANDOFF_TICKET, &["coder"]));
+        assert!(is_allowed(HANDOFF_TICKET, &none));
+        for roles in [&[][..], &["coder"][..], &["reviewer"][..], &["planner"][..]] {
+            assert!(is_allowed(LIST_AGENTS, roles), "{roles:?}");
+        }
+        assert!(!is_allowed(LIST_PROFILES, &["reviewer"]));
+        assert!(!is_allowed(ASSIGN_TICKET, &["planner"]));
         let all = [
             "coder",
             "researcher",
@@ -646,7 +753,7 @@ mod tests {
     #[test]
     fn definitions_are_well_formed() {
         let defs = definitions();
-        assert_eq!(defs.len(), 15);
+        assert_eq!(defs.len(), 17);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert_eq!(names, TOOL_NAMES);
         for d in &defs {
@@ -844,15 +951,15 @@ mod tests {
                 .collect()
         };
         for (roles, n) in [
-            (&[][..], 8),
-            (&["coder"][..], 8),
-            (&["researcher"][..], 8),
-            (&["planner"][..], 8),
-            (&["debugger"][..], 8),
-            (&["reviewer"][..], 10),
-            (&["coordinator"][..], 13),
-            (&["coder", "reviewer", "coordinator"][..], 15),
-            (&["nobody"][..], 8),
+            (&[][..], 11),
+            (&["coder"][..], 11),
+            (&["researcher"][..], 11),
+            (&["planner"][..], 11),
+            (&["debugger"][..], 11),
+            (&["reviewer"][..], 13),
+            (&["coordinator"][..], 15),
+            (&["coder", "reviewer", "coordinator"][..], 17),
+            (&["nobody"][..], 11),
         ] {
             assert_eq!(names(roles).len(), n, "{roles:?}");
             let want: Vec<String> = tools_for_roles(roles)
@@ -961,6 +1068,23 @@ mod tests {
             err(UNASSIGN_TICKET, json!({"id":""})),
             "id skal være en tekst på 1–64 tegn"
         );
+        // Step 5c: both arguments optional.
+        assert_eq!(ok(HANDOFF_TICKET, json!({})), json!({}));
+        assert_eq!(
+            ok(
+                HANDOFF_TICKET,
+                json!({"ticketId":" ab12cd34 ","agentId":"w"})
+            ),
+            json!({"ticketId":"ab12cd34","agentId":"w"})
+        );
+        assert_eq!(
+            err(HANDOFF_TICKET, json!({"agentId":""})),
+            "agentId skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(
+            err(HANDOFF_TICKET, json!({"id":"x"})),
+            "Ukendt argument: id"
+        );
         assert_eq!(
             ok(
                 SPAWN_AGENT,
@@ -976,7 +1100,12 @@ mod tests {
             err(SPAWN_AGENT, json!({"profileId":"coder","seatKind":"desk"})),
             "seatKind skal være \"work\" eller \"staff\""
         );
-        for t in [LIST_AGENTS, LIST_PROFILES, GET_WORKSPACE_RULES] {
+        for t in [
+            LIST_AGENTS,
+            LIST_PROFILES,
+            GET_WORKSPACE_RULES,
+            LIST_PROJECTS,
+        ] {
             assert_eq!(ok(t, json!({})), json!({}));
             assert_eq!(err(t, json!({"x":1})), "Ukendt argument: x");
         }
@@ -1027,5 +1156,108 @@ mod tests {
             ),
             "Rapporten er for lang (maks 20000 tegn)"
         );
+    }
+
+    // ---- step 4b ----
+
+    #[test]
+    fn validate_project_forms() {
+        let ok = |name: &str, args: Value| validate_args(name, &args).unwrap();
+        let err = |name: &str, args: Value| validate_args(name, &args).unwrap_err();
+        for t in [CREATE_TICKET, SPAWN_AGENT, ASSIGN_TICKET, HANDOFF_TICKET] {
+            let base = match t {
+                CREATE_TICKET => json!({"title": "t"}),
+                SPAWN_AGENT => json!({"profileId": "coder"}),
+                ASSIGN_TICKET => json!({"id": "x", "agentId": "a"}),
+                _ => json!({"agentId": "a"}),
+            };
+            let with = |p: Value| {
+                let mut v = base.clone();
+                v["project"] = p;
+                v
+            };
+            let mut want = base.clone();
+            want["project"] = json!("mira");
+            assert_eq!(ok(t, with(json!(" mira "))), want, "{t}");
+            want["project"] = json!({"new": "ny"});
+            assert_eq!(ok(t, with(json!({"new": " ny "}))), want, "{t}");
+            assert_eq!(ok(t, with(Value::Null)), base, "{t}: null = absent");
+            for bad in [
+                json!({"new": ""}),
+                json!({"x": 1}),
+                json!({"new": "a", "x": 1}),
+                json!(5),
+                json!(""),
+                json!("p".repeat(65)),
+                json!({"new": 5}),
+            ] {
+                assert_eq!(err(t, with(bad.clone())), PROJECT_ERROR, "{t}: {bad}");
+            }
+        }
+        assert_eq!(
+            ok(LIST_TICKETS, json!({"filter": "all", "project": " none "})),
+            json!({"filter": "all", "project": "none"})
+        );
+        assert_eq!(
+            err(LIST_TICKETS, json!({"project": ""})),
+            "project skal være en tekst på 1–64 tegn"
+        );
+        assert_eq!(err(LIST_PROJECTS, json!({"x": 1})), "Ukendt argument: x");
+    }
+
+    #[test]
+    fn step4b_definitions() {
+        let defs = definitions();
+        let schema = |d: &str| {
+            json!({
+                "description": d,
+                "oneOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 64},
+                    {"type": "object", "properties": {"new": {"type": "string", "minLength": 1, "maxLength": 64}}, "required": ["new"], "additionalProperties": false}
+                ]
+            })
+        };
+        assert_eq!(
+            def(&defs, CREATE_TICKET)["inputSchema"]["properties"]["project"],
+            schema("Projektet ticketen hører til: et projekt-id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} for et nyt projekt (kun hvis workspacet tillader det). Udelades: dit eget projekt (arbejdsagent) eller assignTo-agentens.")
+        );
+        assert_eq!(
+            def(&defs, LIST_TICKETS)["inputSchema"]["properties"]["project"],
+            json!({"type": "string", "minLength": 1, "maxLength": 64, "description": "Kun tickets i dette projekt (id); \"none\" = tickets uden projekt"})
+        );
+        let spawn = def(&defs, SPAWN_AGENT);
+        assert_eq!(
+            spawn["inputSchema"]["properties"]["project"]["oneOf"],
+            schema("")["oneOf"]
+        );
+        assert!(spawn["description"]
+            .as_str()
+            .unwrap()
+            .contains("En arbejdsplads kræver et projekt"));
+        for t in [ASSIGN_TICKET, HANDOFF_TICKET] {
+            assert_eq!(
+                def(&defs, t)["inputSchema"]["properties"]["project"],
+                schema(PROJECT_ON_ASSIGN),
+                "{t}"
+            );
+            assert!(PROJECT_ON_ASSIGN.starts_with("Kun når ticketen mangler et projekt"));
+        }
+        assert_eq!(
+            def(&defs, LIST_PROJECTS),
+            &json!({
+                "name": "mira_list_projects",
+                "description": "Lister projekterne (mapperne under projektroden) med sti og antal arbejdsagenter i hvert. Brug id'et som project på tickets og ved start af agenter.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+                "annotations": annotations(true, true)
+            })
+        );
+        assert!(def(&defs, LIST_AGENTS)["description"]
+            .as_str()
+            .unwrap()
+            .contains("projekt"));
+        assert!(def(&defs, GET_WORKSPACE_RULES)["description"]
+            .as_str()
+            .unwrap()
+            .contains("projektroden og projektlisten"));
     }
 }

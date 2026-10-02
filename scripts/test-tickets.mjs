@@ -87,8 +87,12 @@ const tickets = [
 eq(k.reviewsFor(tickets, "R1").map((t) => t.id), ["a", "d"], "reviewsFor");
 
 // isCoordinationTask
-eq(k.isCoordinationTask({ seatKind: "staff" }), true, "staff");
-eq(k.isCoordinationTask({ seatKind: "work" }), false, "work");
+eq(k.isCoordinationTask({ seatKind: "staff", roles: ["coordinator"] }), true, "staff");
+eq(k.isCoordinationTask({ seatKind: "staff", roles: ["reviewer", "coder"] }), true, "staff + work role");
+eq(k.isCoordinationTask({ seatKind: "work", roles: ["coder"] }), false, "work");
+eq(k.isCoordinationTask({ seatKind: "work", roles: ["reviewer", "debugger"] }), false, "work + work role");
+eq(k.isCoordinationTask({ seatKind: "work", roles: ["reviewer"] }), true, "work, no work role");
+eq(k.isCoordinationTask({ seatKind: "work", roles: [] }), true, "work, no roles");
 eq(k.isCoordinationTask(null), false, "no agent");
 
 // switchBlocked
@@ -100,5 +104,18 @@ for (const [status, cur, want] of [
   ["exited", null, "Agenten kører ikke"],
 ])
   eq(k.switchBlocked({ status: { kind: status }, currentTicketId: cur }), want, `switchBlocked ${status} ${cur}`);
+
+// canHandOver (step 5c): "Tildel…" on a ticket in progress.
+for (const [state, assignee, want] of [
+  ["inProgress", "A", true],
+  ["inProgress", null, false],
+  ["assigned", "A", false],
+  ["review", "A", false],
+  ["done", "A", false],
+  ["done", null, false],
+  ["backlog", null, false],
+  ["rejected", null, false],
+])
+  eq(k.canHandOver(ticket({ state, assigneeAgentId: assignee })), want, `canHandOver ${state} ${assignee}`);
 
 console.log(`tickets.ts: ${n} cases ok`);

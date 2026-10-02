@@ -87,7 +87,7 @@ pub enum ProfileKind {
     Custom,
 }
 
-/// One profile; file `<agents_root>/.mira-bots/profiles/<id>.json` (C5.2), camelCase.
+/// One profile; file `<projects root>/.mira-bots/profiles/<id>.json` (C5.2), camelCase.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProfile {
@@ -326,8 +326,9 @@ impl AgentProfile {
     }
 
     /// `permissions.deny` (C5.9): the role-bound tools the roles do not allow plus `toolDeny`,
-    /// each as `mcp__mira-bots__<tool>` and sorted, then `extraDeny` as given. Empty for a
-    /// profile with every role and no narrowing.
+    /// each as `mcp__mira-bots__<tool>` and sorted, then [`FILE_EDIT_TOOLS`] when the profile
+    /// has no work role (5c C.2), then `extraDeny` as given. Empty for a profile with every role
+    /// and no narrowing.
     pub fn deny_rules(&self) -> Vec<String> {
         let allowed = mira_mcp::tools::tools_for_roles(&roles::wire_names(&self.roles));
         let mut tools: Vec<String> = mira_mcp::tools::ROLE_BOUND_TOOLS
@@ -339,12 +340,26 @@ impl AgentProfile {
             .collect();
         tools.sort();
         tools.dedup();
+        if !roles::has_work_role(&self.roles) {
+            tools.extend(FILE_EDIT_TOOLS.iter().map(|t| t.to_string()));
+        }
         for r in &self.extra_deny {
             if !tools.contains(r) {
                 tools.push(r.clone());
             }
         }
         tools
+    }
+
+    /// A staff seat needs a profile with a staff role (5c B); a work seat takes any profile.
+    pub fn check_seat(&self, seat: SeatKind) -> Result<(), String> {
+        if seat == SeatKind::Staff && !roles::has_staff_role(&self.roles) {
+            return Err(format!(
+                "Profilen «{}» har ingen stabsrolle (reviewer, koordinator eller planlægger) og kan ikke stå på en stabsplads",
+                self.name
+            ));
+        }
+        Ok(())
     }
 
     /// The snapshot an agent is spawned with: overrides win over the profile's model/effort.
@@ -375,6 +390,10 @@ pub fn validate_overrides(o: SpawnOverrides) -> Result<SpawnOverrides, ProfileEr
     })
 }
 
+/// File-editing tools denied to a profile without a work role (coder, researcher, debugger):
+/// staff agents distribute work instead of doing it (5c C.2).
+pub const FILE_EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
 /// Reviewer: read-only git in other folders (research5 Q6) …
 const REVIEWER_ALLOW: [&str; 4] = [
     "Bash(git -C * diff *)",
@@ -400,7 +419,8 @@ pub fn builtin_profile(id: &str) -> Option<AgentProfile> {
         "researcher" => ("Researcher", vec![Role::Researcher], SeatKind::Work),
         "reviewer" => ("Reviewer", vec![Role::Reviewer], SeatKind::Staff),
         "coordinator" => ("Koordinator", vec![Role::Coordinator], SeatKind::Staff),
-        "planner" => ("Planlægger", vec![Role::Planner], SeatKind::Work),
+        // A staff role only (5c batch 2): the planner stands on a staff seat by default.
+        "planner" => ("Planlægger", vec![Role::Planner], SeatKind::Staff),
         "debugger" => ("Debugger", vec![Role::Debugger], SeatKind::Work),
         "specialist" => (
             "Specialist (alle roller)",
@@ -501,7 +521,8 @@ mod tests {
         let seat = |id: &str| builtin_profile(id).unwrap().default_seat;
         assert_eq!(seat("reviewer"), SeatKind::Staff);
         assert_eq!(seat("coordinator"), SeatKind::Staff);
-        for id in ["coder", "researcher", "planner", "debugger", "specialist"] {
+        assert_eq!(seat("planner"), SeatKind::Staff);
+        for id in ["coder", "researcher", "debugger", "specialist"] {
             assert_eq!(seat(id), SeatKind::Work, "{id}");
         }
         let names: Vec<String> = all.iter().map(|p| p.name.clone()).collect();
@@ -712,7 +733,6 @@ mod tests {
     fn deny_rules_for_each_builtin() {
         let coordinator_set = mira(&[
             "mira_assign_ticket",
-            "mira_list_agents",
             "mira_list_profiles",
             "mira_spawn_agent",
             "mira_unassign_ticket",
@@ -720,16 +740,24 @@ mod tests {
         let all_bound = mira(&[
             "mira_approve_ticket",
             "mira_assign_ticket",
-            "mira_list_agents",
             "mira_list_profiles",
             "mira_reject_ticket",
             "mira_spawn_agent",
             "mira_unassign_ticket",
         ]);
-        for id in ["coder", "researcher", "planner", "debugger"] {
+        let edit: Vec<String> = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        for id in ["coder", "researcher", "debugger"] {
             assert_eq!(builtin_profile(id).unwrap().deny_rules(), all_bound, "{id}");
         }
+        // Without a work role: the four file-editing tools after the MCP tools.
+        let mut want = all_bound.clone();
+        want.extend(edit.iter().cloned());
+        assert_eq!(builtin_profile("planner").unwrap().deny_rules(), want);
         let mut want = coordinator_set.clone();
+        want.extend(edit.iter().cloned());
         want.extend([
             "Bash(git commit *)".to_string(),
             "Bash(git push *)".to_string(),
@@ -737,14 +765,37 @@ mod tests {
             "Bash(git -C * push *)".to_string(),
         ]);
         assert_eq!(builtin_profile("reviewer").unwrap().deny_rules(), want);
-        assert_eq!(
-            builtin_profile("coordinator").unwrap().deny_rules(),
-            mira(&["mira_approve_ticket", "mira_reject_ticket"])
-        );
+        let mut want = mira(&["mira_approve_ticket", "mira_reject_ticket"]);
+        want.extend(edit.iter().cloned());
+        assert_eq!(builtin_profile("coordinator").unwrap().deny_rules(), want);
         assert!(builtin_profile("specialist")
             .unwrap()
             .deny_rules()
             .is_empty());
+        for p in builtin_profiles() {
+            let denies_edit = p.deny_rules().iter().any(|r| r == "Edit");
+            let staff_only = ["reviewer", "coordinator", "planner"].contains(&p.id.as_str());
+            assert_eq!(denies_edit, staff_only, "{}", p.id);
+        }
+        // A custom profile without a work role (and without roles) gets them too, before
+        // extraDeny, without duplicates.
+        let p = AgentProfile {
+            roles: vec![],
+            tool_deny: vec![],
+            extra_deny: vec!["Write".into(), "Bash(rm *)".into()],
+            ..custom()
+        };
+        let mut want = all_bound.clone();
+        want.extend(edit.iter().cloned());
+        want.push("Bash(rm *)".into());
+        assert_eq!(p.deny_rules(), want);
+        // One work role is enough.
+        let p = AgentProfile {
+            roles: vec![Role::Coordinator, Role::Researcher],
+            tool_deny: vec![],
+            ..custom()
+        };
+        assert!(!p.deny_rules().iter().any(|r| edit.contains(r)));
         // toolDeny is added (sorted in), extraDeny follows.
         let p = AgentProfile {
             roles: Role::ALL.to_vec(),
@@ -769,6 +820,41 @@ mod tests {
             builtin_profile("coder").unwrap().allow_rules(),
             ["mcp__mira-bots__*"]
         );
+    }
+
+    #[test]
+    fn check_seat_needs_staff_role_on_staff_seat() {
+        for p in builtin_profiles() {
+            assert_eq!(p.check_seat(SeatKind::Work), Ok(()), "{}", p.id);
+        }
+        for id in ["reviewer", "coordinator", "planner", "specialist"] {
+            let p = builtin_profile(id).unwrap();
+            assert_eq!(p.check_seat(SeatKind::Staff), Ok(()), "{id}");
+        }
+        for (id, name) in [
+            ("coder", "Koder"),
+            ("researcher", "Researcher"),
+            ("debugger", "Debugger"),
+        ] {
+            assert_eq!(
+                builtin_profile(id).unwrap().check_seat(SeatKind::Staff),
+                Err(format!(
+                    "Profilen «{name}» har ingen stabsrolle (reviewer, koordinator eller planlægger) og kan ikke stå på en stabsplads"
+                )),
+                "{id}"
+            );
+        }
+        // A custom profile with defaultSeat staff but no staff role is refused the same way.
+        let p = AgentProfile {
+            name: "Egen".into(),
+            roles: vec![],
+            default_seat: SeatKind::Staff,
+            ..custom()
+        };
+        assert!(p
+            .check_seat(SeatKind::Staff)
+            .unwrap_err()
+            .contains("«Egen»"));
     }
 
     #[test]

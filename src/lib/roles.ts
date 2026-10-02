@@ -21,6 +21,34 @@ export const ROLE_LABEL: Record<Role, string> = {
   debugger: "Debugger",
 };
 
+/** Staff roles (mirrors `Role::is_staff`): a staff seat needs at least one of them. */
+export const STAFF_ROLES: readonly Role[] = ["reviewer", "coordinator", "planner"];
+
+/** Whether the roles include a staff role (mirrors `has_staff_role` in Rust). */
+export function hasStaffRole(roles: readonly Role[]): boolean {
+  return roles.some((r) => STAFF_ROLES.includes(r));
+}
+
+/** Work roles (mirrors `Role::is_work`): without one a profile may not edit files and gets
+ * every ticket as a coordination task, also on a work seat (review 5c W1). */
+export const WORK_ROLES: readonly Role[] = ["coder", "researcher", "debugger"];
+
+/** Whether the roles include a work role (mirrors `has_work_role` in Rust). */
+export function hasWorkRole(roles: readonly Role[]): boolean {
+  return roles.some((r) => WORK_ROLES.includes(r));
+}
+
+/** Staff roles in the order a staff seat prefers them: the coordinator first (it distributes
+ * the work), then reviewer and planner. */
+export const STAFF_PREFERENCE: readonly Role[] = ["coordinator", "reviewer", "planner"];
+
+/** Rank of the best staff role in `roles` by `STAFF_PREFERENCE` (0 = coordinator); roles
+ * without a staff role rank last (`STAFF_PREFERENCE.length`). */
+export function staffRank(roles: readonly Role[]): number {
+  const ranks = roles.map((r) => STAFF_PREFERENCE.indexOf(r)).filter((i) => i >= 0);
+  return ranks.length === 0 ? STAFF_PREFERENCE.length : Math.min(...ranks);
+}
+
 /** Figure (file and generator) name of a role: the coordinator's is `koord`. */
 export function figureNameFor(role: Role): BotCoreRole {
   return role === "coordinator" ? "koord" : role;

@@ -1,4 +1,4 @@
-//! `ProfileStore`: one JSON file per profile in `<agents_root>/.mira-bots/profiles/<id>.json`
+//! `ProfileStore`: one JSON file per profile in `<projects root>/.mira-bots/profiles/<id>.json`
 //! (pretty, UTF-8, written atomically). Missing built-in profiles are generated on load.
 
 use std::collections::BTreeMap;
@@ -9,11 +9,51 @@ use super::model::{builtin_profile, is_builtin_id, kind_for_id, AgentProfile, Pr
 use crate::config::{BUILTIN_PROFILE_IDS, PROFILES_DIR};
 use crate::hooks::settings::write_atomic;
 
-/// `<agents_root>/.mira-bots/profiles` (joined component by component).
-pub fn profiles_dir(agents_root: &Path) -> PathBuf {
+/// `<projects root>/.mira-bots/profiles` (joined component by component).
+pub fn profiles_dir(root: &Path) -> PathBuf {
     PROFILES_DIR
         .split('/')
-        .fold(agents_root.to_path_buf(), |p, c| p.join(c))
+        .fold(root.to_path_buf(), |p, c| p.join(c))
+}
+
+fn is_json(p: &Path) -> bool {
+    p.is_file()
+        && p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+/// Copies the step 1–5 profiles (`<home>/mira-bots/agents/.mira-bots/profiles/*.json`) to the
+/// projects root's profile folder the first time (plan4b A.1): only when `target_dir` holds no
+/// `*.json` yet. Never moves or deletes anything. Returns the number of files copied (0 when the
+/// target already has profiles or the legacy folder does not exist).
+// TODO(windows-verify): after the upgrade the seven profiles are copied from agents\ to
+// projects\.mira-bots\profiles\ and Diagnostik shows "Profiler kopieret ved start: 7" (D.77).
+pub fn migrate_legacy_profiles(legacy_dir: &Path, target_dir: &Path) -> std::io::Result<usize> {
+    if let Ok(entries) = fs::read_dir(target_dir) {
+        if entries.filter_map(Result::ok).any(|e| is_json(&e.path())) {
+            return Ok(0);
+        }
+    }
+    let entries = match fs::read_dir(legacy_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let sources: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| is_json(p))
+        .collect();
+    if sources.is_empty() {
+        return Ok(0);
+    }
+    fs::create_dir_all(target_dir)?;
+    for src in &sources {
+        if let Some(name) = src.file_name() {
+            fs::copy(src, target_dir.join(name))?;
+        }
+    }
+    Ok(sources.len())
 }
 
 pub struct ProfileStore {
@@ -47,7 +87,7 @@ impl ProfileStore {
     /// validated is renamed to `<name>.broken-<now>` and counted in the warning; missing built-in
     /// profiles are generated and written. A file with a built-in id always gets `kind: builtin`.
     /// Never fails: without a usable folder the built-ins live in memory only (warning set).
-    // TODO(windows-verify): on first start %USERPROFILE%\mira-bots\agents\.mira-bots\profiles\
+    // TODO(windows-verify): on first start %USERPROFILE%\mira-bots\projects\.mira-bots\profiles\
     // holds the seven built-in profiles (plan5 D.49).
     pub fn load(dir: PathBuf, now: u64) -> Self {
         let mut store = Self {
@@ -234,11 +274,43 @@ mod tests {
     }
 
     #[test]
-    fn profiles_dir_is_under_the_agents_root() {
+    fn profiles_dir_is_under_the_projects_root() {
         assert_eq!(
-            profiles_dir(Path::new("/h/mira-bots/agents")),
-            Path::new("/h/mira-bots/agents/.mira-bots/profiles")
+            profiles_dir(Path::new("/h/mira-bots/projects")),
+            Path::new("/h/mira-bots/projects/.mira-bots/profiles")
         );
+    }
+
+    #[test]
+    fn legacy_profiles_are_copied_once_into_an_empty_target() {
+        let base = std::env::temp_dir().join(format!("mira-migrate-{}", uuid::Uuid::new_v4()));
+        let legacy = profiles_dir(&base.join("agents"));
+        let target = profiles_dir(&base.join("projects"));
+        // Missing legacy folder: nothing to do.
+        assert_eq!(migrate_legacy_profiles(&legacy, &target).unwrap(), 0);
+        assert!(!target.exists());
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("coder.json"), "{\"id\":\"coder\"}").unwrap();
+        fs::write(legacy.join("mine.json"), "{\"id\":\"mine\"}").unwrap();
+        fs::write(legacy.join("notes.txt"), "x").unwrap();
+        assert_eq!(migrate_legacy_profiles(&legacy, &target).unwrap(), 2);
+        let mut names: Vec<_> = fs::read_dir(&target)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["coder.json", "mine.json"]);
+        assert_eq!(
+            fs::read_to_string(target.join("mine.json")).unwrap(),
+            "{\"id\":\"mine\"}"
+        );
+        // The source is untouched.
+        assert!(legacy.join("coder.json").is_file() && legacy.join("mine.json").is_file());
+        // A target with profiles is left alone.
+        fs::write(legacy.join("extra.json"), "{}").unwrap();
+        assert_eq!(migrate_legacy_profiles(&legacy, &target).unwrap(), 0);
+        assert!(!target.join("extra.json").exists());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

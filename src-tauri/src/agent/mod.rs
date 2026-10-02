@@ -13,13 +13,11 @@ pub use manager::{
 };
 pub use roles::Role;
 
-use crate::config::{MAX_STAFF_AGENTS, MAX_WORK_AGENTS};
-
 /// Text of [`AgentError::LimitReached`].
-fn limit_text(seat: &SeatKind) -> String {
+fn limit_text(seat: &SeatKind, max: &usize) -> String {
     match seat {
-        SeatKind::Work => format!("Loft på {MAX_WORK_AGENTS} arbejdspladser nået"),
-        SeatKind::Staff => format!("Loft på {MAX_STAFF_AGENTS} stabspladser nået"),
+        SeatKind::Work => format!("Loft på {max} arbejdspladser nået"),
+        SeatKind::Staff => format!("Loft på {max} stabspladser nået"),
     }
 }
 
@@ -27,9 +25,10 @@ fn limit_text(seat: &SeatKind) -> String {
 /// them straight to the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    /// All seats of that kind are taken by non-exited agents.
-    #[error("{}", limit_text(.0))]
-    LimitReached(SeatKind),
+    /// All `max` seats of that kind are taken by non-exited agents (`max` from the workspace
+    /// rules, plan4b A.4).
+    #[error("{}", limit_text(.seat, .max))]
+    LimitReached { seat: SeatKind, max: usize },
     #[error("Mappen findes ikke eller er ikke en mappe")]
     InvalidCwd,
     #[error("Fandt ikke claude — installer Claude Code eller sæt MIRA_CLAUDE_PATH")]
@@ -57,6 +56,18 @@ pub enum AgentError {
     Pty(String),
     #[error("I/O-fejl: {0}")]
     Io(#[from] std::io::Error),
+    // ---- step 4b (C4b.3) ----
+    /// "Flyt til projekt…" while the agent still has queued tickets (without `force`).
+    #[error("Agenten har {0} tickets i kø — flyt dem først, eller bekræft at de lægges i Backlog")]
+    QueueNotEmpty(usize),
+    /// `maxAgentsPerProject` live work agents already run in the project.
+    #[error("Loft på {max} agenter i projektet «{project}» nået")]
+    ProjectLimit { project: String, max: usize },
+    /// "Flyt til projekt…" to the agent's own project.
+    #[error("Agenten står allerede i projekt «{0}»")]
+    SameProject(String),
+    #[error("Stabsagenter står i projektroden og kan ikke flyttes")]
+    StaffHasNoProject,
 }
 
 impl From<AgentError> for String {

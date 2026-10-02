@@ -37,6 +37,7 @@ import {
   type TermMode,
 } from "../../lib/office";
 import { readLocal, writeLocal } from "../../lib/persist";
+import { assignmentIssue, coordinatorHint, projectIdOf } from "../../lib/projects";
 import { assignSeats, STAFF_SEATS, WORK_SEATS } from "../../lib/seats";
 import { isExited } from "../../lib/status";
 import {
@@ -47,14 +48,18 @@ import {
   parseWorkplaceTab,
 } from "../../lib/tickets";
 import type {
+  AgentInfo,
+  ProjectRef,
   SeatKind,
   TicketSummary,
   WorkplaceSelection,
   WorkplaceTab,
 } from "../../lib/types";
-import { useStore } from "../../state/store";
+import { useRefreshProjects, useStore } from "../../state/store";
+import MoveAgentDialog from "./MoveAgentDialog";
 import OfficeDefs from "./office/OfficeDefs";
 import Splitter from "./office/Splitter";
+import ProjectPrompt, { WrongProjectDialog } from "./ProjectPrompt";
 import SeatGrid, { SeatOverflow } from "./SeatGrid";
 import Sidebar from "./Sidebar";
 import SpawnDialog from "./SpawnDialog";
@@ -78,6 +83,21 @@ export default function Workplace() {
     null,
   );
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
+  // Step 4b: an assignment that needs a project ("Hvilket projekt?") or meets another project
+  // (explanation + "Flyt agenten til «p»"); opened after a drop or from "Tildel…", never during
+  // the drag itself.
+  const [assignFlow, setAssignFlow] = useState<
+    | { kind: "prompt"; ticket: TicketSummary; agentId: string }
+    | { kind: "wrong"; ticket: TicketSummary; agentId: string; ticketProject: string }
+    | null
+  >(null);
+  // "Flyt agenten til «p»", then the assignment (`then`) once the agent stands in p.
+  const [moveFlow, setMoveFlow] = useState<{
+    agentId: string;
+    preselect: ProjectRef;
+    then: (moved: AgentInfo) => Promise<unknown>;
+  } | null>(null);
+  const refreshProjects = useRefreshProjects();
   // Office look: detail level, terminal mode and floor height are remembered (persist.ts).
   const [detail, setDetail] = useState<OfficeDetail>(() => parseDetail(readLocal(STORAGE_KEYS.detail)));
   const [termMode, setTermMode] = useState<TermMode>(() =>
@@ -155,12 +175,43 @@ export default function Workplace() {
     setTermMode((m) => (m === "min" ? "normal" : m));
   }, []);
 
+  // Latest spawn blocks, read by `apply` below (its effect must not re-run when they change).
+  const spawnBlockedRef = useRef<{ work: string | null; staff: string | null }>({
+    work: null,
+    staff: null,
+  });
+
+  // N7: a spawn request that arrived before this window loaded the app info (a new window):
+  // applied once the info is there, so the limits are known.
+  const appInfoLoadedRef = useRef(false);
+  appInfoLoadedRef.current = appInfo !== null;
+  const pendingSpawnRef = useRef<"work" | "staff" | null>(null);
+  const openSpawn = useCallback(
+    (seat: "work" | "staff") => {
+      const blocked = spawnBlockedRef.current[seat];
+      if (blocked !== null) dispatch({ type: "error/set", error: blocked });
+      else setSpawnFor({ seatKind: seat, ticket: null });
+    },
+    [dispatch],
+  );
+  useEffect(() => {
+    if (appInfo === null || pendingSpawnRef.current === null) return;
+    const seat = pendingSpawnRef.current;
+    pendingSpawnRef.current = null;
+    openSpawn(seat);
+  }, [appInfo, openSpawn]);
+
   // Selection handed over by the island: stored for a new window, pushed to an existing one.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     const apply = (sel: WorkplaceSelection) => {
       if (sel.agentId !== null) selectAgent(sel.agentId);
+      // The island's "+ Ny agent": open the spawn dialog, unless spawning is blocked right now.
+      if (sel.spawn === "work" || sel.spawn === "staff") {
+        if (appInfoLoadedRef.current) openSpawn(sel.spawn);
+        else pendingSpawnRef.current = sel.spawn;
+      }
       const tab = parseWorkplaceTab(sel.tab);
       if (tab !== null) setRequestedTab((prev) => ({ tab, nonce: (prev?.nonce ?? 0) + 1 }));
     };
@@ -188,7 +239,7 @@ export default function Workplace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [dispatch, selectAgent]);
+  }, [dispatch, selectAgent, openSpawn]);
 
   // A selected agent that disappears (removed) simply shows no panel; ids are never reused.
   const selected = agents.find((a) => a.id === selectedId) ?? null;
@@ -208,13 +259,46 @@ export default function Workplace() {
   const spawnBlockedWork = spawnDisabled ?? (liveWork >= maxWork ? limitReached : null);
   const spawnBlockedStaff = spawnDisabled ?? (liveStaff >= maxStaff ? limitReached : null);
 
+  spawnBlockedRef.current = { work: spawnBlockedWork, staff: spawnBlockedStaff };
+
+  const reportError = useCallback(
+    (err: unknown) => dispatch({ type: "error/set", error: errorMessage(err) }),
+    [dispatch],
+  );
+
+  // The project rule before an assignment (plan4b A.2): the backend checks it again.
+  // TODO(windows-verify): a seat in another project shows "Andet projekt: kan ikke få ticketen"
+  // while dragging and the drop opens the explanation; "Tildel…" opens the same dialog; a ticket
+  // without a project on a work agent asks "Hvilket projekt?"; a staff seat takes it directly
+  // (plan4b D.82).
+  const assignTo = useCallback(
+    (ticket: TicketSummary, agent: AgentInfo) => {
+      const issue = assignmentIssue(ticket, agent);
+      if (issue === null) {
+        assignTicket(ticket.id, agent.id).catch(reportError);
+      } else if (issue.kind === "needsProject") {
+        setAssignFlow({ kind: "prompt", ticket, agentId: agent.id });
+      } else {
+        setAssignFlow({ kind: "wrong", ticket, agentId: agent.id, ticketProject: issue.ticketProject });
+      }
+    },
+    [reportError],
+  );
+
   const ticketActions = useMemo<TicketActions>(
     () => ({
       selectAgent,
       spawnWithTicket: (seatKind, ticket) => setSpawnFor({ seatKind, ticket }),
       spawnBlocked: { work: spawnBlockedWork, staff: spawnBlockedStaff },
+      assignTo,
     }),
-    [selectAgent, spawnBlockedWork, spawnBlockedStaff],
+    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo],
+  );
+  // "n agenter, ingen koordinator" per work agent's project (the Seat badge).
+  const hintFor = useCallback(
+    (a: AgentInfo) =>
+      a.seatKind === "work" && a.project !== null ? coordinatorHint(agents, a.project) : null,
+    [agents],
   );
 
   // --- drag-and-drop: backlog notes (sidebar) onto seats ---------------------------------------
@@ -272,9 +356,10 @@ export default function Workplace() {
     const ticket = ticketsById.get(ticketId);
     if (ticket === undefined || !canDrag(ticket)) return;
     if (target.kind === "agent") {
-      assignTicket(ticketId, target.agentId).catch((err: unknown) =>
-        dispatch({ type: "error/set", error: errorMessage(err) }),
-      );
+      // Step 4b: the project check runs after the drop (dialogs via `assignFlow`).
+      const agent = agents.find((a) => a.id === target.agentId);
+      if (agent !== undefined) assignTo(ticket, agent);
+      else assignTicket(ticketId, target.agentId).catch(reportError);
     } else {
       setSpawnFor({ seatKind: target.seatKind, ticket });
     }
@@ -374,6 +459,8 @@ export default function Workplace() {
                   limits={{ work: liveWork >= maxWork, staff: liveStaff >= maxStaff }}
                   tickets={ticketsById}
                   dragging={activeTicket !== null}
+                  draggedTicket={activeTicket}
+                  hintFor={hintFor}
                   onSelect={selectAgent}
                   onSpawn={(seatKind) => setSpawnFor({ seatKind, ticket: null })}
                   detail={detail}
@@ -423,14 +510,77 @@ export default function Workplace() {
             seatKind={spawnFor.seatKind}
             ticket={spawnFor.ticket}
             theme={theme}
-            agentsRoot={appInfo?.agentsRoot ?? null}
+            projectsRoot={appInfo?.projectsRoot ?? null}
             onClose={() => setSpawnFor(null)}
             onSpawned={(id) => {
               setSpawnFor(null);
               selectAgent(id);
+              void refreshProjects();
             }}
           />
         )}
+        {assignFlow !== null &&
+          (() => {
+            const agent = agents.find((a) => a.id === assignFlow.agentId) ?? null;
+            const { ticket } = assignFlow;
+            if (assignFlow.kind === "prompt") {
+              return (
+                <ProjectPrompt
+                  ticket={ticket}
+                  agent={agent}
+                  onClose={() => setAssignFlow(null)}
+                  onPick={async (p) => {
+                    await assignTicket(ticket.id, assignFlow.agentId, p);
+                    setAssignFlow(null);
+                    void refreshProjects();
+                  }}
+                  onMove={(p) => {
+                    setAssignFlow(null);
+                    setMoveFlow({
+                      agentId: assignFlow.agentId,
+                      preselect: p,
+                      then: (moved) => assignTicket(ticket.id, moved.id, p),
+                    });
+                  }}
+                />
+              );
+            }
+            if (agent === null) return null;
+            const ticketProject = assignFlow.ticketProject;
+            return (
+              <WrongProjectDialog
+                ticket={ticket}
+                agent={agent}
+                ticketProject={ticketProject}
+                onClose={() => setAssignFlow(null)}
+                onMove={() => {
+                  setAssignFlow(null);
+                  setMoveFlow({
+                    agentId: agent.id,
+                    // An existing project by id, a project still to be created by name.
+                    preselect: projectIdOf(ticket.project) ?? { new: ticketProject },
+                    then: (moved) => assignTicket(ticket.id, moved.id),
+                  });
+                }}
+              />
+            );
+          })()}
+        {moveFlow !== null &&
+          (() => {
+            const agent = agents.find((a) => a.id === moveFlow.agentId);
+            if (agent === undefined) return null;
+            return (
+              <MoveAgentDialog
+                agent={agent}
+                preselect={moveFlow.preselect}
+                onClose={() => setMoveFlow(null)}
+                onMoved={(moved) => {
+                  setMoveFlow(null);
+                  moveFlow.then(moved).catch(reportError);
+                }}
+              />
+            );
+          })()}
       </div>
     </TicketActionsContext.Provider>
   );

@@ -376,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn version_1_file_without_project_loads_with_none() {
+        // A step 1–5 `tickets.json`: no `project` on any ticket (plan4b punkt 6).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        for t in v["tickets"].as_array_mut().unwrap() {
+            assert!(t.as_object_mut().unwrap().remove("project").is_some());
+        }
+        assert_eq!(v["schemaVersion"], json!(1));
+        let doc = migrate(v).unwrap();
+        assert!(!doc.tickets.is_empty());
+        assert!(doc.tickets.iter().all(|t| t.project.is_none()));
+        assert_eq!(doc, sample_doc());
+    }
+
+    #[test]
     fn unreadable_path_is_an_error_and_never_overwritten() {
         // A directory where the file should be: reading fails with something other than NotFound.
         let dir = TempDir::new();

@@ -69,6 +69,27 @@ impl Role {
     pub fn parse(s: &str) -> Option<Role> {
         Role::ALL.into_iter().find(|r| r.as_str() == s)
     }
+
+    /// A staff role (reviewer, coordinator, planner): required to sit on a staff seat (5c B).
+    pub fn is_staff(self) -> bool {
+        matches!(self, Role::Reviewer | Role::Coordinator | Role::Planner)
+    }
+
+    /// A work role (coder, researcher, debugger): without one, a profile may not edit files
+    /// (5c C.2).
+    pub fn is_work(self) -> bool {
+        matches!(self, Role::Coder | Role::Researcher | Role::Debugger)
+    }
+}
+
+/// At least one staff role ([`Role::is_staff`]): the profile may sit on a staff seat.
+pub fn has_staff_role(roles: &[Role]) -> bool {
+    roles.iter().any(|r| r.is_staff())
+}
+
+/// At least one work role ([`Role::is_work`]): the profile may edit files.
+pub fn has_work_role(roles: &[Role]) -> bool {
+    roles.iter().any(|r| r.is_work())
 }
 
 /// Roles from a comma-separated list (`"coder, reviewer"`): trimmed, unknown names ignored,
@@ -166,6 +187,37 @@ mod tests {
         assert_eq!(join_list(&[]), "");
         assert_eq!(parse_list(&join_list(&Role::ALL)), Role::ALL);
         assert_eq!(wire_names(&[Role::Coordinator]), ["coordinator"]);
+    }
+
+    #[test]
+    fn staff_and_work_roles() {
+        let staff: Vec<Role> = Role::ALL.into_iter().filter(|r| r.is_staff()).collect();
+        assert_eq!(staff, [Role::Reviewer, Role::Coordinator, Role::Planner]);
+        let work: Vec<Role> = Role::ALL.into_iter().filter(|r| r.is_work()).collect();
+        assert_eq!(work, [Role::Coder, Role::Researcher, Role::Debugger]);
+        assert!(Role::ALL.into_iter().all(|r| r.is_staff() != r.is_work()));
+
+        assert!(!has_staff_role(&[]));
+        assert!(!has_staff_role(&[Role::Coder]));
+        assert!(!has_staff_role(&[
+            Role::Coder,
+            Role::Researcher,
+            Role::Debugger
+        ]));
+        assert!(has_staff_role(&[Role::Reviewer]));
+        assert!(has_staff_role(&[Role::Coordinator]));
+        assert!(has_staff_role(&[Role::Planner]));
+        assert!(has_staff_role(&[Role::Coder, Role::Reviewer]));
+        assert!(has_staff_role(&Role::ALL));
+
+        assert!(!has_work_role(&[]));
+        assert!(!has_work_role(&[
+            Role::Reviewer,
+            Role::Coordinator,
+            Role::Planner
+        ]));
+        assert!(has_work_role(&[Role::Debugger]));
+        assert!(has_work_role(&[Role::Coordinator, Role::Researcher]));
     }
 
     #[test]

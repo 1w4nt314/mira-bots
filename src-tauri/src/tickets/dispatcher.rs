@@ -18,14 +18,15 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use super::model::{ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState};
-use super::prompt::{self, ReviewSender};
+use super::model::{
+    ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState, WorkspaceRules,
+};
+use super::prompt::{self, ReviewSender, TicketDelivery};
 use super::service::TicketService;
-use crate::agent::now_ms;
+use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
-    AUTO_REVIEW_ON_STOP, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
-    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
-    TURN_FAILED_TEXT,
+    CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS, ENTER_DELAY_MS,
+    NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -42,8 +43,9 @@ pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
 pub const SUBMISSION_REQUESTED_NOTE: &str = "bedt om aflevering";
 
 /// No ticket is typed into a terminal the user typed into less than this long ago (their
-/// half-written prompt would be merged with the ticket line); the dispatch waits instead.
-pub const USER_INPUT_GRACE_MS: u64 = 5000;
+/// half-written prompt would be merged with the ticket line); the dispatch waits instead. The
+/// effective value is the workspace rule `userInputGraceMs` ([`TicketsHost::rules`]).
+pub use crate::config::USER_INPUT_GRACE_MS;
 
 /// What the dispatcher needs to know about an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +59,12 @@ pub struct AgentSnapshot {
     /// When the user last typed into the terminal ([`Timers::now_ms`] clock); see
     /// [`USER_INPUT_GRACE_MS`].
     pub last_user_input_at: Option<u64>,
+    /// The agent's seat and roles: a ticket for an agent on a staff seat is delivered as a
+    /// coordination task (5c C.1, [`TicketDelivery::for_agent`]).
+    pub seat_kind: SeatKind,
+    pub roles: Vec<Role>,
+    /// The agent's project (plan4b A.1); `None` on a staff seat.
+    pub project: Option<String>,
 }
 
 /// Access to the agents (implemented by `ManagerPort` over `Arc<Mutex<AgentManager>>`; each call
@@ -67,6 +75,11 @@ pub trait AgentPort: Send {
     fn write_input(&self, id: &str, bytes: &[u8]) -> Result<(), String>;
     /// Sets the agent's detail text; `false` when unknown or exited.
     fn set_detail(&self, id: &str, detail: Option<String>) -> bool;
+    /// Names of the other live work agents in `id`'s project (plan4b A.5). Empty by default
+    /// (test ports without projects).
+    fn peers_in_project(&self, _id: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Access to the shared ticket service (implemented for the app's `TicketsCtx`).
@@ -83,6 +96,15 @@ pub trait TicketsHost: Send {
     /// Called when an agent becomes idle and after an automatic move to review. No-op by
     /// default (tests that do not route).
     fn reroute_reviews(&self) {}
+    /// The effective workspace rules (plan4b A.4; `TicketsCtx` reads the workspace file).
+    /// The defaults from `config.rs` unless overridden.
+    fn rules(&self) -> WorkspaceRules {
+        WorkspaceRules::defaults()
+    }
+    /// The project ids under the projects root (plan4b A.6). Empty by default.
+    fn project_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Schedules `msg` to be fed back into the dispatcher after `delay_ms`, and tells the time the
@@ -132,6 +154,15 @@ pub enum DispatchMsg {
     Redispatch { ticket_id: String },
     /// "Bed om aflevering" from the UI: type the nudge line into the in-progress ticket's agent.
     RequestSubmission { ticket_id: String },
+    /// Review 5c W4: someone else (the user) took `agent_id`'s ticket in progress from it, handed
+    /// to `to_name` (`None`: back to the backlog). When the agent is idle it gets
+    /// [`prompt::handed_over_line`] before its next delivery. Never sent when the agent handed
+    /// the ticket on itself.
+    HandedOver {
+        agent_id: String,
+        ticket_id: String,
+        to_name: Option<String>,
+    },
     Timer {
         agent_id: String,
         token: u64,
@@ -177,12 +208,18 @@ pub enum DeliveryKind {
 }
 
 impl DeliveryKind {
-    /// The prefix a submitted prompt must start with to confirm this delivery.
-    fn prefix(self, ticket_id: &str) -> String {
+    /// Whether the submitted `prompt` is this delivery's line: a ticket goes in as
+    /// "Ticket <short>" or, as a coordination task, as "Koordiner ticket <short>" (5c C.1; the
+    /// first word matched tolerantly, review 5c N1); a review as "Review af ticket <short>".
+    fn confirms(self, ticket_id: &str, prompt: &str) -> bool {
         let short = super::model::short_id(ticket_id);
+        let p = prompt.trim_start();
         match self {
-            DeliveryKind::Work => format!("Ticket {short}"),
-            DeliveryKind::Review => format!("Review af ticket {short}"),
+            DeliveryKind::Work => {
+                p.starts_with(&format!("Ticket {short}"))
+                    || prompt::is_coordination_line_for(p, &short)
+            }
+            DeliveryKind::Review => p.starts_with(&format!("Review af ticket {short}")),
         }
     }
 }
@@ -222,13 +259,30 @@ enum Delivery {
         ticket_id: String,
         token: u64,
     },
-    /// Typing the "Bed om aflevering" line (C4.7) for the in-progress `ticket_id`: waiting for
-    /// the grace period (`NudgeDelay`), then for the Enter (`NudgeEnter`). Nothing is confirmed:
-    /// the ticket stays in progress.
+    /// Typing a "Du …" line for `ticket_id`: "Bed om aflevering" (C4.7, the ticket in progress)
+    /// or "stop, it was handed on" (review 5c W4): waiting for the grace period (`NudgeDelay`),
+    /// then for the Enter (`NudgeEnter`). Nothing is confirmed.
     Nudging {
         ticket_id: String,
         token: u64,
+        nudge: Nudge,
     },
+}
+
+/// Which "Du …" line a [`Delivery::Nudging`] types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nudge {
+    /// [`prompt::request_submission_line`]: the ticket is still the agent's, in progress.
+    Submit,
+    /// [`prompt::handed_over_line`]: the ticket left the agent (review 5c W4).
+    Stop,
+}
+
+/// A pending [`prompt::handed_over_line`] for an agent (review 5c W4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StopNotice {
+    ticket_id: String,
+    to_name: Option<String>,
 }
 
 pub struct Dispatcher<H, P, T> {
@@ -236,9 +290,12 @@ pub struct Dispatcher<H, P, T> {
     port: P,
     timers: T,
     deliveries: HashMap<String, Delivery>,
+    /// Agents to tell that their ticket in progress was handed on (review 5c W4), typed when
+    /// they are idle, before their next delivery.
+    stop_notices: HashMap<String, StopNotice>,
     next_token: u64,
-    /// See [`AUTO_REVIEW_ON_STOP`].
-    auto_review_on_stop: bool,
+    /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
+    auto_review_on_stop: Option<bool>,
 }
 
 impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
@@ -248,15 +305,24 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             port,
             timers,
             deliveries: HashMap::new(),
+            stop_notices: HashMap::new(),
             next_token: 0,
-            auto_review_on_stop: AUTO_REVIEW_ON_STOP,
+            auto_review_on_stop: None,
         }
     }
 
-    /// Overrides [`AUTO_REVIEW_ON_STOP`] (tests).
+    /// Overrides the workspace rule `autoReviewOnStop` (default
+    /// [`crate::config::AUTO_REVIEW_ON_STOP`]; tests).
     pub fn with_auto_review(mut self, on: bool) -> Self {
-        self.auto_review_on_stop = on;
+        self.auto_review_on_stop = Some(on);
         self
+    }
+
+    /// Whether a Stop moves the in-progress ticket to review: the override, else the workspace
+    /// rule (read when needed, plan4b A.4).
+    fn auto_review(&self) -> bool {
+        self.auto_review_on_stop
+            .unwrap_or_else(|| self.host.rules().auto_review_on_stop)
     }
 
     fn token(&mut self) -> u64 {
@@ -299,7 +365,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             | DispatchMsg::ReviewAssigned {
                 reviewer_agent_id: agent_id,
             } => self.consider(&agent_id),
-            DispatchMsg::AgentGone { agent_id } | DispatchMsg::AgentRestarting { agent_id } => {
+            DispatchMsg::AgentGone { agent_id } => {
+                self.deliveries.remove(&agent_id);
+                self.stop_notices.remove(&agent_id);
+            }
+            DispatchMsg::AgentRestarting { agent_id } => {
                 self.deliveries.remove(&agent_id);
             }
             DispatchMsg::SpawnedWithTicket {
@@ -311,6 +381,15 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             DispatchMsg::Redispatch { ticket_id } => self.redispatch(&ticket_id),
             DispatchMsg::RequestSubmission { ticket_id } => self.on_request_submission(&ticket_id),
+            DispatchMsg::HandedOver {
+                agent_id,
+                ticket_id,
+                to_name,
+            } => {
+                self.stop_notices
+                    .insert(agent_id.clone(), StopNotice { ticket_id, to_name });
+                self.consider(&agent_id);
+            }
             DispatchMsg::Timer {
                 agent_id,
                 token,
@@ -322,8 +401,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// Starts a delivery sequence if the agent is free, idle and has a review or a queued ticket.
     // TODO(windows-verify): 750 ms after Stop the input field is ready, and the extra Enter on
     // retry neither sends an empty prompt nor closes a dialog (plan D.29).
+    /// A pending stop notice (review 5c W4) goes first: no delivery until it is typed.
     fn consider(&mut self, agent_id: &str) {
         if *self.state(agent_id) != Delivery::Free {
+            return;
+        }
+        if self.stop_notices.contains_key(agent_id) {
+            self.start_stop_notice(agent_id);
             return;
         }
         let Some((snap, _)) = self.ready_item(agent_id) else {
@@ -338,11 +422,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         self.set(agent_id, Delivery::Delaying { token });
     }
 
-    /// Milliseconds left of [`USER_INPUT_GRACE_MS`] since the user last typed, if any.
+    /// Milliseconds left of the grace period (workspace rule `userInputGraceMs`, default
+    /// [`USER_INPUT_GRACE_MS`]) since the user last typed, if any.
     fn user_grace_left(&self, snap: &AgentSnapshot) -> Option<u64> {
         let at = snap.last_user_input_at?;
+        let grace = self.host.rules().user_input_grace_ms;
         let elapsed = self.timers.now_ms().saturating_sub(at);
-        (elapsed < USER_INPUT_GRACE_MS).then(|| USER_INPUT_GRACE_MS - elapsed)
+        (elapsed < grace).then(|| grace - elapsed)
     }
 
     /// The agent (idle, not exited) and what it gets next, if a delivery may start now: its
@@ -420,11 +506,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             _ => return,
         };
-        let expected = kind.prefix(&ticket_id);
         match prompt {
-            Some(p) if p.trim_start().starts_with(&expected) => {
-                self.confirm(agent_id, &ticket_id, kind)
-            }
+            Some(p) if kind.confirms(&ticket_id, p) => self.confirm(agent_id, &ticket_id, kind),
             Some(_) if typed_by_us => {
                 // Another prompt went in while our line was in the terminal (typically the user's
                 // own text, possibly merged with the line). A busy status that follows belongs
@@ -449,7 +532,20 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             .as_ref()
             .map_or_else(|| agent_id.to_string(), |s| s.name.clone());
         let now = now_ms();
+        // The ticket changed hands while its line was on the way (moved back, handed over to
+        // another agent, step 5c): it must not go in progress with the new assignee.
+        let moved = kind == DeliveryKind::Work
+            && self
+                .host
+                .read(|s| s.get(ticket_id))
+                .is_some_and(|t| t.assignee_agent_id.as_deref() != Some(agent_id));
+        if moved {
+            log::info!(
+                "dispatch {agent_id}: ticket {ticket_id} changed hands; not marked dispatched"
+            );
+        }
         let r = match kind {
+            DeliveryKind::Work if moved => Ok(()),
             DeliveryKind::Work => self
                 .host
                 .mutate(|s| s.mark_dispatched(ticket_id, &name, now))
@@ -466,13 +562,17 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             matches!(
                 s.detail.as_deref(),
                 Some(DELIVERY_FAILED_TEXT | TURN_FAILED_TEXT | NOT_SUBMITTED_TEXT)
-            )
+            ) || s
+                .detail
+                .as_deref()
+                .is_some_and(prompt::is_handed_over_detail)
         }) {
             self.port.set_detail(agent_id, None);
         }
     }
 
-    /// Stop: with [`AUTO_REVIEW_ON_STOP`] the in-progress ticket goes to review (step 3).
+    /// Stop: with `autoReviewOnStop` ([`Self::auto_review`]) the in-progress ticket goes to
+    /// review (step 3).
     /// Otherwise (step 4) a ticket still in progress was not submitted with
     /// `mira_submit_for_review`: it keeps its state with `issue: notSubmitted` and the agent gets
     /// [`NOT_SUBMITTED_TEXT`]; no next ticket is considered. Without a ticket in progress (e.g.
@@ -500,7 +600,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             }
             self.port
                 .set_detail(agent_id, Some(TURN_FAILED_TEXT.to_string()));
-        } else if self.auto_review_on_stop {
+        } else if self.auto_review() {
             match self.host.mutate(|s| s.complete_turn(agent_id, now)) {
                 Ok(Some(_)) => self.host.reroute_reviews(),
                 Ok(None) => {}
@@ -559,8 +659,83 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             Delivery::Nudging {
                 ticket_id: t.id,
                 token,
+                nudge: Nudge::Submit,
             },
         );
+    }
+
+    /// The agent's pending stop notice (review 5c W4): typed after the usual delay (and the
+    /// user-input grace) once the agent is idle; while it is busy the notice waits for the next
+    /// [`Self::consider`] (its Stop).
+    fn start_stop_notice(&mut self, agent_id: &str) {
+        let Some(notice) = self.stop_notices.get(agent_id).cloned() else {
+            return;
+        };
+        let Some(snap) = self.port.snapshot(agent_id) else {
+            self.stop_notices.remove(agent_id);
+            return;
+        };
+        if snap.status != AgentStatus::Idle {
+            return;
+        }
+        let delay = self
+            .user_grace_left(&snap)
+            .map_or(DISPATCH_DELAY_MS, |left| left.max(DISPATCH_DELAY_MS));
+        let token = self.token();
+        self.schedule(agent_id, token, TimerKind::NudgeDelay, delay);
+        self.set(
+            agent_id,
+            Delivery::Nudging {
+                ticket_id: notice.ticket_id,
+                token,
+                nudge: Nudge::Stop,
+            },
+        );
+    }
+
+    /// `NudgeDelay` of a stop notice came due: type [`prompt::handed_over_line`] if the agent is
+    /// still idle and the ticket has not come back to it. Typed (or failed) = no longer pending.
+    fn stop_notice_type(&mut self, agent_id: &str, ticket_id: &str, token: u64) {
+        let notice = self
+            .stop_notices
+            .get(agent_id)
+            .filter(|n| n.ticket_id == ticket_id)
+            .cloned();
+        let (Some(notice), Some(snap)) = (notice, self.port.snapshot(agent_id)) else {
+            self.set(agent_id, Delivery::Free);
+            self.consider(agent_id);
+            return;
+        };
+        if let Some(left) = self.user_grace_left(&snap) {
+            log::info!("dispatch {agent_id}: user typed recently; stop notice in {left} ms");
+            self.schedule(agent_id, token, TimerKind::NudgeDelay, left);
+            return;
+        }
+        if snap.status != AgentStatus::Idle {
+            // Still pending: the next Stop considers it again.
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        self.stop_notices.remove(agent_id);
+        let back = self
+            .host
+            .read(|s| s.get(ticket_id))
+            .is_some_and(|t| t.assignee_agent_id.as_deref() == Some(agent_id));
+        if back {
+            log::info!("dispatch {agent_id}: ticket {ticket_id} came back; no stop notice");
+            self.set(agent_id, Delivery::Free);
+            self.consider(agent_id);
+            return;
+        }
+        let short = super::model::short_id(ticket_id);
+        let line = prompt::handed_over_line(&short, notice.to_name.as_deref());
+        if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
+            log::warn!("dispatch {agent_id}: typing the stop notice failed: {e}");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        log::info!("dispatch {agent_id}: told to stop working on ticket {short}");
+        self.schedule(agent_id, token, TimerKind::NudgeEnter, ENTER_DELAY_MS);
     }
 
     /// `NudgeDelay` came due: type the line if the agent is still idle, the user is not typing
@@ -599,13 +774,25 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         self.schedule(agent_id, token, TimerKind::NudgeEnter, ENTER_DELAY_MS);
     }
 
-    /// `NudgeEnter` came due: Enter, then the history note. The ticket's state and issue stay.
-    fn nudge_enter(&mut self, agent_id: &str, ticket_id: &str) {
+    /// `NudgeEnter` came due: Enter, then (for "Bed om aflevering") the history note. The
+    /// ticket's state and issue stay. The note only while the ticket is still the agent's in
+    /// progress: handed on in the meantime, it must not land on the new owner's ticket (review
+    /// 5c N3, the same guard as [`Self::confirm`]).
+    fn nudge_enter(&mut self, agent_id: &str, ticket_id: &str, nudge: Nudge) {
         self.set(agent_id, Delivery::Free);
         if let Err(e) = self.port.write_input(agent_id, b"\r") {
-            log::warn!(
-                "dispatch {agent_id}: sending Enter after the submission request failed: {e}"
-            );
+            log::warn!("dispatch {agent_id}: sending Enter after the {nudge:?} line failed: {e}");
+            return;
+        }
+        if nudge == Nudge::Stop {
+            return;
+        }
+        let still_ours = self
+            .host
+            .read(|s| s.current_for_agent(agent_id))
+            .is_some_and(|t| t.id == ticket_id);
+        if !still_ours {
+            log::info!("dispatch {agent_id}: ticket {ticket_id} changed hands; no request note");
             return;
         }
         let now = now_ms();
@@ -628,7 +815,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         match (state, kind) {
             (Delivery::Delaying { token: t }, TimerKind::DispatchDelay) if t == token => {
                 self.set(agent_id, Delivery::Free);
-                if let Some((snap, item)) = self.ready_item(agent_id) {
+                if self.stop_notices.contains_key(agent_id) {
+                    // A stop notice arrived during the delay: it goes first (review 5c W4).
+                    self.consider(agent_id);
+                } else if let Some((snap, item)) = self.ready_item(agent_id) {
                     if let Some(left) = self.user_grace_left(&snap) {
                         // The user typed during the delay: try again when the grace is over.
                         log::info!("dispatch {agent_id}: user typed recently; waiting {left} ms");
@@ -705,24 +895,50 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 Delivery::Nudging {
                     ticket_id,
                     token: t,
+                    nudge,
                 },
                 TimerKind::NudgeDelay,
-            ) if t == token => self.nudge_type(agent_id, &ticket_id, token),
+            ) if t == token => match nudge {
+                Nudge::Submit => self.nudge_type(agent_id, &ticket_id, token),
+                Nudge::Stop => self.stop_notice_type(agent_id, &ticket_id, token),
+            },
             (
                 Delivery::Nudging {
                     ticket_id,
                     token: t,
+                    nudge,
                 },
                 TimerKind::NudgeEnter,
-            ) if t == token => self.nudge_enter(agent_id, &ticket_id),
+            ) if t == token => self.nudge_enter(agent_id, &ticket_id, nudge),
             _ => log::debug!("dispatch {agent_id}: ignoring stale {kind:?} timer"),
         }
     }
 
-    /// Writes the ticket file and types the line; Enter follows after `ENTER_DELAY_MS`.
+    /// The delivery for the agent (5c C.1) with the step 4b sections: `## Delt projekt` for a
+    /// real work delivery when other live work agents share the project (plan4b A.5), the
+    /// project list for a coordination task (A.6).
+    fn delivery_for(&self, agent_id: &str, snap: &AgentSnapshot) -> TicketDelivery {
+        let mut delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles);
+        if let (Some(p), SeatKind::Work, true) = (&snap.project, snap.seat_kind, delivery.is_work())
+        {
+            let others = self.port.peers_in_project(agent_id);
+            if !others.is_empty() {
+                delivery = delivery.with_shared(p, others);
+            }
+        }
+        if !delivery.is_work() {
+            let may_create = self.host.rules().agents_may_create_projects;
+            delivery = delivery.with_projects(self.host.project_ids(), may_create);
+        }
+        delivery
+    }
+
+    /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
+    /// Enter follows after `ENTER_DELAY_MS`.
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
         let now = now_ms();
-        if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now) {
+        let delivery = self.delivery_for(agent_id, snap);
+        if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, &delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
                 agent_id,
@@ -731,13 +947,17 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             );
             return;
         }
-        let line = prompt::line_for(ticket);
+        let line = prompt::line_for(ticket, &delivery);
         if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
             log::warn!("dispatch {agent_id}: typing the ticket line failed: {e}");
             self.send_to_backlog(agent_id, &ticket.id, TERMINAL_GONE_NOTE);
             return;
         }
-        log::info!("dispatch {agent_id}: typed ticket {}", ticket.short_id());
+        log::info!(
+            "dispatch {agent_id}: typed ticket {} (coordination: {:?})",
+            ticket.short_id(),
+            delivery.coordination
+        );
         self.schedule(agent_id, token, TimerKind::SendEnter, ENTER_DELAY_MS);
         self.set(
             agent_id,
@@ -1044,10 +1264,12 @@ impl Timers for FakeTimers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AUTO_REVIEW_ON_STOP;
     use crate::hooks::event::parse;
     use crate::hooks::fixtures as fx;
     use crate::hooks::status::apply;
     use crate::tickets::model::{TicketActor, TicketDoc};
+    use crate::tickets::service::RejectReturn;
     use crate::tickets::store::MemoryStore;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1062,6 +1284,7 @@ mod tests {
     struct TestHost {
         svc: Arc<Mutex<TicketService>>,
         mutations: Arc<AtomicUsize>,
+        rules: WorkspaceRules,
     }
 
     impl TicketsHost for TestHost {
@@ -1078,6 +1301,10 @@ mod tests {
 
         fn read<R>(&self, f: impl FnOnce(&TicketService) -> R) -> R {
             f(&lock(&self.svc))
+        }
+
+        fn rules(&self) -> WorkspaceRules {
+            self.rules
         }
     }
 
@@ -1114,6 +1341,28 @@ mod tests {
                 None => false,
             }
         }
+
+        fn peers_in_project(&self, id: &str) -> Vec<String> {
+            let s = lock(&self.0);
+            let Some(p) = s.snapshots.get(id).and_then(|a| a.project.clone()) else {
+                return Vec::new();
+            };
+            let mut names: Vec<String> = s
+                .snapshots
+                .iter()
+                .filter(|(other, a)| {
+                    other.as_str() != id
+                        && a.seat_kind == SeatKind::Work
+                        && !matches!(a.status, AgentStatus::Exited { .. })
+                        && a.project
+                            .as_deref()
+                            .is_some_and(|x| crate::projects::same_id(x, &p))
+                })
+                .map(|(_, a)| a.name.clone())
+                .collect();
+            names.sort();
+            names
+        }
     }
 
     struct Harness {
@@ -1139,6 +1388,7 @@ mod tests {
             let host = TestHost {
                 svc: svc.clone(),
                 mutations: Arc::default(),
+                rules: WorkspaceRules::defaults(),
             };
             let port = FakePort::default();
             let timers = FakeTimers::new();
@@ -1152,8 +1402,14 @@ mod tests {
             }
         }
 
-        /// A live agent with its own cwd.
+        /// A live agent with its own cwd (work seat, coder: gets the plain work delivery; review
+        /// 5c W1).
         fn agent(&self, id: &str, status: AgentStatus) {
+            self.agent_on(id, status, SeatKind::Work, &[Role::Coder]);
+        }
+
+        /// A live agent on `seat` with `roles`.
+        fn agent_on(&self, id: &str, status: AgentStatus, seat_kind: SeatKind, roles: &[Role]) {
             let cwd = self.root.join(id);
             fs::create_dir_all(&cwd).unwrap();
             lock(&self.port.0).snapshots.insert(
@@ -1164,8 +1420,16 @@ mod tests {
                     status,
                     detail: None,
                     last_user_input_at: None,
+                    seat_kind,
+                    roles: roles.to_vec(),
+                    project: None,
                 },
             );
+        }
+
+        /// Puts the agent in `project` (plan4b A.1).
+        fn in_project(&self, id: &str, project: &str) {
+            lock(&self.port.0).snapshots.get_mut(id).unwrap().project = Some(project.to_string());
         }
 
         /// The user typed into `id`'s terminal now (fake clock).
@@ -1253,7 +1517,7 @@ mod tests {
     }
 
     fn line(t: &Ticket) -> String {
-        prompt::line_for(t)
+        prompt::line_for(t, &TicketDelivery::work())
     }
 
     fn enter(agent: &str) -> (String, String) {
@@ -1282,6 +1546,69 @@ mod tests {
         h.advance(ENTER_DELAY_MS);
         assert_eq!(h.writes(), vec![("a1".into(), line(&t)), enter("a1")]);
         assert_eq!(h.ticket(&t.id).state, S::Assigned);
+    }
+
+    // 5c C.1: an agent on a staff seat gets the ticket as a coordination task; the
+    // "Koordinér ticket" line confirms it like a ticket line.
+    #[test]
+    fn staff_seat_gets_coordination_task() {
+        use prompt::{CoordinationKind, COORDINATION_DISTRIBUTE_TEXT, COORDINATION_PLAN_TEXT};
+        let mut h = Harness::new();
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        h.agent_on("r1", AgentStatus::Idle, SeatKind::Staff, &[Role::Reviewer]);
+        // A work seat with a work role: the plain delivery, also with the coordinator role.
+        h.agent_on(
+            "w1",
+            AgentStatus::Idle,
+            SeatKind::Work,
+            &[Role::Coder, Role::Coordinator],
+        );
+        let tk = h.queued("k1", "Lav en side");
+        let tr = h.queued("r1", "Plan noget");
+        let tw = h.queued("w1", "Kod noget");
+        for a in ["k1", "r1", "w1"] {
+            h.idle(a);
+        }
+        h.advance(DISPATCH_DELAY_MS);
+        let distribute = TicketDelivery {
+            coordination: Some(CoordinationKind::Distribute),
+            ..TicketDelivery::default()
+        };
+        let plan = TicketDelivery {
+            coordination: Some(CoordinationKind::Plan),
+            ..TicketDelivery::default()
+        };
+        let writes = h.writes();
+        let typed = |a: &str| writes.iter().find(|(x, _)| x == a).unwrap().1.clone();
+        assert_eq!(typed("k1"), prompt::line_for(&tk, &distribute));
+        assert!(typed("k1").starts_with(&format!("Koordiner ticket {}: ", tk.short_id())));
+        assert_eq!(typed("r1"), prompt::line_for(&tr, &plan));
+        assert_eq!(typed("w1"), line(&tw));
+        let fk = h.ticket_file("k1", &tk);
+        // Step 4b: the coordination task lists the projects (none in the test host).
+        let projects = "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra). Mangler ticketen et projekt, angiv `project` når du giver den videre (mira_assign_ticket/mira_handoff_ticket).";
+        assert!(fk.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_DISTRIBUTE_TEXT}\n{projects}\n\n## Regler\n"
+        )));
+        let fr = h.ticket_file("r1", &tr);
+        assert!(fr.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_PLAN_TEXT}\n{projects}\n\n## Regler\n"
+        )));
+        assert!(!h.ticket_file("w1", &tw).contains("Koordineringsopgave"));
+        h.advance(ENTER_DELAY_MS);
+        // The coordination line confirms the delivery (UserPromptSubmit prefix).
+        h.submitted("k1", &typed("k1"));
+        assert_eq!(h.ticket(&tk.id).state, S::InProgress);
+        h.submitted("w1", &typed("w1"));
+        assert_eq!(h.ticket(&tw.id).state, S::InProgress);
+        // Another ticket's coordination line does not.
+        h.submitted("r1", &format!("Koordinér ticket {}: x", tk.short_id()));
+        assert_eq!(h.ticket(&tr.id).state, S::Assigned);
     }
 
     // (2) + busy status as confirmation
@@ -1468,7 +1795,7 @@ mod tests {
     #[test]
     fn turn_end_moves_the_ticket_to_review_or_done() {
         let mut h = Harness::new();
-        h.d.auto_review_on_stop = true;
+        h.d.auto_review_on_stop = Some(true);
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1581,7 +1908,7 @@ mod tests {
     #[test]
     fn rejected_ticket_goes_first_and_its_file_has_the_note() {
         let mut h = Harness::new();
-        h.d.auto_review_on_stop = true;
+        h.d.auto_review_on_stop = Some(true);
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
         let b = h.queued("a1", "B");
@@ -1593,7 +1920,9 @@ mod tests {
             failed: false,
         });
         assert_eq!(h.ticket(&a.id).state, S::Review);
-        h.svc().reject(&a.id, "Mangler test", true, 10).unwrap();
+        h.svc()
+            .reject(&a.id, "Mangler test", RejectReturn::Sender, 10)
+            .unwrap();
         assert_eq!(h.ticket(&a.id).queue_position, Some(0));
         assert_eq!(h.ticket(&b.id).queue_position, Some(1));
         h.set_status("a1", AgentStatus::Idle);
@@ -1934,10 +2263,40 @@ mod tests {
     #[test]
     fn auto_review_follows_the_constant() {
         let h = Harness::new();
-        assert_eq!(h.d.auto_review_on_stop, AUTO_REVIEW_ON_STOP);
-        assert!(!h.d.auto_review_on_stop);
+        assert_eq!(h.d.auto_review(), AUTO_REVIEW_ON_STOP);
+        assert!(!h.d.auto_review());
         let d = Dispatcher::new(h.d.host.clone(), h.port.clone(), h.timers.clone());
-        assert!(d.with_auto_review(true).auto_review_on_stop);
+        assert!(d.with_auto_review(true).auto_review());
+        // Without an override the host's (workspace) rules decide (plan4b A.4).
+        let mut host = h.d.host.clone();
+        host.rules.auto_review_on_stop = true;
+        let d = Dispatcher::new(host.clone(), h.port.clone(), h.timers.clone());
+        assert!(d.auto_review());
+        assert!(!d.with_auto_review(false).auto_review());
+    }
+
+    #[test]
+    fn user_input_grace_follows_the_rules() {
+        let h = Harness::new();
+        let now = h.timers.now();
+        let snap = AgentSnapshot {
+            name: "a".into(),
+            cwd: PathBuf::from("/w"),
+            status: AgentStatus::Idle,
+            detail: None,
+            last_user_input_at: Some(now),
+            seat_kind: SeatKind::Work,
+            roles: vec![],
+            project: None,
+        };
+        assert_eq!(h.d.user_grace_left(&snap), Some(USER_INPUT_GRACE_MS));
+        let mut host = h.d.host.clone();
+        host.rules.user_input_grace_ms = 1000;
+        let d = Dispatcher::new(host.clone(), h.port.clone(), h.timers.clone());
+        assert_eq!(d.user_grace_left(&snap), Some(1000));
+        host.rules.user_input_grace_ms = 0;
+        let d = Dispatcher::new(host, h.port.clone(), h.timers.clone());
+        assert_eq!(d.user_grace_left(&snap), None);
     }
 
     #[test]
@@ -1967,7 +2326,7 @@ mod tests {
     #[test]
     fn stop_with_auto_review_moves_on_to_the_next_ticket() {
         let mut h = Harness::new();
-        h.d.auto_review_on_stop = true;
+        h.d.auto_review_on_stop = Some(true);
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
         assert_eq!(h.ticket(&a.id).state, S::Review);
@@ -2026,6 +2385,99 @@ mod tests {
         });
         h.advance(DISPATCH_DELAY_MS);
         assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    /// Step 5c: a coordinator hands its coordination task to a work agent mid-turn. The ticket
+    /// leaves the coordinator, the work agent gets it as an ordinary ticket, the coordinator's
+    /// Stop marks nothing "ikke afleveret" and its own queue moves on.
+    #[test]
+    fn handoff_mid_turn_frees_the_sender_and_delivers_to_the_target() {
+        let mut h = Harness::new();
+        h.agent_on(
+            "k",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        h.agent("w", AgentStatus::Thinking);
+        let a = h.queued("k", "Lav en HTML-side");
+        let b = h.queued("k", "Næste");
+        deliver_until_enter(&mut h, "k");
+        let coord = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator]);
+        let coord_line = prompt::line_for(&a, &coord);
+        assert!(coord_line.starts_with("Koordiner ticket "));
+        h.submitted("k", &coord_line);
+        assert_eq!(h.ticket(&a.id).state, S::InProgress);
+        h.set_status("k", AgentStatus::Thinking);
+
+        // mira_assign_ticket / mira_handoff_ticket during the coordinator's turn.
+        h.svc()
+            .handoff(&a.id, "w", Some("k"), ("bot-k", "bot-w"), 50)
+            .unwrap();
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "k".into(),
+        });
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "w".into(),
+        });
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2, "nobody idle yet");
+
+        // The coordinator's turn ends: nothing to mark, its queue head is next.
+        h.set_status("k", AgentStatus::Idle);
+        stop(&mut h, "k");
+        let a_now = h.ticket(&a.id);
+        assert_eq!(
+            (a_now.state, a_now.issue, a_now.assignee_agent_id.as_deref()),
+            (S::Assigned, None, Some("w"))
+        );
+        assert_eq!(h.detail("k"), None);
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        assert_eq!(
+            &h.writes()[2..],
+            &[("k".into(), prompt::line_for(&b_now, &coord)), enter("k")]
+        );
+        // Review 5c W4: it handed the ticket on itself, so no "Du skal stoppe …" line.
+        assert!(h.writes().iter().all(|(_, w)| !w.starts_with("Du ")));
+
+        // The work agent becomes idle and gets the handed-over ticket as an ordinary ticket.
+        h.set_status("w", AgentStatus::Idle);
+        deliver_until_enter(&mut h, "w");
+        assert_eq!(&h.writes()[4..], &[("w".into(), line(&a_now)), enter("w")]);
+        assert!(!h.ticket_file("w", &a_now).contains("Koordineringsopgave"));
+        h.submitted("w", &line(&a_now));
+        let a_done = h.ticket(&a.id);
+        assert_eq!(
+            (a_done.state, a_done.assignee_agent_id.as_deref()),
+            (S::InProgress, Some("w"))
+        );
+        assert_eq!(
+            a_done.history.last().unwrap().note.as_deref(),
+            Some("sendt til bot-w")
+        );
+    }
+
+    /// A ticket that changed hands while its line was typed is not marked dispatched to the new
+    /// assignee by the old agent's confirmation.
+    #[test]
+    fn confirmation_after_the_ticket_changed_hands_is_ignored() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("a2", AgentStatus::Thinking);
+        let a = h.queued("a1", "A");
+        deliver_until_enter(&mut h, "a1");
+        {
+            let mut s = h.svc();
+            s.unassign(&a.id, 10).unwrap();
+            s.assign(&a.id, "a2", 11).unwrap();
+        }
+        h.submitted("a1", &line(&a));
+        let now = h.ticket(&a.id);
+        assert_eq!(
+            (now.state, now.assignee_agent_id.as_deref()),
+            (S::Assigned, Some("a2"))
+        );
     }
 
     #[test]
@@ -2221,6 +2673,7 @@ mod tests {
         let host = TestHost {
             svc: h.svc.clone(),
             mutations: Arc::default(),
+            rules: WorkspaceRules::defaults(),
         };
         let d = Dispatcher::new(host, h.port.clone(), h.timers.clone());
         tx2.send(DispatchMsg::QueueChanged {
@@ -2451,5 +2904,234 @@ mod tests {
         h.idle("rev");
         h.advance(DISPATCH_DELAY_MS);
         assert!(h.writes()[0].1.starts_with("Review af ticket "));
+    }
+
+    // ---- review 5c W4/N3: the old agent is told when the user takes its ticket ----
+
+    fn handed_over(h: &mut Harness, agent: &str, t: &Ticket, to_name: Option<&str>) {
+        h.send(DispatchMsg::HandedOver {
+            agent_id: agent.into(),
+            ticket_id: t.id.clone(),
+            to_name: to_name.map(str::to_string),
+        });
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: agent.into(),
+        });
+    }
+
+    /// "Tildel…" mid-turn: nothing is typed while the old agent works; at its Stop it gets the
+    /// "Du skal stoppe …" line (before its next ticket), then the queue moves on.
+    #[test]
+    fn user_handoff_mid_turn_tells_the_old_agent_to_stop_before_its_next_ticket() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.agent("w", AgentStatus::Thinking);
+        h.set_status("a1", AgentStatus::Thinking);
+        h.svc()
+            .handoff(&a.id, "w", None, ("bot-a1", "bot-w"), 50)
+            .unwrap();
+        // TicketsCtx::handed_over sets the detail; the dispatcher clears it like its own hints.
+        h.port
+            .set_detail("a1", Some(prompt::handed_over_detail(&a.short_id(), true)));
+        handed_over(&mut h, "a1", &a, Some("bot-w"));
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2, "busy: nothing typed");
+
+        h.set_status("a1", AgentStatus::Idle);
+        stop(&mut h, "a1");
+        assert_eq!(h.ticket(&a.id).issue, None, "not marked ikke afleveret");
+        h.advance(DISPATCH_DELAY_MS - 1);
+        assert_eq!(h.writes().len(), 2);
+        h.advance(1);
+        let stop_line = prompt::handed_over_line(&a.short_id(), Some("bot-w"));
+        assert_eq!(
+            stop_line,
+            format!(
+                "Du skal stoppe arbejdet på ticket {}: den er givet videre til bot-w. Afslut dit svar.",
+                a.short_id()
+            )
+        );
+        assert_eq!(h.writes()[2], ("a1".into(), stop_line.clone()));
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[3], enter("a1"));
+        assert_eq!(*h.d.state("a1"), Delivery::Free);
+        // The stop line is never taken for a delivery, and B is not typed during its turn.
+        h.submitted("a1", &stop_line);
+        h.set_status("a1", AgentStatus::Thinking);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 4);
+        // Its next Stop: B, whose confirmation clears the "givet videre" detail.
+        h.set_status("a1", AgentStatus::Idle);
+        stop(&mut h, "a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        assert_eq!(
+            &h.writes()[4..],
+            &[("a1".into(), line(&b_now)), enter("a1")]
+        );
+        h.submitted("a1", &line(&b_now));
+        assert_eq!(h.ticket(&b.id).state, S::InProgress);
+        assert_eq!(h.detail("a1"), None);
+    }
+
+    /// "Fjern tildeling" of an idle agent's ticket in progress: the line comes after the delay.
+    #[test]
+    fn user_puts_back_an_idle_agents_ticket_and_it_is_told() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        stop(&mut h, "a1");
+        h.svc().unassign(&a.id, 60).unwrap();
+        handed_over(&mut h, "a1", &a, None);
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(
+            &h.writes()[2..],
+            &[
+                ("a1".into(), prompt::handed_over_line(&a.short_id(), None)),
+                enter("a1")
+            ]
+        );
+        assert!(h.writes()[2]
+            .1
+            .ends_with("lagt tilbage i backlog. Afslut dit svar."));
+    }
+
+    /// No stop line without a HandedOver (the agent handed it on itself), and none when the
+    /// ticket came back to the agent before the line was typed.
+    #[test]
+    fn stop_line_only_for_a_foreign_handoff_and_not_after_it_came_back() {
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.agent("w", AgentStatus::Thinking);
+        h.svc()
+            .handoff(&a.id, "w", Some("a1"), ("bot-a1", "bot-w"), 50)
+            .unwrap();
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        stop(&mut h, "a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let b_now = h.ticket(&b.id);
+        assert_eq!(
+            &h.writes()[2..],
+            &[("a1".into(), line(&b_now)), enter("a1")]
+        );
+        assert!(h.writes().iter().all(|(_, w)| !w.starts_with("Du ")));
+
+        // Came back: the user hands it over, then straight back before a1 is idle.
+        let mut h = Harness::new();
+        let (a, b) = a_in_progress(&mut h);
+        h.agent("w", AgentStatus::Thinking);
+        h.set_status("a1", AgentStatus::Thinking);
+        h.svc()
+            .handoff(&a.id, "w", None, ("bot-a1", "bot-w"), 50)
+            .unwrap();
+        handed_over(&mut h, "a1", &a, Some("bot-w"));
+        h.svc().unassign(&a.id, 51).unwrap();
+        h.svc().assign(&a.id, "a1", 52).unwrap();
+        h.set_status("a1", AgentStatus::Idle);
+        stop(&mut h, "a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert!(h.writes().iter().all(|(_, w)| !w.starts_with("Du ")));
+        // Its queue simply moves on after the usual delay (B, then A again at the end).
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&h.ticket(&b.id))));
+    }
+
+    /// Review 5c N3: handed on between the "Bed om aflevering" line and its Enter, the note
+    /// does not land on the ticket (now someone else's).
+    #[test]
+    fn nudge_enter_skips_the_note_after_a_handoff() {
+        let mut h = Harness::new();
+        let (a, _) = a_in_progress(&mut h);
+        h.agent("w", AgentStatus::Thinking);
+        stop(&mut h, "a1");
+        request(&mut h, &a);
+        h.advance(0);
+        assert_eq!(h.writes()[2], nudge(&a));
+        h.svc()
+            .handoff(&a.id, "w", None, ("bot-a1", "bot-w"), 50)
+            .unwrap();
+        let before = h.ticket(&a.id).history.len();
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[3], enter("a1"));
+        let after = h.ticket(&a.id);
+        assert_eq!(after.history.len(), before);
+        assert_ne!(
+            after.history.last().unwrap().note.as_deref(),
+            Some(SUBMISSION_REQUESTED_NOTE)
+        );
+    }
+
+    /// Review 5c N1: the coordination line confirms with or without the accent.
+    #[test]
+    fn coordination_line_confirms_with_either_spelling() {
+        for typed in ["Koordiner", "Koordinér"] {
+            let mut h = Harness::new();
+            h.agent_on(
+                "k",
+                AgentStatus::Idle,
+                SeatKind::Staff,
+                &[Role::Coordinator],
+            );
+            let t = h.queued("k", "Lav en side");
+            deliver_until_enter(&mut h, "k");
+            h.submitted(
+                "k",
+                &format!("{typed} ticket {}: Lav en side.", t.short_id()),
+            );
+            assert_eq!(h.ticket(&t.id).state, S::InProgress, "{typed}");
+            assert_eq!(h.ticket(&t.id).issue, None, "{typed}");
+        }
+    }
+
+    /// Review 5c W1: a profile without a work role on a work seat gets a coordination task.
+    #[test]
+    fn work_seat_without_work_role_gets_a_coordination_task() {
+        let mut h = Harness::new();
+        h.agent_on("r", AgentStatus::Idle, SeatKind::Work, &[Role::Reviewer]);
+        let t = h.queued("r", "Lav en side");
+        h.idle("r");
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes()[0].1.starts_with("Koordiner ticket "));
+        assert!(h.ticket_file("r", &t).contains(&format!(
+            "## Koordineringsopgave\n{}",
+            prompt::COORDINATION_PLAN_TEXT
+        )));
+    }
+
+    // ---- step 4b: shared project ----
+
+    #[test]
+    fn two_agents_in_one_project_get_the_shared_section() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Thinking);
+        h.agent("a2", AgentStatus::Idle);
+        h.agent("a3", AgentStatus::Idle);
+        h.agent_on("r", AgentStatus::Idle, SeatKind::Work, &[Role::Reviewer]);
+        h.in_project("a1", "p");
+        h.in_project("a2", "P");
+        h.in_project("a3", "q");
+        h.in_project("r", "p");
+        let t2 = h.queued("a2", "To");
+        let t3 = h.queued("a3", "Tre");
+        let tr = h.queued("r", "Fordel");
+        for a in ["a2", "a3", "r"] {
+            h.idle(a);
+        }
+        h.advance(DISPATCH_DELAY_MS);
+        let f2 = h.ticket_file("a2", &t2);
+        assert!(f2.contains("## Delt projekt\n"), "{f2}");
+        // The reviewer on a work seat is a live work agent in p too, but gets a coordination
+        // task without the section.
+        assert!(f2.contains("(projekt «P»): bot-a1, bot-r."), "{f2}");
+        assert!(f2.find("## Delt projekt").unwrap() < f2.find("## Regler").unwrap());
+        assert!(!h.ticket_file("a3", &t3).contains("Delt projekt"));
+        let fr = h.ticket_file("r", &tr);
+        assert!(fr.contains("## Koordineringsopgave"));
+        assert!(!fr.contains("Delt projekt"));
+        // The line itself is the plain work line.
+        let writes = h.writes();
+        let typed = writes.iter().find(|(x, _)| x == "a2").unwrap().1.clone();
+        assert_eq!(typed, line(&t2));
     }
 }

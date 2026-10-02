@@ -1,12 +1,14 @@
 //! Ticket data model (plan C3.1). Wire format: camelCase; enum values camelCase strings.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::{
-    AUTO_REVIEW_ON_STOP, CREATE_TICKET_RATE_LIMIT, MAX_REVIEW_ROUNDS, MAX_STAFF_AGENTS,
-    MAX_WORK_AGENTS, REPORTS_PER_TICKET_MAX, REPORT_BODY_MAX_CHARS, TICKETS_SCHEMA_VERSION,
-    TICKET_BODY_MAX_CHARS, TICKET_SHORT_ID_LEN,
+    AGENTS_MAY_CREATE_PROJECTS, AUTO_REVIEW_ON_STOP, CREATE_TICKET_RATE_LIMIT,
+    MAX_AGENTS_PER_PROJECT, MAX_REVIEW_ROUNDS, MAX_STAFF_AGENTS, MAX_WORK_AGENTS,
+    REPORTS_PER_TICKET_MAX, REPORT_BODY_MAX_CHARS, REVIEW_BY_DEFAULT, TICKETS_SCHEMA_VERSION,
+    TICKET_BODY_MAX_CHARS, TICKET_SHORT_ID_LEN, USER_INPUT_GRACE_MS,
 };
+use crate::projects::ProjectRef;
 
 /// Ticket id (uuid v4 string).
 pub type TicketId = String;
@@ -132,6 +134,9 @@ pub struct Ticket {
     /// Report metadata; the texts are files under `<app_data>/tickets/<id>/reports/`.
     #[serde(default)]
     pub reports: Vec<TicketReport>,
+    /// The project the ticket belongs to (plan4b A.2); absent in step 1–5 files.
+    #[serde(default)]
+    pub project: Option<ProjectRef>,
 }
 
 impl Ticket {
@@ -165,6 +170,8 @@ pub struct TicketSummary {
     pub escalated: bool,
     pub reviewer_agent_id: Option<String>,
     pub report_count: usize,
+    /// Copy of `Ticket.project` (badge and filter without `get_ticket`).
+    pub project: Option<ProjectRef>,
 }
 
 impl From<&Ticket> for TicketSummary {
@@ -188,6 +195,7 @@ impl From<&Ticket> for TicketSummary {
             escalated: t.escalated,
             reviewer_agent_id: t.reviewer_agent_id.clone(),
             report_count: t.reports.len(),
+            project: t.project.clone(),
         }
     }
 }
@@ -202,6 +210,17 @@ pub struct TicketPatch {
     pub body: Option<String>,
     #[serde(default)]
     pub skip_review: Option<bool>,
+    /// Absent: unchanged; `null`: remove the project; a [`ProjectRef`]: set it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub project: Option<Option<ProjectRef>>,
+}
+
+/// A present field (even `null`) becomes `Some(..)`; an absent one stays `None` (serde default).
+fn double_option<'de, D>(d: D) -> Result<Option<Option<ProjectRef>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ProjectRef>::deserialize(d).map(Some)
 }
 
 /// Who wrote a report: an agent (`agentId`) or the user.
@@ -311,6 +330,9 @@ pub enum TicketError {
     NeedsNote,
     #[error("Agenten har allerede en ticket i gang")]
     AgentBusy,
+    /// Step 5c handoff to the agent that already has the ticket.
+    #[error("Ticketen kan ikke gives videre til den agent, der allerede har den")]
+    HandoffToSelf,
     #[error("Kun tickets i backlog, done eller afvist uden agent kan slettes")]
     NotDeletable,
     #[error("{0}")]
@@ -356,10 +378,24 @@ pub enum TicketError {
     /// `assign_reviewer` with the ticket's own sender (C5.4).
     #[error("Afsenderen kan ikke reviewe sin egen ticket")]
     SenderCannotReview,
+    // ---- step 4b (C4b.1) ----
+    #[error("Ticketen mangler et projekt — vælg et, før den tildeles")]
+    ProjectRequired,
+    #[error(
+        "Agenten {agent} står i projekt «{agent_project}»; ticketen hører til «{ticket_project}»"
+    )]
+    WrongProject {
+        agent: String,
+        agent_project: String,
+        ticket_project: String,
+    },
+    #[error("Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent")]
+    ProjectChangeNotAllowed,
 }
 
 /// The rules of this workspace (plan5 C5.1): the "Regler" section of every profile's system
-/// prompt and, from batch 2, the result of `mira_get_workspace_rules`. Compile-time values.
+/// prompt and the result of `mira_get_workspace_rules`. Defaults from `config.rs`; the effective
+/// values come from `mira-bots.workspace.json` (plan4b A.4, `crate::workspace`).
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRules {
@@ -371,11 +407,17 @@ pub struct WorkspaceRules {
     pub ticket_body_max_chars: usize,
     pub report_body_max_chars: usize,
     pub reports_per_ticket_max: usize,
+    // step 4b
+    pub review_by_default: bool,
+    pub user_input_grace_ms: u64,
+    pub agents_may_create_projects: bool,
+    /// 0 = unlimited.
+    pub max_agents_per_project: usize,
 }
 
 impl WorkspaceRules {
     /// The values from `config.rs`.
-    pub fn current() -> Self {
+    pub fn defaults() -> Self {
         Self {
             max_work_agents: MAX_WORK_AGENTS,
             max_staff_agents: MAX_STAFF_AGENTS,
@@ -385,6 +427,10 @@ impl WorkspaceRules {
             ticket_body_max_chars: TICKET_BODY_MAX_CHARS,
             report_body_max_chars: REPORT_BODY_MAX_CHARS,
             reports_per_ticket_max: REPORTS_PER_TICKET_MAX,
+            review_by_default: REVIEW_BY_DEFAULT,
+            user_input_grace_ms: USER_INPUT_GRACE_MS,
+            agents_may_create_projects: AGENTS_MAY_CREATE_PROJECTS,
+            max_agents_per_project: MAX_AGENTS_PER_PROJECT,
         }
     }
 }
@@ -426,6 +472,7 @@ pub(crate) mod test_support {
             escalated: false,
             reviewer_agent_id: None,
             reports: Vec::new(),
+            project: None,
         }
     }
 }
@@ -549,6 +596,24 @@ mod tests {
         let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
         assert_eq!(s["summary"], json!("Rettet og testet"));
         assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+
+        // step 4b: project in both, round-trip of both wire forms.
+        assert_eq!(s["project"], json!(null));
+        for (p, wire) in [
+            (ProjectRef::Existing("mira".into()), json!("mira")),
+            (ProjectRef::New { new: "x".into() }, json!({"new": "x"})),
+        ] {
+            t.project = Some(p);
+            let v = serde_json::to_value(&t).unwrap();
+            assert_eq!(v["project"], wire);
+            let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+            assert_eq!(s["project"], wire);
+            assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+            assert_eq!(
+                serde_json::from_value::<TicketSummary>(s).unwrap().project,
+                t.project
+            );
+        }
     }
 
     #[test]
@@ -573,11 +638,28 @@ mod tests {
             TicketPatch {
                 title: None,
                 body: None,
-                skip_review: Some(true)
+                skip_review: Some(true),
+                project: None,
             }
         );
         let empty: TicketPatch = serde_json::from_value(json!({})).unwrap();
         assert_eq!(empty, TicketPatch::default());
+        assert_eq!(empty.project, None);
+        let p: TicketPatch = serde_json::from_value(json!({"project": null})).unwrap();
+        assert_eq!(p.project, Some(None));
+        let p: TicketPatch = serde_json::from_value(json!({"project": "a"})).unwrap();
+        assert_eq!(p.project, Some(Some(ProjectRef::Existing("a".into()))));
+        let p: TicketPatch = serde_json::from_value(json!({"project": {"new": "b"}})).unwrap();
+        assert_eq!(p.project, Some(Some(ProjectRef::New { new: "b".into() })));
+        assert!(serde_json::from_value::<TicketPatch>(json!({"project": 3})).is_err());
+    }
+
+    #[test]
+    fn workspace_rules_defaults_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&WorkspaceRules::defaults()).unwrap(),
+            r#"{"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0}"#
+        );
     }
 
     #[test]
@@ -631,13 +713,36 @@ mod tests {
             TicketError::RateLimited.to_string(),
             "For mange tickets oprettet den seneste time (maks 20)"
         );
+        assert_eq!(
+            TicketError::ProjectRequired.to_string(),
+            "Ticketen mangler et projekt — vælg et, før den tildeles"
+        );
+        assert_eq!(
+            TicketError::WrongProject {
+                agent: "coder-01".into(),
+                agent_project: "b".into(),
+                ticket_project: "a".into()
+            }
+            .to_string(),
+            "Agenten coder-01 står i projekt «b»; ticketen hører til «a»"
+        );
+        assert_eq!(
+            TicketError::ProjectChangeNotAllowed.to_string(),
+            "Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent"
+        );
     }
 
     #[test]
     fn step3_file_without_new_fields_loads() {
         let mut v = serde_json::to_value(ticket("t1", TicketState::Review)).unwrap();
         let o = v.as_object_mut().unwrap();
-        for k in ["reviewRound", "escalated", "reviewerAgentId", "reports"] {
+        for k in [
+            "reviewRound",
+            "escalated",
+            "reviewerAgentId",
+            "reports",
+            "project",
+        ] {
             assert!(o.remove(k).is_some(), "{k}");
         }
         let t: Ticket = serde_json::from_value(v).unwrap();
@@ -646,9 +751,10 @@ mod tests {
                 t.review_round,
                 t.escalated,
                 t.reviewer_agent_id,
-                t.reports.len()
+                t.reports.len(),
+                t.project
             ),
-            (0, false, None, 0)
+            (0, false, None, 0, None)
         );
         let doc: TicketDoc =
             serde_json::from_value(json!({"schemaVersion":1,"tickets":[]})).unwrap();
@@ -734,6 +840,10 @@ mod tests {
             ),
             (TicketError::ReportNotFound, "Rapporten findes ikke"),
             (TicketError::NotAReviewer, "Agenten er ikke reviewer"),
+            (
+                TicketError::HandoffToSelf,
+                "Ticketen kan ikke gives videre til den agent, der allerede har den",
+            ),
             (TicketError::AgentWorking, "Agenten arbejder"),
             (
                 TicketError::SenderCannotReview,

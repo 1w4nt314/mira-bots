@@ -35,12 +35,15 @@ use crate::config::{
 };
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::hooks::status::AgentStatus;
+use crate::workspace::WorkspaceReader;
 use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
 use model::{
     ReportAuthor, Ticket, TicketActor, TicketError, TicketReport, TicketState, TicketSummary,
+    WorkspaceRules,
 };
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
+pub use service::RejectReturn;
 use service::{ReviewCounts, TicketLinks, TicketService, REVIEWER_REMOVED_NOTE};
 use store::JsonFileStore;
 
@@ -120,6 +123,8 @@ pub struct TicketsCtx {
     /// Serialises report writes (sequence number → file → metadata). Taken before, never
     /// inside, the service lock.
     report_lock: Mutex<()>,
+    /// The workspace file reader (plan4b A.4), shared with `AppState`.
+    pub workspace: Arc<WorkspaceReader>,
 }
 
 impl TicketsCtx {
@@ -129,6 +134,7 @@ impl TicketsCtx {
         dispatch_tx: UnboundedSender<DispatchMsg>,
         emit: EmitFn,
         reports_root: PathBuf,
+        workspace: Arc<WorkspaceReader>,
     ) -> Self {
         TicketsCtx {
             service: Mutex::new(service),
@@ -137,6 +143,7 @@ impl TicketsCtx {
             emit,
             reports: ReportStore::new(reports_root),
             report_lock: Mutex::new(()),
+            workspace,
         }
     }
 
@@ -229,6 +236,40 @@ impl TicketsCtx {
         emit_json(&self.emit, AGENTS_CHANGED, &list);
     }
 
+    /// Where the rejected ticket `id` goes (W1): first in the sender's queue only while the
+    /// sender is live and may still take the ticket — it may have moved to another project
+    /// ("Flyt til projekt…") after submitting. Read before the rejection.
+    pub fn reject_return(&self, id: &str) -> RejectReturn {
+        let Some(tk) = self.read(|s| s.get_by_any_id(id)) else {
+            return RejectReturn::Backlog;
+        };
+        let Some(sender) = tk.assignee_agent_id.as_deref() else {
+            return RejectReturn::Backlog;
+        };
+        let m = lock(&self.manager);
+        match m.get(sender) {
+            Some(a) if !matches!(a.status, AgentStatus::Exited { .. }) => {
+                // Review 4b R2-N1: a ticket without a project (older tickets.json) was never
+                // moved away from its sender, so it goes back to it like before step 4b.
+                let ok = matches!(
+                    crate::projects::assignment_target(
+                        tk.project.as_ref(),
+                        a.seat_kind,
+                        a.project.as_deref(),
+                        &a.name,
+                    ),
+                    Ok(_) | Err(TicketError::ProjectRequired)
+                );
+                if ok {
+                    RejectReturn::Sender
+                } else {
+                    RejectReturn::Moved
+                }
+            }
+            _ => RejectReturn::Backlog,
+        }
+    }
+
     /// Clears the agent's detail when it is the "turn ended without submitting" or "turn failed"
     /// hint ([`NOT_SUBMITTED_TEXT`]/[`TURN_FAILED_TEXT`]): used when its ticket leaves in-progress
     /// (submit, manual move), so the hint does not outlive the ticket. Other texts stay.
@@ -238,6 +279,39 @@ impl TicketsCtx {
             None,
             |d| matches!(d, Some(d) if d == NOT_SUBMITTED_TEXT || d == TURN_FAILED_TEXT),
         );
+    }
+
+    /// Review 5c W4: `from_agent`'s ticket in progress left it (handed to `to_name`, or back to
+    /// the backlog with `None`). Its detail becomes "Ticket <short> givet videre" (whatever the
+    /// actor; it replaces a stale "ikke afleveret"/"turn fejlede" hint and goes like the other
+    /// hints: with the next status or delivery). `by_someone_else` (the user took it, not the
+    /// agent itself): the dispatcher also types a "Du skal stoppe …" line once the agent is
+    /// idle. Call before [`Self::notify`], so the line goes before the agent's next delivery.
+    pub fn handed_over(
+        &self,
+        from_agent: &str,
+        ticket: &Ticket,
+        to_name: Option<&str>,
+        by_someone_else: bool,
+    ) {
+        if from_agent.is_empty() {
+            return;
+        }
+        let short = ticket.short_id();
+        // Review 5c N8: an agent that handed the ticket on itself keeps its own status text; only a
+        // hand-over by someone else replaces it (the agent has not been told yet).
+        if by_someone_else {
+            self.set_agent_detail(
+                from_agent,
+                Some(prompt::handed_over_detail(&short, to_name.is_some())),
+                |_| true,
+            );
+            self.send(DispatchMsg::HandedOver {
+                agent_id: from_agent.to_string(),
+                ticket_id: ticket.id.clone(),
+                to_name: to_name.map(str::to_string),
+            });
+        }
     }
 
     /// Tells the dispatcher that these agents' queues changed (each id once).
@@ -299,6 +373,23 @@ impl TicketsCtx {
                 "agent {agent_id}: {} ticket(s) back to the backlog ({note})",
                 released.len()
             );
+        }
+        Ok(released.len())
+    }
+
+    /// "Flyt til projekt…" with `force` (plan4b A.3): the agent's queued tickets go to the
+    /// backlog with `note`; the agent keeps running (restarted in the new folder), so its
+    /// delivery state and reviews are left alone. Returns how many tickets moved.
+    pub fn release_queue(&self, agent_id: &str, note: &str) -> Result<usize, String> {
+        let now = now_ms();
+        let released =
+            self.mutate_if(|s| s.release_agent(agent_id, note, now), |v| !v.is_empty())?;
+        if !released.is_empty() {
+            log::info!(
+                "agent {agent_id}: {} queued ticket(s) back to the backlog ({note})",
+                released.len()
+            );
+            self.notify([agent_id]);
         }
         Ok(released.len())
     }
@@ -503,6 +594,17 @@ impl TicketsHost for Arc<TicketsCtx> {
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T {
         TicketsCtx::read(self, f)
     }
+
+    fn rules(&self) -> WorkspaceRules {
+        self.workspace.rules()
+    }
+
+    fn project_ids(&self) -> Vec<String> {
+        crate::projects::list_projects(self.workspace.root())
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
 }
 
 /// The dispatcher's [`AgentPort`] over the real manager. Each call takes the manager lock
@@ -531,6 +633,9 @@ impl AgentPort for ManagerPort {
             status: a.status,
             detail: a.detail,
             last_user_input_at,
+            seat_kind: a.seat_kind,
+            roles: a.roles,
+            project: a.project,
         })
     }
 
@@ -538,6 +643,21 @@ impl AgentPort for ManagerPort {
         lock(&self.manager)
             .write_input(id, bytes)
             .map_err(|e| e.to_string())
+    }
+
+    fn peers_in_project(&self, id: &str) -> Vec<String> {
+        let m = lock(&self.manager);
+        let Some(me) = m.get(id) else {
+            return Vec::new();
+        };
+        let Some(project) = me.project.as_deref() else {
+            return Vec::new();
+        };
+        m.live_work_in_project(project)
+            .into_iter()
+            .filter(|a| a.id != id)
+            .map(|a| a.name)
+            .collect()
     }
 
     fn set_detail(&self, id: &str, detail: Option<String>) -> bool {
@@ -583,8 +703,21 @@ pub(crate) mod test_support {
         });
         let reports_root =
             std::env::temp_dir().join(format!("mira-tickets-{}", uuid::Uuid::new_v4()));
+        // A workspace file that does not exist: the defaults.
+        let workspace = Arc::new(WorkspaceReader::new(
+            std::env::temp_dir()
+                .join(format!("mira-ws-{}", uuid::Uuid::new_v4()))
+                .join(crate::config::WORKSPACE_FILE),
+        ));
         TestCtx {
-            ctx: Arc::new(TicketsCtx::new(svc, manager, tx, emit, reports_root)),
+            ctx: Arc::new(TicketsCtx::new(
+                svc,
+                manager,
+                tx,
+                emit,
+                reports_root,
+                workspace,
+            )),
             rx,
             events,
             store,
@@ -714,6 +847,11 @@ mod tests {
             tx,
             Arc::clone(&emit),
             std::env::temp_dir().join("mira-unused-reports"),
+            Arc::new(WorkspaceReader::new(
+                std::env::temp_dir()
+                    .join(format!("mira-ws-{}", uuid::Uuid::new_v4()))
+                    .join(crate::config::WORKSPACE_FILE),
+            )),
         ));
         assert!(slot.set(Arc::clone(&ctx)).is_ok());
         let tk = ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
@@ -946,8 +1084,14 @@ mod tests {
                 AgentMeta {
                     id: uuid::Uuid::new_v4().to_string(),
                     session_id: "s".into(),
-                    profile: ProfileSnapshot::default(),
+                    // A work role: the plain ticket line (review 5c W1).
+                    profile: ProfileSnapshot {
+                        roles: vec![Role::Coder],
+                        ..ProfileSnapshot::default()
+                    },
                     seat_kind: SeatKind::Work,
+                    name: "bot-01".into(),
+                    project: None,
                 },
                 sink,
             )
@@ -1116,7 +1260,7 @@ mod tests {
             assert_eq!(t.ctx.route_reviews(), 1, "round {round}");
             let rev = reviewer_of(&t, &id).unwrap();
             t.ctx
-                .mutate(|s| s.reject_by_agent(&rev, "r", &id, "mere", true, 10))
+                .mutate(|s| s.reject_by_agent(&rev, "r", &id, "mere", RejectReturn::Sender, 10))
                 .unwrap();
             t.ctx.mutate(|s| s.mark_dispatched(&id, "a1", 11)).unwrap();
             t.ctx
@@ -1390,5 +1534,41 @@ mod tests {
         let tk2 = t.ctx.mutate(|s| s.create("y", "", false, 1)).unwrap();
         t.ctx.delete_ticket(&tk2.id).unwrap();
         let _ = std::fs::remove_dir_all(t.ctx.reports.root());
+    }
+
+    #[test]
+    fn manager_port_and_host_see_projects_and_rules() {
+        use crate::agent::SeatKind;
+        let m = Arc::new(Mutex::new(AgentManager::new(5)));
+        let (a, b, c) = {
+            let mut g = lock(&m);
+            let a = g.insert_fake_in("a", "/r/p", &[Role::Coder], SeatKind::Work, Some("p"));
+            let b = g.insert_fake_in("b", "/r/P", &[Role::Coder], SeatKind::Work, Some("P"));
+            let c = g.insert_fake_with("c", "/r", &[Role::Coordinator], SeatKind::Staff);
+            (a, b, c)
+        };
+        let port = ManagerPort::new(Arc::clone(&m), Arc::new(|_, _| {}));
+        assert_eq!(port.peers_in_project(&a), ["P"]);
+        assert_eq!(port.peers_in_project(&b), ["p"]);
+        assert!(port.peers_in_project(&c).is_empty(), "staff: no project");
+        assert!(port.peers_in_project("nope").is_empty());
+        assert_eq!(port.snapshot(&a).unwrap().project.as_deref(), Some("p"));
+
+        // The host reads the (missing) workspace file: defaults, no projects.
+        let t = test_ctx(Arc::clone(&m));
+        assert_eq!(t.ctx.rules(), WorkspaceRules::defaults());
+        assert!(t.ctx.project_ids().is_empty());
+        let root = t.ctx.workspace.root().to_path_buf();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join("Alpha")).unwrap();
+        std::fs::write(
+            t.ctx.workspace.path(),
+            r#"{"userInputGraceMs": 0, "autoReviewOnStop": true}"#,
+        )
+        .unwrap();
+        assert_eq!(t.ctx.project_ids(), ["Alpha", "beta"]);
+        let r = t.ctx.rules();
+        assert!(r.auto_review_on_stop && r.user_input_grace_ms == 0);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

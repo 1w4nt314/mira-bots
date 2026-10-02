@@ -136,10 +136,13 @@ pub fn mira_tool_label(tool_name: &str) -> Option<&'static str> {
         "mira_unassign_ticket" => Some("Fjerner tildeling"),
         "mira_spawn_agent" => Some("Starter agent"),
         "mira_list_agents" => Some("Læser agenter"),
+        "mira_list_projects" => Some("Læser projekter"),
         "mira_list_profiles" => Some("Læser profiler"),
         "mira_get_workspace_rules" => Some("Læser regler"),
         "mira_add_report" => Some("Skriver rapport"),
         "mira_get_report" => Some("Læser rapport"),
+        // Step 5c.
+        "mira_handoff_ticket" => Some("Giver ticket videre"),
         _ => None,
     }
 }
@@ -375,10 +378,12 @@ mod tests {
             ("mira_unassign_ticket", "Fjerner tildeling"),
             ("mira_spawn_agent", "Starter agent"),
             ("mira_list_agents", "Læser agenter"),
+            ("mira_list_projects", "Læser projekter"),
             ("mira_list_profiles", "Læser profiler"),
             ("mira_get_workspace_rules", "Læser regler"),
             ("mira_add_report", "Skriver rapport"),
             ("mira_get_report", "Læser rapport"),
+            ("mira_handoff_ticket", "Giver ticket videre"),
         ];
         // Every tool of the MCP server has a label (and only those).
         let mut names: Vec<&str> = table.iter().map(|(t, _)| *t).collect();

@@ -276,6 +276,7 @@ mod tests {
             ("mira_get_workspace_rules", "Læser regler"),
             ("mira_add_report", "Skriver rapport"),
             ("mira_get_report", "Læser rapport"),
+            ("mira_handoff_ticket", "Giver ticket videre"),
         ];
         for (tool, label) in table {
             let name = format!("mcp__mira-bots__{tool}");

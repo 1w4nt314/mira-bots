@@ -15,6 +15,7 @@ import {
   ACTOR_LABEL,
   canDelete,
   canDrag,
+  canHandOver,
   formatAt,
   isCoordinationTask,
   ISSUE_HINT,
@@ -25,6 +26,7 @@ import {
 } from "../../../lib/tickets";
 import type { AgentInfo, TicketHistoryEntry, TicketSummary } from "../../../lib/types";
 import BotFigure from "../../BotFigure";
+import Markdown from "../../Markdown";
 import { smallBtn, useRun } from "./actions";
 import AssignMenu from "./AssignMenu";
 import ReportsSection from "./ReportsSection";
@@ -111,6 +113,25 @@ function NoteFrame(props: FrameProps) {
           {STATE_LABEL[t.state]}
         </span>
         <span className="font-mono text-[10px] opacity-70">{t.shortId}</span>
+        {typeof t.project === "string" ? (
+          <span className="max-w-[40%] truncate rounded bg-neutral-500/15 px-1 text-[10px]" title={`Projekt: ${t.project}`}>
+            {t.project}
+          </span>
+        ) : t.project !== null ? (
+          <span
+            className="max-w-[40%] truncate rounded bg-neutral-500/15 px-1 text-[10px]"
+            title={`Nyt projekt «${t.project.new}» oprettes ved tildeling`}
+          >
+            +{t.project.new}
+          </span>
+        ) : (
+          !compact &&
+          (t.state === "backlog" || t.state === "rejected") && (
+            <span className="text-[10px] opacity-60" title="Vælg projekt ved tildeling">
+              uden projekt
+            </span>
+          )
+        )}
         {t.skipReview && (
           <span className="text-[10px] opacity-70" title="Går direkte til Done uden review">
             uden review
@@ -144,6 +165,11 @@ function NoteFrame(props: FrameProps) {
       <div className="mt-1 line-clamp-2 break-words font-medium" title={t.title}>
         {t.title}
       </div>
+      {showActions && (
+        <div onPointerDown={stop} onKeyDown={stop} className="cursor-auto">
+          <BodyFold ticket={t} />
+        </div>
+      )}
 
       {!compact && (
         <>
@@ -221,7 +247,7 @@ function NoteActions({
   };
 
   const buttons: ReactNode[] = [];
-  if (canDrag(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
+  if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
   if (canDelete(t)) {
     buttons.push(
       <button
@@ -247,6 +273,56 @@ function NoteActions({
 function historyLine(h: TicketHistoryEntry): string {
   const move = h.from === null ? `oprettet i ${STATE_LABEL[h.to]}` : `${STATE_LABEL[h.from]} → ${STATE_LABEL[h.to]}`;
   return `${move} (${ACTOR_LABEL[h.by]})${h.note ? ` — ${h.note}` : ""}`;
+}
+
+/** The body is not part of `tickets-changed` either: fetched with `getTicket` while unfolded and
+ * shown as markdown (same `<details>` pattern as `HistoryFold`). */
+function BodyFold({ ticket: t }: { ticket: TicketSummary }) {
+  const [open, setOpen] = useState(false);
+  const [body, setBody] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    getTicket(t.id)
+      .then((full) => {
+        if (!alive) return;
+        setBody(full.body);
+        setError(null);
+      })
+      .catch((e: unknown) => {
+        if (alive) setError(errorMessage(e));
+      });
+    return () => {
+      alive = false;
+    };
+    // Refetch when the ticket changes while unfolded.
+  }, [open, t.id, t.updatedAt]);
+
+  return (
+    <details className="mt-1" onToggle={(e) => setOpen(e.currentTarget.open)}>
+      <summary className="cursor-pointer select-none text-[11px] opacity-70 hover:opacity-100">
+        Beskrivelse
+      </summary>
+      {error !== null && (
+        <p className="mt-1 text-[11px] text-rose-600 dark:text-rose-300" role="alert">
+          {error}
+        </p>
+      )}
+      {body === null
+        ? error === null && <p className="mt-1 text-[11px] opacity-70">Henter…</p>
+        : (
+            <div className="mt-1 max-h-[240px] overflow-y-auto pr-1">
+              {body.trim() === "" ? (
+                <p className="text-[11px] opacity-70">(ingen beskrivelse)</p>
+              ) : (
+                <Markdown text={body} />
+              )}
+            </div>
+          )}
+    </details>
+  );
 }
 
 /** History is not part of `tickets-changed`; it is fetched with `getTicket` while unfolded. */

@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { createTicket, errorMessage } from "../../../lib/ipc";
 import { BODY_MAX, TITLE_MAX } from "../../../lib/tickets";
+import type { ProjectRef } from "../../../lib/types";
+import { useRefreshProjects, useStore } from "../../../state/store";
+import ProjectPicker from "../ProjectPicker";
 
 interface Props {
   onClose: () => void;
@@ -9,12 +12,20 @@ interface Props {
 /**
  * New backlog ticket. Enter in the title moves to the description instead of submitting (so a
  * half-written ticket is never created by accident); Ctrl+Enter or "Opret" submits, Esc closes.
- * After a successful create the form is cleared and stays open with focus in the title.
+ * After a successful create the title and description are cleared (the project and the review
+ * choice stay for the next ticket) and the form stays open with focus in the title.
  */
 export default function NewTicketForm({ onClose }: Props) {
+  const { state } = useStore();
+  const refreshProjects = useRefreshProjects();
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
-  const [skipReview, setSkipReview] = useState(false);
+  // The workspace rule `reviewByDefault` presets "Spring review over".
+  const reviewByDefault = state.appInfo?.rules.reviewByDefault ?? true;
+  const [skipReview, setSkipReview] = useState(!reviewByDefault);
+  // Step 4b: an existing project, a new one (created at assignment) or "Vælg senere" (null).
+  const [project, setProject] = useState<ProjectRef | null>(null);
+  const [projectIncomplete, setProjectIncomplete] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const titleRef = useRef<HTMLInputElement>(null);
@@ -22,7 +33,7 @@ export default function NewTicketForm({ onClose }: Props) {
 
   useEffect(() => titleRef.current?.focus(), []);
 
-  const canSubmit = !busy && title.trim() !== "";
+  const canSubmit = !busy && title.trim() !== "" && !projectIncomplete;
 
   const submit = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -30,10 +41,10 @@ export default function NewTicketForm({ onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await createTicket(title.trim(), body, skipReview);
+      await createTicket(title.trim(), body, skipReview, project);
       setTitle("");
       setBody("");
-      setSkipReview(false);
+      void refreshProjects();
       titleRef.current?.focus();
     } catch (err) {
       setError(errorMessage(err));
@@ -78,6 +89,19 @@ export default function NewTicketForm({ onClose }: Props) {
           className={field}
         />
       </label>
+      <div className="block">
+        <span className="text-[var(--muted)]">Projekt</span>
+        <div className="mt-0.5">
+          <ProjectPicker
+            value={project}
+            onChange={setProject}
+            onIncomplete={setProjectIncomplete}
+            allowLater
+            allowNew
+            disabled={busy}
+          />
+        </div>
+      </div>
       <label className="block">
         <span className="text-[var(--muted)]">Beskrivelse</span>
         <textarea

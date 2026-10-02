@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getDiagnostics } from "../../../lib/ipc";
+import { readLocal, writeLocal } from "../../../lib/persist";
+import {
+  matchesFilter,
+  parseProjectFilter,
+  PROJECT_FILTER_KEY,
+  projectFilterKey,
+  projectIdOf,
+  type ProjectFilter,
+} from "../../../lib/projects";
 import { DONE_VISIBLE, groupTickets } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
@@ -31,7 +40,34 @@ function Empty({ text }: { text: string }) {
  */
 export default function TicketsPanel() {
   const { state } = useStore();
+  // Step 4b: the project filter (remembered) applies to Review, Backlog and Done.
+  const [filter, setFilter] = useState<ProjectFilter>(() =>
+    parseProjectFilter(readLocal(PROJECT_FILTER_KEY)),
+  );
+  useEffect(() => writeLocal(PROJECT_FILTER_KEY, projectFilterKey(filter)), [filter]);
   const groups = useMemo(() => groupTickets(state.tickets), [state.tickets]);
+  const shown = useMemo(
+    () => ({
+      review: groups.review.filter((t) => matchesFilter(t, filter)),
+      backlog: groups.backlog.filter((t) => matchesFilter(t, filter)),
+      done: groups.done.filter((t) => matchesFilter(t, filter)),
+    }),
+    [groups, filter],
+  );
+  // The projects on disk plus those named by tickets (deleted folders, other spellings).
+  const filterIds = useMemo(() => {
+    const ids = new Map<string, string>();
+    for (const p of state.projects) ids.set(p.id.toLowerCase(), p.id);
+    for (const t of state.tickets) {
+      const id = projectIdOf(t.project);
+      if (id !== null && !ids.has(id.toLowerCase())) ids.set(id.toLowerCase(), id);
+    }
+    if (typeof filter !== "string" && !ids.has(filter.id.toLowerCase())) {
+      ids.set(filter.id.toLowerCase(), filter.id);
+    }
+    return [...ids.values()].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  }, [state.projects, state.tickets, filter]);
+  const inProject = filter === "all" ? "" : " i dette projekt";
   const agentsById = useMemo(
     () => new Map<string, AgentInfo>(state.agents.map((a) => [a.id, a])),
     [state.agents],
@@ -68,11 +104,27 @@ export default function TicketsPanel() {
   let atAgents = 0;
   for (const s of groups.byAgent.values()) atAgents += s.queue.length + (s.current === null ? 0 : 1);
 
-  const doneShown = groups.done.slice(0, DONE_VISIBLE);
-  const doneHidden = groups.done.length - doneShown.length;
+  const doneShown = shown.done.slice(0, DONE_VISIBLE);
+  const doneHidden = shown.done.length - doneShown.length;
 
   return (
     <div className="office-cork space-y-4 p-3">
+      <label className="flex items-center gap-2 text-xs">
+        <span className="text-[var(--muted)]">Projekt</span>
+        <select
+          value={projectFilterKey(filter)}
+          onChange={(e) => setFilter(parseProjectFilter(e.target.value))}
+          className="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--bg)] p-1 text-xs outline-none focus:border-[var(--accent)]"
+        >
+          <option value="all">Alle projekter</option>
+          <option value="none">Uden projekt</option>
+          {filterIds.map((id) => (
+            <option key={id} value={projectFilterKey({ id })}>
+              {id}
+            </option>
+          ))}
+        </select>
+      </label>
       {fileWarning !== null && (
         <p
           className="rounded-lg border border-amber-400/50 bg-amber-300/20 px-2 py-1 text-xs text-amber-800 dark:text-amber-200"
@@ -90,15 +142,15 @@ export default function TicketsPanel() {
         </p>
       )}
 
-      {groups.review.length > 0 && (
-        <Section title="Review" count={groups.review.length}>
-          {groups.review.map((t) => (
+      {shown.review.length > 0 && (
+        <Section title="Review" count={shown.review.length}>
+          {shown.review.map((t) => (
             <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} onNotice={setNotice} />
           ))}
         </Section>
       )}
 
-      <Section title="Backlog" count={groups.backlog.length}>
+      <Section title="Backlog" count={shown.backlog.length}>
         {showForm ? (
           <NewTicketForm onClose={() => setShowForm(false)} />
         ) : (
@@ -111,14 +163,14 @@ export default function TicketsPanel() {
             + Ny ticket
           </button>
         )}
-        {groups.backlog.length === 0 ? (
-          <Empty text="Ingen tickets i Backlog" />
+        {shown.backlog.length === 0 ? (
+          <Empty text={`Ingen tickets i Backlog${inProject}`} />
         ) : (
           <>
             <p className="text-[11px] text-[var(--muted)]">
               Træk en note til en plads, eller brug Tildel…
             </p>
-            {groups.backlog.map((t) => (
+            {shown.backlog.map((t) => (
               <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable onNotice={setNotice} />
             ))}
           </>
@@ -133,11 +185,11 @@ export default function TicketsPanel() {
 
       <details className="group">
         <summary className="cursor-pointer select-none text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)] hover:text-[var(--fg)]">
-          Done ({groups.done.length})
+          Done ({shown.done.length})
         </summary>
         <div className="mt-2 space-y-2">
-          {groups.done.length === 0 ? (
-            <Empty text="Ingen færdige tickets endnu" />
+          {shown.done.length === 0 ? (
+            <Empty text={filter === "all" ? "Ingen færdige tickets endnu" : `Ingen færdige tickets${inProject}`} />
           ) : (
             <>
               {doneShown.map((t) => (

@@ -282,7 +282,8 @@ pub struct Diagnostics {
     pub tool_calls: u64,
     pub tool_errors: u64,
     pub last_tool_call: Option<LastToolCall>,
-    /// [`crate::config::AUTO_REVIEW_ON_STOP`]: whether a Stop moves the ticket to review.
+    /// Workspace rule `autoReviewOnStop` (default [`crate::config::AUTO_REVIEW_ON_STOP`]):
+    /// whether a Stop moves the ticket to review.
     pub auto_review_on_stop: bool,
     pub pipe_name: String,
     pub pipe_ready: bool,
@@ -291,7 +292,8 @@ pub struct Diagnostics {
     pub last_hook_event: Option<LastHookEvent>,
     pub log_path: Option<String>,
     pub app_version: String,
-    pub agents_root: String,
+    /// The projects root in use (plan4b A.1; a changed setting applies after a restart).
+    pub projects_root: String,
     pub running_agents: usize,
     /// `<app_data_dir>/tickets.json`.
     pub tickets_path: String,
@@ -303,7 +305,7 @@ pub struct Diagnostics {
     pub tickets_read_only: bool,
     /// Number of tickets in memory.
     pub tickets_total: usize,
-    /// `<agents_root>/.mira-bots/profiles` (the profile store).
+    /// `<projects root>/.mira-bots/profiles` (the profile store).
     pub profiles_path: String,
     /// Number of profiles loaded (built-in + custom).
     pub profiles_loaded: usize,
@@ -316,6 +318,16 @@ pub struct Diagnostics {
     pub tickets_escalated: usize,
     /// Reports on all tickets.
     pub reports_total: usize,
+    // ---- step 4b ----
+    /// `<projects root>/mira-bots.workspace.json`.
+    pub workspace_file_path: String,
+    pub workspace_file_exists: bool,
+    /// Set when the workspace file could not be read or parsed (the defaults apply).
+    pub workspace_warning: Option<String>,
+    /// Project folders under the projects root.
+    pub projects_total: usize,
+    /// Profiles copied from the step 1–5 agents root at this start (0 otherwise).
+    pub profiles_migrated: usize,
 }
 
 #[cfg(test)]
@@ -515,18 +527,23 @@ mod tests {
             }),
             log_path: None,
             app_version: "0.1.0".into(),
-            agents_root: "/h/mira-bots/agents".into(),
+            projects_root: "/h/mira-bots/projects".into(),
             running_agents: 2,
             tickets_path: "/d/tickets.json".into(),
             tickets_warning: None,
             tickets_read_only: false,
             tickets_total: 4,
-            profiles_path: "/h/mira-bots/agents/.mira-bots/profiles".into(),
+            profiles_path: "/h/mira-bots/projects/.mira-bots/profiles".into(),
             profiles_loaded: 7,
             profiles_warning: Some("1 profilfil(er) kunne ikke læses".into()),
             review_assignments_open: 2,
             tickets_escalated: 1,
             reports_total: 5,
+            workspace_file_path: "/h/mira-bots/projects/mira-bots.workspace.json".into(),
+            workspace_file_exists: false,
+            workspace_warning: None,
+            projects_total: 3,
+            profiles_migrated: 7,
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -554,18 +571,23 @@ mod tests {
                 "lastHookEvent": {"name": "Stop", "sessionId": "s", "agentId": "a", "at": 9},
                 "logPath": null,
                 "appVersion": "0.1.0",
-                "agentsRoot": "/h/mira-bots/agents",
+                "projectsRoot": "/h/mira-bots/projects",
                 "runningAgents": 2,
                 "ticketsPath": "/d/tickets.json",
                 "ticketsWarning": null,
                 "ticketsReadOnly": false,
                 "ticketsTotal": 4,
-                "profilesPath": "/h/mira-bots/agents/.mira-bots/profiles",
+                "profilesPath": "/h/mira-bots/projects/.mira-bots/profiles",
                 "profilesLoaded": 7,
                 "profilesWarning": "1 profilfil(er) kunne ikke læses",
                 "reviewAssignmentsOpen": 2,
                 "ticketsEscalated": 1,
-                "reportsTotal": 5
+                "reportsTotal": 5,
+                "workspaceFilePath": "/h/mira-bots/projects/mira-bots.workspace.json",
+                "workspaceFileExists": false,
+                "workspaceWarning": null,
+                "projectsTotal": 3,
+                "profilesMigrated": 7
             })
         );
     }

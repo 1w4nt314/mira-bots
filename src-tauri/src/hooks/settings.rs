@@ -140,7 +140,8 @@ pub fn statusline_command(hook_exe: &Path) -> String {
 
 /// The settings file of `profile` (C5.10): the hooks as in [`render_hooks`], allow
 /// (`mcp__mira-bots__*` + `extraAllow`), deny (role-bound tools the roles lack + `toolDeny` +
-/// `extraDeny`; omitted when empty), `model` when set, `effortLevel` when set and not `max`
+/// `Edit`/`Write`/`MultiEdit`/`NotebookEdit` without a work role + `extraDeny`; omitted when
+/// empty), `model` when set, `effortLevel` when set and not `max`
 /// (settings files ignore `max`; it is only passed as `--effort`), and `statusLine` pointing at
 /// the hook exe when [`STATUSLINE_ENABLED`].
 ///
@@ -330,7 +331,6 @@ mod tests {
                     "deny": [
                         "mcp__mira-bots__mira_approve_ticket",
                         "mcp__mira-bots__mira_assign_ticket",
-                        "mcp__mira-bots__mira_list_agents",
                         "mcp__mira-bots__mira_list_profiles",
                         "mcp__mira-bots__mira_reject_ticket",
                         "mcp__mira-bots__mira_spawn_agent",
@@ -342,7 +342,8 @@ mod tests {
         );
     }
 
-    /// The reviewer file exactly: git reads allowed, coordinator tools and commit/push denied.
+    /// The reviewer file exactly: git reads allowed, coordinator tools, file editing (no work
+    /// role, 5c C.2) and commit/push denied.
     #[test]
     fn reviewer_settings_allows_git_reads_and_denies_commit_push() {
         let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("reviewer"));
@@ -360,10 +361,13 @@ mod tests {
                     ],
                     "deny": [
                         "mcp__mira-bots__mira_assign_ticket",
-                        "mcp__mira-bots__mira_list_agents",
                         "mcp__mira-bots__mira_list_profiles",
                         "mcp__mira-bots__mira_spawn_agent",
                         "mcp__mira-bots__mira_unassign_ticket",
+                        "Edit",
+                        "Write",
+                        "MultiEdit",
+                        "NotebookEdit",
                         "Bash(git commit *)",
                         "Bash(git push *)",
                         "Bash(git -C * commit *)",

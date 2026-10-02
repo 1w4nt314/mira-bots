@@ -76,7 +76,7 @@ fn handshake_list_unknown_and_notification_give_three_lines() {
     assert_eq!(r.lines[0]["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(r.lines[1]["id"], 1);
     // Without MIRA_AGENT_ROLES: the common tools only.
-    assert_eq!(r.lines[1]["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(r.lines[1]["result"]["tools"].as_array().unwrap().len(), 11);
     assert_eq!(r.lines[2]["id"], 2);
     assert_eq!(r.lines[2]["error"]["code"], -32601);
     assert!(r.took < Duration::from_secs(5));
@@ -109,6 +109,9 @@ fn tools_list_filtered_by_env() {
         "mira_get_workspace_rules",
         "mira_add_report",
         "mira_get_report",
+        "mira_handoff_ticket",
+        "mira_list_agents",
+        "mira_list_projects",
     ];
     let with = |extra: &[&str]| -> Vec<String> {
         common.iter().chain(extra).map(|s| s.to_string()).collect()
@@ -127,11 +130,10 @@ fn tools_list_filtered_by_env() {
             "mira_assign_ticket",
             "mira_unassign_ticket",
             "mira_spawn_agent",
-            "mira_list_agents",
             "mira_list_profiles"
         ])
     );
-    assert_eq!(listed_names(Some("coder,reviewer,coordinator")).len(), 15);
+    assert_eq!(listed_names(Some("coder,reviewer,coordinator")).len(), 17);
     // A hidden tool is refused without contacting the app (no pipe needed).
     let input = format!(
         "{INIT}\n{}\n",

@@ -5,12 +5,14 @@ import { effortLabel, modelLabel } from "../../lib/models";
 import type { TermMode } from "../../lib/office";
 import { rolesText } from "../../lib/roles";
 import { isExited, isStartingHint, statusLabel } from "../../lib/status";
+import { switchBlocked } from "../../lib/tickets";
 import type { AgentInfo, BotState } from "../../lib/types";
 import { useStore } from "../../state/store";
 import AgentTerminal from "../AgentTerminal";
 import BotFigure from "../BotFigure";
 import AgentReviews from "./AgentReviews";
 import AgentSwitch from "./AgentSwitch";
+import MoveAgentDialog from "./MoveAgentDialog";
 import TicketQueue from "./tickets/TicketQueue";
 
 interface Props {
@@ -33,6 +35,8 @@ export default function TerminalPanel(props: Props) {
   const { agent, botState, theme, mode, onMode, onRemoved, onChromeHeight } = props;
   const { dispatch } = useStore();
   const [confirmStop, setConfirmStop] = useState(false);
+  // "Flyt til projekt…" (step 4b): only work seats have a project.
+  const [moving, setMoving] = useState(false);
   const exited = isExited(agent);
   const chromeRef = useRef<HTMLDivElement>(null);
   const isMin = mode === "min";
@@ -81,8 +85,11 @@ export default function TerminalPanel(props: Props) {
     return () => clearTimeout(t);
   }, [confirmStop]);
 
-  // Another agent: start without a pending confirmation.
-  useEffect(() => setConfirmStop(false), [agent.id]);
+  // Another agent: start without a pending confirmation or an open move dialog.
+  useEffect(() => {
+    setConfirmStop(false);
+    setMoving(false);
+  }, [agent.id]);
 
   const run = async (action: () => Promise<void>) => {
     try {
@@ -191,6 +198,29 @@ export default function TerminalPanel(props: Props) {
           </div>
           {!exited && <AgentSwitch agent={agent} />}
           {!exited && (
+            <span
+              className="max-w-[120px] shrink-0 truncate rounded bg-neutral-500/15 px-1.5 text-[11px]"
+              title={agent.seatKind === "work" ? `Projekt: ${agent.project}` : "Stabsplads: projektroden"}
+            >
+              {agent.seatKind === "work" ? agent.project : "rod"}
+            </span>
+          )}
+          {!exited && agent.seatKind === "work" && (
+            <button
+              type="button"
+              onClick={() => setMoving(true)}
+              disabled={switchBlocked(agent) !== null}
+              title={
+                switchBlocked(agent) ??
+                "Genstart agenten i et andet projekts mappe (samtalen bevares)"
+              }
+              aria-label="Flyt agenten til et andet projekt"
+              className={`${btn} disabled:cursor-not-allowed disabled:opacity-50`}
+            >
+              Flyt til projekt…
+            </button>
+          )}
+          {!exited && (
             <button
               type="button"
               onClick={stop}
@@ -260,6 +290,9 @@ export default function TerminalPanel(props: Props) {
       </div>
       {/* Only in normal/max: switching between them keeps it mounted and the RO refits it. */}
       <AgentTerminal key={agent.id} agentId={agent.id} exited={exited} />
+      {moving && (
+        <MoveAgentDialog agent={agent} onClose={() => setMoving(false)} onMoved={() => setMoving(false)} />
+      )}
     </div>
   );
 }
