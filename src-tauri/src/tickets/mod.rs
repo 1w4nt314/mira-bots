@@ -22,7 +22,7 @@ pub mod store;
 pub mod tools;
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Serialize;
@@ -31,22 +31,24 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::roles::Role;
 use crate::agent::{now_ms, AgentManager};
 use crate::config::{
-    NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS, TURN_FAILED_TEXT,
+    CHANGES_REPORT_TITLE, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS,
+    TURN_FAILED_TEXT,
 };
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
+use crate::git::{self, GitRunner};
 use crate::hooks::status::AgentStatus;
 use crate::workspace::WorkspaceReader;
 use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
 use model::{
-    ReportAuthor, Ticket, TicketActor, TicketError, TicketReport, TicketState, TicketSummary,
-    WorkspaceRules,
+    GitMode, ReportAuthor, Ticket, TicketActor, TicketError, TicketGit, TicketReport, TicketState,
+    TicketSummary, WorkspaceRules,
 };
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
 pub use service::RejectReturn;
 use service::{
-    relation_effects, RelationEffects, ReviewCounts, TicketLinks, TicketService,
-    REVIEWER_REMOVED_NOTE,
+    needs_changes_report, relation_effects, RelationEffects, ReviewCounts, TicketLinks,
+    TicketService, REVIEWER_REMOVED_NOTE,
 };
 use store::JsonFileStore;
 
@@ -131,6 +133,12 @@ pub struct TicketsCtx {
     report_lock: Mutex<()>,
     /// The workspace file reader (plan4b A.4), shared with `AppState`.
     pub workspace: Arc<WorkspaceReader>,
+    /// git for the ticket worktrees and the «Ændringer» report (step 6b; `SystemGit` in the app).
+    pub git: Arc<dyn GitRunner>,
+    /// Serialises git preparation and the «Ændringer» report (check + git + save), so two paths
+    /// never prepare the same worktree or add the report twice. Taken before, never inside, the
+    /// service and report locks; git runs under it but never under the service lock.
+    git_lock: Mutex<()>,
 }
 
 impl TicketsCtx {
@@ -141,6 +149,7 @@ impl TicketsCtx {
         emit: EmitFn,
         reports_root: PathBuf,
         workspace: Arc<WorkspaceReader>,
+        git: Arc<dyn GitRunner>,
     ) -> Self {
         TicketsCtx {
             service: Mutex::new(service),
@@ -150,6 +159,8 @@ impl TicketsCtx {
             reports: ReportStore::new(reports_root),
             report_lock: Mutex::new(()),
             workspace,
+            git,
+            git_lock: Mutex::new(()),
         }
     }
 
@@ -491,6 +502,10 @@ impl TicketsCtx {
         let reviewers = lock(&self.manager).reviewers();
         let mut routed = 0;
         for t in pending {
+            // Step 6b (plan A.6): the app's «Ændringer» report before routing or escalation.
+            if t.git.is_some() {
+                self.attach_changes(&t.id);
+            }
             let now = now_ms();
             if t.review_round >= max {
                 match self.mutate_if(|s| s.escalate(&t.id, max, now), Option::is_some) {
@@ -536,6 +551,129 @@ impl TicketsCtx {
             }
         }
         routed
+    }
+
+    // ---- git per ticket (step 6b, plan A.4/A.6) ----
+
+    /// The ticket's git branch at delivery (plan A.4): a ticket that already has one keeps it (a
+    /// rejected ticket goes back to its branch/worktree). Otherwise only with the workspace rule
+    /// `git: worktree`, for a ticket with an existing project and without children: the base is
+    /// resolved (workspace `gitBase` → origin/HEAD → current branch → commit) and the worktree
+    /// `<project>/.mira-bots/wt/<short>` on `ticket/<short>` is prepared and saved as
+    /// `ticket.git`. A project that is not a repository, a missing git or a failing git command
+    /// is a history note by the system and `None`: the delivery always continues without git.
+    /// Blocking (git, at most `GIT_TIMEOUT_MS` per command); never called under a lock.
+    pub fn prepare_ticket_git(&self, ticket: &Ticket) -> Option<TicketGit> {
+        if ticket.git.is_some() {
+            return ticket.git.clone();
+        }
+        if self.workspace.rules().git != GitMode::Worktree {
+            return None;
+        }
+        let project = ticket.project.as_ref().and_then(|p| p.id())?;
+        if !self.read(|s| s.children(&ticket.id)).is_empty() {
+            return None;
+        }
+        let _guard = lock(&self.git_lock);
+        // Another path may have prepared it while this one waited.
+        let current = self.read(|s| s.get(&ticket.id))?;
+        if current.git.is_some() {
+            return current.git;
+        }
+        let short = ticket.short_id();
+        let Some(found) = crate::projects::find_project(self.workspace.root(), project) else {
+            log::warn!("git: ticket {short}: project «{project}» not found; no git");
+            return None;
+        };
+        let repo = PathBuf::from(&found.path);
+        let prepared = if git::is_git_repo(&repo) {
+            let base = git::resolve_base(
+                self.git.as_ref(),
+                &repo,
+                self.workspace.config().git_base.as_deref(),
+            );
+            git::prepare_worktree(self.git.as_ref(), &repo, &short, &base).map(|wt| TicketGit {
+                mode: GitMode::Worktree,
+                branch: git::branch_name(&short).unwrap_or_default(),
+                base,
+                repo: repo.to_string_lossy().into_owned(),
+                worktree: Some(wt.to_string_lossy().into_owned()),
+            })
+        } else {
+            Err(format!(
+                "git: projektet «{}» er ikke et git-repo; ingen branch",
+                found.id
+            ))
+        };
+        let now = now_ms();
+        match prepared {
+            Ok(info) => match self.mutate(|s| s.set_git(&ticket.id, Some(info.clone()), now)) {
+                Ok(_) => {
+                    log::info!(
+                        "git: ticket {short} on {} in {}",
+                        info.branch,
+                        info.worktree.as_deref().unwrap_or(&info.repo)
+                    );
+                    Some(info)
+                }
+                Err(e) => {
+                    log::warn!("git: saving ticket {short}'s branch failed: {e}");
+                    None
+                }
+            },
+            Err(note) => {
+                log::warn!("git: ticket {short}: {note}; delivering without git");
+                if let Err(e) = self.mutate_if(
+                    |s| s.note_by_system(&ticket.id, &note, now),
+                    Option::is_some,
+                ) {
+                    log::warn!("git: noting on ticket {short} failed: {e}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Adds the app's «Ændringer» report (diff stat `base...branch`, commits `base..branch`,
+    /// uncommitted files in the worktree; author System) to a ticket in review with git info,
+    /// once per review entry ([`needs_changes_report`]). A git failure is logged only. Returns
+    /// whether a report was added.
+    pub fn attach_changes(&self, ticket_id: &str) -> bool {
+        let _guard = lock(&self.git_lock);
+        let Some(t) = self.read(|s| s.get(ticket_id)) else {
+            return false;
+        };
+        if !needs_changes_report(&t) {
+            return false;
+        }
+        let Some(g) = t.git.as_ref() else {
+            return false;
+        };
+        let short = t.short_id();
+        let summary = git::change_summary(
+            self.git.as_ref(),
+            Path::new(&g.repo),
+            g.worktree.as_deref().map(Path::new),
+            &g.base,
+            &g.branch,
+        );
+        let body = match summary {
+            Ok(s) => git::render_changes(&s),
+            Err(e) => {
+                log::warn!("git: changes of ticket {short} could not be read: {e}");
+                return false;
+            }
+        };
+        match self.add_report(&t.id, ReportAuthor::system(), CHANGES_REPORT_TITLE, &body) {
+            Ok(r) => {
+                log::info!("git: report {} «Ændringer» added to ticket {short}", r.id);
+                true
+            }
+            Err(e) => {
+                log::warn!("git: adding the changes report to ticket {short} failed: {e}");
+                false
+            }
+        }
     }
 
     /// `assign_reviewer` (C5.4): the ticket must be in review. `Some(agent)`: a live agent with
@@ -689,6 +827,10 @@ impl TicketsHost for Arc<TicketsCtx> {
             .map(|p| p.id)
             .collect()
     }
+
+    fn prepare_git(&self, ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
+        TicketsCtx::prepare_ticket_git(self, ticket)
+    }
 }
 
 /// The dispatcher's [`AgentPort`] over the real manager. Each call takes the manager lock
@@ -781,6 +923,15 @@ pub(crate) mod test_support {
     }
 
     pub fn test_ctx(manager: Arc<Mutex<AgentManager>>) -> TestCtx {
+        test_ctx_with_git(manager, Arc::new(crate::git::fake::FakeGit::new()))
+    }
+
+    /// [`test_ctx`] with a given git (step 6b). The workspace file (absent: the defaults) is
+    /// `ctx.workspace.path()`; its folder is the projects root.
+    pub fn test_ctx_with_git(
+        manager: Arc<Mutex<AgentManager>>,
+        git: Arc<dyn crate::git::GitRunner>,
+    ) -> TestCtx {
         let store = MemoryStore::new();
         let svc = TicketService::new(Box::new(store.clone()), TicketDoc::default());
         let (tx, rx) = unbounded_channel();
@@ -805,6 +956,7 @@ pub(crate) mod test_support {
                 emit,
                 reports_root,
                 workspace,
+                git,
             )),
             rx,
             events,
@@ -940,6 +1092,7 @@ mod tests {
                     .join(format!("mira-ws-{}", uuid::Uuid::new_v4()))
                     .join(crate::config::WORKSPACE_FILE),
             )),
+            Arc::new(crate::git::fake::FakeGit::new()),
         ));
         assert!(slot.set(Arc::clone(&ctx)).is_ok());
         let tk = ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
@@ -1968,5 +2121,254 @@ mod tests {
         );
         // The user rejects: back to the backlog (nobody to return it to).
         assert_eq!(c.reject_return(&parent.id), RejectReturn::Backlog);
+    }
+
+    // ---- step 6b: git per ticket ----
+
+    use crate::git::fake::FakeGit;
+    use crate::projects::ProjectRef;
+
+    /// A ctx with a scripted git, the workspace file `json` and the project `proj` (with a
+    /// `.git` folder when `repo`).
+    fn git_ctx(json: &str, repo: bool) -> (TestCtx, Arc<FakeGit>, PathBuf, Vec<String>) {
+        let (m, ids) = manager_with(1);
+        let fake = Arc::new(FakeGit::new());
+        let t = test_ctx_with_git(m, fake.clone());
+        let proj = t.ctx.workspace.root().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        if repo {
+            std::fs::create_dir(proj.join(".git")).unwrap();
+        }
+        std::fs::write(t.ctx.workspace.path(), json).unwrap();
+        (t, fake, proj, ids)
+    }
+
+    fn ticket_in(t: &TestCtx, project: Option<&str>) -> Ticket {
+        let p = project.map(|p| ProjectRef::Existing(p.into()));
+        t.ctx
+            .mutate(|s| s.create_in("Ret login", "b", false, p, None, 1))
+            .unwrap()
+    }
+
+    fn cleanup(t: &TestCtx) {
+        let _ = std::fs::remove_dir_all(t.ctx.workspace.root());
+    }
+
+    #[test]
+    fn prepare_git_is_off_by_default_and_needs_a_project() {
+        let (t, fake, _proj, _) = git_ctx("{}", true);
+        let tk = ticket_in(&t, Some("proj"));
+        assert_eq!(t.ctx.prepare_ticket_git(&tk), None);
+        std::fs::write(t.ctx.workspace.path(), r#"{"git": "worktree"}"#).unwrap();
+        let none = ticket_in(&t, None);
+        assert_eq!(t.ctx.prepare_ticket_git(&none), None);
+        assert!(fake.calls().is_empty());
+        let h = t.ctx.read(|s| s.get(&none.id)).unwrap().history;
+        assert_eq!(h.len(), 1, "no note");
+        cleanup(&t);
+    }
+
+    #[test]
+    fn prepare_git_creates_worktree_and_saves_ticket_git() {
+        let (t, fake, proj, _) = git_ctx(r#"{"git": "worktree", "gitBase": "develop"}"#, true);
+        let tk = ticket_in(&t, Some("PROJ"));
+        let short = tk.short_id();
+        let g = t.ctx.prepare_ticket_git(&tk).expect("git");
+        let wt = crate::git::worktree_dir(&proj, &short);
+        assert_eq!(
+            g,
+            TicketGit {
+                mode: GitMode::Worktree,
+                branch: format!("ticket/{short}"),
+                base: "develop".into(),
+                repo: proj.to_string_lossy().into_owned(),
+                worktree: Some(wt.to_string_lossy().into_owned()),
+            }
+        );
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls[0], ["worktree", "prune"]);
+        assert_eq!(
+            calls[3],
+            [
+                "worktree",
+                "add",
+                wt.to_str().unwrap(),
+                "-b",
+                &format!("ticket/{short}"),
+                "develop"
+            ]
+        );
+        assert!(proj.join(".mira-bots").join(".gitignore").is_file());
+        let stored = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(stored.git.as_ref(), Some(&g));
+        // Again (e.g. after a rejection): the stored value, no git call.
+        assert_eq!(t.ctx.prepare_ticket_git(&stored), Some(g.clone()));
+        assert_eq!(t.ctx.prepare_ticket_git(&tk), Some(g));
+        assert_eq!(fake.calls().len(), 4);
+        cleanup(&t);
+    }
+
+    #[test]
+    fn prepare_git_failure_is_a_note_and_the_delivery_goes_on() {
+        let (t, fake, _proj, _) = git_ctx(r#"{"git": "worktree"}"#, true);
+        fake.reply(&["symbolic-ref"], 128, "", "fatal: not a symbolic ref");
+        fake.reply(&["branch", "--show-current"], 0, "main\n", "");
+        fake.reply(
+            &["worktree", "add"],
+            128,
+            "",
+            "Preparing worktree (new branch 'x')\nfatal: invalid reference: main\n",
+        );
+        let tk = ticket_in(&t, Some("proj"));
+        assert_eq!(t.ctx.prepare_ticket_git(&tk), None);
+        let stored = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(stored.git, None);
+        let last = stored.history.last().unwrap();
+        assert_eq!(
+            (last.note.as_deref(), last.by, last.to),
+            (
+                Some("git: fatal: invalid reference: main"),
+                TicketActor::System,
+                TicketState::Backlog
+            )
+        );
+        // The same failure again: no duplicate note.
+        assert_eq!(t.ctx.prepare_ticket_git(&tk), None);
+        let n = t.ctx.read(|s| s.get(&tk.id)).unwrap().history.len();
+        assert_eq!(n, stored.history.len());
+
+        // git missing.
+        let (t2, fake2, _, _) = git_ctx(r#"{"git": "worktree"}"#, true);
+        fake2.fail(&[], crate::git::GIT_NOT_FOUND_NOTE);
+        let tk2 = ticket_in(&t2, Some("proj"));
+        assert_eq!(t2.ctx.prepare_ticket_git(&tk2), None);
+        let h = t2.ctx.read(|s| s.get(&tk2.id)).unwrap().history;
+        assert_eq!(
+            h.last().unwrap().note.as_deref(),
+            Some("git ikke fundet — git: off")
+        );
+        cleanup(&t);
+        cleanup(&t2);
+    }
+
+    #[test]
+    fn prepare_git_for_a_project_without_repo_is_a_note() {
+        let (t, fake, _proj, _) = git_ctx(r#"{"git": "worktree"}"#, false);
+        let tk = ticket_in(&t, Some("proj"));
+        assert_eq!(t.ctx.prepare_ticket_git(&tk), None);
+        assert!(fake.calls().is_empty());
+        let h = t.ctx.read(|s| s.get(&tk.id)).unwrap().history;
+        assert_eq!(
+            h.last().unwrap().note.as_deref(),
+            Some("git: projektet «proj» er ikke et git-repo; ingen branch")
+        );
+        // Branch mode is deferred: off (the workspace note says so), nothing happens.
+        std::fs::write(t.ctx.workspace.path(), r#"{"git": "branch"}"#).unwrap();
+        let tk2 = ticket_in(&t, Some("proj"));
+        assert_eq!(t.ctx.prepare_ticket_git(&tk2), None);
+        assert_eq!(t.ctx.read(|s| s.get(&tk2.id)).unwrap().history.len(), 1);
+        cleanup(&t);
+    }
+
+    #[test]
+    fn route_reviews_attaches_changes_report_once() {
+        let (t, fake, proj, ids) = git_ctx(r#"{"git": "worktree"}"#, true);
+        fake.reply(
+            &["diff"],
+            0,
+            " a.txt | 1 +\n 1 file changed, 1 insertion(+)\n",
+            "",
+        );
+        fake.reply(&["log"], 0, "abc1234 Ret login\n", "");
+        fake.reply(&["status"], 0, "?? notes.txt\n?? .mira-bots/\n", "");
+        let a = &ids[0];
+        let tk = t
+            .ctx
+            .mutate(|s| {
+                s.create_in(
+                    "Ret",
+                    "b",
+                    false,
+                    Some(ProjectRef::Existing("proj".into())),
+                    None,
+                    1,
+                )
+            })
+            .unwrap();
+        let g = t.ctx.prepare_ticket_git(&tk).unwrap();
+        let before = fake.calls().len();
+        t.ctx.mutate(|s| s.assign(&tk.id, a, 2)).unwrap();
+        t.ctx.mutate(|s| s.mark_dispatched(&tk.id, a, 3)).unwrap();
+        t.ctx
+            .mutate(|s| s.submit_by_agent(a, None, "klar", 4))
+            .unwrap();
+        // No reviewer: nothing routed, but the report is there (author: the app).
+        assert_eq!(t.ctx.route_reviews(), 0);
+        let stored = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(stored.reports.len(), 1);
+        let r = &stored.reports[0];
+        assert_eq!(
+            (r.title.as_str(), r.author.clone()),
+            ("Ændringer", ReportAuthor::system())
+        );
+        let body = t.ctx.get_report(&tk.id, &r.id).unwrap().body;
+        assert_eq!(
+            body,
+            format!(
+                "Branch {} fra {}\n\n## Commits (1)\n- abc1234 Ret login\n\n## Ændrede filer\n a.txt | 1 +\n 1 file changed, 1 insertion(+)\n\n## Ikke committet\n1 fil(er) i arbejdsmappen er ikke committet (de indgår ikke i diffen)",
+                g.branch, g.base
+            )
+        );
+        let calls = fake.calls_in();
+        assert_eq!(calls.len(), before + 3);
+        assert_eq!(
+            calls[before + 2].0,
+            PathBuf::from(g.worktree.clone().unwrap())
+        );
+        // Routing again: no second report, no git.
+        t.ctx.route_reviews();
+        assert_eq!(t.ctx.read(|s| s.get(&tk.id)).unwrap().reports.len(), 1);
+        assert_eq!(fake.calls().len(), before + 3);
+
+        // Rejected and submitted again (later than the first report): a new review entry gets
+        // a new report.
+        let later = now_ms() + 1_000;
+        t.ctx
+            .mutate(|s| s.reject(&tk.id, "mere", RejectReturn::Sender, later))
+            .unwrap();
+        t.ctx
+            .mutate(|s| s.mark_dispatched(&tk.id, a, later + 1))
+            .unwrap();
+        t.ctx
+            .mutate(|s| s.submit_by_agent(a, None, "igen", later + 2))
+            .unwrap();
+        t.ctx.route_reviews();
+        assert_eq!(t.ctx.read(|s| s.get(&tk.id)).unwrap().reports.len(), 2);
+        assert!(proj.join(".mira-bots").join(".gitignore").is_file());
+        cleanup(&t);
+    }
+
+    #[test]
+    fn changes_report_failure_is_logged_only() {
+        let (t, fake, _proj, ids) = git_ctx(r#"{"git": "worktree"}"#, true);
+        fake.reply(&["diff"], 128, "", "fatal: bad revision");
+        let a = &ids[0];
+        let tk = ticket_in(&t, Some("proj"));
+        t.ctx.prepare_ticket_git(&tk).unwrap();
+        t.ctx.mutate(|s| s.assign(&tk.id, a, 2)).unwrap();
+        t.ctx.mutate(|s| s.mark_dispatched(&tk.id, a, 3)).unwrap();
+        t.ctx
+            .mutate(|s| s.submit_by_agent(a, None, "klar", 4))
+            .unwrap();
+        assert!(!t.ctx.attach_changes(&tk.id));
+        assert_eq!(t.ctx.route_reviews(), 0);
+        let stored = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert!(stored.reports.is_empty());
+        assert_eq!(stored.state, TicketState::Review);
+        // A ticket without git never gets the report.
+        let plain = submitted(&t, a, "uden git");
+        assert!(!t.ctx.attach_changes(&plain));
+        cleanup(&t);
     }
 }

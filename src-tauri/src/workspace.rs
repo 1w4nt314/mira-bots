@@ -22,6 +22,11 @@ pub const MAX_STAFF_SEATS: usize = 3;
 pub const USER_INPUT_GRACE_MAX_MS: u64 = 60_000;
 /// Most chars of `gitBase`.
 pub const GIT_BASE_MAX_CHARS: usize = 100;
+/// Note for `"git": "branch"` until branch mode exists (plan6b punkt 11, 6b-2): off is used.
+pub const GIT_BRANCH_LATER_NOTE: &str = "git: branch kommer i et senere trin; off bruges";
+/// Note for `"cleanupWorktreesOnDone": true` until it is enforced (plan6b punkt 13, 6b-2).
+pub const CLEANUP_LATER_NOTE: &str =
+    "cleanupWorktreesOnDone håndhæves først i et senere trin (worktrees fjernes ikke automatisk)";
 
 /// The file as written by the user; every field is optional. Unknown keys are ignored, a wrong
 /// type rejects the whole file (defaults + warning).
@@ -176,6 +181,8 @@ pub fn effective(file: &WorkspaceFile) -> (WorkspaceRules, WorkspaceConfig, Vec<
     // ---- step 6b ----
     if let Some(v) = &file.git {
         match GitMode::parse(v) {
+            // plan6b punkt 11 is deferred (6b-2): branch mode behaves as off, with a note.
+            Some(GitMode::Branch) => notes.push(GIT_BRANCH_LATER_NOTE.to_string()),
             Some(m) => r.git = m,
             None => notes.push(format!(
                 "git «{v}» er ukendt (off, branch eller worktree); off bruges"
@@ -201,6 +208,10 @@ pub fn effective(file: &WorkspaceFile) -> (WorkspaceRules, WorkspaceConfig, Vec<
     }
     if let Some(v) = file.cleanup_worktrees_on_done {
         r.cleanup_worktrees_on_done = v;
+        // plan6b punkt 13 is deferred (6b-2): read, not enforced yet.
+        if v {
+            notes.push(CLEANUP_LATER_NOTE.to_string());
+        }
     }
     if let Some(v) = &file.playbooks {
         // Built-in names the file does not mention stay.
@@ -419,7 +430,7 @@ mod tests {
                 ..WorkspaceConfig::default()
             }
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(notes, [CLEANUP_LATER_NOTE], "{notes:?}");
     }
 
     #[test]
@@ -488,10 +499,8 @@ mod tests {
     fn git_mode_parses_and_unknown_gives_note() {
         for (v, want) in [
             ("off", GitMode::Off),
-            ("branch", GitMode::Branch),
             ("worktree", GitMode::Worktree),
             ("Worktree", GitMode::Worktree),
-            (" BRANCH ", GitMode::Branch),
         ] {
             let (r, _, notes) = effective(&WorkspaceFile {
                 git: Some(v.into()),
@@ -499,6 +508,15 @@ mod tests {
             });
             assert_eq!(r.git, want, "{v}");
             assert!(notes.is_empty(), "{v}: {notes:?}");
+        }
+        // Branch mode is deferred (6b-2): off with a note.
+        for v in ["branch", " BRANCH "] {
+            let (r, _, notes) = effective(&WorkspaceFile {
+                git: Some(v.into()),
+                ..WorkspaceFile::default()
+            });
+            assert_eq!(r.git, GitMode::Off, "{v}");
+            assert_eq!(notes, ["git: branch kommer i et senere trin; off bruges"]);
         }
         let (r, _, notes) = effective(&file(r#"{"git": "foo"}"#));
         assert_eq!(r.git, GitMode::Off);
@@ -555,7 +573,7 @@ mod tests {
             r#"{"checksGate": false, "autoSpawnForPlaybook": true,
                 "freshSessionPerTicket": false, "cleanupWorktreesOnDone": true}"#,
         ));
-        assert!(notes.is_empty());
+        assert_eq!(notes, [CLEANUP_LATER_NOTE]);
         assert_eq!(
             (
                 r.checks_gate,

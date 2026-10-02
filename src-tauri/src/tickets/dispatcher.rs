@@ -12,14 +12,15 @@
 //! agents' ticket links and emits).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::model::{
-    ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState, WorkspaceRules,
+    ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketGit, TicketIssue, TicketState,
+    WorkspaceRules,
 };
 use super::prompt::{self, ReviewSender, TicketDelivery, WakeInfo};
 use super::service::{DueWake, TicketService};
@@ -110,6 +111,13 @@ pub trait TicketsHost: Send {
     /// The project ids under the projects root (plan4b A.6). Empty by default.
     fn project_ids(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// Step 6b (plan A.4): the ticket's git branch for a real work delivery to an agent in
+    /// `cwd` (`TicketsCtx::prepare_git`: an existing `ticket.git` is kept; with `git: worktree`
+    /// the worktree is prepared and saved; any failure is a history note and `None`). Blocks
+    /// for the git commands. `None` by default (git off).
+    fn prepare_git(&self, _ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
+        None
     }
 }
 
@@ -1298,10 +1306,19 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
-    /// Enter follows after `ENTER_DELAY_MS`.
+    /// Enter follows after `ENTER_DELAY_MS`. Step 6b: a real work delivery asks the host for the
+    /// ticket's git branch first (`## Git` in the file). The file is written in the agent's cwd
+    /// as before; with a worktree the section names the worktree folder (an agent spawned with
+    /// the ticket already runs there; moving a running agent there is the fresh-session step).
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
         let now = now_ms();
         let delivery = self.delivery_for(agent_id, snap, ticket);
+        let delivery = if delivery.is_work() {
+            let git = self.host.prepare_git(ticket, &snap.cwd);
+            delivery.with_git(git)
+        } else {
+            delivery
+        };
         if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, &delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
@@ -1665,6 +1682,9 @@ mod tests {
         svc: Arc<Mutex<TicketService>>,
         mutations: Arc<AtomicUsize>,
         rules: WorkspaceRules,
+        /// Step 6b: what `prepare_git` prepares for a ticket without git (saved like the app).
+        git: Arc<Mutex<Option<TicketGit>>>,
+        git_calls: Arc<AtomicUsize>,
     }
 
     impl TicketsHost for TestHost {
@@ -1685,6 +1705,18 @@ mod tests {
 
         fn rules(&self) -> WorkspaceRules {
             self.rules
+        }
+
+        fn prepare_git(&self, ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
+            self.git_calls.fetch_add(1, Ordering::SeqCst);
+            if ticket.git.is_some() {
+                return ticket.git.clone();
+            }
+            let git = lock(&self.git).clone()?;
+            lock(&self.svc)
+                .set_git(&ticket.id, Some(git.clone()), 5)
+                .unwrap();
+            Some(git)
         }
     }
 
@@ -1754,6 +1786,9 @@ mod tests {
     struct Harness {
         d: Dispatcher<TestHost, FakePort, FakeTimers>,
         svc: Arc<Mutex<TicketService>>,
+        /// The host's `prepare_git` answer and call count (step 6b).
+        git: Arc<Mutex<Option<TicketGit>>>,
+        git_calls: Arc<AtomicUsize>,
         port: FakePort,
         timers: FakeTimers,
         root: PathBuf,
@@ -1775,13 +1810,18 @@ mod tests {
                 svc: svc.clone(),
                 mutations: Arc::default(),
                 rules: WorkspaceRules::defaults(),
+                git: Arc::default(),
+                git_calls: Arc::default(),
             };
+            let (git, git_calls) = (host.git.clone(), host.git_calls.clone());
             let port = FakePort::default();
             let timers = FakeTimers::new();
             let root = std::env::temp_dir().join(format!("mira-dispatch-{}", uuid::Uuid::new_v4()));
             Harness {
                 d: Dispatcher::new(host, port.clone(), timers.clone()),
                 svc,
+                git,
+                git_calls,
                 port,
                 timers,
                 root,
@@ -3060,6 +3100,8 @@ mod tests {
             svc: h.svc.clone(),
             mutations: Arc::default(),
             rules: WorkspaceRules::defaults(),
+            git: Arc::default(),
+            git_calls: Arc::default(),
         };
         let d = Dispatcher::new(host, h.port.clone(), h.timers.clone());
         tx2.send(DispatchMsg::QueueChanged {
@@ -3070,6 +3112,85 @@ mod tests {
         run(rx2, d).await;
         assert_eq!(h.timers.pending(), 1);
         assert_eq!(h.ticket(&t.id).state, S::Assigned);
+    }
+
+    // ---- step 6b: git in the delivery ----
+
+    fn worktree_git(short: &str) -> TicketGit {
+        TicketGit {
+            mode: crate::tickets::model::GitMode::Worktree,
+            branch: format!("ticket/{short}"),
+            base: "main".into(),
+            repo: "/p/proj".into(),
+            worktree: Some(format!("/p/proj/.mira-bots/wt/{short}")),
+        }
+    }
+
+    #[test]
+    fn work_delivery_asks_host_for_git_and_writes_git_section() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        let g = worktree_git(&t.short_id());
+        *lock(&h.git) = Some(g.clone());
+        deliver_until_enter(&mut h, "a1");
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 1);
+        // The line is unchanged; the file has `## Git` before `## Regler`; the ticket keeps it.
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t)), enter("a1")]);
+        let f = h.ticket_file("a1", &t);
+        let section = format!(
+            "## Git\n- branch: {} (fra main)\n- mappe: {}\n- Commit dine ændringer",
+            g.branch,
+            g.worktree.as_deref().unwrap()
+        );
+        assert!(f.contains(&section), "{f}");
+        assert!(f.find("## Git").unwrap() < f.find("## Regler").unwrap());
+        assert_eq!(h.ticket(&t.id).git, Some(g));
+    }
+
+    #[test]
+    fn delivery_without_git_has_no_git_section() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        deliver_until_enter(&mut h, "a1");
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 1);
+        assert!(!h.ticket_file("a1", &t).contains("## Git"));
+        assert_eq!(h.ticket(&t.id).git, None);
+    }
+
+    #[test]
+    fn rejected_ticket_keeps_its_git_info() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        let first = worktree_git(&t.short_id());
+        h.svc().set_git(&t.id, Some(first.clone()), 3).unwrap();
+        // The host would prepare something else for a ticket without git.
+        *lock(&h.git) = Some(TicketGit {
+            branch: "ticket/other".into(),
+            ..worktree_git("ffffffff")
+        });
+        deliver_until_enter(&mut h, "a1");
+        let f = h.ticket_file("a1", &t);
+        assert!(
+            f.contains(&format!("- branch: {} (fra main)", first.branch)),
+            "{f}"
+        );
+        assert!(!f.contains("ticket/other"));
+        assert_eq!(h.ticket(&t.id).git, Some(first));
+    }
+
+    #[test]
+    fn coordination_task_never_asks_for_git() {
+        let mut h = Harness::new();
+        h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+        let t = h.queued("p1", "Plan noget");
+        *lock(&h.git) = Some(worktree_git(&t.short_id()));
+        deliver_until_enter(&mut h, "p1");
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 0);
+        assert!(!h.ticket_file("p1", &t).contains("## Git"));
+        assert_eq!(h.ticket(&t.id).git, None);
     }
 
     // ---- review deliveries (plan5 punkt 12) ----

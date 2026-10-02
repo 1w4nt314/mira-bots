@@ -5,10 +5,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::model::{Ticket, TicketState};
+use super::model::{Ticket, TicketGit, TicketState};
 use crate::agent::roles::{self, Role};
 use crate::agent::SeatKind;
-use crate::config::{REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
+use crate::config::{MIRA_GITIGNORE, REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
 
 /// Title used when nothing is left after sanitising.
 pub const EMPTY_TITLE: &str = "(uden titel)";
@@ -205,6 +205,8 @@ pub struct TicketDelivery {
     pub coordinator_available: bool,
     /// The ticket's children (`## Del-tickets`, step 6a); empty = no section.
     pub children: Vec<ChildLine>,
+    /// The ticket's git branch (`## Git`, step 6b; only for real work deliveries).
+    pub git: Option<TicketGit>,
 }
 
 impl TicketDelivery {
@@ -247,6 +249,14 @@ impl TicketDelivery {
     /// Sets [`Self::coordinator_available`] (step 6a).
     pub fn with_coordinator(mut self, available: bool) -> Self {
         self.coordinator_available = available;
+        self
+    }
+
+    /// Adds the ticket's git branch (`## Git`, step 6b); ignored for a coordination task.
+    pub fn with_git(mut self, git: Option<TicketGit>) -> Self {
+        if self.is_work() {
+            self.git = git;
+        }
         self
     }
 
@@ -538,6 +548,9 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: &TicketDelivery) -> String
             shared_project_text(shared)
         ));
     }
+    if let Some(git) = delivery.git.as_ref().filter(|_| delivery.is_work()) {
+        out.push_str(&git_section(git));
+    }
     out.push_str(
         "## Regler\n\
          - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
@@ -547,6 +560,35 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: &TicketDelivery) -> String
     out
 }
 
+/// `## Git` of a work delivery (plan6b C6b.4): the branch, the folder to work in (the worktree,
+/// or the repository in `branch` mode) and the commit rules.
+pub fn git_section(g: &TicketGit) -> String {
+    let place = match &g.worktree {
+        Some(w) => format!("mappe: {w}"),
+        None => format!("repo: {}", g.repo),
+    };
+    format!(
+        "## Git\n- branch: {} (fra {})\n- {place}\n- Commit dine ændringer på denne branch med små, beskrivende commits. Push ikke (`git push` er slået fra; brugeren merger). Skift ikke branch, og rør ikke andre worktrees.\n\n",
+        g.branch, g.base
+    )
+}
+
+/// Makes sure `<dir>/.mira-bots/.gitignore` exists (step 6b, plan A.3): written as
+/// [`MIRA_GITIGNORE`] (`*` + `!project.json`) when missing, upgraded when its content is exactly
+/// `*\n` (what older versions wrote), otherwise left alone (the user may have changed it). The
+/// user's own `.gitignore` is never touched.
+pub fn ensure_mira_gitignore(dir: &Path) -> io::Result<()> {
+    let root = dir.join(".mira-bots");
+    fs::create_dir_all(&root)?;
+    let path = root.join(".gitignore");
+    match fs::read(&path) {
+        Ok(bytes) if bytes == b"*\n" => fs::write(&path, MIRA_GITIGNORE),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::write(&path, MIRA_GITIGNORE),
+        Err(e) => Err(e),
+    }
+}
+
 /// `<cwd>/.mira-bots/tickets`, joined component by component.
 pub fn ticket_dir(cwd: &Path) -> PathBuf {
     TICKET_DIR
@@ -554,8 +596,7 @@ pub fn ticket_dir(cwd: &Path) -> PathBuf {
         .fold(cwd.to_path_buf(), |p, part| p.join(part))
 }
 
-/// Writes the ticket file (overwriting) and, if missing, `<cwd>/.mira-bots/.gitignore` with `*`.
-/// Returns the file's path.
+/// Writes the ticket file (overwriting) and [`ensure_mira_gitignore`]. Returns the file's path.
 pub fn write_ticket_file(
     cwd: &Path,
     t: &Ticket,
@@ -564,12 +605,7 @@ pub fn write_ticket_file(
 ) -> io::Result<PathBuf> {
     let dir = ticket_dir(cwd);
     fs::create_dir_all(&dir)?;
-    if let Some(root) = dir.parent() {
-        let gitignore = root.join(".gitignore");
-        if !gitignore.exists() {
-            fs::write(&gitignore, "*\n")?;
-        }
-    }
+    ensure_mira_gitignore(cwd)?;
     let path = dir.join(format!("{}.md", t.short_id()));
     fs::write(&path, render_file(t, now_ms, delivery))?;
     Ok(path)
@@ -748,8 +784,8 @@ pub fn review_dir(cwd: &Path) -> PathBuf {
         .fold(cwd.to_path_buf(), |p, part| p.join(part))
 }
 
-/// Writes the review file in the reviewer's folder (overwriting) and, if missing,
-/// `<cwd>/.mira-bots/.gitignore` with `*`. Returns the file's path.
+/// Writes the review file in the reviewer's folder (overwriting) and [`ensure_mira_gitignore`].
+/// Returns the file's path.
 pub fn write_review_file(
     cwd: &Path,
     t: &Ticket,
@@ -760,12 +796,7 @@ pub fn write_review_file(
 ) -> io::Result<PathBuf> {
     let dir = review_dir(cwd);
     fs::create_dir_all(&dir)?;
-    if let Some(root) = dir.parent() {
-        let gitignore = root.join(".gitignore");
-        if !gitignore.exists() {
-            fs::write(&gitignore, "*\n")?;
-        }
-    }
+    ensure_mira_gitignore(cwd)?;
     let path = dir.join(format!("{}.md", t.short_id()));
     fs::write(
         &path,
@@ -1166,7 +1197,7 @@ mod tests {
             render_file(&t, 0, &TicketDelivery::work())
         );
         let gi = cwd.join(".mira-bots").join(".gitignore");
-        assert_eq!(fs::read_to_string(&gi).unwrap(), "*\n");
+        assert_eq!(fs::read_to_string(&gi).unwrap(), MIRA_GITIGNORE);
 
         // Existing .gitignore is kept; the ticket file is overwritten.
         fs::write(&gi, "custom\n").unwrap();
@@ -1286,7 +1317,7 @@ mod tests {
         assert!(p.is_file());
         assert_eq!(
             std::fs::read_to_string(dir.join(".mira-bots").join(".gitignore")).unwrap(),
-            "*\n"
+            MIRA_GITIGNORE
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1599,5 +1630,67 @@ mod tests {
         // Without children: unchanged.
         let f = render_review_file(&t, None, &|_| String::new(), &[], 3);
         assert!(!f.contains("Del-tickets") && !f.contains(PARENT_REVIEW_RULE));
+    }
+
+    // ---- step 6b: git ----
+
+    fn tgit(worktree: Option<&str>) -> TicketGit {
+        TicketGit {
+            mode: if worktree.is_some() {
+                crate::tickets::model::GitMode::Worktree
+            } else {
+                crate::tickets::model::GitMode::Branch
+            },
+            branch: "ticket/abcdef01".into(),
+            base: "main".into(),
+            repo: "/p/proj".into(),
+            worktree: worktree.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn render_file_git_section_worktree_and_branch() {
+        let t = ticket(ID, TicketState::Assigned);
+        let rules = "## Regler\n";
+        let wt = TicketDelivery::work()
+            .with_shared("proj", vec!["coder-02".into()])
+            .with_git(Some(tgit(Some("/p/proj/.mira-bots/wt/abcdef01"))));
+        let f = render_file(&t, 0, &wt);
+        let section = "## Git\n- branch: ticket/abcdef01 (fra main)\n- mappe: /p/proj/.mira-bots/wt/abcdef01\n- Commit dine ændringer på denne branch med små, beskrivende commits. Push ikke (`git push` er slået fra; brugeren merger). Skift ikke branch, og rør ikke andre worktrees.\n\n";
+        assert!(f.contains(&format!("{section}{rules}")), "{f}");
+        // After `## Delt projekt`, before `## Regler`.
+        assert!(f.find("## Delt projekt").unwrap() < f.find("## Git").unwrap());
+        let branch = TicketDelivery::work().with_git(Some(tgit(None)));
+        let f = render_file(&t, 0, &branch);
+        assert!(f.contains("- branch: ticket/abcdef01 (fra main)\n- repo: /p/proj\n- Commit"));
+        // Never for a coordination task, and nothing without git.
+        let coord = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Planner])
+            .with_git(Some(tgit(Some("/w"))));
+        assert_eq!(coord.git, None);
+        assert!(!render_file(&t, 0, &coord).contains("## Git"));
+        assert!(!render_file(&t, 0, &TicketDelivery::work()).contains("## Git"));
+    }
+
+    #[test]
+    fn ensure_mira_gitignore_upgrades_star_only() {
+        let dir = std::env::temp_dir().join(format!("mira-gi-{}", uuid::Uuid::new_v4()));
+        let gi = dir.join(".mira-bots").join(".gitignore");
+        // Missing (and the folder too): written.
+        ensure_mira_gitignore(&dir).unwrap();
+        assert_eq!(fs::read_to_string(&gi).unwrap(), MIRA_GITIGNORE);
+        assert_eq!(MIRA_GITIGNORE, "*\n!project.json\n");
+        // What older versions wrote: upgraded.
+        fs::write(&gi, "*\n").unwrap();
+        ensure_mira_gitignore(&dir).unwrap();
+        assert_eq!(fs::read_to_string(&gi).unwrap(), MIRA_GITIGNORE);
+        // Anything else is the user's: kept.
+        for other in ["*", "* \n", "custom\n", "*\n\n"] {
+            fs::write(&gi, other).unwrap();
+            ensure_mira_gitignore(&dir).unwrap();
+            assert_eq!(fs::read_to_string(&gi).unwrap(), other);
+        }
+        // The user's own .gitignore next to .mira-bots is never created.
+        assert!(!dir.join(".gitignore").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

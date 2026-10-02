@@ -4,12 +4,14 @@ pub mod commands;
 pub mod config;
 pub mod diagnostics;
 pub mod events;
+pub mod git;
 pub mod hooks;
 pub mod island;
 pub mod mcp;
 pub mod permissions;
 pub mod pipe;
 pub mod platform;
+pub mod proc;
 pub mod profiles;
 pub mod projects;
 pub mod tickets;
@@ -493,6 +495,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&emit),
         data_dir.join(REPORTS_DIR),
         Arc::clone(&workspace),
+        // git is looked up (and probed) on first use, not at startup.
+        Arc::new(git::SystemGit::new()),
     ));
     let sink = tauri_sink(
         handle.clone(),
@@ -704,6 +708,8 @@ pub fn run() {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 lock(&state.manager).kill_all();
             }
+            // Step 6b: git (and, from B4, check) children still running.
+            proc::registry().kill_running();
         }
         // The process exits without dropping the pipe server task (and its SocketGuard).
         #[cfg(unix)]

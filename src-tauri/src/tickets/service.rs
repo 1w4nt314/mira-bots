@@ -17,17 +17,18 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 
 use super::model::{
-    short_id, ReviewAssignment, Ticket, TicketActor, TicketDoc, TicketError, TicketHistoryEntry,
-    TicketId, TicketIssue, TicketPatch, TicketReport, TicketSource, TicketState, TicketSummary,
+    short_id, ReportAuthorKind, ReviewAssignment, Ticket, TicketActor, TicketDoc, TicketError,
+    TicketGit, TicketHistoryEntry, TicketId, TicketIssue, TicketPatch, TicketReport, TicketSource,
+    TicketState, TicketSummary,
 };
 use super::prompt::{one_line, ChildLine, ChildReview};
 use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
 use crate::config::{
-    playbook_created_note, BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, FLOW_DONE_NOTE, MOVED_NOTE,
-    PARENT_DELETED_NOTE, PLAYBOOK_STEPS_MAX, REPORTS_PER_TICKET_MAX, RESTART_NOTE,
-    REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
+    playbook_created_note, BLOCKED_BY_MAX, CHANGES_REPORT_TITLE, CHILDREN_DONE_NOTE,
+    FLOW_DONE_NOTE, MOVED_NOTE, PARENT_DELETED_NOTE, PLAYBOOK_STEPS_MAX, REPORTS_PER_TICKET_MAX,
+    RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
     TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
 };
 use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
@@ -41,6 +42,25 @@ pub const RESENT_NOTE: &str = "sendt igen";
 pub const REVIEW_UNDELIVERED_NOTE: &str = "review kunne ikke leveres";
 /// History note when the user removed the reviewer.
 pub const REVIEWER_REMOVED_NOTE: &str = "reviewer fjernet";
+
+/// Whether the ticket (in review) still needs the app's «Ændringer» report (step 6b, plan A.6):
+/// it has git info and no system report with that title since it last entered review.
+pub fn needs_changes_report(t: &Ticket) -> bool {
+    if t.git.is_none() || t.state != TicketState::Review {
+        return false;
+    }
+    let since = t
+        .history
+        .iter()
+        .rev()
+        .find(|h| h.to == TicketState::Review && h.from != Some(TicketState::Review))
+        .map_or(0, |h| h.at);
+    !t.reports.iter().any(|r| {
+        r.author.kind == ReportAuthorKind::System
+            && r.title == CHANGES_REPORT_TITLE
+            && r.created_at >= since
+    })
+}
 
 /// `"eskaleret efter {max} runder"` (`max` = the workspace's `maxReviewRounds`).
 pub fn escalated_note(max: u32) -> String {
@@ -1851,6 +1871,44 @@ impl TicketService {
             Ok(())
         })?;
         self.fetch(&t.id).map(Some)
+    }
+
+    // ---- git per ticket (step 6b) ----
+
+    /// Stores the ticket's git branch/worktree (`None` removes it). No history entry.
+    pub fn set_git(
+        &mut self,
+        id: &str,
+        git: Option<TicketGit>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            t.git = git;
+            t.updated_at = now;
+            Ok(())
+        })?;
+        self.fetch(id)
+    }
+
+    /// A history entry by the system (state unchanged), e.g. why the ticket got no git branch.
+    /// `Ok(None)` (nothing saved) when the same note is already its last entry.
+    pub fn note_by_system(
+        &mut self,
+        id: &str,
+        note: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(id).ok_or(TicketError::NotFound)?;
+        if t.history.last().and_then(|h| h.note.as_deref()) == Some(note) {
+            return Ok(None);
+        }
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            note_entry(t, TicketActor::System, note.to_string(), now);
+            Ok(())
+        })?;
+        self.fetch(id).map(Some)
     }
 
     // ---- review routing and agent review/coordination tools (step 5) ----

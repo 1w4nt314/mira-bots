@@ -1083,7 +1083,7 @@ pub fn spawn_with_ticket_core(
     profile.check_seat(seat)?;
     let may_create = spawn_may_create(&ticket, may_create);
     let project = spawn_project(&ticket, seat, project)?;
-    let (ctx, placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
+    let (ctx, mut placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
     ticket = ticket_in_placement(&state.tickets, ticket, &placement)?;
     let rules = state.workspace.rules();
     // On a staff seat the first ticket is a coordination task (5c C.1).
@@ -1094,7 +1094,27 @@ pub fn spawn_with_ticket_core(
         placement.project.as_deref(),
         &rules,
     );
-    let delivery = relation_delivery(state, &ticket, delivery);
+    let mut delivery = relation_delivery(state, &ticket, delivery);
+    // Step 6b (plan A.4): a work delivery gets the ticket's git branch; with a worktree the agent
+    // starts in it, so the ticket file lands in `<worktree>/.mira-bots/tickets/`. A failure is a
+    // history note and the spawn continues without git.
+    if delivery.is_work() {
+        if let Some(git) = state.tickets.prepare_ticket_git(&ticket) {
+            if let Some(wt) = git.worktree.as_deref().map(PathBuf::from) {
+                if wt.is_dir() {
+                    placement.cwd = wt;
+                } else {
+                    log::warn!(
+                        "git: worktree {} of ticket {} is missing; the agent starts in the project",
+                        wt.display(),
+                        ticket.short_id()
+                    );
+                }
+            }
+            ticket.git = Some(git.clone());
+            delivery = delivery.with_git(Some(git));
+        }
+    }
     let file = prompt::write_ticket_file(&placement.cwd, &ticket, now_ms(), &delivery)
         .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
     let line = prompt::line_for(&ticket, &delivery);
