@@ -87,6 +87,17 @@ export interface AgentInfo {
   currentTicketId: string | null;
   /** Number of queued (`assigned`) tickets. */
   queueLength: number;
+  /** The agent's project (work seat); null on a staff seat (it runs in the projects root). */
+  project: string | null;
+}
+
+/** A ticket's project: an existing project id, or a project to create (`{ new: name }`). */
+export type ProjectRef = string | { new: string };
+
+/** A project folder under the projects root (`list_projects`). */
+export interface Project {
+  id: string;
+  path: string;
 }
 
 export interface PermissionRequestInfo {
@@ -289,6 +300,8 @@ export interface TicketSummary {
   /** The reviewer agent while in review (kept after approval). */
   reviewerAgentId: string | null;
   reportCount: number;
+  /** The ticket's project; null = none yet (it must get one before a work agent takes it). */
+  project: ProjectRef | null;
 }
 
 /** Who wrote a report: an agent (`agentId`) or the user. */
@@ -344,6 +357,8 @@ export interface TicketPatch {
   title?: string;
   body?: string;
   skipReview?: boolean;
+  /** `null` removes the project; only while the ticket is in the backlog. */
+  project?: ProjectRef | null;
 }
 
 /** Sidebar tabs `openWorkplace` may select. */

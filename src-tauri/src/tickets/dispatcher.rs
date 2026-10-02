@@ -914,12 +914,31 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
+    /// The delivery for the agent (5c C.1) with the step 4b sections: `## Delt projekt` for a
+    /// real work delivery when other live work agents share the project (plan4b A.5), the
+    /// project list for a coordination task (A.6).
+    fn delivery_for(&self, agent_id: &str, snap: &AgentSnapshot) -> TicketDelivery {
+        let mut delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles);
+        if let (Some(p), SeatKind::Work, true) = (&snap.project, snap.seat_kind, delivery.is_work())
+        {
+            let others = self.port.peers_in_project(agent_id);
+            if !others.is_empty() {
+                delivery = delivery.with_shared(p, others);
+            }
+        }
+        if !delivery.is_work() {
+            let may_create = self.host.rules().agents_may_create_projects;
+            delivery = delivery.with_projects(self.host.project_ids(), may_create);
+        }
+        delivery
+    }
+
     /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
     /// Enter follows after `ENTER_DELAY_MS`.
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
         let now = now_ms();
-        let delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles);
-        if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, delivery) {
+        let delivery = self.delivery_for(agent_id, snap);
+        if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, &delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
                 agent_id,
@@ -928,7 +947,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             );
             return;
         }
-        let line = prompt::line_for(ticket, delivery);
+        let line = prompt::line_for(ticket, &delivery);
         if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
             log::warn!("dispatch {agent_id}: typing the ticket line failed: {e}");
             self.send_to_backlog(agent_id, &ticket.id, TERMINAL_GONE_NOTE);
@@ -1321,6 +1340,28 @@ mod tests {
                 None => false,
             }
         }
+
+        fn peers_in_project(&self, id: &str) -> Vec<String> {
+            let s = lock(&self.0);
+            let Some(p) = s.snapshots.get(id).and_then(|a| a.project.clone()) else {
+                return Vec::new();
+            };
+            let mut names: Vec<String> = s
+                .snapshots
+                .iter()
+                .filter(|(other, a)| {
+                    other.as_str() != id
+                        && a.seat_kind == SeatKind::Work
+                        && !matches!(a.status, AgentStatus::Exited { .. })
+                        && a.project
+                            .as_deref()
+                            .is_some_and(|x| x.eq_ignore_ascii_case(&p))
+                })
+                .map(|(_, a)| a.name.clone())
+                .collect();
+            names.sort();
+            names
+        }
     }
 
     struct Harness {
@@ -1383,6 +1424,11 @@ mod tests {
                     project: None,
                 },
             );
+        }
+
+        /// Puts the agent in `project` (plan4b A.1).
+        fn in_project(&self, id: &str, project: &str) {
+            lock(&self.port.0).snapshots.get_mut(id).unwrap().project = Some(project.to_string());
         }
 
         /// The user typed into `id`'s terminal now (fake clock).
@@ -1470,7 +1516,7 @@ mod tests {
     }
 
     fn line(t: &Ticket) -> String {
-        prompt::line_for(t, TicketDelivery::WORK)
+        prompt::line_for(t, &TicketDelivery::work())
     }
 
     fn enter(agent: &str) -> (String, String) {
@@ -1530,23 +1576,27 @@ mod tests {
         h.advance(DISPATCH_DELAY_MS);
         let distribute = TicketDelivery {
             coordination: Some(CoordinationKind::Distribute),
+            ..TicketDelivery::default()
         };
         let plan = TicketDelivery {
             coordination: Some(CoordinationKind::Plan),
+            ..TicketDelivery::default()
         };
         let writes = h.writes();
         let typed = |a: &str| writes.iter().find(|(x, _)| x == a).unwrap().1.clone();
-        assert_eq!(typed("k1"), prompt::line_for(&tk, distribute));
+        assert_eq!(typed("k1"), prompt::line_for(&tk, &distribute));
         assert!(typed("k1").starts_with(&format!("Koordiner ticket {}: ", tk.short_id())));
-        assert_eq!(typed("r1"), prompt::line_for(&tr, plan));
+        assert_eq!(typed("r1"), prompt::line_for(&tr, &plan));
         assert_eq!(typed("w1"), line(&tw));
         let fk = h.ticket_file("k1", &tk);
+        // Step 4b: the coordination task lists the projects (none in the test host).
+        let projects = "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra).";
         assert!(fk.contains(&format!(
-            "## Koordineringsopgave\n{COORDINATION_DISTRIBUTE_TEXT}\n\n## Regler\n"
+            "## Koordineringsopgave\n{COORDINATION_DISTRIBUTE_TEXT}\n{projects}\n\n## Regler\n"
         )));
         let fr = h.ticket_file("r1", &tr);
         assert!(fr.contains(&format!(
-            "## Koordineringsopgave\n{COORDINATION_PLAN_TEXT}\n\n## Regler\n"
+            "## Koordineringsopgave\n{COORDINATION_PLAN_TEXT}\n{projects}\n\n## Regler\n"
         )));
         assert!(!h.ticket_file("w1", &tw).contains("Koordineringsopgave"));
         h.advance(ENTER_DELAY_MS);
@@ -2351,7 +2401,7 @@ mod tests {
         let b = h.queued("k", "Næste");
         deliver_until_enter(&mut h, "k");
         let coord = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator]);
-        let coord_line = prompt::line_for(&a, coord);
+        let coord_line = prompt::line_for(&a, &coord);
         assert!(coord_line.starts_with("Koordiner ticket "));
         h.submitted("k", &coord_line);
         assert_eq!(h.ticket(&a.id).state, S::InProgress);
@@ -2383,7 +2433,7 @@ mod tests {
         let b_now = h.ticket(&b.id);
         assert_eq!(
             &h.writes()[2..],
-            &[("k".into(), prompt::line_for(&b_now, coord)), enter("k")]
+            &[("k".into(), prompt::line_for(&b_now, &coord)), enter("k")]
         );
         // Review 5c W4: it handed the ticket on itself, so no "Du skal stoppe …" line.
         assert!(h.writes().iter().all(|(_, w)| !w.starts_with("Du ")));
@@ -3044,5 +3094,41 @@ mod tests {
             "## Koordineringsopgave\n{}",
             prompt::COORDINATION_PLAN_TEXT
         )));
+    }
+
+    // ---- step 4b: shared project ----
+
+    #[test]
+    fn two_agents_in_one_project_get_the_shared_section() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Thinking);
+        h.agent("a2", AgentStatus::Idle);
+        h.agent("a3", AgentStatus::Idle);
+        h.agent_on("r", AgentStatus::Idle, SeatKind::Work, &[Role::Reviewer]);
+        h.in_project("a1", "p");
+        h.in_project("a2", "P");
+        h.in_project("a3", "q");
+        h.in_project("r", "p");
+        let t2 = h.queued("a2", "To");
+        let t3 = h.queued("a3", "Tre");
+        let tr = h.queued("r", "Fordel");
+        for a in ["a2", "a3", "r"] {
+            h.idle(a);
+        }
+        h.advance(DISPATCH_DELAY_MS);
+        let f2 = h.ticket_file("a2", &t2);
+        assert!(f2.contains("## Delt projekt\n"), "{f2}");
+        // The reviewer on a work seat is a live work agent in p too, but gets a coordination
+        // task without the section.
+        assert!(f2.contains("(projekt «P»): bot-a1, bot-r."), "{f2}");
+        assert!(f2.find("## Delt projekt").unwrap() < f2.find("## Regler").unwrap());
+        assert!(!h.ticket_file("a3", &t3).contains("Delt projekt"));
+        let fr = h.ticket_file("r", &tr);
+        assert!(fr.contains("## Koordineringsopgave"));
+        assert!(!fr.contains("Delt projekt"));
+        // The line itself is the plain work line.
+        let writes = h.writes();
+        let typed = writes.iter().find(|(x, _)| x == "a2").unwrap().1.clone();
+        assert_eq!(typed, line(&t2));
     }
 }

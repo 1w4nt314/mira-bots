@@ -13,6 +13,8 @@ import type {
   HookEventPayload,
   PermissionRequestInfo,
   PermissionResolvedPayload,
+  Project,
+  ProjectRef,
   ReportContent,
   ReviewAssignment,
   SeatKind,
@@ -71,6 +73,11 @@ export const COMMANDS = {
   openReportDir: "open_report_dir",
   assignReviewer: "assign_reviewer",
   listReviewAssignments: "list_review_assignments",
+  listProjects: "list_projects",
+  createProject: "create_project",
+  openProjectFolder: "open_project_folder",
+  setProjectsRoot: "set_projects_root",
+  moveAgentToProject: "move_agent_to_project",
 } as const;
 
 export const EVENTS = {
@@ -97,16 +104,17 @@ export const uiReady = () => invoke<void>(COMMANDS.uiReady);
 export const getAppInfo = () => invoke<AppInfo>(COMMANDS.getAppInfo);
 export const listAgents = () => invoke<AgentInfo[]>(COMMANDS.listAgents);
 /**
- * `profileId` null → "coder"; `overrides` replace the profile's model/effort; `cwd` null/blank →
- * default folder `<projectsRoot>/<prefix>-nn`; `seatKind` null → the profile's `defaultSeat`.
+ * `profileId` null → "coder"; `overrides` replace the profile's model/effort; `project`: a work
+ * seat needs one (`{ new: name }` creates the folder), a staff seat runs in the projects root;
+ * `seatKind` null → the profile's `defaultSeat`.
  */
 export const spawnAgent = (
   profileId: string | null,
   overrides: SpawnOverrides | null,
-  cwd: string | null,
+  project: ProjectRef | null,
   prompt: string | null,
   seatKind: SeatKind | null,
-) => invoke<AgentInfo>(COMMANDS.spawnAgent, { profileId, overrides, cwd, prompt, seatKind });
+) => invoke<AgentInfo>(COMMANDS.spawnAgent, { profileId, overrides, project, prompt, seatKind });
 export const stopAgent = (agentId: string) => invoke<void>(COMMANDS.stopAgent, { agentId });
 export const removeAgent = (agentId: string) => invoke<void>(COMMANDS.removeAgent, { agentId });
 /** `userInitiated` false for the terminal's automatic replies: they do not count as user typing. */
@@ -139,8 +147,12 @@ export const openLogDir = () => invoke<void>(COMMANDS.openLogDir);
 export const listTickets = () => invoke<TicketSummary[]>(COMMANDS.listTickets);
 /** One ticket with its history. */
 export const getTicket = (id: string) => invoke<Ticket>(COMMANDS.getTicket, { id });
-export const createTicket = (title: string, body: string, skipReview: boolean) =>
-  invoke<TicketSummary>(COMMANDS.createTicket, { title, body, skipReview });
+export const createTicket = (
+  title: string,
+  body: string,
+  skipReview: boolean,
+  project: ProjectRef | null = null,
+) => invoke<TicketSummary>(COMMANDS.createTicket, { title, body, skipReview, project });
 export const updateTicket = (id: string, patch: TicketPatch) =>
   invoke<TicketSummary>(COMMANDS.updateTicket, { id, patch });
 /** Only backlog/done tickets and rejected ones without an agent. */
@@ -167,19 +179,20 @@ export const requestSubmission = (ticketId: string) =>
   invoke<void>(COMMANDS.requestSubmission, { ticketId });
 /** "Send igen": the dispatcher decides whether the ticket can be delivered now. */
 export const redispatchTicket = (id: string) => invoke<void>(COMMANDS.redispatchTicket, { id });
-/** Like `spawnAgent`, with the ticket line as the first prompt; the ticket heads the new queue. */
+/** Like `spawnAgent`, with the ticket line as the first prompt; the ticket heads the new queue.
+ *  On a work seat the ticket's project wins over `project`. */
 export const spawnAgentWithTicket = (
   ticketId: string,
   profileId: string | null,
   overrides: SpawnOverrides | null,
-  cwd: string | null,
+  project: ProjectRef | null,
   seatKind: SeatKind | null,
 ) =>
   invoke<AgentInfo>(COMMANDS.spawnAgentWithTicket, {
     ticketId,
     profileId,
     overrides,
-    cwd,
+    project,
     seatKind,
   });
 
@@ -216,6 +229,23 @@ export const assignReviewer = (ticketId: string, agentId: string | null) =>
 export const listReviewAssignments = () =>
   invoke<ReviewAssignment[]>(COMMANDS.listReviewAssignments);
 
+// projects (plan4b C4b.4)
+/** The project folders under the projects root, sorted by name. */
+export const listProjects = () => invoke<Project[]>(COMMANDS.listProjects);
+/** Creates a project folder (Windows folder-name rules; existing names are refused). */
+export const createProject = (name: string) =>
+  invoke<Project>(COMMANDS.createProject, { name });
+/** Opens a project folder (`null` = the projects root) in Explorer. */
+export const openProjectFolder = (project: string | null) =>
+  invoke<void>(COMMANDS.openProjectFolder, { project });
+/** Stores a new projects root; it applies after a restart of mira-bots. Returns the path. */
+export const setProjectsRoot = (path: string) =>
+  invoke<string>(COMMANDS.setProjectsRoot, { path });
+/** "Flyt til projekt…": restarts the agent with `--resume` in the project's folder. With a
+ *  queue, `force` puts the queued tickets back in the backlog; otherwise the move is refused. */
+export const moveAgentToProject = (agentId: string, project: ProjectRef, force: boolean) =>
+  invoke<AgentInfo>(COMMANDS.moveAgentToProject, { agentId, project, force });
+
 // --- events (each returns the unlisten function) ----------------------------------------------
 
 export const onAgentsChanged = (cb: (agents: AgentInfo[]) => void): Promise<UnlistenFn> =>
@@ -247,11 +277,11 @@ export const onProfilesChanged = (cb: (profiles: AgentProfile[]) => void): Promi
 /** Native folder picker. Resolves to the chosen path, or null if the user cancelled. */
 // TODO(windows-verify): the folder picker opens in front of the island and returns a
 // backslash path that spawn_agent accepts (plan D.11).
-export async function pickFolder(): Promise<string | null> {
+export async function pickFolder(title = "Vælg mappe"): Promise<string | null> {
   const picked = await open({
     directory: true,
     multiple: false,
-    title: "Vælg mappe til agenten",
+    title,
   });
   return typeof picked === "string" ? picked : null;
 }

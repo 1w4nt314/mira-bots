@@ -30,7 +30,7 @@ export default function NewTicketForm({ onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await createTicket(title.trim(), body, skipReview);
+      await createTicket(title.trim(), body, skipReview, null);
       setTitle("");
       setBody("");
       setSkipReview(false);

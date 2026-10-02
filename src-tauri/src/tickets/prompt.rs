@@ -138,16 +138,64 @@ pub enum CoordinationKind {
     Plan,
 }
 
+/// Other work agents in the same project folder (plan4b A.5): the `## Delt projekt` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedProject {
+    pub project: String,
+    /// Names of the other live work agents in the project.
+    pub others: Vec<String>,
+}
+
+/// The project list of a coordination task (plan4b A.6): it changes while the agent runs, so it
+/// goes in the file, not in the system prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectList {
+    pub ids: Vec<String>,
+    /// `agentsMayCreateProjects` from the workspace file.
+    pub may_create: bool,
+}
+
 /// How a ticket is delivered: as work (the default) or as a coordination task (the assignee sits
-/// on a staff seat).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// on a staff seat), plus the step 4b file sections.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TicketDelivery {
     pub coordination: Option<CoordinationKind>,
+    /// `## Delt projekt` (only for real work deliveries).
+    pub shared: Option<SharedProject>,
+    /// "Projekter lige nu: …" (only for coordination tasks).
+    pub projects: Option<ProjectList>,
 }
 
 impl TicketDelivery {
-    /// A plain work delivery (unchanged file and line).
-    pub const WORK: TicketDelivery = TicketDelivery { coordination: None };
+    /// A plain work delivery (unchanged line).
+    pub fn work() -> TicketDelivery {
+        TicketDelivery::default()
+    }
+
+    /// Whether this is a real work delivery (not a coordination task).
+    pub fn is_work(&self) -> bool {
+        self.coordination.is_none()
+    }
+
+    /// Adds the `## Delt projekt` section (plan4b A.5); ignored for a coordination task or
+    /// without other agents.
+    pub fn with_shared(mut self, project: &str, others: Vec<String>) -> Self {
+        if self.is_work() && !others.is_empty() {
+            self.shared = Some(SharedProject {
+                project: project.to_string(),
+                others,
+            });
+        }
+        self
+    }
+
+    /// Adds the project list line (plan4b A.6); ignored for a work delivery.
+    pub fn with_projects(mut self, ids: Vec<String>, may_create: bool) -> Self {
+        if !self.is_work() {
+            self.projects = Some(ProjectList { ids, may_create });
+        }
+        self
+    }
 
     /// The delivery for an agent on `seat` with `roles` (review 5c W1: the role decides what
     /// the agent may do, the seat which tickets it gets). The work delivery only for a work
@@ -163,7 +211,49 @@ impl TicketDelivery {
         } else {
             Some(CoordinationKind::Plan)
         };
-        TicketDelivery { coordination }
+        TicketDelivery {
+            coordination,
+            ..TicketDelivery::default()
+        }
+    }
+}
+
+/// `## Delt projekt` (plan4b C4b.6); `{project}` and `{others}` are filled in.
+pub const SHARED_PROJECT_TEXT: &str = "Andre agenter arbejder i samme mappe (projekt «{project}»): {others}. Hold dig til de filer din ticket handler om. Brug `git add <stier>` på netop dine filer — aldrig `git add -A` eller `git add .`. Kør ikke `git reset`, `git checkout -- <fil>`, `git stash` eller andet, der rører de andres ændringer; opdager du ændringer, du ikke selv har lavet, så lad dem stå. Skriv i din rapport, hvilke filer du har rørt.";
+
+/// The `## Delt projekt` text for `shared`.
+pub fn shared_project_text(shared: &SharedProject) -> String {
+    let others: Vec<String> = shared.others.iter().map(|n| one_line(n)).collect();
+    SHARED_PROJECT_TEXT
+        .replace("{project}", &one_line(&shared.project))
+        .replace("{others}", &others.join(", "))
+}
+
+/// The project line of a coordination task (plan4b C4b.6).
+pub fn project_list_text(list: &ProjectList) -> String {
+    let ids = if list.ids.is_empty() {
+        "ingen".to_string()
+    } else {
+        list.ids.join(", ")
+    };
+    let create = if list.may_create {
+        "kan oprettes med {\"new\": …}"
+    } else {
+        "skal brugeren oprette (agentsMayCreateProjects er slået fra)"
+    };
+    format!(
+        "Projekter lige nu: {ids}. Angiv `project` på hver ticket du opretter; nye projekter {create}."
+    )
+}
+
+/// The `- projekt:` header line value of a ticket file.
+fn project_header(t: &Ticket) -> String {
+    match &t.project {
+        Some(crate::projects::ProjectRef::Existing(id)) => one_line(id),
+        Some(crate::projects::ProjectRef::New { new }) => {
+            format!("{} (oprettes ved tildeling)", one_line(new))
+        }
+        None => "ingen".to_string(),
     }
 }
 
@@ -209,7 +299,7 @@ pub fn is_handed_over_detail(detail: &str) -> bool {
 
 /// The line for a ticket (sanitises the title): [`render_line`], or
 /// [`render_coordination_line`] for a coordination task.
-pub fn line_for(t: &Ticket, delivery: TicketDelivery) -> String {
+pub fn line_for(t: &Ticket, delivery: &TicketDelivery) -> String {
     let (short, title) = (t.short_id(), sanitize_title(&t.title));
     match delivery.coordination {
         None => render_line(&short, &title),
@@ -242,7 +332,7 @@ pub fn clean_body(s: &str) -> String {
 
 /// Content of `<cwd>/.mira-bots/tickets/<short>.md` (plan C3.6, rules from plan4 C4.7); a
 /// coordination task gets `## Koordineringsopgave` before `## Regler` (5c C.1).
-pub fn render_file(t: &Ticket, now_ms: u64, delivery: TicketDelivery) -> String {
+pub fn render_file(t: &Ticket, now_ms: u64, delivery: &TicketDelivery) -> String {
     let short = t.short_id();
     let body = t.body.replace("\r\n", "\n");
     let body = body.trim_end_matches('\n');
@@ -259,7 +349,8 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: TicketDelivery) -> String 
          - oprettet: {created}\n\
          - opdateret: {updated}\n\
          - status: {state}\n\
-         - review: {review}\n\n\
+         - review: {review}\n\
+         - projekt: {project}\n\n\
          ## Opgave\n\n\
          {body}\n\n",
         title = one_line(&t.title),
@@ -267,6 +358,7 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: TicketDelivery) -> String 
         created = iso_utc(t.created_at),
         updated = iso_utc(now_ms),
         state = t.state.as_str(),
+        project = project_header(t),
     );
     if let Some(note) = &t.rejection_note {
         out.push_str(&format!(
@@ -280,7 +372,18 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: TicketDelivery) -> String 
             CoordinationKind::Distribute => COORDINATION_DISTRIBUTE_TEXT,
             CoordinationKind::Plan => COORDINATION_PLAN_TEXT,
         };
-        out.push_str(&format!("## Koordineringsopgave\n{text}\n\n"));
+        out.push_str(&format!("## Koordineringsopgave\n{text}\n"));
+        if let Some(list) = &delivery.projects {
+            out.push_str(&project_list_text(list));
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if let Some(shared) = delivery.shared.as_ref().filter(|_| delivery.is_work()) {
+        out.push_str(&format!(
+            "## Delt projekt\n{}\n\n",
+            shared_project_text(shared)
+        ));
     }
     out.push_str(
         "## Regler\n\
@@ -304,7 +407,7 @@ pub fn write_ticket_file(
     cwd: &Path,
     t: &Ticket,
     now_ms: u64,
-    delivery: TicketDelivery,
+    delivery: &TicketDelivery,
 ) -> io::Result<PathBuf> {
     let dir = ticket_dir(cwd);
     fs::create_dir_all(&dir)?;
@@ -616,13 +719,13 @@ mod tests {
             &"z".repeat(300),
         ] {
             t.title = raw.to_string();
-            let line = line_for(&t, TicketDelivery::WORK);
+            let line = line_for(&t, &TicketDelivery::work());
             assert_line_safe(&line);
             assert!(line.starts_with("Ticket abcdef01: "));
             assert!(!line.contains('\u{200B}') && !line.contains('@'));
         }
         t.title = "z".repeat(300);
-        assert!(line_for(&t, TicketDelivery::WORK).chars().count() < 300);
+        assert!(line_for(&t, &TicketDelivery::work()).chars().count() < 300);
     }
 
     #[test]
@@ -642,14 +745,14 @@ mod tests {
         let mut t = ticket(ID, TicketState::Assigned);
         t.title = "Ret\nlogin".into();
         t.body = "Linje 1\r\n\r\n- punkt @x /y\n".into();
-        let f = render_file(&t, 1_700_000_000_000, TicketDelivery::WORK);
+        let f = render_file(&t, 1_700_000_000_000, &TicketDelivery::work());
         assert!(f.starts_with("# Ticket abcdef01: Ret login\n\n"), "{f}");
         assert!(f.contains(&format!("- id: {ID}\n")));
         assert!(f.contains("- kort-id: abcdef01\n"));
         assert!(f.contains("- oprettet: 1970-01-01T00:00:01Z\n"));
         assert!(f.contains("- opdateret: 2023-11-14T22:13:20Z\n"));
         assert!(f.contains("- status: assigned\n"));
-        assert!(f.contains("- review: ja\n"));
+        assert!(f.contains("- review: ja\n- projekt: ingen\n\n## Opgave"));
         assert!(f.contains("## Opgave\n\nLinje 1\n\n- punkt @x /y\n\n## Regler\n"));
         assert!(!f.contains('\r'));
         assert!(!f.contains("## Afvist:"));
@@ -664,7 +767,7 @@ mod tests {
         t.skip_review = true;
         t.body = String::new();
         t.rejection_note = Some("Mangler\ntest".into());
-        let f = render_file(&t, 0, TicketDelivery::default());
+        let f = render_file(&t, 0, &TicketDelivery::default());
         assert!(f.contains("- review: springes over\n"));
         assert!(f.contains("## Opgave\n\n(ingen beskrivelse)\n\n"));
         assert!(f.contains(
@@ -720,7 +823,7 @@ mod tests {
             d(SeatKind::Staff, &[Role::Planner, Role::Reviewer]),
             Some(CoordinationKind::Plan)
         );
-        assert_eq!(TicketDelivery::default(), TicketDelivery::WORK);
+        assert_eq!(TicketDelivery::default(), TicketDelivery::work());
     }
 
     #[test]
@@ -728,16 +831,18 @@ mod tests {
         let mut t = ticket(ID, TicketState::Assigned);
         t.title = "Lav @en side".into();
         t.rejection_note = Some("Prøv igen".into());
-        let work = render_file(&t, 0, TicketDelivery::WORK);
+        let work = render_file(&t, 0, &TicketDelivery::work());
         let distribute = TicketDelivery {
             coordination: Some(CoordinationKind::Distribute),
+            ..TicketDelivery::default()
         };
         let plan = TicketDelivery {
             coordination: Some(CoordinationKind::Plan),
+            ..TicketDelivery::default()
         };
         // The work delivery is unchanged: no coordination section, the plain line.
         assert!(!work.contains("Koordineringsopgave"));
-        assert!(line_for(&t, TicketDelivery::WORK).starts_with("Ticket abcdef01: "));
+        assert!(line_for(&t, &TicketDelivery::work()).starts_with("Ticket abcdef01: "));
         for (d, text, other) in [
             (
                 distribute,
@@ -746,7 +851,7 @@ mod tests {
             ),
             (plan, COORDINATION_PLAN_TEXT, COORDINATION_DISTRIBUTE_TEXT),
         ] {
-            let line = line_for(&t, d);
+            let line = line_for(&t, &d);
             assert_eq!(
                 line,
                 "Koordiner ticket abcdef01: Lav (at)en side. Læs filen .mira-bots/tickets/abcdef01.md og fordel opgaven; udfør den ikke selv."
@@ -758,7 +863,7 @@ mod tests {
                 line.starts_with(COORDINATION_LINE_PREFIX) && COORDINATION_LINE_PREFIX.is_ascii()
             );
             assert!(is_coordination_line_for(&line, "abcdef01"));
-            let f = render_file(&t, 0, d);
+            let f = render_file(&t, 0, &d);
             let section = format!("## Koordineringsopgave\n{text}\n\n## Regler\n");
             assert!(f.contains(&section), "{f}");
             assert!(!f.contains(other));
@@ -858,14 +963,14 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("mira-prompt-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&cwd).unwrap();
         let t = ticket(ID, TicketState::Assigned);
-        let path = write_ticket_file(&cwd, &t, 0, TicketDelivery::WORK).unwrap();
+        let path = write_ticket_file(&cwd, &t, 0, &TicketDelivery::work()).unwrap();
         assert_eq!(
             path,
             cwd.join(".mira-bots").join("tickets").join("abcdef01.md")
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            render_file(&t, 0, TicketDelivery::WORK)
+            render_file(&t, 0, &TicketDelivery::work())
         );
         let gi = cwd.join(".mira-bots").join(".gitignore");
         assert_eq!(fs::read_to_string(&gi).unwrap(), "*\n");
@@ -874,7 +979,7 @@ mod tests {
         fs::write(&gi, "custom\n").unwrap();
         let mut t2 = t.clone();
         t2.title = "Ny titel".into();
-        write_ticket_file(&cwd, &t2, 0, TicketDelivery::WORK).unwrap();
+        write_ticket_file(&cwd, &t2, 0, &TicketDelivery::work()).unwrap();
         assert_eq!(fs::read_to_string(&gi).unwrap(), "custom\n");
         assert!(fs::read_to_string(&path).unwrap().contains("Ny titel"));
         let _ = fs::remove_dir_all(&cwd);
@@ -974,5 +1079,65 @@ mod tests {
             "*\n"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- step 4b ----
+
+    #[test]
+    fn render_file_shows_the_project() {
+        use crate::projects::ProjectRef;
+        let mut t = ticket(ID, TicketState::Assigned);
+        t.project = Some(ProjectRef::Existing("mira".into()));
+        let f = render_file(&t, 0, &TicketDelivery::work());
+        assert!(f.contains("- review: ja\n- projekt: mira\n\n"), "{f}");
+        t.project = Some(ProjectRef::New { new: "ny".into() });
+        let f = render_file(&t, 0, &TicketDelivery::work());
+        assert!(
+            f.contains("- projekt: ny (oprettes ved tildeling)\n"),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn shared_project_section_lists_the_others() {
+        let t = ticket(ID, TicketState::Assigned);
+        let d = TicketDelivery::work().with_shared("p", vec!["coder-01".into(), "coder-02".into()]);
+        let f = render_file(&t, 0, &d);
+        let section = f.find("## Delt projekt\n").expect("section");
+        assert!(section < f.find("## Regler").unwrap());
+        assert!(f.contains("(projekt «p»): coder-01, coder-02."), "{f}");
+        assert!(f.contains("aldrig `git add -A` eller `git add .`"));
+        assert!(f.contains("`git stash`"));
+        // No others, or a coordination task: no section.
+        let none = TicketDelivery::work().with_shared("p", Vec::new());
+        assert!(!render_file(&t, 0, &none).contains("Delt projekt"));
+        let coord = TicketDelivery::for_agent(SeatKind::Work, &[Role::Reviewer])
+            .with_shared("p", vec!["coder-01".into()]);
+        assert_eq!(coord.shared, None);
+        assert!(!render_file(&t, 0, &coord).contains("Delt projekt"));
+        // The line is the plain work line.
+        assert!(line_for(&t, &d).starts_with("Ticket abcdef01: "));
+    }
+
+    #[test]
+    fn coordination_file_lists_projects() {
+        let t = ticket(ID, TicketState::Assigned);
+        let d = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator])
+            .with_projects(vec!["a".into(), "b".into()], false);
+        let f = render_file(&t, 0, &d);
+        let line = "Projekter lige nu: a, b. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra).\n\n## Regler";
+        assert!(
+            f.contains(&format!("{COORDINATION_DISTRIBUTE_TEXT}\n{line}")),
+            "{f}"
+        );
+        let d = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Planner])
+            .with_projects(Vec::new(), true);
+        let f = render_file(&t, 0, &d);
+        assert!(f.contains(
+            "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter kan oprettes med {\"new\": …}."
+        ));
+        // A work delivery ignores the list.
+        let w = TicketDelivery::work().with_projects(vec!["a".into()], true);
+        assert_eq!(w.projects, None);
     }
 }

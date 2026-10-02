@@ -653,6 +653,11 @@ pub fn run() {
             commands::open_report_dir,
             commands::assign_reviewer,
             commands::list_review_assignments,
+            commands::list_projects,
+            commands::create_project,
+            commands::open_project_folder,
+            commands::set_projects_root,
+            commands::move_agent_to_project,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -732,6 +737,34 @@ mod tests {
             assert_eq!(c[5], Path::new("/ws/target/release").join(&n));
             assert_eq!(c.len(), 6);
         }
+    }
+
+    /// The Tauri command list (plan4b punkt 9: 44 → 49). Counted from the source so a command
+    /// added without a handler (or the other way round) is noticed.
+    #[test]
+    fn generate_handler_lists_49_commands() {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler![").expect("handler list");
+        let list = &src[start..start + src[start..].find("])").expect("end of list")];
+        let names: Vec<&str> = list
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("commands::"))
+            .map(|l| l.trim_end_matches(','))
+            .collect();
+        assert_eq!(names.len(), 49, "{names:?}");
+        for n in [
+            "list_projects",
+            "create_project",
+            "open_project_folder",
+            "set_projects_root",
+            "move_agent_to_project",
+        ] {
+            assert!(names.contains(&n), "{n}");
+        }
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "duplicates");
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::config::{
     MAX_REVIEW_ROUNDS, REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS,
     TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS,
 };
+use crate::projects::{validate_project_id, ProjectId, ProjectRef};
 
 /// History note when a turn ended normally (Stop hook).
 pub const TURN_ENDED_NOTE: &str = "auto: turn afsluttet";
@@ -135,6 +136,42 @@ fn normalize_reviews(doc: &mut TicketDoc) {
         {
             t.reviewer_agent_id = None;
         }
+    }
+}
+
+/// The project name of `r` checked against the folder-name rules (plan4b C4b.1).
+fn validate_project_ref(r: Option<ProjectRef>) -> Result<Option<ProjectRef>, TicketError> {
+    if let Some(r) = &r {
+        validate_project_id(r.name())?;
+    }
+    Ok(r)
+}
+
+/// History note of a project change.
+fn project_note(project: Option<&ProjectRef>) -> String {
+    match project {
+        Some(ProjectRef::Existing(id)) => format!("projekt: «{id}»"),
+        Some(ProjectRef::New { new }) => format!("projekt: «{new}» (oprettes ved tildeling)"),
+        None => "projekt fjernet".to_string(),
+    }
+}
+
+/// Sets the ticket's project with a history note; no-op when it is unchanged.
+fn put_project(t: &mut Ticket, project: Option<ProjectRef>, by: TicketActor, now: u64) {
+    if t.project == project {
+        return;
+    }
+    note_entry(t, by, project_note(project.as_ref()), now);
+    t.project = project;
+}
+
+/// The project may only change while the ticket waits in the backlog (or was rejected and has
+/// no agent).
+fn project_changeable(t: &Ticket) -> bool {
+    match t.state {
+        TicketState::Backlog => true,
+        TicketState::Rejected => t.assignee_agent_id.is_none(),
+        _ => false,
     }
 }
 
@@ -411,11 +448,25 @@ impl TicketService {
         skip_review: bool,
         now: u64,
     ) -> Result<Ticket, TicketError> {
+        self.create_in(title, body, skip_review, None, now)
+    }
+
+    /// [`Self::create`] with a project (validated against the folder-name rules; a `New` name is
+    /// only created when the ticket is assigned or spawned with, plan4b A.2).
+    pub fn create_in(
+        &mut self,
+        title: &str,
+        body: &str,
+        skip_review: bool,
+        project: Option<ProjectRef>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
         self.create_with_id_source(
             &mut || uuid::Uuid::new_v4().to_string(),
             title,
             body,
             skip_review,
+            project,
             (TicketSource::User, TicketActor::User),
             now,
         )
@@ -423,16 +474,18 @@ impl TicketService {
 
     /// `create` with injectable ids (tests force a short-id collision) and origin (`source`, and
     /// the creation entry's `by`). Ids whose short id is already taken are skipped.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_with_id_source(
         &mut self,
         next_id: &mut dyn FnMut() -> String,
         title: &str,
         body: &str,
         skip_review: bool,
+        project: Option<ProjectRef>,
         origin: (TicketSource, TicketActor),
         now: u64,
     ) -> Result<Ticket, TicketError> {
-        let t = self.new_ticket(next_id, title, body, skip_review, origin, now)?;
+        let t = self.new_ticket(next_id, title, body, skip_review, project, origin, now)?;
         let id = t.id.clone();
         self.commit(|doc| {
             doc.tickets.push(t);
@@ -442,17 +495,20 @@ impl TicketService {
     }
 
     /// A validated backlog ticket with a fresh id (not yet in the document).
+    #[allow(clippy::too_many_arguments)]
     fn new_ticket(
         &self,
         next_id: &mut dyn FnMut() -> String,
         title: &str,
         body: &str,
         skip_review: bool,
+        project: Option<ProjectRef>,
         (source, by): (TicketSource, TicketActor),
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let title = validate_title(title)?;
         validate_body(body)?;
+        let project = validate_project_ref(project)?;
         let taken: HashSet<String> = self.doc.tickets.iter().map(Ticket::short_id).collect();
         let id = loop {
             let id = next_id();
@@ -485,12 +541,13 @@ impl TicketService {
             escalated: false,
             reviewer_agent_id: None,
             reports: Vec::new(),
-            project: None,
+            project,
         };
         Ok(t)
     }
 
-    /// Title/body/skipReview in any state (same validation as `create`).
+    /// Title/body/skipReview in any state (same validation as `create`); the project only as
+    /// [`Self::set_project`] allows (an unchanged project is accepted in any state).
     pub fn update(
         &mut self,
         id: &str,
@@ -501,8 +558,17 @@ impl TicketService {
         if let Some(b) = &patch.body {
             validate_body(b)?;
         }
+        let project = patch.project.map(validate_project_ref).transpose()?;
         self.commit(|doc| {
             let t = find_mut(doc, id)?;
+            if let Some(p) = project {
+                if t.project != p {
+                    if !project_changeable(t) {
+                        return Err(TicketError::ProjectChangeNotAllowed);
+                    }
+                    put_project(t, p, TicketActor::User, now);
+                }
+            }
             if let Some(title) = title {
                 t.title = title;
             }
@@ -513,6 +579,29 @@ impl TicketService {
                 t.skip_review = s;
             }
             t.updated_at = now;
+            Ok(())
+        })?;
+        self.fetch(id)
+    }
+
+    /// Sets or removes the ticket's project (the user; plan4b punkt 8). Only in the backlog, or
+    /// rejected without an agent ([`TicketError::ProjectChangeNotAllowed`]).
+    pub fn set_project(
+        &mut self,
+        id: &str,
+        project: Option<ProjectRef>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let project = validate_project_ref(project)?;
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            if t.project == project {
+                return Ok(());
+            }
+            if !project_changeable(t) {
+                return Err(TicketError::ProjectChangeNotAllowed);
+            }
+            put_project(t, project, TicketActor::User, now);
             Ok(())
         })?;
         self.fetch(id)
@@ -538,8 +627,25 @@ impl TicketService {
     /// backlog/rejected → assigned, at the end of the agent's queue. The caller checks that the
     /// agent is alive.
     pub fn assign(&mut self, id: &str, agent_id: &str, now: u64) -> Result<Ticket, TicketError> {
+        self.assign_in(id, agent_id, None, now)
+    }
+
+    /// [`Self::assign`]; `Some(project)` makes the ticket's project `Existing(project)` in the
+    /// same save, before the assignment (a realised "new project", or one picked at assignment;
+    /// the caller checked it against the agent, plan4b A.2).
+    pub fn assign_in(
+        &mut self,
+        id: &str,
+        agent_id: &str,
+        project: Option<ProjectId>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
         self.commit(|doc| {
-            let state = find_mut(doc, id)?.state;
+            let t = find_mut(doc, id)?;
+            if let Some(p) = project {
+                put_project(t, Some(ProjectRef::Existing(p)), TicketActor::User, now);
+            }
+            let state = t.state;
             if state == TicketState::Rejected {
                 apply(
                     doc,
@@ -884,6 +990,7 @@ impl TicketService {
         body: &str,
         skip_review: bool,
         assign_to: Option<(&str, &str)>,
+        project: Option<ProjectRef>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let t = self.new_ticket(
@@ -891,6 +998,7 @@ impl TicketService {
             title,
             body,
             skip_review,
+            project,
             (TicketSource::Agent, TicketActor::Agent),
             now,
         )?;
@@ -1365,11 +1473,16 @@ impl TicketService {
         ticket_id: &str,
         target: &str,
         by_name: &str,
+        project: Option<ProjectId>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let t = self.get_by_any_id(ticket_id).ok_or(TicketError::NotFound)?;
         let note = Some(format!("tildelt af koordinator {by_name}"));
         self.commit(|doc| {
+            if let Some(p) = project {
+                let tk = find_mut(doc, &t.id)?;
+                put_project(tk, Some(ProjectRef::Existing(p)), TicketActor::Agent, now);
+            }
             if t.state == TicketState::Rejected {
                 apply(
                     doc,
@@ -1445,7 +1558,21 @@ impl TicketService {
         ticket_id: &str,
         to_agent: &str,
         by_agent: Option<&str>,
+        names: (&str, &str),
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.handoff_in(ticket_id, to_agent, by_agent, names, None, now)
+    }
+
+    /// [`Self::handoff`]; `Some(project)` makes the ticket's project `Existing(project)` in the
+    /// same save (a `{"new": …}` matching the new agent's project, plan4b A.2).
+    pub fn handoff_in(
+        &mut self,
+        ticket_id: &str,
+        to_agent: &str,
+        by_agent: Option<&str>,
         (from_name, to_name): (&str, &str),
+        project: Option<ProjectId>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let t = self.handoff_source(ticket_id, by_agent)?;
@@ -1458,7 +1585,13 @@ impl TicketService {
             to_agent_id: to_agent.to_string(),
         };
         let note = Some(format!("overdraget fra {from_name} til {to_name}"));
-        self.commit(|doc| apply(doc, &t.id, &ev, by, note, now))?;
+        self.commit(|doc| {
+            if let Some(p) = project {
+                let tk = find_mut(doc, &t.id)?;
+                put_project(tk, Some(ProjectRef::Existing(p)), by, now);
+            }
+            apply(doc, &t.id, &ev, by, note, now)
+        })?;
         self.fetch(&t.id)
     }
 
@@ -1614,6 +1747,7 @@ mod tests {
                 "a",
                 "",
                 false,
+                None,
                 (TicketSource::User, TicketActor::User),
                 1,
             )
@@ -1629,6 +1763,7 @@ mod tests {
                 "b",
                 "",
                 false,
+                None,
                 (TicketSource::User, TicketActor::User),
                 2,
             )
@@ -2206,7 +2341,7 @@ mod tests {
     fn create_by_agent_is_marked_as_agent_work() {
         let (mut s, _) = svc();
         let t = s
-            .create_by_agent("Følg op", "detaljer", true, None, 9)
+            .create_by_agent("Følg op", "detaljer", true, None, None, 9)
             .unwrap();
         assert_eq!(t.source, TicketSource::Agent);
         assert_eq!((t.state, t.skip_review), (S::Backlog, true));
@@ -2214,7 +2349,7 @@ mod tests {
         assert_eq!(t.history.len(), 1);
         assert_eq!(t.history[0].by, TicketActor::Agent);
         assert_eq!(
-            s.create_by_agent(" ", "", false, None, 9)
+            s.create_by_agent(" ", "", false, None, None, 9)
                 .unwrap_err()
                 .to_string(),
             "Titel må ikke være tom"
@@ -2568,7 +2703,9 @@ mod tests {
     fn assign_by_agent_requires_backlog_or_rejected() {
         let (mut s, _) = svc();
         let b = mk(&mut s, "b", 1);
-        let t = s.assign_by_agent(&b.short_id(), "a1", "koord", 2).unwrap();
+        let t = s
+            .assign_by_agent(&b.short_id(), "a1", "koord", None, 2)
+            .unwrap();
         assert_eq!(
             (t.state, t.assignee_agent_id.as_deref()),
             (S::Assigned, Some("a1"))
@@ -2578,7 +2715,7 @@ mod tests {
             (last.by, last.note.as_deref()),
             (TicketActor::Agent, Some("tildelt af koordinator koord"))
         );
-        let err = s.assign_by_agent(&b.id, "a2", "k", 3).unwrap_err();
+        let err = s.assign_by_agent(&b.id, "a2", "k", None, 3).unwrap_err();
         assert!(
             matches!(err, TicketError::IllegalTransition { .. }),
             "{err:?}"
@@ -2586,9 +2723,9 @@ mod tests {
         let u = s.unassign_by_agent(&b.id, "k", 4).unwrap();
         assert_eq!(u.state, S::Backlog);
         let p = in_review(&mut s, "a1", "p");
-        assert!(s.assign_by_agent(&p.id, "a2", "k", 5).is_err());
+        assert!(s.assign_by_agent(&p.id, "a2", "k", None, 5).is_err());
         assert_eq!(
-            s.assign_by_agent("nope", "a2", "k", 5),
+            s.assign_by_agent("nope", "a2", "k", None, 5),
             Err(TicketError::NotFound)
         );
         assert_invariants(&s);
@@ -2601,7 +2738,7 @@ mod tests {
         s.assign(&q.id, "a1", 2).unwrap();
         let saves = m.saves();
         let t = s
-            .create_by_agent("Ny", "", false, Some(("a1", "koord")), 3)
+            .create_by_agent("Ny", "", false, Some(("a1", "koord")), None, 3)
             .unwrap();
         assert_eq!(m.saves(), saves + 1, "one save");
         assert_eq!((t.state, t.queue_position), (S::Assigned, Some(1)));
@@ -2775,5 +2912,118 @@ mod tests {
             Err(TicketError::NotInProgress)
         );
         assert_invariants(&s);
+    }
+
+    // ---- step 4b: projects on tickets ----
+
+    #[test]
+    fn create_in_validates_the_project_name() {
+        let (mut s, _) = svc();
+        let err = s
+            .create_in(
+                "t",
+                "",
+                false,
+                Some(ProjectRef::New { new: "CON".into() }),
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Projektnavnet «CON» er ugyldigt: er et reserveret navn i Windows"
+        );
+        assert!(s.is_empty());
+        let t = s
+            .create_in("t", "", false, Some(ProjectRef::Existing("p".into())), 2)
+            .unwrap();
+        assert_eq!(t.project, Some(ProjectRef::Existing("p".into())));
+        assert_eq!(s.create("u", "", false, 3).unwrap().project, None);
+    }
+
+    #[test]
+    fn set_project_only_in_backlog_or_rejected_without_agent() {
+        let (mut s, _) = svc();
+        let t = mk(&mut s, "a", 1);
+        let p = Some(ProjectRef::Existing("p".into()));
+        let u = s.set_project(&t.id, p.clone(), 2).unwrap();
+        assert_eq!(u.project, p);
+        assert_eq!(
+            u.history.last().unwrap().note.as_deref(),
+            Some("projekt: «p»")
+        );
+        let n = u.history.len();
+        // Unchanged: no new entry.
+        assert_eq!(s.set_project(&t.id, p.clone(), 3).unwrap().history.len(), n);
+        let r = s.set_project(&t.id, None, 4).unwrap();
+        assert_eq!(r.project, None);
+        assert_eq!(
+            r.history.last().unwrap().note.as_deref(),
+            Some("projekt fjernet")
+        );
+        s.assign(&t.id, "a1", 5).unwrap();
+        assert_eq!(
+            s.set_project(&t.id, p.clone(), 6),
+            Err(TicketError::ProjectChangeNotAllowed)
+        );
+        // Same project in another state is no change: accepted.
+        assert!(s.set_project(&t.id, None, 7).is_ok());
+    }
+
+    #[test]
+    fn assign_in_sets_the_project_and_assigns_in_one_save() {
+        let (mut s, store) = svc();
+        let t = s
+            .create_in("t", "", false, Some(ProjectRef::New { new: "P".into() }), 1)
+            .unwrap();
+        let before = store.saves();
+        let a = s.assign_in(&t.id, "a1", Some("p".into()), 2).unwrap();
+        assert_eq!(store.saves(), before + 1);
+        assert_eq!(a.project, Some(ProjectRef::Existing("p".into())));
+        assert_eq!(a.state, S::Assigned);
+        assert_eq!(a.assignee_agent_id.as_deref(), Some("a1"));
+        // By an agent: the same.
+        let t2 = mk(&mut s, "b", 3);
+        let b = s
+            .assign_by_agent(&t2.id, "a1", "koord", Some("q".into()), 4)
+            .unwrap();
+        assert_eq!(b.project, Some(ProjectRef::Existing("q".into())));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn create_by_agent_and_update_handle_the_project() {
+        let (mut s, _) = svc();
+        let t = s
+            .create_by_agent(
+                "x",
+                "",
+                false,
+                None,
+                Some(ProjectRef::Existing("p".into())),
+                1,
+            )
+            .unwrap();
+        assert_eq!(t.project, Some(ProjectRef::Existing("p".into())));
+        let patch: TicketPatch = serde_json::from_str(r#"{"project": null}"#).unwrap();
+        assert_eq!(s.update(&t.id, patch, 2).unwrap().project, None);
+        let patch: TicketPatch = serde_json::from_str(r#"{"project": {"new": "a:b"}}"#).unwrap();
+        assert!(matches!(
+            s.update(&t.id, patch, 3),
+            Err(TicketError::Validation(_))
+        ));
+        let patch: TicketPatch = serde_json::from_str(r#"{"project": "q"}"#).unwrap();
+        assert_eq!(
+            s.update(&t.id, patch, 4).unwrap().project,
+            Some(ProjectRef::Existing("q".into()))
+        );
+        s.assign(&t.id, "a1", 5).unwrap();
+        let patch: TicketPatch = serde_json::from_str(r#"{"project": "r"}"#).unwrap();
+        assert_eq!(
+            s.update(&t.id, patch, 6),
+            Err(TicketError::ProjectChangeNotAllowed)
+        );
+        // Title only: fine in any state.
+        let patch: TicketPatch = serde_json::from_str(r#"{"title": "y"}"#).unwrap();
+        assert!(s.update(&t.id, patch, 7).is_ok());
     }
 }

@@ -201,7 +201,7 @@ mod tests {
         );
 
         let r = line(&b, r#"{"method":"tools/list","jsonrpc":"2.0","id":1}"#).unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 11);
         assert_eq!(
             r["result"]["tools"],
             json!(tools::definitions_for(&[] as &[&str]))
@@ -352,7 +352,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"x"}}"#,
         )
         .unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 11);
         assert!(r["result"].get("nextCursor").is_none());
     }
 
@@ -378,13 +378,13 @@ mod tests {
         assert_eq!(listed(&b, &[]), common);
         assert_eq!(listed(&b, &["coder"]), common);
         let rev = listed(&b, &["reviewer"]);
-        assert_eq!(rev.len(), 12);
+        assert_eq!(rev.len(), 13);
         assert!(rev.contains(&"mira_approve_ticket".into()));
         assert!(rev.contains(&"mira_reject_ticket".into()));
         let co = listed(&b, &["coordinator"]);
-        assert_eq!(co.len(), 14);
+        assert_eq!(co.len(), 15);
         assert!(!co.contains(&"mira_approve_ticket".into()));
-        assert_eq!(listed(&b, &["reviewer", "coordinator"]).len(), 16);
+        assert_eq!(listed(&b, &["reviewer", "coordinator"]).len(), 17);
     }
 
     #[test]

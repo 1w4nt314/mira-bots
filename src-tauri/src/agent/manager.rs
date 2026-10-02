@@ -440,6 +440,12 @@ impl AgentManager {
         Ok(())
     }
 
+    /// The seat-limit check of [`Self::spawn`], so callers can refuse before they create
+    /// anything (a project folder, a ticket file; plan4b C4b.4).
+    pub fn can_spawn(&self, seat: SeatKind) -> Result<(), AgentError> {
+        self.check_limit(seat)
+    }
+
     /// Changes the seat limits (from the workspace rules, plan4b A.4); running agents are never
     /// stopped, a lower limit only blocks new spawns.
     pub fn set_limits(&mut self, work: usize, staff: usize) {
@@ -1047,7 +1053,8 @@ impl AgentManager {
         self.insert_fake_with(session_id, cwd, &[], SeatKind::Work)
     }
 
-    /// Test helper: an agent without a PTY.
+    /// Test helper: an agent without a PTY. On a work seat it is in project `p` (every work agent
+    /// has a project from step 4b on).
     #[cfg(test)]
     pub fn insert_fake_with(
         &mut self,
@@ -1056,7 +1063,8 @@ impl AgentManager {
         roles: &[Role],
         seat_kind: SeatKind,
     ) -> AgentId {
-        self.insert_fake_in(session_id, cwd, roles, seat_kind, None)
+        let project = (seat_kind == SeatKind::Work).then_some("p");
+        self.insert_fake_in(session_id, cwd, roles, seat_kind, project)
     }
 
     /// Test helper: an agent without a PTY in `project`.
@@ -1952,7 +1960,8 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "{key}");
         }
-        assert_eq!(v["project"], Value::Null);
+        // Test fakes on a work seat are in project "p" (insert_fake_with).
+        assert_eq!(v["project"], "p");
         assert_eq!(v["currentTicketId"], Value::Null);
         assert_eq!(v["queueLength"], 0);
         m.set_ticket_link(&id, Some("t1".into()), 2);

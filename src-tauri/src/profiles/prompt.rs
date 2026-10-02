@@ -18,7 +18,7 @@ Regler:
 - Når en ticket er færdig, SKAL du kalde værktøjet mira_submit_for_review med en kort opsummering (hvad du gjorde, hvad brugeren bør kigge på). Afslut først dit svar bagefter. Uden kaldet står ticketen som \"ikke afleveret\".
 - Opdager du opfølgende arbejde, så opret en ny ticket med mira_create_ticket i stedet for at udvide opgaven.
 - Er din igangværende ticket ikke til dig, så giv den videre med mira_handoff_ticket (med agentId til en anden agent; uden agentId tilbage i backlog) og afslut dit svar.
-- mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje; mira_add_report lægger en rapport (markdown) på ticketen, så brugeren og revieweren kan se hvad du har lavet — gør det ved større opgaver, gerne som `report` i mira_submit_for_review; mira_get_workspace_rules viser reglerne.
+- mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje; mira_add_report lægger en rapport (markdown) på ticketen, så brugeren og revieweren kan se hvad du har lavet — gør det ved større opgaver, gerne som `report` i mira_submit_for_review; mira_get_workspace_rules viser reglerne; mira_list_projects viser projekterne (mapperne under projektroden).
 - Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den.
 ";
 
@@ -28,7 +28,7 @@ pub fn role_text(role: Role) -> &'static str {
         Role::Coder => "Du er koder: du implementerer tickets i din arbejdsmappe, kører tests og afleverer med en rapport der beskriver ændringerne.",
         Role::Researcher => "Du er researcher: du undersøger og dokumenterer; dine afleveringer er tekst (rapport), ikke kodeændringer, medmindre ticketen siger andet.",
         Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report.",
-        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op.",
+        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Hver ticket skal have et projekt (`project`: et id fra mira_list_projects); en arbejdsagent kan kun få tickets fra sit eget projekt, så vælg agent efter projekt eller start en ny i det rigtige projekt (mira_spawn_agent med project). Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op.",
         Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede tickets med klare acceptkriterier (mira_create_ticket), men tildeler dem ikke.",
         Role::Debugger => "Du er debugger: du reproducerer fejl, finder årsagen og retter eller dokumenterer den; skriv altid reproduktion og årsag i rapporten.",
     }
@@ -43,7 +43,27 @@ pub const ROLE_HEADING: &str = "## Din rolle";
 /// Heading of the rules section (always last).
 pub const RULES_HEADING: &str = "## Regler i dette workspace";
 
-/// The rules section: limits, review rounds, report limits.
+/// The project rule lines of [`rules_section`] (plan4b C4b.6).
+fn project_rules(r: &WorkspaceRules) -> String {
+    let mut out = String::from(
+        "- Projekter er mapper under projektroden; en ticket skal have et projekt (`project`), før den kan tildeles en arbejdsagent. Angiv `project` på hver ticket du opretter (eksisterende id, eller `{\"new\": \"<navn>\"}`).\n",
+    );
+    out.push_str(if r.agents_may_create_projects {
+        "- Agenter må oprette nye projekter; brug `{\"new\": …}` sparsomt.\n"
+    } else {
+        "- Agenter må ikke oprette nye projekter; bed brugeren om det.\n"
+    });
+    if r.max_agents_per_project > 0 {
+        out.push_str(&format!(
+            "- Højst {} agenter pr. projekt.\n",
+            r.max_agents_per_project
+        ));
+    }
+    out
+}
+
+/// The rules section: limits, review rounds, projects, report limits (the effective rules of
+/// the workspace file, read when the agent starts).
 fn rules_section(r: &WorkspaceRules) -> String {
     let stop = if r.auto_review_on_stop {
         "Når din turn slutter, sendes din igangværende ticket automatisk til review."
@@ -55,11 +75,13 @@ fn rules_section(r: &WorkspaceRules) -> String {
          - Højst {work} arbejdsagenter og {staff} stabsagenter kører samtidig.\n\
          - En ticket kan afvises i review højst {rounds} gange; derefter afgør brugeren.\n\
          - {stop}\n\
+         {projects}\
          - Du kan oprette højst {rate} tickets i timen; en ticket-tekst må højst være {body} tegn.\n\
          - Højst {reports} rapporter pr. ticket, hver højst {report_body} tegn.\n",
         work = r.max_work_agents,
         staff = r.max_staff_agents,
         rounds = r.max_review_rounds,
+        projects = project_rules(r),
         rate = r.create_ticket_rate_limit,
         body = r.ticket_body_max_chars,
         reports = r.reports_per_ticket_max,
@@ -234,10 +256,42 @@ mod tests {
             "højst 3 gange",
             "Højst 20 rapporter pr. ticket, hver højst 20000 tegn.",
             "højst 20 tickets i timen",
+            "mira_list_projects",
+            "skal have et projekt",
+            "må ikke oprette nye projekter",
         ] {
             assert!(text.contains(needle), "{needle}");
         }
+        assert!(!text.contains("agenter pr. projekt"));
         assert!(text.trim_end().ends_with("20000 tegn."));
+    }
+
+    #[test]
+    fn project_rules_follow_the_workspace() {
+        let r = WorkspaceRules {
+            agents_may_create_projects: true,
+            max_agents_per_project: 2,
+            ..rules()
+        };
+        let text = render_profile_prompt(&builtin_profile("coordinator").unwrap(), &r);
+        assert!(
+            text.contains("- Agenter må oprette nye projekter; brug `{\"new\": …}` sparsomt.\n")
+        );
+        assert!(!text.contains("må ikke oprette"));
+        assert!(text.contains("- Højst 2 agenter pr. projekt.\n"));
+        let rules_at = text.find(RULES_HEADING).unwrap();
+        assert!(
+            text.find("en ticket skal have et projekt (`project`), før")
+                .unwrap()
+                > rules_at
+        );
+        // The coordinator text names project before its last sentences.
+        let coord = role_text(Role::Coordinator);
+        assert!(coord.contains("mira_spawn_agent med project"));
+        assert!(
+            coord.find("Hver ticket skal have et projekt").unwrap()
+                < coord.find("Du godkender ikke tickets selv").unwrap()
+        );
     }
 
     #[test]

@@ -1,15 +1,8 @@
 import { useEffect, useState } from "react";
 import type { Theme } from "../../lib/bots";
-import {
-  errorMessage,
-  listProfiles,
-  pickFolder,
-  spawnAgent,
-  spawnAgentWithTicket,
-} from "../../lib/ipc";
+import { errorMessage, listProfiles, spawnAgent, spawnAgentWithTicket } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
 import {
-  folderPrefix,
   hasStaffRole,
   hasWorkRole,
   isSpecialist,
@@ -24,11 +17,6 @@ import StickyNote from "./tickets/StickyNote";
 
 /** Profile used when none is chosen (mirrors `DEFAULT_PROFILE_ID` in Rust). */
 const DEFAULT_PROFILE = "coder";
-
-/** Folder name prefix of the default folder (mirrors `roles::prefix_for` in Rust). */
-function profilePrefix(p: AgentProfile | undefined): string {
-  return p === undefined ? DEFAULT_PROFILE : folderPrefix(p.roles, isSpecialist(p));
-}
 
 const SEAT_TEXT: Record<SeatKind, string> = { work: "arbejdsplads", staff: "stabsplads" };
 
@@ -67,15 +55,14 @@ interface Props {
 }
 
 export default function SpawnDialog(props: Props) {
-  const { seatKind, theme, projectsRoot, ticket = null, onClose, onSpawned } = props;
+  // `projectsRoot` is shown again with the project picker (step 4b batch 3).
+  const { seatKind, theme, ticket = null, onClose, onSpawned } = props;
   const { state, dispatch } = useStore();
   const profiles = state.profiles;
   // `null` until the user picks one: the default then follows the loaded profiles.
   const [chosenId, setProfileId] = useState<string | null>(null);
   const [overrideModel, setOverrideModel] = useState<string | null>(null);
   const [overrideEffort, setOverrideEffort] = useState<Effort | null>(null);
-  const [folderMode, setFolderMode] = useState<"default" | "custom">("default");
-  const [folder, setFolder] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -97,28 +84,15 @@ export default function SpawnDialog(props: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, onClose]);
 
-  const sep = projectsRoot !== null && projectsRoot.includes("\\") ? "\\" : "/";
   const profileId = chosenId ?? defaultProfileId(profiles, seatKind);
   const profile = profiles.find((p) => p.id === profileId);
-  const defaultPath = `${projectsRoot ?? "…"}${sep}${profilePrefix(profile)}-nn`;
-
-  const choose = async () => {
-    try {
-      const picked = await pickFolder();
-      if (picked !== null) {
-        setFolder(picked);
-        setFolderMode("custom");
-      }
-    } catch (e) {
-      setError(errorMessage(e));
-    }
-  };
 
   const start = async () => {
     setBusy(true);
     setError(null);
     try {
-      const cwd = folderMode === "custom" ? folder : null;
+      // The project picker follows in step 4b batch 3; a ticket brings its own project.
+      const project = null;
       const text = prompt.trim();
       const overrides: SpawnOverrides | null =
         overrideModel !== null || overrideEffort !== null
@@ -126,8 +100,8 @@ export default function SpawnDialog(props: Props) {
           : null;
       const agent =
         ticket !== null
-          ? await spawnAgentWithTicket(ticket.id, profileId, overrides, cwd, seatKind)
-          : await spawnAgent(profileId, overrides, cwd, text === "" ? null : text, seatKind);
+          ? await spawnAgentWithTicket(ticket.id, profileId, overrides, project, seatKind)
+          : await spawnAgent(profileId, overrides, project, text === "" ? null : text, seatKind);
       onSpawned(agent.id);
     } catch (e) {
       setError(errorMessage(e));
@@ -138,8 +112,7 @@ export default function SpawnDialog(props: Props) {
   const overridesValid = modelChoiceValid(overrideModel);
   // On a staff seat a profile must be chosen and have a staff role (the backend refuses it too).
   const seatOk = seatKind === "work" || (profile !== undefined && fitsSeat(profile, seatKind));
-  const canStart =
-    !busy && overridesValid && seatOk && (folderMode === "default" || folder !== null);
+  const canStart = !busy && overridesValid && seatOk;
   // The seat the user clicked wins over the profile's default seat.
   const seatDiffers = profile !== undefined && profile.defaultSeat !== seatKind;
 
@@ -249,44 +222,6 @@ export default function SpawnDialog(props: Props) {
           </div>
           <p className="mt-1 text-[11px] text-[var(--muted)]">Gælder kun denne agent; profilen ændres ikke.</p>
         </details>
-
-        <fieldset className="mt-4 space-y-1.5">
-          <legend className="mb-1 text-xs font-medium text-[var(--muted)]">Mappe</legend>
-          <label className="flex items-center gap-2">
-            <input
-              type="radio"
-              name="folder"
-              checked={folderMode === "default"}
-              onChange={() => setFolderMode("default")}
-            />
-            <span>
-              Standardmappe <span className="font-mono text-xs text-[var(--muted)]">{defaultPath}</span>
-            </span>
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="radio"
-              name="folder"
-              checked={folderMode === "custom"}
-              onChange={() => (folder === null ? void choose() : setFolderMode("custom"))}
-            />
-            <span className="flex min-w-0 items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void choose()}
-                title="Vælg en eksisterende mappe"
-                className="shrink-0 rounded-md border border-[var(--border)] px-2 py-0.5 text-xs hover:border-[var(--accent)]"
-              >
-                Vælg mappe…
-              </button>
-              {folder !== null && (
-                <span className="truncate font-mono text-xs text-[var(--muted)]" title={folder}>
-                  {folder}
-                </span>
-              )}
-            </span>
-          </label>
-        </fieldset>
 
         {ticket !== null ? (
           <div className="mt-4">

@@ -21,7 +21,10 @@ use crate::agent::workdir::{ensure_dir, next_agent_name};
 use crate::agent::{
     now_ms, AgentError, AgentInfo, AgentManager, EventSink, SeatKind, SpawnContext, SpawnRequest,
 };
-use crate::config::{DEFAULT_PROFILE_ID, SETTINGS_FILE, STARTING_HINT_AFTER, SYSTEM_PROMPT_FILE};
+use crate::app_settings::{self, AppSettings};
+use crate::config::{
+    DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER, SYSTEM_PROMPT_FILE,
+};
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
 use crate::hooks::settings::write_profile_settings;
@@ -35,6 +38,7 @@ use crate::profiles::model::{
 };
 use crate::profiles::prompt::{profile_files_dir, write_profile_prompt};
 use crate::profiles::ProfilesCtx;
+use crate::projects::{self, AssignmentProject, Project, ProjectError, ProjectId, ProjectRef};
 use crate::tickets::dispatcher::DispatchMsg;
 use crate::tickets::model::{
     ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
@@ -231,24 +235,73 @@ pub fn emit_agent_list(app: &AppHandle, manager: &Mutex<AgentManager>) {
     }
 }
 
-/// Explicit folder if given and non-blank, otherwise a default folder named after the next free
-/// agent name (`<projects_root>/<prefix>-<nn>`, prefix from the profile's roles), created on
-/// disk. Step 4b batch 1 keeps this until the project placement replaces it (batch 2).
-pub fn resolve_cwd(
-    cwd: Option<String>,
-    projects_root: &std::path::Path,
-    prefix: &str,
+/// A spawn on a work seat without a project (and without a ticket that has one).
+pub const WORK_SEAT_NEEDS_PROJECT: &str =
+    "En arbejdsplads kræver et projekt — vælg et projekt til agenten";
+
+/// Where a new agent runs (plan4b C4b.3): its folder, name and project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub cwd: PathBuf,
+    pub name: String,
+    pub project: Option<ProjectId>,
+}
+
+/// `maxAgentsPerProject` (0 = unlimited): refuses when `max` live work agents (other than
+/// `except`) already run in `project`.
+pub fn check_project_limit(
     manager: &Mutex<AgentManager>,
-) -> Result<PathBuf, AgentError> {
-    match cwd {
-        Some(s) if !s.trim().is_empty() => Ok(PathBuf::from(s)),
-        _ => {
-            let taken = lock(manager).names();
-            let dir = projects_root.join(next_agent_name(prefix, &taken));
-            ensure_dir(&dir)?;
-            Ok(dir)
-        }
+    project: &str,
+    max: usize,
+    except: Option<&str>,
+) -> Result<(), AgentError> {
+    if max == 0 {
+        return Ok(());
     }
+    let n = lock(manager)
+        .live_work_in_project(project)
+        .iter()
+        .filter(|a| Some(a.id.as_str()) != except)
+        .count();
+    if n >= max {
+        return Err(AgentError::ProjectLimit {
+            project: project.to_string(),
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// The folder, name and project of a new agent (plan4b A.1, C4b.4): a staff seat runs in the
+/// projects root without a project; a work seat needs `project`, which is realised (a `New` is
+/// created only with `may_create`), then `maxAgentsPerProject` is checked. The name is the next
+/// free `<prefix>-<nn>` among all known agents, whatever the folder.
+// TODO(windows-verify): a work agent starts in <root>\<project>, a staff agent in <root>; two
+// agents in one project are coder-01 and coder-02 (plan4b D.79).
+pub fn resolve_placement(
+    state: &AppState,
+    profile: &AgentProfile,
+    seat: SeatKind,
+    project: Option<&ProjectRef>,
+    may_create: bool,
+) -> Result<Placement, String> {
+    let root = &state.paths.projects_root;
+    let (cwd, project) = match seat {
+        SeatKind::Staff => {
+            ensure_dir(root).map_err(AgentError::Io)?;
+            (root.clone(), None)
+        }
+        SeatKind::Work => {
+            let r = project.ok_or(WORK_SEAT_NEEDS_PROJECT)?;
+            let p = projects::realize(root, r, may_create)?;
+            let max = state.workspace.rules().max_agents_per_project;
+            check_project_limit(&state.manager, &p.id, max, None)?;
+            (PathBuf::from(&p.path), Some(p.id))
+        }
+    };
+    let prefix = prefix_for(&profile.roles, profile.is_specialist());
+    let name = next_agent_name(prefix, &lock(&state.manager).names());
+    Ok(Placement { cwd, name, project })
 }
 
 /// Takes (and clears) the pending workplace selection.
@@ -334,9 +387,10 @@ pub fn ticket_create(
     title: &str,
     body: &str,
     skip_review: bool,
+    project: Option<ProjectRef>,
 ) -> Result<TicketSummary, String> {
     let now = now_ms();
-    t.mutate(|s| s.create(title, body, skip_review, now))
+    t.mutate(|s| s.create_in(title, body, skip_review, project, now))
         .map(|tk| TicketSummary::from(&tk))
 }
 
@@ -358,14 +412,34 @@ pub fn ticket_delete(t: &TicketsCtx, id: &str) -> Result<(), String> {
 /// backlog/rejected → the agent's queue (at the end). The agent must exist and not have exited.
 /// A ticket in progress is handed over (step 5c): it leaves its agent ("overdraget fra … til
 /// …") and goes last in the new agent's queue.
+///
+/// Step 4b (plan4b A.2): a work agent only takes tickets of its own project
+/// ([`projects::assignment_target`]); a ticket with `{"new": name}` matching the agent's
+/// project becomes that project in the same save. Staff seats take any ticket.
+// TODO(windows-verify): a ticket of project A dropped on an agent in B is refused with the
+// WrongProject text; one without a project on a work agent asks "Hvilket projekt?" (plan4b D.82).
 pub fn ticket_assign(t: &TicketsCtx, id: &str, agent_id: &str) -> Result<TicketSummary, String> {
-    if !agent_live(&t.manager, agent_id) {
-        return Err(TicketError::AgentNotLive.into());
-    }
+    let info = lock(&t.manager)
+        .get(agent_id)
+        .filter(|a| !matches!(a.status, AgentStatus::Exited { .. }))
+        .ok_or(TicketError::AgentNotLive)?;
     let before = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    let target = projects::assignment_target(
+        before.project.as_ref(),
+        info.seat_kind,
+        info.project.as_deref(),
+        &info.name,
+    )?;
     let now = now_ms();
+    let set = match target {
+        AssignmentProject::Unchanged => None,
+        // The user may create projects: a missing folder is created.
+        AssignmentProject::Set(p) => {
+            Some(projects::realize(t.workspace.root(), &ProjectRef::New { new: p }, true)?.id)
+        }
+    };
     if before.state != TicketState::InProgress {
-        let tk = t.mutate(|s| s.assign(id, agent_id, now))?;
+        let tk = t.mutate(|s| s.assign_in(id, agent_id, set, now))?;
         t.notify([agent_id]);
         return Ok(TicketSummary::from(&tk));
     }
@@ -375,7 +449,7 @@ pub fn ticket_assign(t: &TicketsCtx, id: &str, agent_id: &str) -> Result<TicketS
         let name = |a: &str| m.get(a).map_or_else(|| a.to_string(), |i| i.name);
         (name(&old), name(agent_id))
     };
-    let tk = t.mutate(|s| s.handoff(id, agent_id, None, (&from_name, &to_name), now))?;
+    let tk = t.mutate(|s| s.handoff_in(id, agent_id, None, (&from_name, &to_name), set, now))?;
     // The user took it from the old agent: tell it to stop (review 5c W4).
     t.handed_over(&old, &tk, Some(&to_name), true);
     t.notify([old.as_str(), agent_id]);
@@ -585,13 +659,14 @@ pub fn spawn_request(
 pub fn write_profile_files(
     paths: &AppPaths,
     profile: &AgentProfile,
+    rules: &WorkspaceRules,
 ) -> std::io::Result<(PathBuf, PathBuf)> {
     let hook = paths
         .hook_exe
         .clone()
         .unwrap_or_else(|| PathBuf::from("mira-hook-not-found"));
     let settings = write_profile_settings(&paths.data_dir, &hook, profile)?;
-    let prompt = write_profile_prompt(&paths.data_dir, profile, &WorkspaceRules::defaults())?;
+    let prompt = write_profile_prompt(&paths.data_dir, profile, rules)?;
     Ok((settings, prompt))
 }
 
@@ -616,9 +691,8 @@ pub fn spawn_context(
         Some(p) => {
             let settings =
                 write_profile_settings(&state.paths.data_dir, hook_exe, p).map_err(io)?;
-            let prompt =
-                write_profile_prompt(&state.paths.data_dir, p, &WorkspaceRules::defaults())
-                    .map_err(io)?;
+            let rules = state.workspace.rules();
+            let prompt = write_profile_prompt(&state.paths.data_dir, p, &rules).map_err(io)?;
             (settings, prompt)
         }
         None => {
@@ -647,17 +721,43 @@ pub fn spawn_context(
     })
 }
 
-/// [`spawn_context`] for `profile`, then the working folder (prefix from the profile's roles; a
-/// refused spawn never creates a default folder).
+/// Sets the manager's seat limits from the workspace rules (read before every spawn, plan4b
+/// A.4) and returns the rules.
+pub fn apply_limits(state: &AppState) -> WorkspaceRules {
+    let rules = state.workspace.rules();
+    lock(&state.manager).set_limits(rules.max_work_agents, rules.max_staff_agents);
+    rules
+}
+
+/// The checks of a spawn in the order of plan4b C4b.4: seat limits from the workspace rules,
+/// [`spawn_context`] (hook/pipe/claude/profile files), the seat limit, then the placement (a
+/// refused spawn never creates a project folder: it is realised last).
 pub fn prepare_spawn(
     state: &AppState,
     profile: &AgentProfile,
-    cwd: Option<String>,
-) -> Result<(SpawnContext, PathBuf), String> {
+    seat: SeatKind,
+    project: Option<&ProjectRef>,
+    may_create: bool,
+) -> Result<(SpawnContext, Placement), String> {
+    apply_limits(state);
     let ctx = spawn_context(state, &profile.id, Some(profile))?;
-    let prefix = prefix_for(&profile.roles, profile.is_specialist());
-    let cwd = resolve_cwd(cwd, &state.paths.projects_root, prefix, &state.manager)?;
-    Ok((ctx, cwd))
+    lock(&state.manager).can_spawn(seat)?;
+    let placement = resolve_placement(state, profile, seat, project, may_create)?;
+    Ok((ctx, placement))
+}
+
+/// [`spawn_request`] in `placement` (folder, name, project).
+fn placed_request(
+    profile: &AgentProfile,
+    overrides: Option<SpawnOverrides>,
+    placement: Placement,
+    prompt: Option<String>,
+    seat: SeatKind,
+) -> Result<SpawnRequest, String> {
+    let mut req = spawn_request(profile, overrides, placement.cwd, prompt, Some(seat))?;
+    req.name = Some(placement.name);
+    req.project = placement.project;
+    Ok(req)
 }
 
 /// Starts the agent in an already resolved folder, emits `agents-changed` and schedules the
@@ -689,28 +789,33 @@ fn spawn_prepared(
     Ok(info)
 }
 
-/// The shared core of `spawn_agent` (and, from batch 2, `mira_spawn_agent`).
+/// The shared core of `spawn_agent` and `mira_spawn_agent`. `may_create`: whether a
+/// `{"new": …}` project may be created (always for the user; `agentsMayCreateProjects` for an
+/// agent).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_core(
     app: &AppHandle,
     state: &AppState,
     profile_id: Option<String>,
     overrides: Option<SpawnOverrides>,
-    cwd: Option<String>,
+    project: Option<ProjectRef>,
     prompt: Option<String>,
     seat_kind: Option<SeatKind>,
+    may_create: bool,
 ) -> Result<AgentInfo, String> {
     let profile = resolve_profile(&state.profiles, profile_id.as_deref())?;
     // Validate the overrides and the seat before anything is written or a folder created.
     validate_overrides(overrides.clone().unwrap_or_default())?;
-    profile.check_seat(seat_kind.unwrap_or(profile.default_seat))?;
-    let (ctx, cwd) = prepare_spawn(state, &profile, cwd)?;
-    let req = spawn_request(&profile, overrides, cwd, prompt, seat_kind)?;
+    let seat = seat_kind.unwrap_or(profile.default_seat);
+    profile.check_seat(seat)?;
+    let (ctx, placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
+    let req = placed_request(&profile, overrides, placement, prompt, seat)?;
     spawn_prepared(app, state, &ctx, req)
 }
 
 /// `profileId` null → `coder`; `overrides` replace the profile's model/effort for this agent;
-/// `cwd` null/blank → default folder (prefix from the roles); `seatKind` null → the profile's
-/// `defaultSeat`. After [`STARTING_HINT_AFTER`] without a hook event, the agent gets the
+/// `project` (a work seat needs one; `{"new": name}` creates the folder; ignored on a staff
+/// seat, which runs in the projects root); `seatKind` null → the profile's `defaultSeat`. After [`STARTING_HINT_AFTER`] without a hook event, the agent gets the
 /// Starting hint.
 // TODO(windows-verify): a spawn from a profile starts claude with the profile's settings file
 // and `--model`/`--effort` when set; the TUI header shows them (plan5 D.50).
@@ -720,11 +825,13 @@ pub fn spawn_agent(
     state: State<'_, AppState>,
     profile_id: Option<String>,
     overrides: Option<SpawnOverrides>,
-    cwd: Option<String>,
+    project: Option<ProjectRef>,
     prompt: Option<String>,
     seat_kind: Option<SeatKind>,
 ) -> Result<AgentInfo, String> {
-    spawn_core(&app, &state, profile_id, overrides, cwd, prompt, seat_kind)
+    spawn_core(
+        &app, &state, profile_id, overrides, project, prompt, seat_kind, true,
+    )
 }
 
 /// Like `spawn_agent`, with a backlog ticket: the ticket file is written in the agent's folder
@@ -741,41 +848,118 @@ pub fn spawn_agent_with_ticket(
     ticket_id: String,
     profile_id: Option<String>,
     overrides: Option<SpawnOverrides>,
-    cwd: Option<String>,
+    project: Option<ProjectRef>,
     seat_kind: Option<SeatKind>,
 ) -> Result<AgentInfo, String> {
     spawn_with_ticket_core(
-        &app, &state, &ticket_id, profile_id, overrides, cwd, seat_kind,
+        &app, &state, &ticket_id, profile_id, overrides, project, seat_kind, true,
     )
 }
 
+/// The project a spawn with `ticket` on `seat` runs in (plan4b punkt 9): a work seat takes the
+/// ticket's project when it has one, otherwise `project` ([`TicketError::ProjectRequired`]
+/// when both are missing); a staff seat has none.
+pub fn spawn_project(
+    ticket: &Ticket,
+    seat: SeatKind,
+    project: Option<ProjectRef>,
+) -> Result<Option<ProjectRef>, String> {
+    match seat {
+        SeatKind::Staff => Ok(None),
+        SeatKind::Work => ticket
+            .project
+            .clone()
+            .or(project)
+            .map(Some)
+            .ok_or_else(|| TicketError::ProjectRequired.into()),
+    }
+}
+
+/// The ticket of a spawn on a work seat gets the (realised) project of the placement before its
+/// file is written, so the file shows it (plan4b punkt 9). Unchanged on a staff seat.
+pub fn ticket_in_placement(
+    t: &TicketsCtx,
+    ticket: Ticket,
+    placement: &Placement,
+) -> Result<Ticket, String> {
+    let Some(p) = &placement.project else {
+        return Ok(ticket);
+    };
+    let realized = Some(ProjectRef::Existing(p.clone()));
+    if ticket.project == realized {
+        return Ok(ticket);
+    }
+    let now = now_ms();
+    t.mutate(|s| s.set_project(&ticket.id, realized, now))
+}
+
+/// The delivery of the first ticket of a new agent (plan4b A.5/A.6): `## Delt projekt` when
+/// other live work agents already run in the project (real work deliveries only), the project
+/// list for a coordination task.
+pub fn first_delivery(
+    state: &AppState,
+    seat: SeatKind,
+    roles: &[crate::agent::Role],
+    project: Option<&str>,
+    rules: &WorkspaceRules,
+) -> prompt::TicketDelivery {
+    let delivery = prompt::TicketDelivery::for_agent(seat, roles);
+    if !delivery.is_work() {
+        let ids = projects::list_projects(&state.paths.projects_root)
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        return delivery.with_projects(ids, rules.agents_may_create_projects);
+    }
+    match project {
+        Some(p) => {
+            let others = lock(&state.manager)
+                .live_work_in_project(p)
+                .into_iter()
+                .map(|a| a.name)
+                .collect();
+            delivery.with_shared(p, others)
+        }
+        None => delivery,
+    }
+}
+
 /// The shared core of `spawn_agent_with_ticket` and `mira_spawn_agent` with `firstTicketId`.
+/// A ticket without a project (or with `{"new": …}`) gets the agent's project before the file
+/// is written; if the spawn then fails the project stays (an empty folder may remain; plan4b
+/// A.2).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_with_ticket_core(
     app: &AppHandle,
     state: &AppState,
     ticket_id: &str,
     profile_id: Option<String>,
     overrides: Option<SpawnOverrides>,
-    cwd: Option<String>,
+    project: Option<ProjectRef>,
     seat_kind: Option<SeatKind>,
+    may_create: bool,
 ) -> Result<AgentInfo, String> {
-    let ticket = ticket_for_spawn(&state.tickets, ticket_id)?;
+    let mut ticket = ticket_for_spawn(&state.tickets, ticket_id)?;
     let profile = resolve_profile(&state.profiles, profile_id.as_deref())?;
     validate_overrides(overrides.clone().unwrap_or_default())?;
     let seat = seat_kind.unwrap_or(profile.default_seat);
     profile.check_seat(seat)?;
-    let (ctx, cwd) = prepare_spawn(state, &profile, cwd)?;
+    let project = spawn_project(&ticket, seat, project)?;
+    let (ctx, placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
+    ticket = ticket_in_placement(&state.tickets, ticket, &placement)?;
+    let rules = state.workspace.rules();
     // On a staff seat the first ticket is a coordination task (5c C.1).
-    let delivery = prompt::TicketDelivery::for_agent(seat, &profile.roles);
-    let file = prompt::write_ticket_file(&cwd, &ticket, now_ms(), delivery)
+    let delivery = first_delivery(
+        state,
+        seat,
+        &profile.roles,
+        placement.project.as_deref(),
+        &rules,
+    );
+    let file = prompt::write_ticket_file(&placement.cwd, &ticket, now_ms(), &delivery)
         .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
-    let req = spawn_request(
-        &profile,
-        overrides,
-        cwd,
-        Some(prompt::line_for(&ticket, delivery)),
-        Some(seat),
-    )?;
+    let line = prompt::line_for(&ticket, &delivery);
+    let req = placed_request(&profile, overrides, placement, Some(line), seat)?;
     let info = match spawn_prepared(app, state, &ctx, req) {
         Ok(info) => info,
         Err(e) => {
@@ -796,11 +980,13 @@ pub fn spawn_with_ticket_core(
 
 /// `mira_spawn_agent` (the tool's [`crate::tickets::tools::SpawnPort`]): the same path and seat
 /// limits as the UI. With `first_ticket_id` (full or short id of a backlog ticket) it is
-/// `spawn_agent_with_ticket`. Default folder, no overrides.
+/// `spawn_agent_with_ticket`. No overrides; `project` as in the UI (the ticket's project wins).
 pub fn spawn_for_tool(app: &AppHandle, req: SpawnByProfile) -> Result<AgentInfo, String> {
     let state = app
         .try_state::<AppState>()
         .ok_or_else(|| SPAWN_UNAVAILABLE.to_string())?;
+    // An agent may create a project only when the workspace allows it (plan4b A.2).
+    let may_create = state.workspace.rules().agents_may_create_projects;
     match req.first_ticket_id {
         Some(id) => {
             let ticket = state
@@ -813,8 +999,9 @@ pub fn spawn_for_tool(app: &AppHandle, req: SpawnByProfile) -> Result<AgentInfo,
                 &ticket.id,
                 Some(req.profile_id),
                 None,
-                None,
+                req.project,
                 req.seat_kind,
+                may_create,
             )
         }
         None => spawn_core(
@@ -822,9 +1009,10 @@ pub fn spawn_for_tool(app: &AppHandle, req: SpawnByProfile) -> Result<AgentInfo,
             &state,
             Some(req.profile_id),
             None,
-            None,
+            req.project,
             None,
             req.seat_kind,
+            may_create,
         ),
     }
 }
@@ -866,10 +1054,23 @@ pub fn restart_request(
     model: Option<String>,
     effort: Option<Effort>,
 ) -> SpawnRequest {
+    let project = info.project.clone();
+    restart_request_in(info, model, effort, PathBuf::from(&info.cwd), project)
+}
+
+/// [`restart_request`] in another folder and project ("Flyt til projekt…", plan4b A.3); the
+/// name stays.
+pub fn restart_request_in(
+    info: &AgentInfo,
+    model: Option<String>,
+    effort: Option<Effort>,
+    cwd: PathBuf,
+    project: Option<String>,
+) -> SpawnRequest {
     SpawnRequest {
-        cwd: PathBuf::from(&info.cwd),
+        cwd,
         name: Some(info.name.clone()),
-        project: info.project.clone(),
+        project,
         prompt: None,
         seat_kind: info.seat_kind,
         profile: ProfileSnapshot {
@@ -894,11 +1095,32 @@ fn restart_agent(
     model: Option<Option<String>>,
     effort: Option<Effort>,
 ) -> Result<AgentInfo, String> {
+    restart_with(app, state, agent_id, model, effort, None)
+}
+
+/// [`restart_agent`], optionally in another folder and project (`moved`; plan4b A.3).
+fn restart_with(
+    app: &AppHandle,
+    state: &AppState,
+    agent_id: &str,
+    model: Option<Option<String>>,
+    effort: Option<Effort>,
+    moved: Option<(PathBuf, String)>,
+) -> Result<AgentInfo, String> {
     let info = check_restartable(lock(&state.manager).get(agent_id).as_ref())?;
     let (model, effort) = restart_values(&info, model, effort);
     let profile = state.profiles.get(&info.profile_id);
     let ctx = spawn_context(state, &info.profile_id, profile.as_ref())?;
-    let req = restart_request(&info, model.clone(), effort);
+    let req = match &moved {
+        Some((cwd, project)) => restart_request_in(
+            &info,
+            model.clone(),
+            effort,
+            cwd.clone(),
+            Some(project.clone()),
+        ),
+        None => restart_request(&info, model.clone(), effort),
+    };
     lock(&state.pending).remove_for_agent(agent_id);
     let (result, old_pty, resumed) = {
         let mut m = lock(&state.manager);
@@ -933,6 +1155,15 @@ fn restart_agent(
                 model.as_deref().unwrap_or("default"),
                 effort.map_or("-", Effort::as_str)
             );
+            let info = match &moved {
+                Some((_, project)) => {
+                    let mut m = lock(&state.manager);
+                    m.set_project(agent_id, Some(project.clone()));
+                    log::info!("agent {agent_id} moved to project {project}");
+                    m.get(agent_id).unwrap_or(info)
+                }
+                None => info,
+            };
             state.emit_agents(app);
             Ok(info)
         }
@@ -980,6 +1211,137 @@ pub fn set_agent_effort(
     restart_agent(&app, &state, &agent_id, None, Some(effort))
 }
 
+// ---- projects (plan4b C4b.4) ----
+
+/// The gate of `move_agent_to_project`, in the order of C4b.4 (without the restart, so it is
+/// unit tested): running, idle, no ticket in progress → work seat → empty queue (or `force`) →
+/// the project exists (a `New` is created: the user may) → not the agent's own → the
+/// `maxAgentsPerProject` limit (the agent itself not counted). Returns the agent and the
+/// project.
+pub fn move_gate(
+    state: &AppState,
+    agent_id: &str,
+    project: &ProjectRef,
+    force: bool,
+) -> Result<(AgentInfo, Project), String> {
+    let info = check_restartable(lock(&state.manager).get(agent_id).as_ref())?;
+    if info.seat_kind != SeatKind::Work {
+        return Err(AgentError::StaffHasNoProject.into());
+    }
+    if info.queue_length > 0 && !force {
+        return Err(AgentError::QueueNotEmpty(info.queue_length).into());
+    }
+    let p = projects::realize(&state.paths.projects_root, project, true)?;
+    if info
+        .project
+        .as_deref()
+        .is_some_and(|cur| projects::same_id(cur, &p.id))
+    {
+        return Err(AgentError::SameProject(p.id).into());
+    }
+    let max = state.workspace.rules().max_agents_per_project;
+    check_project_limit(&state.manager, &p.id, max, Some(agent_id))?;
+    Ok((info, p))
+}
+
+/// "Flyt til projekt…" (plan4b A.3): restarts the agent with `--resume` in the project's
+/// folder (the conversation is kept, research4b §2). Only on a work seat, idle without a ticket
+/// in progress; queued tickets go to the backlog with [`MOVED_NOTE`] when `force`, otherwise the
+/// move is refused.
+// TODO(windows-verify): the agent restarts with --resume in the new folder, the conversation is
+// kept, the trust dialog comes for a git project, and the next ticket file lands in the new
+// folder (plan4b D.81).
+#[tauri::command]
+pub fn move_agent_to_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_id: String,
+    project: ProjectRef,
+    force: bool,
+) -> Result<AgentInfo, String> {
+    let (info, p) = move_gate(&state, &agent_id, &project, force)?;
+    if info.queue_length > 0 {
+        state.tickets.release_queue(&agent_id, MOVED_NOTE)?;
+    }
+    restart_with(
+        &app,
+        &state,
+        &agent_id,
+        None,
+        None,
+        Some((PathBuf::from(&p.path), p.id)),
+    )
+}
+
+/// The project folders under the projects root.
+#[tauri::command]
+pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    Ok(projects::list_projects(&state.paths.projects_root))
+}
+
+/// Creates a project folder (the user may always).
+#[tauri::command]
+pub fn create_project(state: State<'_, AppState>, name: String) -> Result<Project, String> {
+    let p = projects::create_project(&state.paths.projects_root, name.trim())?;
+    log::info!("project {} created", p.id);
+    Ok(p)
+}
+
+/// The folder `open_project_folder` opens: the root (`None`, created if missing) or an existing
+/// project.
+pub fn project_folder(root: &std::path::Path, project: Option<&str>) -> Result<PathBuf, String> {
+    match project.map(str::trim).filter(|s| !s.is_empty()) {
+        None => {
+            ensure_dir(root).map_err(|e| format!("Kunne ikke oprette projektroden: {e}"))?;
+            Ok(root.to_path_buf())
+        }
+        Some(id) => projects::find_project(root, id)
+            .map(|p| PathBuf::from(p.path))
+            .ok_or_else(|| ProjectError::NotFound(id.to_string()).into()),
+    }
+}
+
+/// Opens the projects root (`project` null) or a project folder in the file manager.
+#[tauri::command]
+pub fn open_project_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project: Option<String>,
+) -> Result<(), String> {
+    let dir = project_folder(&state.paths.projects_root, project.as_deref())?;
+    app.opener()
+        .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
+}
+
+/// Stores a new projects root in `app-settings.json` (created if missing). It applies after a
+/// restart of mira-bots (plan4b A.1); returns the stored path.
+pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Vælg en mappe til projektroden".into());
+    }
+    let dir = PathBuf::from(path);
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Mappen kunne ikke oprettes: {e}"))?;
+    }
+    let settings = AppSettings {
+        projects_root: Some(path.to_string()),
+    };
+    app_settings::save(data_dir, &settings)
+        .map_err(|e| format!("Indstillingen kunne ikke gemmes: {e}"))?;
+    Ok(path.to_string())
+}
+
+// TODO(windows-verify): the path is stored in %APPDATA%\dk.mira.bots\app-settings.json and
+// only used after a restart (plan4b D.86).
+#[tauri::command]
+pub fn set_projects_root(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let stored = store_projects_root(&state.paths.data_dir, &path)?;
+    log::info!("projects root set to {stored} (applies after a restart)");
+    Ok(stored)
+}
+
 // ---- profiles (plan5 C5.4) ----
 
 /// `save_profile` without Tauri: an empty id becomes a new `custom-<8 hex>`; validation and the
@@ -999,8 +1361,8 @@ pub fn profile_save(
 
 /// Rewrites the per-profile files after a save/reset (failures are only logged: the next spawn
 /// writes them again).
-fn refresh_profile_files(paths: &AppPaths, profile: &AgentProfile) {
-    if let Err(e) = write_profile_files(paths, profile) {
+fn refresh_profile_files(state: &AppState, profile: &AgentProfile) {
+    if let Err(e) = write_profile_files(&state.paths, profile, &state.workspace.rules()) {
         log::warn!("could not write the files of profile {}: {e}", profile.id);
     }
 }
@@ -1027,7 +1389,7 @@ pub fn save_profile(
 ) -> Result<AgentProfile, String> {
     let saved = profile_save(&state.profiles, profile, now_ms())?;
     log::info!("profile {} saved", saved.id);
-    refresh_profile_files(&state.paths, &saved);
+    refresh_profile_files(&state, &saved);
     Ok(saved)
 }
 
@@ -1047,7 +1409,7 @@ pub fn reset_builtin_profile(
 ) -> Result<AgentProfile, String> {
     let p = state.profiles.mutate(|s| s.reset_builtin(&id, now_ms()))?;
     log::info!("profile {id} reset");
-    refresh_profile_files(&state.paths, &p);
+    refresh_profile_files(&state, &p);
     Ok(p)
 }
 
@@ -1286,8 +1648,9 @@ pub fn create_ticket(
     title: String,
     body: String,
     skip_review: bool,
+    project: Option<ProjectRef>,
 ) -> Result<TicketSummary, String> {
-    ticket_create(&state.tickets, &title, &body, skip_review)
+    ticket_create(&state.tickets, &title, &body, skip_review, project)
 }
 
 #[tauri::command]
@@ -1447,6 +1810,11 @@ mod tests {
     use crate::profiles::store::{profiles_dir, ProfileStore};
     use crate::tickets::test_support::{test_ctx, TestCtx};
     use serde_json::json;
+
+    /// The project of the test fakes on work seats (`insert_fake_with`).
+    fn p() -> Option<ProjectRef> {
+        Some(ProjectRef::Existing("p".into()))
+    }
 
     fn request(id: &str, agent: &str) -> PermissionRequestInfo {
         PermissionRequestInfo {
@@ -1885,7 +2253,8 @@ mod tests {
         assert!(saved.id.starts_with("custom-"), "{}", saved.id);
         assert_eq!(saved.kind, crate::profiles::ProfileKind::Custom);
         assert_eq!(state.profiles.list().len(), 8);
-        let (settings, prompt) = write_profile_files(&state.paths, &saved).unwrap();
+        let (settings, prompt) =
+            write_profile_files(&state.paths, &saved, &WorkspaceRules::defaults()).unwrap();
         assert_eq!(
             settings,
             dir.join("profiles").join(&saved.id).join("settings.json")
@@ -2056,7 +2425,7 @@ mod tests {
     #[test]
     fn assign_needs_a_live_agent_and_notifies_the_dispatcher() {
         let (mut t, live, dead) = tickets_setup();
-        let tk = ticket_create(&t.ctx, "  Opgave  ", "", false).unwrap();
+        let tk = ticket_create(&t.ctx, "  Opgave  ", "", false, p()).unwrap();
         assert_eq!(tk.title, "Opgave");
         for agent in [dead.as_str(), "nope"] {
             assert_eq!(
@@ -2095,7 +2464,7 @@ mod tests {
         let (t, live, _) = tickets_setup();
         let detail = |t: &TestCtx| lock(&t.ctx.manager).get(&live).unwrap().detail;
         let in_progress = |t: &TestCtx| {
-            let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+            let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
             ticket_assign(&t.ctx, &tk.id, &live).unwrap();
             ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
             tk.id
@@ -2123,7 +2492,7 @@ mod tests {
         ticket_set_state(&t.ctx, &id, TicketState::Review, None).unwrap();
         assert_eq!(detail(&t).as_deref(), Some("Kører tests"));
         let id = in_progress(&t);
-        let other = ticket_create(&t.ctx, "y", "", false).unwrap();
+        let other = ticket_create(&t.ctx, "y", "", false, p()).unwrap();
         ticket_assign(&t.ctx, &other.id, &live).unwrap();
         lock(&t.ctx.manager).set_detail(&live, Some(NOT_SUBMITTED_TEXT.into()));
         ticket_set_state(&t.ctx, &other.id, TicketState::Backlog, None).unwrap();
@@ -2144,7 +2513,7 @@ mod tests {
             m.set_status(&id, AgentStatus::Idle, None).unwrap();
             id
         };
-        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
         ticket_assign(&t.ctx, &tk.id, &live).unwrap();
         ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
         lock(&t.ctx.manager).set_detail(&live, Some(NOT_SUBMITTED_TEXT.into()));
@@ -2228,7 +2597,7 @@ mod tests {
     #[test]
     fn set_ticket_state_maps_errors_to_danish_text() {
         let (mut t, live, _) = tickets_setup();
-        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
         assert_eq!(
             ticket_set_state(&t.ctx, &tk.id, TicketState::Done, None).unwrap_err(),
             "Kan ikke flytte en ticket fra Backlog til Done"
@@ -2268,7 +2637,7 @@ mod tests {
     fn reject_requeues_for_a_live_agent_and_approve_finishes() {
         let (mut t, live, dead) = tickets_setup();
         let mk = |t: &TestCtx, agent: &str| {
-            let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+            let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
             t.ctx
                 .mutate(|s| {
                     s.assign(&tk.id, agent, 1)?;
@@ -2310,7 +2679,7 @@ mod tests {
         let (mut t, live, _) = tickets_setup();
         let ids: Vec<String> = (0..2)
             .map(|i| {
-                let tk = ticket_create(&t.ctx, &format!("t{i}"), "", false).unwrap();
+                let tk = ticket_create(&t.ctx, &format!("t{i}"), "", false, p()).unwrap();
                 ticket_assign(&t.ctx, &tk.id, &live).unwrap();
                 tk.id
             })
@@ -2349,14 +2718,14 @@ mod tests {
             ticket_for_spawn(&t.ctx, &ids[0]).unwrap_err(),
             format!("Kan ikke flytte en ticket fra {queued} til {queued}")
         );
-        let fresh = ticket_create(&t.ctx, "ny", "", false).unwrap();
+        let fresh = ticket_create(&t.ctx, "ny", "", false, p()).unwrap();
         assert_eq!(ticket_for_spawn(&t.ctx, &fresh.id).unwrap().id, fresh.id);
     }
 
     #[test]
     fn a_spawned_ticket_waits_for_the_session_and_heads_the_queue() {
         let (mut t, live, _) = tickets_setup();
-        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
         ticket_attach_spawned(&t.ctx, &tk.id, &live).unwrap();
         // The dispatcher hears about the spawn before the ticket shows up in the queue.
         assert_eq!(
@@ -2376,7 +2745,7 @@ mod tests {
     fn request_submission_needs_an_in_progress_ticket_with_a_live_agent() {
         let (mut t, live, dead) = tickets_setup();
         let in_progress = |agent: &str| {
-            let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+            let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
             t.ctx
                 .mutate(|s| {
                     s.assign(&tk.id, agent, 2)?;
@@ -2406,7 +2775,7 @@ mod tests {
             ticket_request_submission(&t.ctx, &mine.id).unwrap_err(),
             "Ticketen er ikke i gang"
         );
-        let backlog = ticket_create(&t.ctx, "y", "", false).unwrap();
+        let backlog = ticket_create(&t.ctx, "y", "", false, p()).unwrap();
         assert_eq!(
             ticket_request_submission(&t.ctx, &backlog.id).unwrap_err(),
             "Ticketen er ikke i gang"
@@ -2418,28 +2787,372 @@ mod tests {
         assert!(t.sent().is_empty());
     }
 
+    fn temp_state() -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mira-place-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        (app_state(&dir), dir)
+    }
+
+    fn profile(state: &AppState, id: &str) -> AgentProfile {
+        state.profiles.get(id).unwrap()
+    }
+
     #[test]
-    fn resolve_cwd_uses_explicit_or_next_default_folder() {
-        let base = std::env::temp_dir().join(format!("mira-cwd-{}", uuid::Uuid::new_v4()));
-        let root = base.join("projects");
-        let m = Mutex::new(AgentManager::new(5));
+    fn resolve_placement_by_seat_and_project() {
+        let (state, dir) = temp_state();
+        let root = state.paths.projects_root.clone();
+        let coder = profile(&state, "coder");
+        // Staff: the root, no project.
+        let staff = resolve_placement(
+            &state,
+            &profile(&state, "reviewer"),
+            SeatKind::Staff,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(
-            resolve_cwd(Some("/w/x".into()), &root, "bot", &m).unwrap(),
-            PathBuf::from("/w/x")
+            (staff.cwd.clone(), staff.project.clone()),
+            (root.clone(), None)
         );
-        let first = resolve_cwd(Some("  ".into()), &root, "bot", &m).unwrap();
-        assert_eq!(first, root.join("bot-01"));
-        assert!(first.is_dir());
-        lock(&m).insert_fake("s", &first.to_string_lossy());
+        // Work without a project.
         assert_eq!(
-            resolve_cwd(None, &root, "bot", &m).unwrap(),
-            root.join("bot-02")
+            resolve_placement(&state, &coder, SeatKind::Work, None, true).unwrap_err(),
+            WORK_SEAT_NEEDS_PROJECT
+        );
+        // A new project is created; names count all agents, not folders.
+        let new = ProjectRef::New { new: "demo".into() };
+        let a = resolve_placement(&state, &coder, SeatKind::Work, Some(&new), true).unwrap();
+        assert_eq!(a.cwd, root.join("demo"));
+        assert!(a.cwd.is_dir());
+        assert_eq!(a.project.as_deref(), Some("demo"));
+        assert_eq!(a.name, "coder-01");
+        lock(&state.manager).insert_fake_in(
+            "s9",
+            &a.cwd.to_string_lossy(),
+            &[Role::Coder],
+            SeatKind::Work,
+            Some("demo"),
+        );
+        let existing = ProjectRef::Existing("DEMO".into());
+        let b = resolve_placement(&state, &coder, SeatKind::Work, Some(&existing), false).unwrap();
+        assert_eq!(
+            (b.cwd.clone(), b.project.as_deref()),
+            (root.join("demo"), Some("demo"))
+        );
+        // Unknown project; an agent may not create one.
+        assert_eq!(
+            resolve_placement(
+                &state,
+                &coder,
+                SeatKind::Work,
+                Some(&ProjectRef::Existing("nope".into())),
+                true
+            )
+            .unwrap_err(),
+            "Projektet «nope» findes ikke"
+        );
+        let err = resolve_placement(
+            &state,
+            &coder,
+            SeatKind::Work,
+            Some(&ProjectRef::New {
+                new: "andet".into(),
+            }),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("agentsMayCreateProjects"), "{err}");
+        assert!(!root.join("andet").exists());
+        // maxAgentsPerProject from the workspace file.
+        std::fs::write(
+            root.join(crate::config::WORKSPACE_FILE),
+            r#"{"maxAgentsPerProject": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_placement(&state, &coder, SeatKind::Work, Some(&existing), false).unwrap_err(),
+            "Loft på 1 agenter i projektet «demo» nået"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn placement_names_follow_the_known_agents() {
+        let (state, dir) = temp_state();
+        let coder = profile(&state, "coder");
+        let new = ProjectRef::New { new: "x".into() };
+        let a = resolve_placement(&state, &coder, SeatKind::Work, Some(&new), true).unwrap();
+        assert_eq!(a.name, "coder-01");
+        // A fake is named after its folder: "coder-01" takes the name, not the folder.
+        lock(&state.manager).insert_fake_in("s1", "/w/coder-01", &[], SeatKind::Work, Some("x"));
+        let b = resolve_placement(&state, &coder, SeatKind::Work, Some(&new), true).unwrap();
+        assert_eq!(
+            (b.name.as_str(), b.cwd.clone()),
+            ("coder-02", a.cwd.clone())
+        );
+        let req = placed_request(&coder, None, b, None, SeatKind::Work).unwrap();
+        assert_eq!(
+            (req.name.as_deref(), req.project.as_deref()),
+            (Some("coder-02"), Some("x"))
+        );
+        // Seat limits come from the workspace file before every spawn.
+        std::fs::write(
+            state
+                .paths
+                .projects_root
+                .join(crate::config::WORKSPACE_FILE),
+            r#"{"maxWorkAgents": 1}"#,
+        )
+        .unwrap();
+        let rules = apply_limits(&state);
+        assert_eq!(rules.max_work_agents, 1);
+        assert_eq!(
+            lock(&state.manager)
+                .can_spawn(SeatKind::Work)
+                .unwrap_err()
+                .to_string(),
+            "Loft på 1 arbejdspladser nået"
+        );
+        assert!(lock(&state.manager).can_spawn(SeatKind::Staff).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn spawn_with_ticket_realizes_a_new_project() {
+        let (state, dir) = temp_state();
+        let coder = profile(&state, "coder");
+        let tk = ticket_create(
+            &state.tickets,
+            "ny",
+            "",
+            false,
+            Some(ProjectRef::New { new: "App".into() }),
+        )
+        .unwrap();
+        let ticket = ticket_for_spawn(&state.tickets, &tk.id).unwrap();
+        let project = spawn_project(&ticket, SeatKind::Work, None).unwrap();
+        let placement =
+            resolve_placement(&state, &coder, SeatKind::Work, project.as_ref(), true).unwrap();
+        assert!(state.paths.projects_root.join("App").is_dir());
+        let ticket = ticket_in_placement(&state.tickets, ticket, &placement).unwrap();
+        assert_eq!(ticket.project, Some(ProjectRef::Existing("App".into())));
+        assert_eq!(ticket.state, TicketState::Backlog);
+        // The ticket file shows the project.
+        let delivery = first_delivery(
+            &state,
+            SeatKind::Work,
+            &coder.roles,
+            placement.project.as_deref(),
+            &WorkspaceRules::defaults(),
+        );
+        let file = prompt::write_ticket_file(&placement.cwd, &ticket, 0, &delivery).unwrap();
+        assert!(std::fs::read_to_string(file)
+            .unwrap()
+            .contains("- projekt: App\n"));
+        // An agent may not create one: refused before anything exists.
+        let tk2 = ticket_create(
+            &state.tickets,
+            "andet",
+            "",
+            false,
+            Some(ProjectRef::New {
+                new: "Andet".into(),
+            }),
+        )
+        .unwrap();
+        let t2 = ticket_for_spawn(&state.tickets, &tk2.id).unwrap();
+        let p2 = spawn_project(&t2, SeatKind::Work, None).unwrap();
+        let err =
+            resolve_placement(&state, &coder, SeatKind::Work, p2.as_ref(), false).unwrap_err();
+        assert!(
+            err.starts_with("Agenter må ikke oprette projekter"),
+            "{err}"
+        );
+        assert!(!state.paths.projects_root.join("Andet").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn spawn_project_takes_the_tickets_project_first() {
+        let mut tk = crate::tickets::model::test_support::ticket(
+            "abcdef01-0000-4000-8000-000000000001",
+            TicketState::Backlog,
+        );
+        let param = Some(ProjectRef::Existing("b".into()));
+        assert_eq!(
+            spawn_project(&tk, SeatKind::Work, None).unwrap_err(),
+            TicketError::ProjectRequired.to_string()
         );
         assert_eq!(
-            resolve_cwd(None, &root, "researcher", &m).unwrap(),
-            root.join("researcher-01")
+            spawn_project(&tk, SeatKind::Work, param.clone()).unwrap(),
+            param
         );
-        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(
+            spawn_project(&tk, SeatKind::Staff, param.clone()).unwrap(),
+            None
+        );
+        tk.project = Some(ProjectRef::New { new: "a".into() });
+        assert_eq!(
+            spawn_project(&tk, SeatKind::Work, param).unwrap(),
+            Some(ProjectRef::New { new: "a".into() })
+        );
+    }
+
+    #[test]
+    fn first_delivery_shared_only_for_work_and_projects_for_coordination() {
+        let (state, dir) = temp_state();
+        let rules = WorkspaceRules::defaults();
+        std::fs::create_dir_all(state.paths.projects_root.join("p")).unwrap();
+        // The fixture's live fake (work seat) is in project p.
+        let d = first_delivery(&state, SeatKind::Work, &[Role::Coder], Some("p"), &rules);
+        assert_eq!(d.shared.as_ref().unwrap().others, ["demo"]);
+        let alone = first_delivery(&state, SeatKind::Work, &[Role::Coder], Some("q"), &rules);
+        assert_eq!(alone.shared, None);
+        // A reviewer on a work seat gets a coordination task: no shared section, the list.
+        let r = first_delivery(&state, SeatKind::Work, &[Role::Reviewer], Some("p"), &rules);
+        assert_eq!(r.shared, None);
+        assert_eq!(r.projects.as_ref().unwrap().ids, ["p"]);
+        let staff = first_delivery(&state, SeatKind::Staff, &[Role::Coordinator], None, &rules);
+        assert!(!staff.projects.as_ref().unwrap().may_create);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ticket_assign_follows_the_project_rules() {
+        let (state, dir) = temp_state();
+        let root = state.paths.projects_root.clone();
+        for p in ["a", "b"] {
+            std::fs::create_dir_all(root.join(p)).unwrap();
+        }
+        let (in_a, in_b, staff) = {
+            let mut m = lock(&state.manager);
+            let a = m.insert_fake_in("sa", "/w/a", &[Role::Coder], SeatKind::Work, Some("a"));
+            let b = m.insert_fake_in("sb", "/w/b", &[Role::Coder], SeatKind::Work, Some("b"));
+            let s = m.insert_fake_with("ss", "/w/s", &[Role::Coordinator], SeatKind::Staff);
+            (a, b, s)
+        };
+        let t = &state.tickets;
+        // No project: refused on a work seat, fine on a staff seat.
+        let none = ticket_create(t, "uden", "", false, None).unwrap();
+        assert_eq!(
+            ticket_assign(t, &none.id, &in_a).unwrap_err(),
+            TicketError::ProjectRequired.to_string()
+        );
+        assert_eq!(ticket_assign(t, &none.id, &staff).unwrap().project, None);
+        // Existing(a) to an agent in b.
+        let ta = ticket_create(t, "a", "", false, Some(ProjectRef::Existing("a".into()))).unwrap();
+        let err = ticket_assign(t, &ta.id, &in_b).unwrap_err();
+        assert_eq!(err, "Agenten b står i projekt «b»; ticketen hører til «a»");
+        assert_eq!(
+            ticket_assign(t, &ta.id, &in_a)
+                .unwrap()
+                .assignee_agent_id
+                .as_deref(),
+            Some(in_a.as_str())
+        );
+        // New{"A"} on the agent in a: realised as a.
+        let tn =
+            ticket_create(t, "n", "", false, Some(ProjectRef::New { new: "A".into() })).unwrap();
+        let assigned = ticket_assign(t, &tn.id, &in_a).unwrap();
+        assert_eq!(assigned.project, Some(ProjectRef::Existing("a".into())));
+        // New{"c"} on the agent in a: wrong project, nothing created.
+        let tc =
+            ticket_create(t, "c", "", false, Some(ProjectRef::New { new: "c".into() })).unwrap();
+        assert!(ticket_assign(t, &tc.id, &in_a).unwrap_err().contains("«c»"));
+        assert!(!root.join("c").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_gate_checks_in_order() {
+        let (state, dir) = temp_state();
+        let root = state.paths.projects_root.clone();
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        let (work, staff, busy) = {
+            let mut m = lock(&state.manager);
+            let w = m.insert_fake_in("mw", "/w/p", &[Role::Coder], SeatKind::Work, Some("p"));
+            let s = m.insert_fake_with("ms", "/w/r", &[Role::Coordinator], SeatKind::Staff);
+            let b = m.insert_fake_in("mb", "/w/p2", &[Role::Coder], SeatKind::Work, Some("q"));
+            for id in [&w, &s] {
+                m.set_status(id, AgentStatus::Idle, None).unwrap();
+            }
+            (w, s, b)
+        };
+        let q = ProjectRef::Existing("q".into());
+        assert_eq!(
+            move_gate(&state, "nope", &q, false).unwrap_err(),
+            "Agenten kører ikke"
+        );
+        assert_eq!(
+            move_gate(&state, &busy, &q, false).unwrap_err(),
+            "Agenten arbejder"
+        );
+        assert_eq!(
+            move_gate(&state, &staff, &q, false).unwrap_err(),
+            AgentError::StaffHasNoProject.to_string()
+        );
+        // A queued ticket: refused without force.
+        let tk = ticket_create(&state.tickets, "x", "", false, p()).unwrap();
+        ticket_assign(&state.tickets, &tk.id, &work).unwrap();
+        assert_eq!(
+            move_gate(&state, &work, &q, false).unwrap_err(),
+            AgentError::QueueNotEmpty(1).to_string()
+        );
+        // force: passes the queue check; its own project is refused (case-insensitive).
+        assert_eq!(
+            move_gate(&state, &work, &ProjectRef::Existing("P".into()), true).unwrap_err(),
+            AgentError::SameProject("p".into()).to_string()
+        );
+        let (info, proj) = move_gate(&state, &work, &q, true).unwrap();
+        assert_eq!((info.id.as_str(), proj.id.as_str()), (work.as_str(), "q"));
+        // With force the queue goes to the backlog with the move note.
+        assert_eq!(state.tickets.release_queue(&work, MOVED_NOTE).unwrap(), 1);
+        let back = state.tickets.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(back.state, TicketState::Backlog);
+        assert_eq!(
+            back.history.last().unwrap().note.as_deref(),
+            Some(MOVED_NOTE)
+        );
+        assert!(move_gate(&state, &work, &q, false).is_ok());
+        // A new project is created by the user's move; the limit does not count the agent.
+        std::fs::write(
+            root.join(crate::config::WORKSPACE_FILE),
+            r#"{"maxAgentsPerProject": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            move_gate(&state, &work, &q, false).unwrap_err(),
+            "Loft på 1 agenter i projektet «q» nået"
+        );
+        let (_, n) =
+            move_gate(&state, &work, &ProjectRef::New { new: "ny".into() }, false).unwrap();
+        assert!(PathBuf::from(&n.path).is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn project_folder_and_projects_root_setting() {
+        let (state, dir) = temp_state();
+        let root = state.paths.projects_root.clone();
+        assert_eq!(project_folder(&root, None).unwrap(), root);
+        assert_eq!(
+            project_folder(&root, Some("x")).unwrap_err(),
+            "Projektet «x» findes ikke"
+        );
+        std::fs::create_dir_all(root.join("X")).unwrap();
+        assert_eq!(project_folder(&root, Some("x")).unwrap(), root.join("X"));
+        assert_eq!(
+            store_projects_root(&dir, "  ").unwrap_err(),
+            "Vælg en mappe til projektroden"
+        );
+        let other = dir.join("andet").join("rod");
+        let stored = store_projects_root(&dir, &format!(" {} ", other.display())).unwrap();
+        assert_eq!(stored, other.to_string_lossy());
+        assert!(other.is_dir());
+        assert_eq!(app_settings::load(&dir).projects_root(), Some(other));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2461,7 +3174,7 @@ mod tests {
         m.set_status(&live, AgentStatus::Idle, None).unwrap();
         let rev = m.insert_fake_with("s2", "/w/rev", &[Role::Reviewer], SeatKind::Staff);
         let mut t = test_ctx(Arc::new(Mutex::new(m)));
-        let tk = ticket_create(&t.ctx, "x", "", false).unwrap();
+        let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
         ticket_assign(&t.ctx, &tk.id, &live).unwrap();
         ticket_set_state(&t.ctx, &tk.id, TicketState::InProgress, None).unwrap();
         t.sent();

@@ -342,6 +342,23 @@ impl TicketsCtx {
         Ok(released.len())
     }
 
+    /// "Flyt til projekt…" with `force` (plan4b A.3): the agent's queued tickets go to the
+    /// backlog with `note`; the agent keeps running (restarted in the new folder), so its
+    /// delivery state and reviews are left alone. Returns how many tickets moved.
+    pub fn release_queue(&self, agent_id: &str, note: &str) -> Result<usize, String> {
+        let now = now_ms();
+        let released =
+            self.mutate_if(|s| s.release_agent(agent_id, note, now), |v| !v.is_empty())?;
+        if !released.is_empty() {
+            log::info!(
+                "agent {agent_id}: {} queued ticket(s) back to the backlog ({note})",
+                released.len()
+            );
+            self.notify([agent_id]);
+        }
+        Ok(released.len())
+    }
+
     // ---- review routing (plan5 A.6) ----
 
     /// Gives every ticket in review without a reviewer (and not escalated) to a reviewer, or
