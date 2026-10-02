@@ -159,6 +159,15 @@ pub fn parse_project(args: &Map<String, Value>) -> Result<Option<ProjectRef>, St
     }
 }
 
+/// `project` on `mira_assign_ticket`/`mira_handoff_ticket` for a ticket that already has one.
+pub fn ticket_has_project(p: &ProjectRef) -> String {
+    format!("Ticketen har allerede projekt «{}»", p.name())
+}
+
+/// `project` on `mira_handoff_ticket` without `agentId` (back to the backlog).
+pub const PROJECT_NEEDS_TARGET: &str =
+    "project bruges kun sammen med agentId (ticketen gives videre til en agent)";
+
 /// The status kind as a plain string (`"idle"`, `"exited"`, …).
 fn status_kind(s: &AgentStatus) -> Value {
     serde_json::to_value(s)
@@ -339,6 +348,36 @@ impl ToolsCtx {
                 ))
             }
         }
+    }
+
+    /// The project the ticket gets when it goes to `target`: without `given` the plain rule
+    /// ([`Self::target_project`]); with `given` (`project` on `mira_assign_ticket` /
+    /// `mira_handoff_ticket`) only for a ticket without a project ([`ticket_has_project`]
+    /// otherwise), checked against `target` before a new folder is created.
+    fn assignment_project(
+        &self,
+        current: Option<&ProjectRef>,
+        given: Option<ProjectRef>,
+        target: &AgentInfo,
+    ) -> Result<Option<ProjectId>, String> {
+        let Some(given) = given else {
+            return self.target_project(current, target);
+        };
+        if let Some(p) = current {
+            return Err(ticket_has_project(p));
+        }
+        let given = self
+            .agent_project(given)?
+            .ok_or(TicketError::ProjectRequired)?;
+        projects::assignment_target(
+            Some(&given),
+            target.seat_kind,
+            target.project.as_deref(),
+            &target.name,
+        )?;
+        let may_create = self.tickets.workspace.rules().agents_may_create_projects;
+        let root = self.tickets.workspace.root();
+        Ok(Some(projects::realize(root, &given, may_create)?.id))
     }
 
     fn create(
@@ -685,16 +724,18 @@ impl ToolsCtx {
     ) -> Result<Value, String> {
         let id = req_id(args, "id")?;
         let target = self.target_agent(req_id(args, "agentId")?)?;
+        let given = parse_project(args)?;
         let ticket = self
             .tickets
             .read(|s| s.get_by_any_id(id))
             .ok_or(TicketError::NotFound)?;
         // A ticket in progress: only the coordinator's own, handed over (step 5c).
         if ticket.state == TicketState::InProgress {
-            return self.hand_on(agent, id, Some(&target), now);
+            return self.hand_on(agent, id, Some(&target), given, now);
         }
-        // Step 4b: a work agent only takes tickets of its own project.
-        let set = self.target_project(ticket.project.as_ref(), &target)?;
+        // Step 4b: a work agent only takes tickets of its own project; `project` names the
+        // project of a ticket that has none.
+        let set = self.assignment_project(ticket.project.as_ref(), given, &target)?;
         let t = self
             .tickets
             .mutate(|s| s.assign_by_agent(id, &target.id, &agent.name, set, now))?;
@@ -727,7 +768,7 @@ impl ToolsCtx {
             .as_ref()
             .is_some_and(|t| t.state == TicketState::InProgress)
         {
-            return self.hand_on(agent, id, None, now);
+            return self.hand_on(agent, id, None, None, now);
         }
         let old = before.and_then(|t| t.assignee_agent_id);
         let t = self
@@ -759,7 +800,11 @@ impl ToolsCtx {
         let target = opt_id(args, "agentId")?
             .map(|a| self.target_agent(a))
             .transpose()?;
-        self.hand_on(agent, &ticket_id, target.as_ref(), now)
+        let given = parse_project(args)?;
+        if given.is_some() && target.is_none() {
+            return Err(PROJECT_NEEDS_TARGET.into());
+        }
+        self.hand_on(agent, &ticket_id, target.as_ref(), given, now)
     }
 
     /// Hands `agent`'s own ticket in progress to `target` (last in its queue) or back to the
@@ -773,6 +818,7 @@ impl ToolsCtx {
         agent: &AgentInfo,
         ticket_id: &str,
         target: Option<&AgentInfo>,
+        given: Option<ProjectRef>,
         now: u64,
     ) -> Result<Value, String> {
         let t = match target {
@@ -783,7 +829,7 @@ impl ToolsCtx {
                     .tickets
                     .read(|s| s.get_by_any_id(ticket_id))
                     .and_then(|t| t.project);
-                let set = self.target_project(project.as_ref(), to)?;
+                let set = self.assignment_project(project.as_ref(), given, to)?;
                 self.tickets.mutate(|s| {
                     s.handoff_in(
                         ticket_id,
@@ -2651,6 +2697,199 @@ mod tests {
             Err("Ticketen er tildelt en anden agent".into())
         );
         assert_eq!(t.ticket(&other.id).state, TicketState::InProgress);
+    }
+
+    #[test]
+    fn assign_tool_names_the_project_of_a_ticket_without_one() {
+        let t = setup();
+        let q = t.agent_in_project("q");
+        let create = |title: &str, project: Value, now: u64| {
+            let mut args = json!({ "title": title });
+            if !project.is_null() {
+                args["project"] = project;
+            }
+            t.call(Some(&t.k), "mira_create_ticket", args, now).unwrap()
+        };
+        // A ticket without a project goes to the agent in p with project "P" (disk spelling).
+        let x = create("x", Value::Null, 1);
+        assert_eq!(x["project"], Value::Null);
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": x["id"], "agentId": t.a, "project": "P"}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "assigned");
+        let x_id = x["id"].as_str().unwrap();
+        assert_eq!(
+            t.ticket(x_id).project,
+            Some(ProjectRef::Existing("p".into()))
+        );
+        // Another project than the agent's: refused, the ticket keeps no project.
+        let y = create("y", Value::Null, 3);
+        let y_id = y["id"].as_str().unwrap();
+        let name_a = t.tc.ctx.manager.lock().unwrap().get(&t.a).unwrap().name;
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": y_id, "agentId": t.a, "project": "q"}),
+                4
+            ),
+            Err(format!(
+                "Agenten {name_a} står i projekt «p»; ticketen hører til «q»"
+            ))
+        );
+        assert_eq!(t.ticket(y_id).project, None);
+        assert_eq!(t.ticket(y_id).state, TicketState::Backlog);
+        // A new project needs agentsMayCreateProjects; nothing is created.
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": y_id, "agentId": t.a, "project": {"new": "zz"}}),
+                5
+            ),
+            Err(ProjectError::AgentsMayNotCreate("zz".into()).to_string())
+        );
+        assert!(!t.tc.ctx.workspace.root().join("zz").exists());
+        // An unknown project id.
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": y_id, "agentId": t.a, "project": "nope"}),
+                5
+            ),
+            Err("Projektet «nope» findes ikke".into())
+        );
+        // A staff target takes the project too (coordination task in project q).
+        t.call(
+            Some(&t.k),
+            "mira_assign_ticket",
+            json!({"id": y_id, "agentId": t.r, "project": "q"}),
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            t.ticket(y_id).project,
+            Some(ProjectRef::Existing("q".into()))
+        );
+        // A ticket with a project: `project` is refused, even when it is the same.
+        let z = create("z", json!("q"), 7);
+        for p in [json!("q"), json!("p"), json!({"new": "q"})] {
+            assert_eq!(
+                t.call(
+                    Some(&t.k),
+                    "mira_assign_ticket",
+                    json!({"id": z["id"], "agentId": q, "project": p}),
+                    8
+                ),
+                Err("Ticketen har allerede projekt «q»".into())
+            );
+        }
+        // Without `project` it goes to the agent in q as before.
+        assert!(t
+            .call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": z["id"], "agentId": q}),
+                9
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn assign_tool_creates_a_named_new_project_when_allowed() {
+        let t = setup();
+        workspace_file(&t, r#"{"agentsMayCreateProjects": true}"#);
+        let x = t
+            .call(Some(&t.k), "mira_create_ticket", json!({"title": "x"}), 1)
+            .unwrap();
+        // To a work agent in p: {"new": "nyt"} does not match its project → refused, no folder.
+        let err = t
+            .call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": x["id"], "agentId": t.a, "project": {"new": "nyt"}}),
+                2,
+            )
+            .unwrap_err();
+        assert!(err.contains("ticketen hører til «nyt»"), "{err}");
+        assert!(!t.tc.ctx.workspace.root().join("nyt").exists());
+        // To a staff agent: created and set.
+        t.call(
+            Some(&t.k),
+            "mira_assign_ticket",
+            json!({"id": x["id"], "agentId": t.r, "project": {"new": "nyt"}}),
+            3,
+        )
+        .unwrap();
+        assert!(t.tc.ctx.workspace.root().join("nyt").is_dir());
+        assert_eq!(
+            t.ticket(x["id"].as_str().unwrap()).project,
+            Some(ProjectRef::Existing("nyt".into()))
+        );
+    }
+
+    #[test]
+    fn handoff_tool_names_the_project_of_a_ticket_without_one() {
+        let t = setup();
+        let c = &t.tc.ctx;
+        let tk = c
+            .mutate(|s| s.create_in("uden", "b", false, None, 1))
+            .unwrap();
+        c.mutate(|s| s.assign(&tk.id, &t.a, 2)).unwrap();
+        c.mutate(|s| s.mark_dispatched(&tk.id, &t.a, 3)).unwrap();
+        // Without a project a work agent cannot take it.
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"agentId": t.b}),
+                4
+            ),
+            Err(TicketError::ProjectRequired.to_string())
+        );
+        // `project` without agentId (back to the backlog) is refused.
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"project": "p"}),
+                4
+            ),
+            Err(PROJECT_NEEDS_TARGET.into())
+        );
+        assert_eq!(t.ticket(&tk.id).state, TicketState::InProgress);
+        // With the target's project: handed on and the project set.
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"agentId": t.b, "project": "p"}),
+                5,
+            )
+            .unwrap();
+        assert_eq!(r["assigneeAgentId"], json!(t.b));
+        assert_eq!(
+            t.ticket(&tk.id).project,
+            Some(ProjectRef::Existing("p".into()))
+        );
+        // A ticket in progress with a project: `project` is refused (handoff and assign).
+        let mine = t.in_progress(&t.a, "med projekt", false);
+        assert_eq!(
+            t.call(
+                Some(&t.a),
+                "mira_handoff_ticket",
+                json!({"ticketId": mine.id, "agentId": t.b, "project": "p"}),
+                6
+            ),
+            Err("Ticketen har allerede projekt «p»".into())
+        );
+        assert_eq!(t.ticket(&mine.id).assignee_agent_id, Some(t.a.clone()));
     }
 
     #[test]

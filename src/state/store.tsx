@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useReducer,
@@ -13,6 +14,7 @@ import {
   listAgents,
   listPendingPermissions,
   listProfiles,
+  listProjects,
   listTickets,
   onAgentsChanged,
   onPermissionRequest,
@@ -26,6 +28,7 @@ import type {
   AgentProfile,
   AppInfo,
   PermissionRequestInfo,
+  Project,
   TicketSummary,
 } from "../lib/types";
 
@@ -40,6 +43,8 @@ export interface State {
   tickets: TicketSummary[];
   /** All agent profiles, built-in first (`profiles-changed` replaces the whole list). */
   profiles: AgentProfile[];
+  /** The project folders under the projects root (`listProjects`; refreshed on demand). */
+  projects: Project[];
 }
 
 export type Action =
@@ -51,7 +56,8 @@ export type Action =
   | { type: "error/set"; error: string | null }
   | { type: "appInfo/set"; appInfo: AppInfo }
   | { type: "tickets/set"; tickets: TicketSummary[] }
-  | { type: "profiles/set"; profiles: AgentProfile[] };
+  | { type: "profiles/set"; profiles: AgentProfile[] }
+  | { type: "projects/set"; projects: Project[] };
 
 export const initialState: State = {
   agents: [],
@@ -61,6 +67,7 @@ export const initialState: State = {
   appInfo: null,
   tickets: [],
   profiles: [],
+  projects: [],
 };
 
 export function reducer(state: State, action: Action): State {
@@ -84,6 +91,8 @@ export function reducer(state: State, action: Action): State {
       return { ...state, tickets: action.tickets };
     case "profiles/set":
       return { ...state, profiles: action.profiles };
+    case "projects/set":
+      return { ...state, projects: action.projects };
   }
 }
 
@@ -133,12 +142,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         await uiReady();
         // Both windows load the tickets; the island only uses the review count.
         // Profiles feed the spawn dialog and the "Agenter" tab (both windows keep them current).
-        const [agents, pending, appInfo, tickets, profiles] = await Promise.all([
+        // Projects are optional for the start: a failure gives an empty list, no error.
+        const [agents, pending, appInfo, tickets, profiles, projects] = await Promise.all([
           listAgents(),
           listPendingPermissions(),
           getAppInfo(),
           listTickets(),
           listProfiles(),
+          listProjects().catch(() => [] as Project[]),
         ]);
         if (cancelled) return;
         dispatch({ type: "agents/set", agents });
@@ -146,6 +157,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (!profilesFromEvent) dispatch({ type: "profiles/set", profiles });
         for (const request of pending) dispatch({ type: "permission/add", request });
         dispatch({ type: "appInfo/set", appInfo });
+        dispatch({ type: "projects/set", projects });
       } catch (e) {
         if (!cancelled) dispatch({ type: "error/set", error: errorMessage(e) });
       }
@@ -171,4 +183,20 @@ export function useStore(): Store {
   const store = useContext(StoreContext);
   if (store === null) throw new Error("useStore must be used inside <StoreProvider>");
   return store;
+}
+
+/**
+ * Reloads the project list into the store (a failure keeps the old list). Called by the project
+ * picker when it mounts and after anything that may create a project (spawn, assignment,
+ * "Nyt projekt…", moving an agent).
+ */
+export function useRefreshProjects(): () => Promise<void> {
+  const { dispatch } = useStore();
+  return useCallback(
+    () =>
+      listProjects()
+        .then((projects) => dispatch({ type: "projects/set", projects }))
+        .catch(() => {}),
+    [dispatch],
+  );
 }

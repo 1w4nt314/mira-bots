@@ -2,7 +2,7 @@ import type { Theme } from "../../lib/bots";
 import { errorMessage, removeAgent } from "../../lib/ipc";
 import type { OfficeDetail, TermMode } from "../../lib/office";
 import type { SeatAssignment } from "../../lib/seats";
-import type { BotState, SeatKind, TicketSummary } from "../../lib/types";
+import type { AgentInfo, BotState, SeatKind, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
 import RoomDecor from "./office/RoomDecor";
 import WallDecor from "./office/WallDecor";
@@ -21,6 +21,10 @@ interface Props {
   tickets: Map<string, TicketSummary>;
   /** A ticket note is being dragged. */
   dragging: boolean;
+  /** The dragged ticket (step 4b: seats of another project say so). */
+  draggedTicket: TicketSummary | null;
+  /** "n agenter, ingen koordinator" for a work agent's project, or null. */
+  hintFor: (agent: AgentInfo) => string | null;
   /** "more" adds the wall strip, room furniture and desk items. */
   detail: OfficeDetail;
   /** "max" shows the narrow strip (compact seats, no wall or furniture). */
@@ -33,7 +37,14 @@ interface Props {
 
 export default function SeatGrid(props: Props) {
   const { seats, botStates, theme, selectedId, spawnDisabled, limits, onSelect, onSpawn } = props;
-  const { tickets, dragging, detail, mode, fig } = props;
+  const { tickets, dragging, draggedTicket, hintFor, detail, mode, fig } = props;
+  // The staff sign names the projects where work agents share a folder without a coordinator.
+  const hints = new Map<string, string>();
+  for (const a of seats.work) {
+    const hint = a === null ? null : hintFor(a);
+    if (a !== null && hint !== null && a.project !== null) hints.set(a.project.toLowerCase(), `${a.project}: ${hint}`);
+  }
+  const staffHint = hints.size === 0 ? null : [...hints.values()].join("\n");
   const roomy = mode !== "max";
 
   const row = (kind: SeatKind, list: SeatAssignment["work"]) =>
@@ -53,6 +64,8 @@ export default function SeatGrid(props: Props) {
           agent?.currentTicketId != null ? (tickets.get(agent.currentTicketId) ?? null) : null
         }
         dragging={dragging}
+        draggedTicket={draggedTicket}
+        projectHint={agent === null ? null : hintFor(agent)}
         detail={detail}
         compact={mode === "max"}
         fig={fig}
@@ -66,7 +79,12 @@ export default function SeatGrid(props: Props) {
       {detail === "more" && roomy && <WallDecor />}
       <div className="office-seats">
         <div className="office-staff" aria-label="Stabspladser">
-          <span className="office-sign">Stab</span>
+          <span
+            className="office-sign"
+            title={staffHint === null ? undefined : `Projekter uden koordinator:\n${staffHint}`}
+          >
+            Stab{staffHint !== null && " ⚠"}
+          </span>
           {detail === "more" && roomy && <RoomDecor side="left" />}
           <div className="office-row3">{row("staff", seats.staff)}</div>
           {detail === "more" && roomy && <RoomDecor side="right" />}

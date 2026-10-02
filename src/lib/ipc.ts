@@ -157,9 +157,10 @@ export const updateTicket = (id: string, patch: TicketPatch) =>
   invoke<TicketSummary>(COMMANDS.updateTicket, { id, patch });
 /** Only backlog/done tickets and rejected ones without an agent. */
 export const deleteTicket = (id: string) => invoke<void>(COMMANDS.deleteTicket, { id });
-/** backlog/rejected → end of the agent's queue; the agent must be running. */
-export const assignTicket = (id: string, agentId: string) =>
-  invoke<TicketSummary>(COMMANDS.assignTicket, { id, agentId });
+/** backlog/rejected → end of the agent's queue; the agent must be running. `project` (only for a
+ *  ticket without one, "Hvilket projekt?") is checked against the agent and set in the same save. */
+export const assignTicket = (id: string, agentId: string, project: ProjectRef | null = null) =>
+  invoke<TicketSummary>(COMMANDS.assignTicket, { id, agentId, project });
 export const unassignTicket = (id: string) =>
   invoke<TicketSummary>(COMMANDS.unassignTicket, { id });
 /** `ticketIds` must be exactly the agent's queued tickets; returns the new queue. */

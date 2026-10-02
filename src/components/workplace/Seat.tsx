@@ -2,6 +2,7 @@ import { useDroppable } from "@dnd-kit/core";
 import type { CSSProperties } from "react";
 import type { Theme } from "../../lib/bots";
 import { COMPACT, itemsFor, type OfficeDetail } from "../../lib/office";
+import { assignmentIssue } from "../../lib/projects";
 import { rolesText } from "../../lib/roles";
 import { isExited, statusLabel } from "../../lib/status";
 import { agentDropId, emptyDropId } from "../../lib/tickets";
@@ -22,6 +23,10 @@ interface Props {
   currentTicket: TicketSummary | null;
   /** A ticket note is being dragged: show which seats accept it. */
   dragging: boolean;
+  /** The dragged ticket, if any (step 4b: a work agent of another project says so). */
+  draggedTicket: TicketSummary | null;
+  /** "n agenter, ingen koordinator" for the agent's project, or null. */
+  projectHint: string | null;
   /** "more" adds desk items (deterministic per agent). */
   detail: OfficeDetail;
   /** Narrow one-row variant for the maximised terminal (no desk art). */
@@ -39,7 +44,8 @@ interface Props {
 // (plan D.31; slip på tom plads → SpawnDialog med ticket: D.32).
 export default function Seat(props: Props) {
   const { agent, seatKind, index, botState, theme, selected, spawnDisabled } = props;
-  const { currentTicket, dragging, detail, compact, fig, onSelect, onSpawn } = props;
+  const { currentTicket, dragging, draggedTicket, projectHint, detail, compact, fig, onSelect, onSpawn } =
+    props;
   const exited = agent !== null && isExited(agent);
   // Exited agents cannot take tickets; empty seats only while an agent may be started there.
   const dropDisabled = agent !== null ? exited : spawnDisabled !== null;
@@ -110,14 +116,27 @@ export default function Seat(props: Props) {
 
   const label = statusLabel(agent.status);
   const statusText = `${label}${agent.detail ? ` · ${agent.detail}` : ""}`;
+  // Step 4b: the project (work seat) or the projects root (staff seat).
+  const project = agent.seatKind === "work" ? agent.project : null;
+  const projectTitle =
+    project !== null
+      ? `Projekt: ${project}${projectHint !== null ? ` — ${projectHint}` : ""}`
+      : agent.seatKind === "staff"
+        ? "Projektroden"
+        : "";
+  // Dropping still works: the drop opens the explanation with "Flyt agenten til «p»".
+  const otherProject =
+    dragging && !exited && draggedTicket !== null && assignmentIssue(draggedTicket, agent)?.kind === "wrongProject";
   return (
     <button
       ref={setNodeRef}
       type="button"
       onClick={() => onSelect(agent.id)}
       title={`${agent.name} — ${label}${agent.detail ? `: ${agent.detail}` : ""}\n${agent.cwd}${
-        currentTicket !== null ? `\nI gang: ${currentTicket.title}` : ""
-      }${dragging && exited ? "\nAfsluttet: kan ikke få tickets" : ""}`}
+        projectTitle !== "" ? `\n${projectTitle}` : ""
+      }${currentTicket !== null ? `\nI gang: ${currentTicket.title}` : ""}${
+        dragging && exited ? "\nAfsluttet: kan ikke få tickets" : ""
+      }${otherProject ? "\nAndet projekt: kan ikke få ticketen" : ""}`}
       aria-label={`Vis terminal for ${agent.name}`}
       aria-pressed={selected}
       data-state={botState}
@@ -143,6 +162,11 @@ export default function Seat(props: Props) {
         </>
       ) : (
         <>
+          {otherProject && (
+            <span className="absolute left-1/2 top-[12%] z-[3] w-[90%] -translate-x-1/2 px-1 text-center text-[11px] text-amber-700 dark:text-amber-300">
+              Andet projekt: kan ikke få ticketen
+            </span>
+          )}
           {agent.queueLength > 0 && (
             <span
               className="absolute right-1.5 top-1.5 z-[3] rounded-full bg-sky-500/20 px-1.5 text-[10px] leading-4 text-sky-700 dark:text-sky-300"
@@ -178,12 +202,30 @@ export default function Seat(props: Props) {
             <span className="office-ticketline" title={currentTicket?.title}>
               {currentTicket !== null ? `▸ ${currentTicket.title}` : " "}
             </span>
-            <span
-              className="max-w-full truncate rounded bg-[var(--accent)]/15 px-1.5 text-[10px] leading-3 text-[var(--accent)]"
-              title={`Profil: ${agent.profileName}\nRoller: ${rolesText(agent.roles)}`}
-            >
-              {agent.profileName}
-            </span>
+            {project !== null ? (
+              <span className="flex max-w-full items-center gap-1">
+                <span
+                  className="min-w-0 max-w-full truncate rounded bg-[var(--accent)]/15 px-1.5 text-[10px] leading-3 text-[var(--accent)]"
+                  title={`Profil: ${agent.profileName}\nRoller: ${rolesText(agent.roles)}`}
+                >
+                  {agent.profileName}
+                </span>
+                <span
+                  className="max-w-[55%] truncate rounded bg-neutral-500/15 px-1 text-[10px] leading-3"
+                  title={projectTitle}
+                >
+                  {projectHint !== null ? "⚠ " : ""}
+                  {project}
+                </span>
+              </span>
+            ) : (
+              <span
+                className="max-w-full truncate rounded bg-[var(--accent)]/15 px-1.5 text-[10px] leading-3 text-[var(--accent)]"
+                title={`Profil: ${agent.profileName}\nRoller: ${rolesText(agent.roles)}`}
+              >
+                {agent.profileName}
+              </span>
+            )}
           </span>
         </>
       )}

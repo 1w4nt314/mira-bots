@@ -1,5 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { errorMessage, getDiagnostics, onHookEvent, openLogDir } from "../../lib/ipc";
+import {
+  createProject,
+  errorMessage,
+  getDiagnostics,
+  listProjects,
+  onHookEvent,
+  openLogDir,
+  openProjectFolder,
+  pickFolder,
+  setProjectsRoot,
+} from "../../lib/ipc";
+import {
+  coordinatorHint,
+  countsByProject,
+  countsFor,
+  PROJECT_NAME_MAX,
+  validateProjectName,
+} from "../../lib/projects";
 import type { Diagnostics, LastHookEvent, LastToolCall } from "../../lib/types";
 import { useStore } from "../../state/store";
 
@@ -90,6 +107,7 @@ function warningsFor(d: Diagnostics): string[] {
     out.push("mcp.json mangler");
   }
   if (d.ticketsWarning !== null) out.push(d.ticketsWarning);
+  if (d.workspaceWarning !== null) out.push(d.workspaceWarning);
   if (d.profilesWarning !== null) out.push(d.profilesWarning);
   if (d.ticketsEscalated > 0) {
     out.push(
@@ -106,7 +124,7 @@ function warningsFor(d: Diagnostics): string[] {
 
 /** Mounted only while its tab is visible, so the refresh timer stops with the tab. */
 export default function DiagnosticsPanel() {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const [diag, setDiag] = useState<Diagnostics | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -115,6 +133,12 @@ export default function DiagnosticsPanel() {
   const alive = useRef(true);
 
   const refresh = useCallback(async () => {
+    // The project list (a cheap readdir) refreshes with the diagnostics, into the store.
+    listProjects()
+      .then((projects) => {
+        if (alive.current) dispatch({ type: "projects/set", projects });
+      })
+      .catch(() => {});
     try {
       const d = await getDiagnostics();
       if (!alive.current) return;
@@ -123,7 +147,7 @@ export default function DiagnosticsPanel() {
     } catch (e) {
       if (alive.current) setLoadError(errorMessage(e));
     }
-  }, []);
+  }, [dispatch]);
 
   useEffect(() => {
     alive.current = true;
@@ -178,6 +202,7 @@ export default function DiagnosticsPanel() {
   const btn =
     "rounded-md border border-[var(--border)] px-2.5 py-1 text-xs hover:border-[var(--accent)] disabled:opacity-50";
   const warnings = diag === null ? [] : warningsFor(diag);
+  const counts = countsByProject(state.agents, state.tickets);
 
   return (
     <div className="space-y-3 p-3 text-xs">
@@ -232,6 +257,13 @@ export default function DiagnosticsPanel() {
         </ul>
       )}
 
+      <ProjectsSection
+        counts={counts}
+        hintOf={(id) => coordinatorHint(state.agents, id)}
+        btn={btn}
+        onChanged={() => void refresh()}
+      />
+
       {diag === null ? (
         loadError === null && <p className="text-[var(--muted)]">Henter diagnostik…</p>
       ) : (
@@ -250,5 +282,173 @@ export default function DiagnosticsPanel() {
         </dl>
       )}
     </div>
+  );
+}
+
+// TODO(windows-verify): "Vælg projektrod…" opens the folder picker in front of the workplace,
+// stores the path in %APPDATA%\dk.mira.bots\app-settings.json, and only after a restart do
+// profiles, the workspace file and new agents live under the new root (plan4b D.86).
+/** "Projekter": the list with counts and buttons, "Nyt projekt…", the projects root. */
+function ProjectsSection(props: {
+  counts: ReturnType<typeof countsByProject>;
+  hintOf: (id: string) => string | null;
+  btn: string;
+  onChanged: () => void;
+}) {
+  const { counts, hintOf, btn, onChanged } = props;
+  const { state } = useStore();
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const nameError = name === "" ? null : validateProjectName(name);
+
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await action();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const create = () =>
+    run(async () => {
+      await createProject(name);
+      setName("");
+      setCreating(false);
+      onChanged();
+    });
+
+  const chooseRoot = () =>
+    run(async () => {
+      const path = await pickFolder("Vælg projektrod");
+      if (path === null) return;
+      const stored = await setProjectsRoot(path);
+      setNotice(`Projektroden er gemt: ${stored}. Gælder efter genstart af mira-bots.`);
+    });
+
+  return (
+    <section className="space-y-2" aria-labelledby="diag-projects">
+      <h3 id="diag-projects" className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+        Projekter
+      </h3>
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => setCreating((c) => !c)}
+          aria-expanded={creating}
+          title="Opret en projektmappe under projektroden"
+          className={btn}
+        >
+          Nyt projekt…
+        </button>
+        <button
+          type="button"
+          onClick={() => void run(() => openProjectFolder(null))}
+          title="Åbn projektroden i Stifinder"
+          className={btn}
+        >
+          Åbn projektroden
+        </button>
+        <button
+          type="button"
+          onClick={() => void chooseRoot()}
+          disabled={busy}
+          title="Vælg en anden mappe som projektrod (gælder efter genstart)"
+          className={btn}
+        >
+          Vælg projektrod…
+        </button>
+      </div>
+      {creating && (
+        <form
+          className="flex items-start gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (name !== "" && nameError === null && !busy) void create();
+          }}
+        >
+          <div className="min-w-0 flex-1">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setCreating(false);
+                }
+              }}
+              maxLength={PROJECT_NAME_MAX}
+              placeholder="mappenavn, fx min-app"
+              aria-label="Navn på det nye projekt"
+              aria-invalid={nameError !== null}
+              autoFocus
+              className="block w-full rounded-md border border-[var(--border)] bg-[var(--bg)] p-1.5 text-xs outline-none focus:border-[var(--accent)]"
+            />
+            {nameError !== null && <p className="mt-0.5 text-[11px] text-rose-500">{nameError}</p>}
+          </div>
+          <button type="submit" disabled={busy || name === "" || nameError !== null} className={btn}>
+            Opret
+          </button>
+        </form>
+      )}
+      {error !== null && (
+        <p className="text-rose-500" role="alert">
+          {error}
+        </p>
+      )}
+      {notice !== null && (
+        <p
+          className="rounded-lg border border-emerald-500/40 bg-emerald-400/15 px-2 py-1 text-emerald-800 dark:text-emerald-200"
+          role="status"
+        >
+          {notice}
+        </p>
+      )}
+      {state.projects.length === 0 ? (
+        <p className="text-[var(--muted)]">Ingen projekter endnu</p>
+      ) : (
+        <ul className="space-y-1">
+          {state.projects.map((p) => {
+            const c = countsFor(counts, p.id);
+            const hint = hintOf(p.id);
+            return (
+              <li
+                key={p.id}
+                className="flex items-center gap-2 rounded-lg border border-[var(--border)] px-2 py-1"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate" title={p.path}>
+                    <span className="font-medium">{p.id}</span>
+                    <span className="text-[var(--muted)]">
+                      {" "}
+                      · {c.agents} {c.agents === 1 ? "agent" : "agenter"} · {c.tickets}{" "}
+                      {c.tickets === 1 ? "ticket" : "tickets"}
+                    </span>
+                  </span>
+                  {hint !== null && (
+                    <span className="block text-[11px] text-amber-700 dark:text-amber-300">⚠ {hint}</span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void run(() => openProjectFolder(p.id))}
+                  title={`Åbn ${p.path} i Stifinder`}
+                  aria-label={`Åbn mappen for projektet ${p.id}`}
+                  className={btn}
+                >
+                  Åbn mappe
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }

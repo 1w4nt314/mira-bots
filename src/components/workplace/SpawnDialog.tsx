@@ -2,17 +2,27 @@ import { useEffect, useState } from "react";
 import type { Theme } from "../../lib/bots";
 import { errorMessage, listProfiles, spawnAgent, spawnAgentWithTicket } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
+import { projectName, projectPath } from "../../lib/projects";
 import {
+  folderPrefix,
   hasStaffRole,
   hasWorkRole,
   isSpecialist,
   rolesText,
   staffRank,
 } from "../../lib/roles";
-import type { AgentProfile, Effort, SeatKind, SpawnOverrides, TicketSummary } from "../../lib/types";
+import type {
+  AgentProfile,
+  Effort,
+  ProjectRef,
+  SeatKind,
+  SpawnOverrides,
+  TicketSummary,
+} from "../../lib/types";
 import { useStore } from "../../state/store";
 import BotFigure from "../BotFigure";
 import ModelPicker, { EffortSelect, modelChoiceValid } from "./agents/ModelPicker";
+import ProjectPicker from "./ProjectPicker";
 import StickyNote from "./tickets/StickyNote";
 
 /** Profile used when none is chosen (mirrors `DEFAULT_PROFILE_ID` in Rust). */
@@ -55,8 +65,7 @@ interface Props {
 }
 
 export default function SpawnDialog(props: Props) {
-  // `projectsRoot` is shown again with the project picker (step 4b batch 3).
-  const { seatKind, theme, ticket = null, onClose, onSpawned } = props;
+  const { seatKind, theme, projectsRoot, ticket = null, onClose, onSpawned } = props;
   const { state, dispatch } = useStore();
   const profiles = state.profiles;
   // `null` until the user picks one: the default then follows the loaded profiles.
@@ -64,6 +73,9 @@ export default function SpawnDialog(props: Props) {
   const [overrideModel, setOverrideModel] = useState<string | null>(null);
   const [overrideEffort, setOverrideEffort] = useState<Effort | null>(null);
   const [prompt, setPrompt] = useState("");
+  // Step 4b: a work seat needs a project. A ticket with a project brings it (shown locked).
+  const ticketProject = ticket?.project ?? null;
+  const [project, setProject] = useState<ProjectRef | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -91,17 +103,17 @@ export default function SpawnDialog(props: Props) {
     setBusy(true);
     setError(null);
     try {
-      // The project picker follows in step 4b batch 3; a ticket brings its own project.
-      const project = null;
       const text = prompt.trim();
       const overrides: SpawnOverrides | null =
         overrideModel !== null || overrideEffort !== null
           ? { model: overrideModel, effort: overrideEffort }
           : null;
+      // The ticket's own project wins in the backend; a staff seat runs in the projects root.
+      const chosen = seatKind === "work" && ticketProject === null ? project : null;
       const agent =
         ticket !== null
-          ? await spawnAgentWithTicket(ticket.id, profileId, overrides, project, seatKind)
-          : await spawnAgent(profileId, overrides, project, text === "" ? null : text, seatKind);
+          ? await spawnAgentWithTicket(ticket.id, profileId, overrides, chosen, seatKind)
+          : await spawnAgent(profileId, overrides, chosen, text === "" ? null : text, seatKind);
       onSpawned(agent.id);
     } catch (e) {
       setError(errorMessage(e));
@@ -112,7 +124,19 @@ export default function SpawnDialog(props: Props) {
   const overridesValid = modelChoiceValid(overrideModel);
   // On a staff seat a profile must be chosen and have a staff role (the backend refuses it too).
   const seatOk = seatKind === "work" || (profile !== undefined && fitsSeat(profile, seatKind));
-  const canStart = !busy && overridesValid && seatOk;
+  const effectiveProject = ticketProject ?? project;
+  const projectOk = seatKind === "staff" || effectiveProject !== null;
+  const canStart = !busy && overridesValid && seatOk && projectOk;
+  const namePrefix = profile !== undefined ? folderPrefix(profile.roles, isSpecialist(profile)) : null;
+  const effectiveName = projectName(effectiveProject);
+  const folder =
+    projectsRoot === null
+      ? null
+      : seatKind === "staff"
+        ? projectsRoot
+        : effectiveName !== null
+          ? projectPath(projectsRoot, effectiveName)
+          : null;
   // The seat the user clicked wins over the profile's default seat.
   const seatDiffers = profile !== undefined && profile.defaultSeat !== seatKind;
 
@@ -202,6 +226,27 @@ export default function SpawnDialog(props: Props) {
           )}
         </fieldset>
 
+        <fieldset className="mt-3">
+          <legend className="mb-1 text-xs font-medium text-[var(--muted)]">Projekt</legend>
+          {seatKind === "staff" ? null : typeof ticketProject === "string" ? (
+            <p className="text-xs">Fra ticketen: «{ticketProject}»</p>
+          ) : ticketProject !== null ? (
+            <p className="text-xs">Nyt projekt «{ticketProject.new}» oprettes</p>
+          ) : (
+            <ProjectPicker value={project} onChange={setProject} allowLater={false} allowNew />
+          )}
+          <p className="mt-1 truncate font-mono text-[11px] text-[var(--muted)]" title={folder ?? undefined}>
+            {seatKind === "staff"
+              ? `Mappe: ${projectsRoot ?? "projektroden"} (projektroden; staben læser alle projekter)`
+              : `Mappe: ${folder ?? "vælg et projekt"}`}
+          </p>
+          {namePrefix !== null && (
+            <p className="text-[11px] text-[var(--muted)]">
+              Navn: {namePrefix}-nn (første ledige nummer)
+            </p>
+          )}
+        </fieldset>
+
         <details className="mt-3">
           <summary className="cursor-pointer select-none text-xs text-[var(--muted)] hover:text-[var(--fg)]">
             Overskriv model/effort
@@ -263,7 +308,7 @@ export default function SpawnDialog(props: Props) {
             type="button"
             onClick={() => void start()}
             disabled={!canStart}
-            title="Start agenten"
+            title={projectOk ? "Start agenten" : "Vælg et projekt til arbejdspladsen"}
             className="rounded-md bg-[var(--accent)] px-3 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {busy ? "Starter…" : ticket !== null ? "Start med ticket" : "Start"}

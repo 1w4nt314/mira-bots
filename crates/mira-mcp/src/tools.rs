@@ -134,6 +134,9 @@ pub const PROJECT_ERROR: &str =
     "project skal være et projekt-id (1–64 tegn) eller {\"new\": \"<navn>\"}";
 
 /// The `project` schema of `mira_create_ticket` and `mira_spawn_agent` (plan4b C4b.5).
+/// `project` on `mira_assign_ticket`/`mira_handoff_ticket`: only for a ticket without a project.
+pub const PROJECT_ON_ASSIGN: &str = "Kun når ticketen mangler et projekt: projektet den skal have (et id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} hvis workspacet tillader det). En arbejdsagent tager kun tickets fra sit eget projekt.";
+
 fn project_ref_schema(description: &str) -> Value {
     json!({
         "description": description,
@@ -265,7 +268,8 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
-                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agenten der skal have ticketen; udelad for at lægge den tilbage i backlog"}
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agenten der skal have ticketen; udelad for at lægge den tilbage i backlog"},
+                    "project": project_ref_schema(PROJECT_ON_ASSIGN)
                 },
                 "additionalProperties": false
             },
@@ -318,7 +322,8 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
-                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX}
+                    "agentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX},
+                    "project": project_ref_schema(PROJECT_ON_ASSIGN)
                 },
                 "required": ["id", "agentId"],
                 "additionalProperties": false
@@ -475,13 +480,13 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         SUBMIT_FOR_REVIEW => &["summary", "ticketId", "report"],
         UPDATE_STATUS => &["note"],
         APPROVE_TICKET | REJECT_TICKET => &["id", "note"],
-        ASSIGN_TICKET => &["id", "agentId"],
+        ASSIGN_TICKET => &["id", "agentId", "project"],
         UNASSIGN_TICKET => &["id"],
         SPAWN_AGENT => &["profileId", "seatKind", "firstTicketId", "project"],
         LIST_AGENTS | LIST_PROFILES | GET_WORKSPACE_RULES | LIST_PROJECTS => &[],
         ADD_REPORT => &["ticketId", "title", "body"],
         GET_REPORT => &["ticketId", "reportId"],
-        HANDOFF_TICKET => &["ticketId", "agentId"],
+        HANDOFF_TICKET => &["ticketId", "agentId", "project"],
         other => return Err(format!("Ukendt værktøj: {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -606,6 +611,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         ASSIGN_TICKET => {
             take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?;
             take_str(obj, &mut out, &id_rule("agentId", true, ID_MAX))?;
+            take_project(obj, &mut out)?;
         }
         UNASSIGN_TICKET => take_str(obj, &mut out, &id_rule("id", true, ID_MAX))?,
         SPAWN_AGENT => {
@@ -655,6 +661,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         HANDOFF_TICKET => {
             take_str(obj, &mut out, &id_rule("ticketId", false, ID_MAX))?;
             take_str(obj, &mut out, &id_rule("agentId", false, ID_MAX))?;
+            take_project(obj, &mut out)?;
         }
         _ => take_str(
             obj,
@@ -1157,11 +1164,12 @@ mod tests {
     fn validate_project_forms() {
         let ok = |name: &str, args: Value| validate_args(name, &args).unwrap();
         let err = |name: &str, args: Value| validate_args(name, &args).unwrap_err();
-        for t in [CREATE_TICKET, SPAWN_AGENT] {
-            let base = if t == CREATE_TICKET {
-                json!({"title": "t"})
-            } else {
-                json!({"profileId": "coder"})
+        for t in [CREATE_TICKET, SPAWN_AGENT, ASSIGN_TICKET, HANDOFF_TICKET] {
+            let base = match t {
+                CREATE_TICKET => json!({"title": "t"}),
+                SPAWN_AGENT => json!({"profileId": "coder"}),
+                ASSIGN_TICKET => json!({"id": "x", "agentId": "a"}),
+                _ => json!({"agentId": "a"}),
             };
             let with = |p: Value| {
                 let mut v = base.clone();
@@ -1226,6 +1234,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("En arbejdsplads kræver et projekt"));
+        for t in [ASSIGN_TICKET, HANDOFF_TICKET] {
+            assert_eq!(
+                def(&defs, t)["inputSchema"]["properties"]["project"],
+                schema(PROJECT_ON_ASSIGN),
+                "{t}"
+            );
+            assert!(PROJECT_ON_ASSIGN.starts_with("Kun når ticketen mangler et projekt"));
+        }
         assert_eq!(
             def(&defs, LIST_PROJECTS),
             &json!({

@@ -1,10 +1,10 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
-import { assignTicket } from "../../../lib/ipc";
+import { assignmentIssue, wrongProjectText } from "../../../lib/projects";
 import { isExited } from "../../../lib/status";
 import { isCoordinationTask } from "../../../lib/tickets";
 import type { TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
-import { smallBtn, useRun, useTicketActions } from "./actions";
+import { smallBtn, useTicketActions } from "./actions";
 
 interface Item {
   key: string;
@@ -22,8 +22,7 @@ interface Item {
  */
 export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
   const { state } = useStore();
-  const { spawnBlocked, spawnWithTicket } = useTicketActions();
-  const run = useRun();
+  const { spawnBlocked, spawnWithTicket, assignTo } = useTicketActions();
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -52,20 +51,28 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
         },
       ];
   const items: Item[] = [
-    ...live.map((a) => ({
-      key: a.id,
-      // Review 5c N4: a staff agent gets the ticket as a coordination task, not as work.
-      label: isCoordinationTask(a)
-        ? `${a.name} (koordineringsopgave) · ${a.queueLength} i kø`
-        : `${a.name} · arbejdsplads · ${a.queueLength} i kø`,
-      title:
-        (handOver
-          ? `Giv ticketen videre: den forlader sin agent og sættes bagerst i køen hos ${a.name}`
-          : `Sæt ticketen bagerst i køen hos ${a.name}`) +
-        (isCoordinationTask(a) ? " som koordineringsopgave (den fordeles, ikke udføres)" : ""),
-      disabled: false,
-      act: () => void run(() => assignTicket(ticket.id, a.id)),
-    })),
+    ...live.map((a) => {
+      // Step 4b: a work agent only takes tickets of its own project.
+      const issue = assignmentIssue(ticket, a);
+      const where = a.seatKind === "work" && a.project !== null ? ` · ${a.project}` : "";
+      return {
+        key: a.id,
+        // Review 5c N4: a staff agent gets the ticket as a coordination task, not as work.
+        label: isCoordinationTask(a)
+          ? `${a.name} (koordineringsopgave)${where} · ${a.queueLength} i kø`
+          : `${a.name} · arbejdsplads${where} · ${a.queueLength} i kø`,
+        title:
+          issue?.kind === "wrongProject"
+            ? wrongProjectText(issue.agentProject, issue.ticketProject)
+            : (handOver
+                ? `Giv ticketen videre: den forlader sin agent og sættes bagerst i køen hos ${a.name}`
+                : `Sæt ticketen bagerst i køen hos ${a.name}`) +
+              (isCoordinationTask(a) ? " som koordineringsopgave (den fordeles, ikke udføres)" : "") +
+              (issue?.kind === "needsProject" ? " — vælg først et projekt" : ""),
+        disabled: false,
+        act: () => assignTo(ticket, a),
+      };
+    }),
     ...spawnItems,
   ];
 

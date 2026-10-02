@@ -1,0 +1,187 @@
+// Pure helpers for projects (plan4b C4b.8): name rules (the same as `projects.rs`), the
+// assignment rule of a ticket to an agent, the "n agenter, ingen koordinator" hint, counts and
+// the ticket list's project filter. No DOM; only type imports, so it transpiles on its own
+// (scripts/test-projects.mjs).
+import type { AgentInfo, ProjectRef, Role, TicketSummary } from "./types";
+
+export const PROJECT_NAME_MAX = 64;
+/** localStorage key (via persist.ts) of the ticket list's project filter. */
+export const PROJECT_FILTER_KEY = "mira-bots.tickets.projectFilter";
+
+export type ProjectFilter = "all" | "none" | { id: string };
+
+const INVALID_CHARS = ["<", ">", ":", '"', "/", "\\", "|", "?", "*"];
+/** Device names Windows reserves in every folder, also with an extension (`NUL.txt`). */
+const RESERVED_STEMS = new Set([
+  "con", "prn", "aux", "nul",
+  "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+  "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+  "com¹", "com²", "com³", "lpt¹", "lpt²", "lpt³",
+]);
+
+/**
+ * null when `name` is a valid project folder name, otherwise the Danish error (the same text and
+ * the same order of checks as `validate_project_id` in Rust; the Windows rules on every host).
+ */
+export function validateProjectName(name: string): string | null {
+  const bad = (reason: string) => `Projektnavnet «${name}» er ugyldigt: ${reason}`;
+  const chars = Array.from(name);
+  if (chars.length === 0) return bad("tomt");
+  if (chars.length > PROJECT_NAME_MAX) return bad("må højst være 64 tegn");
+  if (chars.some((c) => INVALID_CHARS.includes(c))) {
+    return bad('indeholder et ugyldigt tegn (< > : " / \\ | ? *)');
+  }
+  if (chars.some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)) {
+    return bad("indeholder et kontroltegn");
+  }
+  if (chars.every((c) => c === ".")) return bad("må ikke kun bestå af punktummer");
+  if (name.startsWith(".")) return bad("må ikke begynde med punktum");
+  if (name.startsWith(" ") || name.endsWith(" ")) {
+    return bad("må ikke begynde eller slutte med mellemrum");
+  }
+  if (name.endsWith(".")) return bad("må ikke slutte med punktum");
+  const stem = name.split(".")[0].replace(/ +$/, "").toLowerCase();
+  if (RESERVED_STEMS.has(stem)) return bad("er et reserveret navn i Windows");
+  return null;
+}
+
+/** The id of an existing project; null for none or a project still to be created. */
+export function projectIdOf(ref: ProjectRef | null): string | null {
+  return typeof ref === "string" ? ref : null;
+}
+
+/** The project's name: the id, or the name of a project still to be created. */
+export function projectName(ref: ProjectRef | null): string | null {
+  if (ref === null) return null;
+  return typeof ref === "string" ? ref : ref.new;
+}
+
+/** Short label: "a", "+navn" (created at assignment) or "uden projekt". */
+export function projectLabel(ref: ProjectRef | null): string {
+  if (ref === null) return "uden projekt";
+  return typeof ref === "string" ? ref : `+${ref.new}`;
+}
+
+/** Folds A–Z only, like Rust's `eq_ignore_ascii_case` (NTFS compares project folders so). */
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/** Project ids compare ASCII-case-insensitively; null never equals anything. */
+export function sameProjectId(a: string | null, b: string | null): boolean {
+  return a !== null && b !== null && asciiLower(a) === asciiLower(b);
+}
+
+export type AssignmentIssue =
+  | { kind: "needsProject" }
+  | { kind: "wrongProject"; agentProject: string; ticketProject: string };
+
+/**
+ * Why `agent` cannot take ticket `t` as it is (mirrors `assignment_target` in Rust): a staff
+ * seat takes any ticket; a work agent only one of its own project (`needsProject` when the
+ * ticket has none yet: "Hvilket projekt?"), a `{ new }` with the agent's project name included.
+ */
+export function assignmentIssue(
+  t: Pick<TicketSummary, "project">,
+  agent: Pick<AgentInfo, "seatKind" | "project">,
+): AssignmentIssue | null {
+  if (agent.seatKind === "staff") return null;
+  const ticketProject = projectName(t.project);
+  if (ticketProject === null) return { kind: "needsProject" };
+  if (sameProjectId(ticketProject, agent.project)) return null;
+  return { kind: "wrongProject", agentProject: agent.project ?? "", ticketProject };
+}
+
+/** The explanation shown for a `wrongProject` issue (AssignMenu title, drag error). */
+export function wrongProjectText(agentProject: string, ticketProject: string): string {
+  return `Agenten står i projekt «${agentProject}»; ticketen hører til «${ticketProject}». Flyt agenten fra dens terminalpanel («Flyt til projekt…»), eller vælg en anden agent.`;
+}
+
+const isLive = (a: Pick<AgentInfo, "status">) => a.status.kind !== "exited";
+
+/** The running work agents in project `projectId`. */
+export function liveWorkAgentsIn(agents: readonly AgentInfo[], projectId: string): AgentInfo[] {
+  return agents.filter(
+    (a) => isLive(a) && a.seatKind === "work" && sameProjectId(a.project, projectId),
+  );
+}
+
+const COORDINATOR: Role = "coordinator";
+
+/** Whether a running agent (any seat) has the coordinator role. */
+export function hasLiveCoordinator(agents: readonly AgentInfo[]): boolean {
+  return agents.some((a) => isLive(a) && a.roles.includes(COORDINATOR));
+}
+
+/** "n agenter, ingen koordinator" when ≥ 2 work agents share the project and none coordinates. */
+export function coordinatorHint(agents: readonly AgentInfo[], projectId: string): string | null {
+  const n = liveWorkAgentsIn(agents, projectId).length;
+  if (n < 2 || hasLiveCoordinator(agents)) return null;
+  return `${n} agenter, ingen koordinator`;
+}
+
+/**
+ * Running work agents and tickets (any state, existing project only) per project; the key is
+ * the ASCII-lowercased id.
+ */
+export function countsByProject(
+  agents: readonly AgentInfo[],
+  tickets: readonly TicketSummary[],
+): Map<string, { agents: number; tickets: number }> {
+  const out = new Map<string, { agents: number; tickets: number }>();
+  const entry = (id: string) => {
+    const key = asciiLower(id);
+    let e = out.get(key);
+    if (e === undefined) {
+      e = { agents: 0, tickets: 0 };
+      out.set(key, e);
+    }
+    return e;
+  };
+  for (const a of agents) {
+    if (isLive(a) && a.seatKind === "work" && a.project !== null) entry(a.project).agents++;
+  }
+  for (const t of tickets) {
+    const id = projectIdOf(t.project);
+    if (id !== null) entry(id).tickets++;
+  }
+  return out;
+}
+
+/** The counts of `id` from [`countsByProject`] (zeros when absent). */
+export function countsFor(
+  counts: Map<string, { agents: number; tickets: number }>,
+  id: string,
+): { agents: number; tickets: number } {
+  return counts.get(asciiLower(id)) ?? { agents: 0, tickets: 0 };
+}
+
+// A project may be called "all" or "none": those ids are stored with a prefix that no project
+// name can contain (":" is an invalid character).
+const ID_PREFIX = "project:";
+
+/** The stored filter: null/"all" → all, "none" → tickets without a project, otherwise one id. */
+export function parseProjectFilter(s: string | null): ProjectFilter {
+  if (s === null || s === "" || s === "all") return "all";
+  if (s === "none") return "none";
+  return { id: s.startsWith(ID_PREFIX) ? s.slice(ID_PREFIX.length) : s };
+}
+
+/** The string stored for a filter (and used as the `<select>` value). */
+export function projectFilterKey(f: ProjectFilter): string {
+  if (f === "all" || f === "none") return f;
+  return f.id === "all" || f.id === "none" ? `${ID_PREFIX}${f.id}` : f.id;
+}
+
+/** Whether ticket `t` is shown under filter `f` (a `{ new }` counts under its name). */
+export function matchesFilter(t: Pick<TicketSummary, "project">, f: ProjectFilter): boolean {
+  if (f === "all") return true;
+  if (f === "none") return t.project === null;
+  return sameProjectId(projectName(t.project), f.id);
+}
+
+/** `<root><sep><id>` with the root's own separator (backslash on Windows). */
+export function projectPath(root: string, id: string): string {
+  const sep = root.includes("\\") ? "\\" : "/";
+  return root.endsWith(sep) ? `${root}${id}` : `${root}${sep}${id}`;
+}

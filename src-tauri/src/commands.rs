@@ -44,7 +44,7 @@ use crate::tickets::model::{
     ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
     TicketSummary, WorkspaceRules,
 };
-use crate::tickets::tools::{SpawnByProfile, SPAWN_UNAVAILABLE};
+use crate::tickets::tools::{ticket_has_project, SpawnByProfile, SPAWN_UNAVAILABLE};
 use crate::tickets::{prompt, ReportContent, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
 use crate::workplace;
 use crate::workspace::WorkspaceReader;
@@ -419,23 +419,43 @@ pub fn ticket_delete(t: &TicketsCtx, id: &str) -> Result<(), String> {
 // TODO(windows-verify): a ticket of project A dropped on an agent in B is refused with the
 // WrongProject text; one without a project on a work agent asks "Hvilket projekt?" (plan4b D.82).
 pub fn ticket_assign(t: &TicketsCtx, id: &str, agent_id: &str) -> Result<TicketSummary, String> {
+    ticket_assign_in(t, id, agent_id, None)
+}
+
+/// [`ticket_assign`] with the project picked in "Hvilket projekt?" (step 4b batch 3): only for a
+/// ticket without a project ("Ticketen har allerede projekt «x»" otherwise, as for the agents'
+/// `project` on `mira_assign_ticket`); it is checked against the agent like the ticket's own
+/// project, created when new (the user may create projects) and set in the same save.
+pub fn ticket_assign_in(
+    t: &TicketsCtx,
+    id: &str,
+    agent_id: &str,
+    project: Option<ProjectRef>,
+) -> Result<TicketSummary, String> {
     let info = lock(&t.manager)
         .get(agent_id)
         .filter(|a| !matches!(a.status, AgentStatus::Exited { .. }))
         .ok_or(TicketError::AgentNotLive)?;
     let before = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    if let (Some(cur), Some(_)) = (&before.project, &project) {
+        return Err(ticket_has_project(cur));
+    }
+    let effective = project.as_ref().or(before.project.as_ref());
     let target = projects::assignment_target(
-        before.project.as_ref(),
+        effective,
         info.seat_kind,
         info.project.as_deref(),
         &info.name,
     )?;
     let now = now_ms();
-    let set = match target {
-        AssignmentProject::Unchanged => None,
+    let root = t.workspace.root();
+    let set = match (&project, target) {
+        // Picked now: always stored (in the spelling on disk).
+        (Some(p), _) => Some(projects::realize(root, p, true)?.id),
+        (None, AssignmentProject::Unchanged) => None,
         // The user may create projects: a missing folder is created.
-        AssignmentProject::Set(p) => {
-            Some(projects::realize(t.workspace.root(), &ProjectRef::New { new: p }, true)?.id)
+        (None, AssignmentProject::Set(p)) => {
+            Some(projects::realize(root, &ProjectRef::New { new: p }, true)?.id)
         }
     };
     if before.state != TicketState::InProgress {
@@ -1672,8 +1692,9 @@ pub fn assign_ticket(
     state: State<'_, AppState>,
     id: String,
     agent_id: String,
+    project: Option<ProjectRef>,
 ) -> Result<TicketSummary, String> {
-    ticket_assign(&state.tickets, &id, &agent_id)
+    ticket_assign_in(&state.tickets, &id, &agent_id, project)
 }
 
 #[tauri::command]
@@ -3062,6 +3083,52 @@ mod tests {
         assert!(ticket_assign(t, &tc.id, &in_a).unwrap_err().contains("«c»"));
         assert!(!root.join("c").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ticket_assign_with_a_picked_project() {
+        let (state, dir) = temp_state();
+        // The tickets context reads projects under its own workspace root.
+        let root = state.tickets.workspace.root().to_path_buf();
+        for p in ["a", "b"] {
+            std::fs::create_dir_all(root.join(p)).unwrap();
+        }
+        let (in_a, staff) = {
+            let mut m = lock(&state.manager);
+            let a = m.insert_fake_in("sa", "/w/a", &[Role::Coder], SeatKind::Work, Some("a"));
+            let s = m.insert_fake_with("ss", "/w/s", &[Role::Coordinator], SeatKind::Staff);
+            (a, s)
+        };
+        let t = &state.tickets;
+        let existing = |p: &str| Some(ProjectRef::Existing(p.into()));
+        // "Hvilket projekt?" → the agent's project (any case): set and assigned in one go.
+        let x = ticket_create(t, "x", "", false, None).unwrap();
+        let s = ticket_assign_in(t, &x.id, &in_a, existing("A")).unwrap();
+        assert_eq!(s.project, existing("a"));
+        assert_eq!(s.state, TicketState::Assigned);
+        // Another project than the agent's: refused, nothing stored.
+        let y = ticket_create(t, "y", "", false, None).unwrap();
+        let err = ticket_assign_in(t, &y.id, &in_a, existing("b")).unwrap_err();
+        assert_eq!(err, "Agenten a står i projekt «a»; ticketen hører til «b»");
+        let err = ticket_assign_in(t, &y.id, &in_a, Some(ProjectRef::New { new: "ny".into() }))
+            .unwrap_err();
+        assert!(err.contains("«ny»"), "{err}");
+        assert!(!root.join("ny").exists());
+        assert_eq!(t.read(|s| s.get(&y.id)).unwrap().project, None);
+        // A new project to a staff agent: created (the user may) and set.
+        let s =
+            ticket_assign_in(t, &y.id, &staff, Some(ProjectRef::New { new: "ny".into() })).unwrap();
+        assert_eq!(s.project, existing("ny"));
+        assert!(root.join("ny").is_dir());
+        // A ticket with a project: a picked project is refused.
+        let z = ticket_create(t, "z", "", false, existing("a")).unwrap();
+        assert_eq!(
+            ticket_assign_in(t, &z.id, &in_a, existing("a")).unwrap_err(),
+            "Ticketen har allerede projekt «a»"
+        );
+        assert!(ticket_assign_in(t, &z.id, &in_a, None).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

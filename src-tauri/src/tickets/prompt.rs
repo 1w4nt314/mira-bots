@@ -242,7 +242,7 @@ pub fn project_list_text(list: &ProjectList) -> String {
         "skal brugeren oprette (agentsMayCreateProjects er slået fra)"
     };
     format!(
-        "Projekter lige nu: {ids}. Angiv `project` på hver ticket du opretter; nye projekter {create}."
+        "Projekter lige nu: {ids}. Angiv `project` på hver ticket du opretter; nye projekter {create}. Mangler ticketen et projekt, angiv `project` når du giver den videre (mira_assign_ticket/mira_handoff_ticket)."
     )
 }
 
@@ -1125,7 +1125,7 @@ mod tests {
         let d = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator])
             .with_projects(vec!["a".into(), "b".into()], false);
         let f = render_file(&t, 0, &d);
-        let line = "Projekter lige nu: a, b. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra).\n\n## Regler";
+        let line = "Projekter lige nu: a, b. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra). Mangler ticketen et projekt, angiv `project` når du giver den videre (mira_assign_ticket/mira_handoff_ticket).\n\n## Regler";
         assert!(
             f.contains(&format!("{COORDINATION_DISTRIBUTE_TEXT}\n{line}")),
             "{f}"
@@ -1134,7 +1134,7 @@ mod tests {
             .with_projects(Vec::new(), true);
         let f = render_file(&t, 0, &d);
         assert!(f.contains(
-            "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter kan oprettes med {\"new\": …}."
+            "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter kan oprettes med {\"new\": …}. Mangler ticketen et projekt, angiv `project` når du giver den videre"
         ));
         // A work delivery ignores the list.
         let w = TicketDelivery::work().with_projects(vec!["a".into()], true);

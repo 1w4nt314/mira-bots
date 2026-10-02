@@ -1590,7 +1590,7 @@ mod tests {
         assert_eq!(typed("w1"), line(&tw));
         let fk = h.ticket_file("k1", &tk);
         // Step 4b: the coordination task lists the projects (none in the test host).
-        let projects = "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra).";
+        let projects = "Projekter lige nu: ingen. Angiv `project` på hver ticket du opretter; nye projekter skal brugeren oprette (agentsMayCreateProjects er slået fra). Mangler ticketen et projekt, angiv `project` når du giver den videre (mira_assign_ticket/mira_handoff_ticket).";
         assert!(fk.contains(&format!(
             "## Koordineringsopgave\n{COORDINATION_DISTRIBUTE_TEXT}\n{projects}\n\n## Regler\n"
         )));

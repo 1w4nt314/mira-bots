@@ -113,6 +113,25 @@ function NoteFrame(props: FrameProps) {
           {STATE_LABEL[t.state]}
         </span>
         <span className="font-mono text-[10px] opacity-70">{t.shortId}</span>
+        {typeof t.project === "string" ? (
+          <span className="max-w-[40%] truncate rounded bg-neutral-500/15 px-1 text-[10px]" title={`Projekt: ${t.project}`}>
+            {t.project}
+          </span>
+        ) : t.project !== null ? (
+          <span
+            className="max-w-[40%] truncate rounded bg-neutral-500/15 px-1 text-[10px]"
+            title={`Nyt projekt «${t.project.new}» oprettes ved tildeling`}
+          >
+            +{t.project.new}
+          </span>
+        ) : (
+          !compact &&
+          (t.state === "backlog" || t.state === "rejected") && (
+            <span className="text-[10px] opacity-60" title="Vælg projekt ved tildeling">
+              uden projekt
+            </span>
+          )
+        )}
         {t.skipReview && (
           <span className="text-[10px] opacity-70" title="Går direkte til Done uden review">
             uden review
