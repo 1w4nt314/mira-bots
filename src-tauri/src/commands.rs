@@ -630,17 +630,26 @@ pub fn ticket_request_submission(t: &TicketsCtx, id: &str) -> Result<(), String>
     }
 }
 
-/// Only backlog tickets and rejected tickets without an agent can start a new agent.
+/// Only backlog tickets and rejected tickets without an agent can start a new agent, and only
+/// when no blocker is open (step 6a: "Ticketen venter på …").
+// TODO(windows-verify): "Ny agent med ticket" on a blocked ticket is refused with "Ticketen
+// venter på …" (plan6a D.95).
 pub fn ticket_for_spawn(t: &TicketsCtx, id: &str) -> Result<Ticket, String> {
     let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
     match (tk.state, &tk.assignee_agent_id) {
-        (TicketState::Backlog, _) | (TicketState::Rejected, None) => Ok(tk),
-        (from, _) => Err(TicketError::IllegalTransition {
-            from,
-            to: TicketState::Assigned,
+        (TicketState::Backlog, _) | (TicketState::Rejected, None) => {}
+        (from, _) => {
+            return Err(TicketError::IllegalTransition {
+                from,
+                to: TicketState::Assigned,
+            }
+            .into())
         }
-        .into()),
     }
+    if let Some(blockers) = t.read(|s| s.blocked_text(&tk.id)) {
+        return Err(TicketError::Blocked(blockers).into());
+    }
+    Ok(tk)
 }
 
 /// After a spawn with the ticket line as positional prompt: the dispatcher waits for the session
@@ -998,6 +1007,32 @@ pub fn first_delivery(
     }
 }
 
+/// Step 6a: the first delivery's `## Del-tickets` and, for a planning task, whether a coordinator
+/// runs (a live agent with the role, or the ticket's parent belongs to one) — as the
+/// dispatcher's `delivery_for`. Takes the service lock and the manager lock one after the other.
+fn relation_delivery(
+    state: &AppState,
+    ticket: &Ticket,
+    delivery: prompt::TicketDelivery,
+) -> prompt::TicketDelivery {
+    let children = state.tickets.read(|s| s.child_lines(&ticket.id));
+    let delivery = delivery.with_children(children);
+    if delivery.coordination != Some(prompt::CoordinationKind::Plan) {
+        return delivery;
+    }
+    let parent_assignee = ticket
+        .parent_id
+        .as_deref()
+        .and_then(|p| state.tickets.read(|s| s.get(p)))
+        .and_then(|p| p.assignee_agent_id);
+    let m = lock(&state.manager);
+    let available = m.has_live_coordinator()
+        || parent_assignee
+            .and_then(|a| m.get(&a))
+            .is_some_and(|a| a.roles.contains(&crate::agent::Role::Coordinator));
+    delivery.with_coordinator(available)
+}
+
 /// The shared core of `spawn_agent_with_ticket` and `mira_spawn_agent` with `firstTicketId`.
 /// A ticket without a project (or with `{"new": …}`) gets the agent's project before the file
 /// is written; if the spawn then fails the project stays (an empty folder may remain; plan4b
@@ -1031,6 +1066,7 @@ pub fn spawn_with_ticket_core(
         placement.project.as_deref(),
         &rules,
     );
+    let delivery = relation_delivery(state, &ticket, delivery);
     let file = prompt::write_ticket_file(&placement.cwd, &ticket, now_ms(), &delivery)
         .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
     let line = prompt::line_for(&ticket, &delivery);
@@ -2906,6 +2942,41 @@ mod tests {
         );
         let fresh = ticket_create(&t.ctx, "ny", "", false, p()).unwrap();
         assert_eq!(ticket_for_spawn(&t.ctx, &fresh.id).unwrap().id, fresh.id);
+    }
+
+    // Step 6a (plan A.4): "Ny agent med ticket" refuses a blocked ticket.
+    #[test]
+    fn spawn_with_blocked_ticket_is_refused() {
+        let (t, _, _) = tickets_setup();
+        let blocker = ticket_create(&t.ctx, "Plan", "", false, p()).unwrap();
+        let blocked = t
+            .ctx
+            .mutate(|s| {
+                s.create_by_agent_related(
+                    "Byg",
+                    "",
+                    false,
+                    None,
+                    p(),
+                    None,
+                    vec![blocker.id.clone()],
+                    2,
+                )
+            })
+            .unwrap();
+        let short = crate::tickets::model::short_id(&blocker.id);
+        assert_eq!(
+            ticket_for_spawn(&t.ctx, &blocked.id).unwrap_err(),
+            format!("Ticketen venter på {short}")
+        );
+        // The blocker deleted: it no longer blocks.
+        t.ctx.delete_ticket(&blocker.id).unwrap();
+        assert_eq!(
+            ticket_for_spawn(&t.ctx, &blocked.id).unwrap().id,
+            blocked.id
+        );
+        // The state rule still comes first.
+        assert!(ticket_for_spawn(&t.ctx, "nope").is_err());
     }
 
     #[test]

@@ -21,12 +21,13 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use super::model::{
     ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState, WorkspaceRules,
 };
-use super::prompt::{self, ReviewSender, TicketDelivery};
-use super::service::TicketService;
+use super::prompt::{self, ReviewSender, TicketDelivery, WakeInfo};
+use super::service::{DueWake, TicketService};
 use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
-    CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS, ENTER_DELAY_MS,
-    NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT,
+    CHILDREN_DONE_NOTE, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
+    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
+    TURN_FAILED_TEXT, WOKEN_NOTE,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -79,6 +80,11 @@ pub trait AgentPort: Send {
     /// (test ports without projects).
     fn peers_in_project(&self, _id: &str) -> Vec<String> {
         Vec::new()
+    }
+    /// Whether a live agent has the coordinator role (step 6a: the planner's text). `false` by
+    /// default (test ports).
+    fn has_live_coordinator(&self) -> bool {
+        false
     }
 }
 
@@ -259,9 +265,10 @@ enum Delivery {
         ticket_id: String,
         token: u64,
     },
-    /// Typing a "Du …" line for `ticket_id`: "Bed om aflevering" (C4.7, the ticket in progress)
-    /// or "stop, it was handed on" (review 5c W4): waiting for the grace period (`NudgeDelay`),
-    /// then for the Enter (`NudgeEnter`). Nothing is confirmed.
+    /// Typing a "Du …" line for `ticket_id`: "Bed om aflevering" (C4.7, the ticket in progress),
+    /// "stop, it was handed on" (review 5c W4) or the wake line of a waiting parent (step 6a):
+    /// waiting for the grace period (`NudgeDelay`), then for the Enter (`NudgeEnter`). Nothing is
+    /// confirmed.
     Nudging {
         ticket_id: String,
         token: u64,
@@ -276,6 +283,9 @@ enum Nudge {
     Submit,
     /// [`prompt::handed_over_line`]: the ticket left the agent (review 5c W4).
     Stop,
+    /// [`prompt::wake_line`]: `ticket_id` is the agent's waiting parent and a child is done
+    /// (step 6a, plan A.2). The parent goes back in progress only after the Enter.
+    Wake,
 }
 
 /// A pending [`prompt::handed_over_line`] for an agent (review 5c W4).
@@ -401,13 +411,18 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// Starts a delivery sequence if the agent is free, idle and has a review or a queued ticket.
     // TODO(windows-verify): 750 ms after Stop the input field is ready, and the extra Enter on
     // retry neither sends an empty prompt nor closes a dialog (plan D.29).
-    /// A pending stop notice (review 5c W4) goes first: no delivery until it is typed.
+    /// A pending stop notice (review 5c W4) goes first: no delivery until it is typed. Then a
+    /// due wake line for a waiting parent (step 6a), then reviews and the queue.
     fn consider(&mut self, agent_id: &str) {
         if *self.state(agent_id) != Delivery::Free {
             return;
         }
         if self.stop_notices.contains_key(agent_id) {
             self.start_stop_notice(agent_id);
+            return;
+        }
+        if let Some((snap, _)) = self.due_wake(agent_id) {
+            self.start_wake(agent_id, &snap);
             return;
         }
         let Some((snap, _)) = self.ready_item(agent_id) else {
@@ -429,6 +444,97 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         let grace = self.host.rules().user_input_grace_ms;
         let elapsed = self.timers.now_ms().saturating_sub(at);
         (elapsed < grace).then(|| grace - elapsed)
+    }
+
+    /// The agent's due wake (step 6a, plan A.2): only while it is idle without a ticket in
+    /// progress, and a waiting parent of its own is due ([`TicketService::due_wake_for`]).
+    fn due_wake(&self, agent_id: &str) -> Option<(AgentSnapshot, DueWake)> {
+        let snap = self.port.snapshot(agent_id)?;
+        if snap.status != AgentStatus::Idle {
+            return None;
+        }
+        if self.host.read(|s| s.current_for_agent(agent_id)).is_some() {
+            return None;
+        }
+        let w = self.host.read(|s| s.due_wake_for(agent_id))?;
+        Some((snap, w))
+    }
+
+    /// Schedules the wake line after the usual delay and the user-input grace (like a stop
+    /// notice). What is typed is decided again when the timer comes due ([`Self::wake_type`]).
+    fn start_wake(&mut self, agent_id: &str, snap: &AgentSnapshot) {
+        let Some(w) = self.host.read(|s| s.due_wake_for(agent_id)) else {
+            return;
+        };
+        let delay = self
+            .user_grace_left(snap)
+            .map_or(DISPATCH_DELAY_MS, |left| left.max(DISPATCH_DELAY_MS));
+        let token = self.token();
+        self.schedule(agent_id, token, TimerKind::NudgeDelay, delay);
+        self.set(
+            agent_id,
+            Delivery::Nudging {
+                ticket_id: w.parent.id,
+                token,
+                nudge: Nudge::Wake,
+            },
+        );
+    }
+
+    /// `NudgeDelay` of a wake came due: type [`prompt::wake_line`] if the agent is still idle
+    /// without a ticket in progress, the user is not typing and the parent is still due; else
+    /// free the agent (and consider it again when the wake is no longer due).
+    // TODO(windows-verify): "Du har fået besked: …" is typed about 1 s after the coordinator is
+    // idle and the parent shows "I gang" with the note "vækket …" (plan6a D.91/92).
+    fn wake_type(&mut self, agent_id: &str, parent_id: &str, token: u64) {
+        let Some(snap) = self.port.snapshot(agent_id) else {
+            self.set(agent_id, Delivery::Free);
+            return;
+        };
+        if let Some(left) = self.user_grace_left(&snap) {
+            log::info!("dispatch {agent_id}: user typed recently; wake line in {left} ms");
+            self.schedule(agent_id, token, TimerKind::NudgeDelay, left);
+            return;
+        }
+        if snap.status != AgentStatus::Idle
+            || self.host.read(|s| s.current_for_agent(agent_id)).is_some()
+        {
+            // Still due: the next Stop/Idle considers it again.
+            log::info!("dispatch {agent_id}: busy again; no wake line now");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        let due = self
+            .host
+            .read(|s| s.due_wake_for(agent_id))
+            .filter(|w| w.parent.id == parent_id);
+        let Some(w) = due else {
+            self.set(agent_id, Delivery::Free);
+            self.consider(agent_id);
+            return;
+        };
+        let info = WakeInfo {
+            parent_short: w.parent.short_id(),
+            newly_done: w
+                .newly_done
+                .iter()
+                .map(|c| (c.short_id(), c.title.clone()))
+                .collect(),
+            open_left: w.open_left,
+        };
+        let line = prompt::wake_line(&info);
+        if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
+            log::warn!("dispatch {agent_id}: typing the wake line failed: {e}");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        log::info!(
+            "dispatch {agent_id}: woke for parent {} ({} children done, {} open)",
+            info.parent_short,
+            w.newly_done.len(),
+            w.open_left
+        );
+        self.schedule(agent_id, token, TimerKind::NudgeEnter, ENTER_DELAY_MS);
     }
 
     /// The agent (idle, not exited) and what it gets next, if a delivery may start now: its
@@ -576,7 +682,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// Otherwise (step 4) a ticket still in progress was not submitted with
     /// `mira_submit_for_review`: it keeps its state with `issue: notSubmitted` and the agent gets
     /// [`NOT_SUBMITTED_TEXT`]; no next ticket is considered. Without a ticket in progress (e.g.
-    /// submitted by the tool in this turn) the queue moves on.
+    /// submitted by the tool in this turn) the queue moves on. Step 6a: a parent with open
+    /// children goes to waiting instead (no hint) and the queue moves on.
     // TODO(windows-verify): Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure
     // shows the "Turn fejlede" hint and "Send igen" works (plan D.33). Stop without
     // `mira_submit_for_review` shows "Ikke afleveret"; with it, the ticket is in review before or
@@ -602,13 +709,26 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 .set_detail(agent_id, Some(TURN_FAILED_TEXT.to_string()));
         } else if self.auto_review() {
             match self.host.mutate(|s| s.complete_turn(agent_id, now)) {
-                Ok(Some(_)) => self.host.reroute_reviews(),
-                Ok(None) => {}
+                Ok(Some(t)) if t.state == TicketState::Waiting => log::info!(
+                    "dispatch {agent_id}: turn ended; parent {} waits for its children",
+                    t.short_id()
+                ),
+                Ok(Some(t)) if t.state == TicketState::Review => self.host.reroute_reviews(),
+                Ok(_) => {}
                 Err(e) => log::warn!("dispatch {agent_id}: completing the turn failed: {e}"),
             }
             self.consider(agent_id);
         } else {
             match self.host.mutate(|s| s.mark_not_submitted(agent_id, now)) {
+                // Step 6a: a parent with open children waits instead ("Ikke afleveret" would be
+                // wrong); the agent is free for its queue.
+                Ok(Some(t)) if t.state == TicketState::Waiting => {
+                    log::info!(
+                        "dispatch {agent_id}: turn ended; parent {} waits for its children",
+                        t.short_id()
+                    );
+                    self.consider(agent_id);
+                }
                 Ok(Some(t)) => {
                     log::info!(
                         "dispatch {agent_id}: turn ended without submitting ticket {}",
@@ -784,8 +904,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             log::warn!("dispatch {agent_id}: sending Enter after the {nudge:?} line failed: {e}");
             return;
         }
-        if nudge == Nudge::Stop {
-            return;
+        match nudge {
+            Nudge::Stop => return,
+            Nudge::Wake => {
+                self.wake_entered(agent_id, ticket_id);
+                return;
+            }
+            Nudge::Submit => {}
         }
         let still_ours = self
             .host
@@ -810,13 +935,41 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
+    /// The wake line was entered (step 6a, plan P2): the parent goes waiting → in progress with
+    /// [`WOKEN_NOTE`] ([`CHILDREN_DONE_NOTE`] when no child is open any more). Nothing happens
+    /// when it is no longer the agent's waiting parent or the agent has another ticket in
+    /// progress (`Ok(None)`).
+    fn wake_entered(&mut self, agent_id: &str, parent_id: &str) {
+        let now = now_ms();
+        let r = self.host.mutate(|s| {
+            let note = if s.open_children_count(parent_id) == 0 {
+                CHILDREN_DONE_NOTE
+            } else {
+                WOKEN_NOTE
+            };
+            s.resume_after_wake(parent_id, agent_id, note, now)
+        });
+        match r {
+            Ok(Some(t)) => log::info!(
+                "dispatch {agent_id}: parent {} back in progress",
+                t.short_id()
+            ),
+            Ok(None) => log::info!(
+                "dispatch {agent_id}: parent {} not resumed (no longer waiting or agent busy)",
+                super::model::short_id(parent_id)
+            ),
+            Err(e) => log::warn!("dispatch {agent_id}: resuming the parent failed: {e}"),
+        }
+    }
+
     fn on_timer(&mut self, agent_id: &str, token: u64, kind: TimerKind) {
         let state = self.state(agent_id).clone();
         match (state, kind) {
             (Delivery::Delaying { token: t }, TimerKind::DispatchDelay) if t == token => {
                 self.set(agent_id, Delivery::Free);
-                if self.stop_notices.contains_key(agent_id) {
-                    // A stop notice arrived during the delay: it goes first (review 5c W4).
+                if self.stop_notices.contains_key(agent_id) || self.due_wake(agent_id).is_some() {
+                    // A stop notice (review 5c W4) or a wake (step 6a) arrived during the delay:
+                    // it goes first.
                     self.consider(agent_id);
                 } else if let Some((snap, item)) = self.ready_item(agent_id) {
                     if let Some(left) = self.user_grace_left(&snap) {
@@ -901,6 +1054,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             ) if t == token => match nudge {
                 Nudge::Submit => self.nudge_type(agent_id, &ticket_id, token),
                 Nudge::Stop => self.stop_notice_type(agent_id, &ticket_id, token),
+                Nudge::Wake => self.wake_type(agent_id, &ticket_id, token),
             },
             (
                 Delivery::Nudging {
@@ -916,9 +1070,21 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
 
     /// The delivery for the agent (5c C.1) with the step 4b sections: `## Delt projekt` for a
     /// real work delivery when other live work agents share the project (plan4b A.5), the
-    /// project list for a coordination task (A.6).
-    fn delivery_for(&self, agent_id: &str, snap: &AgentSnapshot) -> TicketDelivery {
-        let mut delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles);
+    /// project list for a coordination task (A.6). Step 6a: `## Del-tickets` for a ticket with
+    /// children, and a planning task knows whether a coordinator runs (a live agent with the
+    /// role, or the ticket's parent belongs to one).
+    fn delivery_for(
+        &self,
+        agent_id: &str,
+        snap: &AgentSnapshot,
+        ticket: &Ticket,
+    ) -> TicketDelivery {
+        let mut delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles)
+            .with_children(self.host.read(|s| s.child_lines(&ticket.id)));
+        if delivery.coordination == Some(prompt::CoordinationKind::Plan) {
+            let available = self.port.has_live_coordinator() || self.parent_is_coordinators(ticket);
+            delivery = delivery.with_coordinator(available);
+        }
         if let (Some(p), SeatKind::Work, true) = (&snap.project, snap.seat_kind, delivery.is_work())
         {
             let others = self.port.peers_in_project(agent_id);
@@ -933,11 +1099,23 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         delivery
     }
 
+    /// Whether `ticket`'s parent has an assignee with the coordinator role (step 6a).
+    fn parent_is_coordinators(&self, ticket: &Ticket) -> bool {
+        let Some(parent) = ticket.parent_id.as_deref() else {
+            return false;
+        };
+        self.host
+            .read(|s| s.get(parent))
+            .and_then(|p| p.assignee_agent_id)
+            .and_then(|a| self.port.snapshot(&a))
+            .is_some_and(|a| a.roles.contains(&Role::Coordinator))
+    }
+
     /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
     /// Enter follows after `ENTER_DELAY_MS`.
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
         let now = now_ms();
-        let delivery = self.delivery_for(agent_id, snap);
+        let delivery = self.delivery_for(agent_id, snap, ticket);
         if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, &delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
@@ -996,7 +1174,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 cwd: s.cwd.to_string_lossy().into_owned(),
             });
         let author = |a: &ReportAuthor| self.author_name(a);
-        if let Err(e) = prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author) {
+        // Step 6a: a parent's review file lists its children (already reviewed).
+        let children = self.host.read(|s| s.child_reviews(&ticket.id));
+        if let Err(e) =
+            prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author, &children)
+        {
             log::warn!("dispatch {agent_id}: writing the review file failed: {e}");
             self.review_failed(agent_id, &ticket.id);
             return;
@@ -1131,7 +1313,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         let snap = self.port.snapshot(&agent_id);
         let idle = snap.as_ref().is_some_and(|s| s.status == AgentStatus::Idle);
         if !eligible || !idle || *self.state(&agent_id) != Delivery::Free {
-            log::info!("redispatch: ticket {} is not deliverable now", t.short_id());
+            match self.host.read(|s| s.blocked_text(&t.id)) {
+                // Step 6a: a blocked ticket is skipped by `next_for_agent` and never re-sent.
+                Some(b) => log::info!("redispatch: ticket {} waits for {b}", t.short_id()),
+                None => log::info!("redispatch: ticket {} is not deliverable now", t.short_id()),
+            }
             return;
         }
         let now = now_ms();
@@ -1313,12 +1499,18 @@ mod tests {
         snapshots: HashMap<String, AgentSnapshot>,
         writes: Vec<(String, Vec<u8>)>,
         fail_writes: bool,
+        /// `has_live_coordinator` (step 6a).
+        coordinator_live: bool,
     }
 
     #[derive(Clone, Default)]
     struct FakePort(Arc<Mutex<PortState>>);
 
     impl AgentPort for FakePort {
+        fn has_live_coordinator(&self) -> bool {
+            lock(&self.0).coordinator_live
+        }
+
         fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
             lock(&self.0).snapshots.get(id).cloned()
         }
@@ -3133,5 +3325,394 @@ mod tests {
         let writes = h.writes();
         let typed = writes.iter().find(|(x, _)| x == "a2").unwrap().1.clone();
         assert_eq!(typed, line(&t2));
+    }
+
+    // ---- step 6a: wake lines, waiting on Stop, blocked tickets ----
+
+    /// A child of `parent`, assigned to and submitted to review by the portless agent "x".
+    fn child_in_review(h: &Harness, parent: &Ticket, title: &str) -> Ticket {
+        let mut s = h.svc();
+        let c = s
+            .create_by_agent_related(
+                title,
+                "",
+                false,
+                None,
+                None,
+                Some(parent.id.clone()),
+                vec![],
+                3,
+            )
+            .unwrap();
+        s.assign(&c.id, "x", 4).unwrap();
+        s.mark_dispatched(&c.id, "x", 5).unwrap();
+        s.submit_by_agent("x", None, "HEMMELIG opsummering", 6)
+            .unwrap()
+    }
+
+    /// Coordinator k1 (staff, idle) whose parent waits for `n` children in review.
+    fn waiting_parent(h: &mut Harness, n: usize) -> (Ticket, Vec<Ticket>) {
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        let p = h.queued("k1", "Byg spillet");
+        h.svc().mark_dispatched(&p.id, "k1", 2).unwrap();
+        let kids: Vec<Ticket> = (0..n)
+            .map(|i| child_in_review(h, &p, &format!("Del {i}")))
+            .collect();
+        let p = h.svc().submit_by_agent("k1", None, "fordelt", 7).unwrap();
+        assert_eq!(p.state, S::Waiting);
+        (p, kids)
+    }
+
+    fn queue_changed(h: &mut Harness, agent: &str) {
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: agent.into(),
+        });
+    }
+
+    #[test]
+    fn child_done_wakes_idle_parent_assignee() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        // TicketsCtx's hook sends this for the parent's assignee.
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS - 1);
+        assert!(h.writes().is_empty(), "the usual delay");
+        h.advance(1);
+        let w = h.writes();
+        assert_eq!(w.len(), 1);
+        let l = &w[0].1;
+        assert!(l.starts_with("Du har fået besked"), "{l}");
+        assert!(
+            l.contains(&kids[0].short_id()) && l.contains(&p.short_id()),
+            "{l}"
+        );
+        assert!(l.contains("1 del-ticket(s) mangler stadig"), "{l}");
+        assert!(!l.contains("HEMMELIG"), "no child summary in the terminal");
+        assert!(!l.contains(['\r', '\n']));
+        // P2: the parent waits until the line is entered.
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[1], enter("k1"));
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::InProgress);
+        let last = pt.history.last().unwrap();
+        assert_eq!(last.note.as_deref(), Some(WOKEN_NOTE));
+        assert_eq!(last.by, TicketActor::System);
+        // Not due any more: no second line at the next idle.
+        h.idle("k1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+    }
+
+    #[test]
+    fn wake_waits_while_agent_busy_or_working() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 1);
+        // k1 took its next ticket while the parent waits.
+        let other = h.queued("k1", "Næste");
+        h.svc().mark_dispatched(&other.id, "k1", 8).unwrap();
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.idle("k1");
+        h.advance(10_000);
+        assert!(
+            h.writes().is_empty(),
+            "never in the middle of another ticket"
+        );
+        // That ticket is submitted, but the agent is busy: nothing either.
+        h.svc().submit_by_agent("k1", None, "ok", 11).unwrap();
+        h.set_status("k1", AgentStatus::Thinking);
+        queue_changed(&mut h, "k1");
+        h.advance(10_000);
+        assert!(h.writes().is_empty(), "busy");
+        // Idle again, but the user just typed: the grace first.
+        h.set_status("k1", AgentStatus::Idle);
+        h.user_typed("k1");
+        h.idle("k1");
+        h.advance(USER_INPUT_GRACE_MS - 1);
+        assert!(h.writes().is_empty(), "grace");
+        h.advance(1);
+        let w = h.writes();
+        assert_eq!(w.len(), 1);
+        assert!(w[0]
+            .1
+            .starts_with("Du har fået besked: alle del-tickets til ticket"));
+        // The Enter is still pending: the parent waits until then.
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+    }
+
+    #[test]
+    fn wake_is_dropped_when_the_agent_gets_busy_before_typing() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 1);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.set_status("k1", AgentStatus::Thinking);
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes().is_empty());
+        // Still due (derived from the data): typed at the next idle.
+        h.set_status("k1", AgentStatus::Idle);
+        h.idle("k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+    }
+
+    #[test]
+    fn last_child_done_line_asks_for_submission() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 1);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        assert_eq!(
+            l,
+            prompt::wake_line(&WakeInfo {
+                parent_short: p.short_id(),
+                newly_done: vec![(kids[0].short_id(), "Del 0".into())],
+                open_left: 0,
+            })
+        );
+        assert!(l.contains(&format!(
+            "alle del-tickets til ticket {} er afsluttet",
+            p.short_id()
+        )));
+        assert!(l.contains(&format!("(ticketId {})", p.short_id())));
+        h.advance(ENTER_DELAY_MS);
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::InProgress);
+        assert_eq!(
+            pt.history.last().unwrap().note.as_deref(),
+            Some(CHILDREN_DONE_NOTE)
+        );
+        // A Stop without submitting now: nothing open → "Ikke afleveret" as before.
+        stop(&mut h, "k1");
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        assert_eq!(h.ticket(&p.id).issue, Some(TicketIssue::NotSubmitted));
+        assert_eq!(h.detail("k1").as_deref(), Some(NOT_SUBMITTED_TEXT));
+    }
+
+    #[test]
+    fn wake_is_not_confirmed_as_delivery() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        for id in [&p.id, &kids[0].id, &kids[1].id] {
+            assert!(!DeliveryKind::Work.confirms(id, &l));
+            assert!(!DeliveryKind::Review.confirms(id, &l));
+        }
+        // UserPromptSubmit with the line and a busy status change nothing.
+        let before = h.ticket(&p.id);
+        h.submitted("k1", &l);
+        h.send(DispatchMsg::AgentBusy {
+            agent_id: "k1".into(),
+        });
+        assert_eq!(h.ticket(&p.id), before);
+        assert_eq!(h.ticket(&kids[1].id).state, S::Review);
+        // The Enter still follows, and only then the parent resumes.
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[1], enter("k1"));
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+    }
+
+    #[test]
+    fn stop_without_submit_on_parent_with_open_children_waits_without_hint() {
+        let mut h = Harness::new();
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        let p = h.queued("k1", "Byg spillet");
+        h.svc().mark_dispatched(&p.id, "k1", 2).unwrap();
+        child_in_review(&h, &p, "Del");
+        let next = h.queued("k1", "Næste");
+        stop(&mut h, "k1");
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::Waiting);
+        assert_eq!(pt.issue, None);
+        assert_eq!(h.detail("k1"), None, "no NOT_SUBMITTED_TEXT");
+        // The queue moves on.
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes()[0]
+            .1
+            .starts_with(&format!("Koordiner ticket {}: ", next.short_id())));
+
+        // Also with autoReviewOnStop: waiting, not review.
+        let mut h = Harness::new();
+        h.d.auto_review_on_stop = Some(true);
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        let p = h.queued("k1", "Byg spillet");
+        h.svc().mark_dispatched(&p.id, "k1", 2).unwrap();
+        child_in_review(&h, &p, "Del");
+        stop(&mut h, "k1");
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        assert_eq!(h.detail("k1"), None);
+    }
+
+    #[test]
+    fn blocked_ticket_is_skipped_and_delivered_when_blocker_is_done() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        // The blocker: in review with the portless agent "x".
+        let blocker = {
+            let mut s = h.svc();
+            let b = s.create("Plan", "", false, 1).unwrap();
+            s.assign(&b.id, "x", 2).unwrap();
+            s.mark_dispatched(&b.id, "x", 3).unwrap();
+            s.submit_by_agent("x", None, "plan", 4).unwrap()
+        };
+        let first = {
+            let mut s = h.svc();
+            let t = s
+                .create_by_agent_related(
+                    "Byg",
+                    "",
+                    false,
+                    None,
+                    None,
+                    None,
+                    vec![blocker.id.clone()],
+                    5,
+                )
+                .unwrap();
+            s.assign(&t.id, "a1", 6).unwrap()
+        };
+        let second = h.queued("a1", "Andet");
+        assert_eq!(first.queue_position, Some(0));
+        deliver_until_enter(&mut h, "a1");
+        assert_eq!(h.writes()[0], ("a1".into(), line(&second)));
+        h.submitted("a1", &line(&second));
+        assert_eq!(h.ticket(&second.id).state, S::InProgress);
+        // The blocked ticket keeps its place.
+        assert_eq!(h.ticket(&first.id).queue_position, Some(0));
+        assert_eq!(h.ticket(&first.id).state, S::Assigned);
+        // "Send igen" of the blocked ticket does nothing.
+        h.svc().submit_by_agent("a1", None, "ok", 7).unwrap();
+        h.send(DispatchMsg::Redispatch {
+            ticket_id: first.id.clone(),
+        });
+        assert_eq!(h.writes().len(), 2);
+        h.idle("a1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2, "still blocked");
+        // The blocker is approved: the hook's QueueChanged delivers it.
+        h.svc().approve(&blocker.id, 20).unwrap();
+        queue_changed(&mut h, "a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&first)));
+    }
+
+    #[test]
+    fn plan_delivery_switches_text_when_coordinator_lives() {
+        use prompt::{COORDINATION_PLAN_TEXT, COORDINATION_PLAN_WITH_COORDINATOR_TEXT};
+        let plan_file = |coordinator_live: bool| {
+            let mut h = Harness::new();
+            lock(&h.port.0).coordinator_live = coordinator_live;
+            h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+            let t = h.queued("p1", "Plan spillet");
+            h.idle("p1");
+            h.advance(DISPATCH_DELAY_MS);
+            assert!(h.writes()[0].1.starts_with("Koordiner ticket "));
+            h.ticket_file("p1", &t)
+        };
+        let f = plan_file(false);
+        assert!(f.contains(COORDINATION_PLAN_TEXT));
+        assert!(!f.contains("Der er en koordinator i staben"));
+        let f = plan_file(true);
+        assert!(f.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_PLAN_WITH_COORDINATOR_TEXT}\n"
+        )));
+        assert!(!f.contains(COORDINATION_PLAN_TEXT));
+
+        // No live coordinator per the port, but the ticket's parent belongs to one; the parent's
+        // own file lists its children.
+        let mut h = Harness::new();
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+        let parent = h.queued("k1", "Mål");
+        let child = {
+            let mut s = h.svc();
+            let c = s
+                .create_by_agent_related(
+                    "Plan",
+                    "",
+                    false,
+                    None,
+                    None,
+                    Some(parent.id.clone()),
+                    vec![],
+                    3,
+                )
+                .unwrap();
+            s.assign(&c.id, "p1", 4).unwrap()
+        };
+        h.idle("p1");
+        h.idle("k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let f = h.ticket_file("p1", &child);
+        assert!(f.contains(COORDINATION_PLAN_WITH_COORDINATOR_TEXT), "{f}");
+        let f = h.ticket_file("k1", &parent);
+        assert!(
+            f.contains(&format!(
+                "## Del-tickets\n{}\n- {} Plan — I kø\n",
+                prompt::CHILDREN_INTRO,
+                child.short_id()
+            )),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn review_of_parent_lists_children_and_rule() {
+        let mut h = Harness::new();
+        h.agent_on("rev", AgentStatus::Idle, SeatKind::Staff, &[Role::Reviewer]);
+        let (p, kids) = waiting_parent(&mut h, 1);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        // The coordinator submits the parent (all children done) → review, routed to "rev".
+        {
+            let mut s = h.svc();
+            s.resume_after_wake(&p.id, "k1", WOKEN_NOTE, 11).unwrap();
+            assert_eq!(
+                s.submit_by_agent("k1", None, "Samlet", 12).unwrap().state,
+                S::Review
+            );
+            s.route_review(&p.id, "rev", "bot-rev", 13).unwrap();
+        }
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        let f = fs::read_to_string(
+            prompt::review_dir(&h.root.join("rev")).join(format!("{}.md", p.short_id())),
+        )
+        .unwrap();
+        assert!(
+            f.contains(&format!(
+                "## Del-tickets (allerede reviewet)\n- {} Del 0 — Done: HEMMELIG opsummering\n## Opgaven\n",
+                kids[0].short_id()
+            )),
+            "{f}"
+        );
+        assert!(f.ends_with(&format!("{}\n", prompt::PARENT_REVIEW_RULE)));
     }
 }

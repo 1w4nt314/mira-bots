@@ -134,9 +134,35 @@ pub fn is_coordination_line_for(prompt: &str, short: &str) -> bool {
 pub enum CoordinationKind {
     /// Has the coordinator role: hand the ticket to a work agent (or split it up).
     Distribute,
-    /// Reviewer/planner without the coordinator role: split it into backlog tickets.
+    /// Reviewer/planner without the coordinator role: split it into backlog tickets (or, when
+    /// a coordinator runs, write the plan as a report; step 6a).
     Plan,
 }
+
+/// One child of the delivered ticket for the file's `## Del-tickets` (step 6a, C6.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildLine {
+    pub short: String,
+    /// The raw title (made one-line when rendered).
+    pub title: String,
+    pub state: TicketState,
+    /// Short ids of its open blockers.
+    pub open_blockers: Vec<String>,
+}
+
+/// One child of a parent in review, for the review file (step 6a, C6.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildReview {
+    pub short: String,
+    /// The raw title (made one-line when rendered).
+    pub title: String,
+    pub state: TicketState,
+    /// The child's summary (agent text: one line, cut to [`CHILD_SUMMARY_MAX_CHARS`]).
+    pub summary: Option<String>,
+}
+
+/// A child's summary in a parent's review file is cut to this many characters (then "…").
+pub const CHILD_SUMMARY_MAX_CHARS: usize = 300;
 
 /// Other work agents in the same project folder (plan4b A.5): the `## Delt projekt` section.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +190,12 @@ pub struct TicketDelivery {
     pub shared: Option<SharedProject>,
     /// "Projekter lige nu: …" (only for coordination tasks).
     pub projects: Option<ProjectList>,
+    /// A live agent has the coordinator role, or the ticket's parent belongs to one (step 6a):
+    /// a [`CoordinationKind::Plan`] task then gets
+    /// [`COORDINATION_PLAN_WITH_COORDINATOR_TEXT`].
+    pub coordinator_available: bool,
+    /// The ticket's children (`## Del-tickets`, step 6a); empty = no section.
+    pub children: Vec<ChildLine>,
 }
 
 impl TicketDelivery {
@@ -194,6 +226,18 @@ impl TicketDelivery {
         if !self.is_work() {
             self.projects = Some(ProjectList { ids, may_create });
         }
+        self
+    }
+
+    /// Adds the ticket's children (`## Del-tickets`, step 6a).
+    pub fn with_children(mut self, children: Vec<ChildLine>) -> Self {
+        self.children = children;
+        self
+    }
+
+    /// Sets [`Self::coordinator_available`] (step 6a).
+    pub fn with_coordinator(mut self, available: bool) -> Self {
+        self.coordinator_available = available;
         self
     }
 
@@ -264,10 +308,85 @@ fn project_header(t: &Ticket) -> String {
 }
 
 /// `## Koordineringsopgave` text for an agent with the coordinator role.
-pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Find en ledig arbejdsagent med mira_list_agents og giv den denne ticket med mira_assign_ticket (ticketen flytter fra dig til den, også selv om den er i gang hos dig; arbejd så ikke videre på den). Er opgaven for stor, opret del-tickets med mira_create_ticket og assignTo, og aflever denne ticket med mira_submit_for_review med en kort plan for fordelingen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers skriv hvorfor med mira_update_status og læg så ticketen tilbage i backlog med mira_unassign_ticket.";
+pub const COORDINATION_DISTRIBUTE_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Tjek først `mira_list_tickets all` for del-tickets og dubletter, der allerede findes. Kan én ledig arbejdsagent (mira_list_agents) tage hele opgaven, så giv den ticketen med mira_assign_ticket (den flytter fra dig; arbejd så ikke videre på den). Ellers opret del-tickets med mira_create_ticket: `parentId` er som standard denne ticket, `assignTo` giver dem direkte til en agent, og `blockedBy` lader en del-ticket vente på en anden — fx byg-ticketen til koderen med det samme med `blockedBy: [plan-ticketens id]`. Få, større del-tickets er bedre end mange små (højst 20 oprettelser i timen). Aflever så denne ticket med mira_submit_for_review og en kort fordelingsplan: den venter automatisk, til del-ticketsene er godkendt, og du får besked efter hver — tildel næste del-ticket eller aflever igen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers skriv hvorfor med mira_update_status og læg ticketen tilbage i backlog med mira_unassign_ticket.";
 /// `## Koordineringsopgave` text for an agent without the coordinator role (reviewer, planner,
 /// no roles): hand the ticket to a free work agent (review 5c W2), else split it up.
-pub const COORDINATION_PLAN_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Find en ledig arbejdsagent (arbejdsplads, rollen koder, researcher eller debugger, ingen ticket i gang) med mira_list_agents og giv ticketen videre med mira_handoff_ticket(ticketId, agentId); arbejd så ikke videre på den. Er der ingen ledig arbejdsagent, så del opgaven op i del-tickets med mira_create_ticket (de lander i backlog) og aflever denne ticket med planen med mira_submit_for_review, eller læg den tilbage i backlog med mira_handoff_ticket uden agentId.";
+pub const COORDINATION_PLAN_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Find en ledig arbejdsagent (arbejdsplads, rollen koder, researcher eller debugger, ingen ticket i gang) med mira_list_agents og giv ticketen videre med mira_handoff_ticket(ticketId, agentId); arbejd så ikke videre på den. Er der ingen ledig arbejdsagent, så del opgaven op i del-tickets med mira_create_ticket (`parentId` = denne ticket, så de hænger sammen; de lander i backlog), og aflever denne ticket med planen med mira_submit_for_review — eller læg den tilbage i backlog med mira_handoff_ticket uden agentId.";
+/// `## Koordineringsopgave` text for an agent without the coordinator role while a coordinator
+/// runs, or when the ticket's parent belongs to one (step 6a, C6.3): only the plan, as a report.
+pub const COORDINATION_PLAN_WITH_COORDINATOR_TEXT: &str = "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Der er en koordinator i staben: skriv planen som rapport (mira_add_report, eller `report` i mira_submit_for_review) med små, ordnede del-opgaver og klare acceptkriterier, og aflever ticketen. Opret IKKE selv del-tickets og tildel ingen; det gør koordinatoren ud fra din plan.";
+
+/// Intro of a ticket file's `## Del-tickets` section (step 6a, C6.3).
+pub const CHILDREN_INTRO: &str = "Denne ticket har del-tickets; tjek dem før du opretter nye:";
+/// The extra rule in a parent's review file (step 6a, C6.3).
+pub const PARENT_REVIEW_RULE: &str = "- Del-ticketsene er allerede reviewet hver for sig; vurdér helheden: hænger delene sammen, og er ticketens mål nået? Åbne del-tickets taler imod godkendelse.";
+/// Children named in a wake line; the rest are counted (" og {k} til").
+pub const WAKE_LINE_MAX_CHILDREN: usize = 3;
+
+/// What a wake line says (step 6a, plan A.2): the waiting parent, the children that became Done
+/// since it was last in progress (Done order; raw titles) and how many are still open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WakeInfo {
+    pub parent_short: String,
+    /// `(short id, raw title)` of the newly done children.
+    pub newly_done: Vec<(String, String)>,
+    pub open_left: usize,
+}
+
+/// `a`, `a og b`, `a, b og c` (Danish list).
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} og {last}", init.join(", ")),
+    }
+}
+
+/// The wake line typed into a waiting parent's assignee (step 6a, C6.3). Starts with "Du har
+/// fået besked:" — never with "Ticket", "Koordin…" or "Review af ticket", so the dispatcher never
+/// takes it for a delivery ([`super::dispatcher`]'s `DeliveryKind::confirms`). Only short ids and
+/// sanitised titles; never a child's summary (another agent's text, research §3.2). At most
+/// [`WAKE_LINE_MAX_CHILDREN`] children are named. One line, no `\r`/`\n`.
+pub fn wake_line(w: &WakeInfo) -> String {
+    let p = &w.parent_short;
+    let named: Vec<String> = w
+        .newly_done
+        .iter()
+        .take(WAKE_LINE_MAX_CHILDREN)
+        .map(|(short, title)| format!("{short} ({})", sanitize_title(title)))
+        .collect();
+    let more = w.newly_done.len().saturating_sub(WAKE_LINE_MAX_CHILDREN);
+    if w.open_left == 0 {
+        return match w.newly_done.last() {
+            Some((short, title)) => format!(
+                "Du har fået besked: alle del-tickets til ticket {p} er afsluttet (sidst {short}: {}). Læs opsummeringerne med mira_get_ticket, og aflever ticket {p} med mira_submit_for_review (ticketId {p}) med en samlet opsummering.",
+                sanitize_title(title)
+            ),
+            None => format!(
+                "Du har fået besked: alle del-tickets til ticket {p} er afsluttet. Aflever ticket {p} med mira_submit_for_review (ticketId {p})."
+            ),
+        };
+    }
+    let m = w.open_left;
+    let tail = format!(
+        "Tildel næste del-ticket hvis der mangler én, og aflever så ticket {p} igen med mira_submit_for_review (ticketId {p})."
+    );
+    match w.newly_done.as_slice() {
+        [(short, _)] => format!(
+            "Du har fået besked: del-ticket {} til ticket {p} er godkendt; {m} del-ticket(s) mangler stadig. Læs opsummeringen med mira_get_ticket {short}. {tail}",
+            named[0]
+        ),
+        _ => {
+            let mut list = and_list(&named);
+            if more > 0 {
+                list = format!("{} og {more} mere", named.join(", "));
+            }
+            format!(
+                "Du har fået besked: del-tickets {list} til ticket {p} er godkendt; {m} del-ticket(s) mangler stadig. Læs opsummeringerne med mira_get_ticket. {tail}"
+            )
+        }
+    }
+}
 
 /// "Bed om aflevering" (C4.7): typed like a ticket line (one write, `\r` separately). It starts
 /// with "Du", never with "Ticket", so the dispatcher can never take it for a ticket delivery.
@@ -376,11 +495,30 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: &TicketDelivery) -> String
     if let Some(kind) = delivery.coordination {
         let text = match kind {
             CoordinationKind::Distribute => COORDINATION_DISTRIBUTE_TEXT,
+            CoordinationKind::Plan if delivery.coordinator_available => {
+                COORDINATION_PLAN_WITH_COORDINATOR_TEXT
+            }
             CoordinationKind::Plan => COORDINATION_PLAN_TEXT,
         };
         out.push_str(&format!("## Koordineringsopgave\n{text}\n"));
         if let Some(list) = &delivery.projects {
             out.push_str(&project_list_text(list));
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if !delivery.children.is_empty() {
+        out.push_str(&format!("## Del-tickets\n{CHILDREN_INTRO}\n"));
+        for c in &delivery.children {
+            out.push_str(&format!(
+                "- {} {} — {}",
+                c.short,
+                one_line(&c.title),
+                c.state.label_da()
+            ));
+            if !c.open_blockers.is_empty() {
+                out.push_str(&format!(" — venter på {}", c.open_blockers.join(", ")));
+            }
             out.push('\n');
         }
         out.push('\n');
@@ -496,12 +634,29 @@ fn submitted_at(t: &Ticket) -> u64 {
         .map_or(t.updated_at, |h| h.at)
 }
 
+/// A child's summary for a parent's review file: one line, cut to [`CHILD_SUMMARY_MAX_CHARS`]
+/// with "…"; "(ingen opsummering)" when there is none.
+fn child_summary(summary: Option<&str>) -> String {
+    let s = summary.map(one_line).unwrap_or_default();
+    if s.is_empty() {
+        return "(ingen opsummering)".to_string();
+    }
+    if s.chars().count() <= CHILD_SUMMARY_MAX_CHARS {
+        return s;
+    }
+    let mut out: String = s.chars().take(CHILD_SUMMARY_MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
 /// Content of `<reviewer cwd>/.mira-bots/reviews/<short>.md` (C5.12). `author_name` turns a
-/// report author into a display name.
+/// report author into a display name. A parent (`children` not empty, step 6a) gets
+/// `## Del-tickets (allerede reviewet)` before `## Opgaven` and [`PARENT_REVIEW_RULE`].
 pub fn render_review_file(
     t: &Ticket,
     sender: Option<&ReviewSender>,
     author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
+    children: &[ChildReview],
 ) -> String {
     let short = t.short_id();
     let (sender_line, git_dir) = match sender {
@@ -548,6 +703,18 @@ pub fn render_review_file(
             at = iso_utc(r.created_at),
         ));
     }
+    if !children.is_empty() {
+        out.push_str("## Del-tickets (allerede reviewet)\n");
+        for c in children {
+            out.push_str(&format!(
+                "- {} {} — {}: {}\n",
+                c.short,
+                one_line(&c.title),
+                c.state.label_da(),
+                child_summary(c.summary.as_deref())
+            ));
+        }
+    }
     out.push_str(&format!(
         "## Opgaven\n\
          {body}\n\
@@ -556,6 +723,10 @@ pub fn render_review_file(
          - Afgør med mira_approve_ticket {short} (note: hvad du tjekkede) eller mira_reject_ticket {short} (note: hvad der mangler, konkret).\n\
          - Læg gerne en review-rapport med mira_add_report før du afgør.\n"
     ));
+    if !children.is_empty() {
+        out.push_str(PARENT_REVIEW_RULE);
+        out.push('\n');
+    }
     out
 }
 
@@ -573,6 +744,7 @@ pub fn write_review_file(
     t: &Ticket,
     sender: Option<&ReviewSender>,
     author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
+    children: &[ChildReview],
 ) -> io::Result<PathBuf> {
     let dir = review_dir(cwd);
     fs::create_dir_all(&dir)?;
@@ -583,7 +755,7 @@ pub fn write_review_file(
         }
     }
     let path = dir.join(format!("{}.md", t.short_id()));
-    fs::write(&path, render_review_file(t, sender, author_name))?;
+    fs::write(&path, render_review_file(t, sender, author_name, children))?;
     Ok(path)
 }
 
@@ -883,7 +1055,7 @@ mod tests {
         }
         assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_assign_ticket"));
         // Step 5c: both tools work on the coordinator's own ticket in progress.
-        assert!(COORDINATION_DISTRIBUTE_TEXT.contains("flytter fra dig til den"));
+        assert!(COORDINATION_DISTRIBUTE_TEXT.contains("den flytter fra dig"));
         assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_unassign_ticket"));
         assert!(COORDINATION_DISTRIBUTE_TEXT.contains("mira_list_agents"));
         assert!(COORDINATION_PLAN_TEXT.contains("mira_create_ticket"));
@@ -1046,9 +1218,12 @@ mod tests {
             name: "coder-01".into(),
             cwd: "/w/coder-01".into(),
         };
-        let f = render_review_file(&t, Some(&sender), &|a| {
-            a.agent_id.clone().unwrap_or_else(|| "dig".into())
-        });
+        let f = render_review_file(
+            &t,
+            Some(&sender),
+            &|a| a.agent_id.clone().unwrap_or_else(|| "dig".into()),
+            &[],
+        );
         assert!(f.starts_with("# Review af ticket abcdef01: Ret @login /nu\n"));
         assert!(f.contains(
             "Afsender: coder-01 (/w/coder-01)   Runde: 2 af 3   Afleveret: 2023-11-14T22:13:20Z\n"
@@ -1059,13 +1234,18 @@ mod tests {
         ));
         assert!(f.contains("- Læs ændringerne med git -C \"/w/coder-01\" diff/log/status/show;"));
         assert!(f.ends_with("- Læg gerne en review-rapport med mira_add_report før du afgør.\n"));
-        let f = render_review_file(&ticket(ID, TicketState::Review), None, &|_| String::new());
+        let f = render_review_file(
+            &ticket(ID, TicketState::Review),
+            None,
+            &|_| String::new(),
+            &[],
+        );
         assert!(f.contains("Afsender: afsenderens mappe kendes ikke længere   Runde: 1 af 3"));
         assert!(f.contains("## Opsummering fra afsenderen\n(ingen)\n## Rapporter\n(ingen)\n"));
         // An escalated ticket with a hand-picked reviewer: capped at the last round.
         let mut t = ticket(ID, TicketState::Review);
         t.review_round = MAX_REVIEW_ROUNDS;
-        let f = render_review_file(&t, None, &|_| String::new());
+        let f = render_review_file(&t, None, &|_| String::new(), &[]);
         assert!(f.contains("Runde: 3 af 3   "), "{f}");
     }
 
@@ -1074,7 +1254,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mira-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let t = review_ticket();
-        let p = write_review_file(&dir, &t, None, &|_| String::new()).unwrap();
+        let p = write_review_file(&dir, &t, None, &|_| String::new(), &[]).unwrap();
         assert_eq!(
             p,
             dir.join(".mira-bots").join("reviews").join("abcdef01.md")
@@ -1145,5 +1325,228 @@ mod tests {
         // A work delivery ignores the list.
         let w = TicketDelivery::work().with_projects(vec!["a".into()], true);
         assert_eq!(w.projects, None);
+    }
+
+    // ---- step 6a ----
+
+    fn wake(parent: &str, done: &[(&str, &str)], open_left: usize) -> String {
+        wake_line(&WakeInfo {
+            parent_short: parent.into(),
+            newly_done: done
+                .iter()
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+                .collect(),
+            open_left,
+        })
+    }
+
+    #[test]
+    fn wake_line_starts_with_du_and_never_ticket() {
+        let one = wake("pppppppp", &[("cccccccc", "Plan")], 1);
+        assert_eq!(
+            one,
+            "Du har fået besked: del-ticket cccccccc (Plan) til ticket pppppppp er godkendt; 1 del-ticket(s) mangler stadig. Læs opsummeringen med mira_get_ticket cccccccc. Tildel næste del-ticket hvis der mangler én, og aflever så ticket pppppppp igen med mira_submit_for_review (ticketId pppppppp)."
+        );
+        let last = wake("pppppppp", &[("cccccccc", "Byg")], 0);
+        assert_eq!(
+            last,
+            "Du har fået besked: alle del-tickets til ticket pppppppp er afsluttet (sidst cccccccc: Byg). Læs opsummeringerne med mira_get_ticket, og aflever ticket pppppppp med mira_submit_for_review (ticketId pppppppp) med en samlet opsummering."
+        );
+        let gone = wake("pppppppp", &[], 0);
+        assert_eq!(
+            gone,
+            "Du har fået besked: alle del-tickets til ticket pppppppp er afsluttet. Aflever ticket pppppppp med mira_submit_for_review (ticketId pppppppp)."
+        );
+        let two = wake("pppppppp", &[("aaaaaaaa", "A"), ("bbbbbbbb", "B")], 2);
+        assert!(
+            two.starts_with(
+                "Du har fået besked: del-tickets aaaaaaaa (A) og bbbbbbbb (B) til ticket pppppppp er godkendt; 2 del-ticket(s) mangler stadig. Læs opsummeringerne med mira_get_ticket. "
+            ),
+            "{two}"
+        );
+        for l in [&one, &last, &gone, &two] {
+            assert!(l.starts_with("Du har fået besked"), "{l}");
+            assert!(!l.contains(['\r', '\n', '@']), "{l:?}");
+            assert!(!l.starts_with("Ticket ") && !l.starts_with("Koordin"));
+            assert!(!l.starts_with("Review af ticket"));
+            assert!(!is_coordination_line_for(l, "pppppppp"));
+            assert!(!l.chars().any(|c| c.is_control()));
+        }
+    }
+
+    #[test]
+    fn wake_line_sanitises_titles_and_caps_children() {
+        let l = wake(
+            "pppppppp",
+            &[
+                ("aaaaaaaa", "@evil\n/compact ultrathink"),
+                ("bbbbbbbb", "B"),
+                ("cccccccc", "C"),
+                ("dddddddd", "D"),
+            ],
+            1,
+        );
+        assert!(
+            l.contains(
+                "del-tickets aaaaaaaa ((at)evil \u{2215}compact ultra-think), bbbbbbbb (B), cccccccc (C) og 1 mere til ticket pppppppp"
+            ),
+            "{l}"
+        );
+        assert!(!l.contains("dddddddd") && !l.contains('@') && !l.contains('\n'));
+        // Exactly three named.
+        let l = wake(
+            "pppppppp",
+            &[("aaaaaaaa", "A"), ("bbbbbbbb", "B"), ("cccccccc", "C")],
+            1,
+        );
+        assert!(
+            l.contains("del-tickets aaaaaaaa (A), bbbbbbbb (B) og cccccccc (C) til ticket"),
+            "{l}"
+        );
+        // The last-child title is sanitised too.
+        let l = wake("pppppppp", &[("aaaaaaaa", "x\r\ny:z")], 0);
+        assert!(l.contains("(sidst aaaaaaaa: x y: z)"), "{l}");
+    }
+
+    #[test]
+    fn step6a_texts_match_c6_3() {
+        assert_eq!(
+            COORDINATION_DISTRIBUTE_TEXT,
+            "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Tjek først `mira_list_tickets all` for del-tickets og dubletter, der allerede findes. Kan én ledig arbejdsagent (mira_list_agents) tage hele opgaven, så giv den ticketen med mira_assign_ticket (den flytter fra dig; arbejd så ikke videre på den). Ellers opret del-tickets med mira_create_ticket: `parentId` er som standard denne ticket, `assignTo` giver dem direkte til en agent, og `blockedBy` lader en del-ticket vente på en anden — fx byg-ticketen til koderen med det samme med `blockedBy: [plan-ticketens id]`. Få, større del-tickets er bedre end mange små (højst 20 oprettelser i timen). Aflever så denne ticket med mira_submit_for_review og en kort fordelingsplan: den venter automatisk, til del-ticketsene er godkendt, og du får besked efter hver — tildel næste del-ticket eller aflever igen. Er der ingen ledig arbejdsagent, start en fra en profil med mira_spawn_agent (mira_list_profiles) hvis der er en fri arbejdsplads; ellers skriv hvorfor med mira_update_status og læg ticketen tilbage i backlog med mira_unassign_ticket."
+        );
+        assert!(COORDINATION_PLAN_TEXT.ends_with(
+            "Er der ingen ledig arbejdsagent, så del opgaven op i del-tickets med mira_create_ticket (`parentId` = denne ticket, så de hænger sammen; de lander i backlog), og aflever denne ticket med planen med mira_submit_for_review — eller læg den tilbage i backlog med mira_handoff_ticket uden agentId."
+        ));
+        assert!(COORDINATION_PLAN_TEXT.starts_with(
+            "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Find en ledig arbejdsagent (arbejdsplads, rollen koder, researcher eller debugger, ingen ticket i gang) med mira_list_agents og giv ticketen videre med mira_handoff_ticket(ticketId, agentId); arbejd så ikke videre på den. Er der ingen"
+        ));
+        assert_eq!(
+            COORDINATION_PLAN_WITH_COORDINATOR_TEXT,
+            "Du sidder på en stabsplads eller har ingen arbejdsrolle: udfør IKKE opgaven selv (skriv ingen kode og ingen filer; brug heller ikke Bash til at skrive eller ændre filer (ingen `>`/heredoc/sed -i)). Der er en koordinator i staben: skriv planen som rapport (mira_add_report, eller `report` i mira_submit_for_review) med små, ordnede del-opgaver og klare acceptkriterier, og aflever ticketen. Opret IKKE selv del-tickets og tildel ingen; det gør koordinatoren ud fra din plan."
+        );
+        assert_eq!(
+            PARENT_REVIEW_RULE,
+            "- Del-ticketsene er allerede reviewet hver for sig; vurdér helheden: hænger delene sammen, og er ticketens mål nået? Åbne del-tickets taler imod godkendelse."
+        );
+        assert_eq!(
+            CHILDREN_INTRO,
+            "Denne ticket har del-tickets; tjek dem før du opretter nye:"
+        );
+    }
+
+    fn child(short: &str, title: &str, state: TicketState, blockers: &[&str]) -> ChildLine {
+        ChildLine {
+            short: short.into(),
+            title: title.into(),
+            state,
+            open_blockers: blockers.iter().map(|b| b.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn render_file_lists_children_with_states_and_blockers() {
+        let t = ticket(ID, TicketState::Assigned);
+        let d = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator])
+            .with_projects(vec!["p".into()], false)
+            .with_children(vec![
+                child("aaaaaaaa", "Plan\nspil", TicketState::Done, &[]),
+                child(
+                    "bbbbbbbb",
+                    "Byg",
+                    TicketState::Assigned,
+                    &["aaaaaaaa", "cccccccc"],
+                ),
+            ]);
+        let f = render_file(&t, 0, &d);
+        let section = "## Del-tickets\nDenne ticket har del-tickets; tjek dem før du opretter nye:\n- aaaaaaaa Plan spil — Done\n- bbbbbbbb Byg — I kø — venter på aaaaaaaa, cccccccc\n\n";
+        assert!(f.contains(section), "{f}");
+        let at = f.find("## Del-tickets").unwrap();
+        assert!(f.find("## Koordineringsopgave").unwrap() < at);
+        assert!(at < f.find("## Regler").unwrap());
+        // A work delivery: after nothing, before `## Delt projekt`.
+        let w = TicketDelivery::work()
+            .with_shared("p", vec!["coder-02".into()])
+            .with_children(vec![child("aaaaaaaa", "A", TicketState::Review, &[])]);
+        let f = render_file(&t, 0, &w);
+        let at = f.find("## Del-tickets").unwrap();
+        assert!(at < f.find("## Delt projekt").unwrap());
+        assert!(f.contains("- aaaaaaaa A — Review\n"));
+    }
+
+    #[test]
+    fn render_file_without_children_has_no_section() {
+        let t = ticket(ID, TicketState::Assigned);
+        for d in [
+            TicketDelivery::work(),
+            TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator]),
+            TicketDelivery::for_agent(SeatKind::Staff, &[Role::Planner]).with_children(Vec::new()),
+        ] {
+            assert!(!render_file(&t, 0, &d).contains("Del-tickets"));
+        }
+    }
+
+    #[test]
+    fn plan_text_depends_on_coordinator() {
+        let t = ticket(ID, TicketState::Assigned);
+        let plan = TicketDelivery::for_agent(SeatKind::Staff, &[Role::Planner]);
+        let f = render_file(&t, 0, &plan);
+        assert!(f.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_PLAN_TEXT}\n"
+        )));
+        assert!(!f.contains("Der er en koordinator i staben"));
+        let f = render_file(&t, 0, &plan.clone().with_coordinator(true));
+        assert!(f.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_PLAN_WITH_COORDINATOR_TEXT}\n"
+        )));
+        assert!(!f.contains(COORDINATION_PLAN_TEXT));
+        // The coordinator's own text and a work delivery ignore the flag.
+        let dist =
+            TicketDelivery::for_agent(SeatKind::Staff, &[Role::Coordinator]).with_coordinator(true);
+        assert!(render_file(&t, 0, &dist).contains(COORDINATION_DISTRIBUTE_TEXT));
+        let w = TicketDelivery::work().with_coordinator(true);
+        assert!(!render_file(&t, 0, &w).contains("Koordineringsopgave"));
+        // The line is the same coordination line either way.
+        assert_eq!(
+            line_for(&t, &plan),
+            line_for(&t, &plan.clone().with_coordinator(true))
+        );
+    }
+
+    #[test]
+    fn review_file_for_parent_lists_children_and_rule() {
+        let t = review_ticket();
+        let long = "æ".repeat(400);
+        let children = vec![
+            ChildReview {
+                short: "aaaaaaaa".into(),
+                title: "Plan\nspil".into(),
+                state: TicketState::Done,
+                summary: Some("Planen\r\ner skrevet".into()),
+            },
+            ChildReview {
+                short: "bbbbbbbb".into(),
+                title: "Byg".into(),
+                state: TicketState::Done,
+                summary: Some(long),
+            },
+            ChildReview {
+                short: "cccccccc".into(),
+                title: "Test".into(),
+                state: TicketState::Assigned,
+                summary: None,
+            },
+        ];
+        let f = render_review_file(&t, None, &|_| String::new(), &children);
+        let cut = format!("{}…", "æ".repeat(CHILD_SUMMARY_MAX_CHARS));
+        let section = format!(
+            "## Del-tickets (allerede reviewet)\n- aaaaaaaa Plan spil — Done: Planen  er skrevet\n- bbbbbbbb Byg — Done: {cut}\n- cccccccc Test — I kø: (ingen opsummering)\n## Opgaven\n"
+        );
+        assert!(f.contains(&section), "{f}");
+        assert!(f.ends_with(&format!("{PARENT_REVIEW_RULE}\n")), "{f}");
+        let rules = f.find("## Regler").unwrap();
+        assert!(f.find(PARENT_REVIEW_RULE).unwrap() > rules);
+        // Without children: unchanged.
+        let f = render_review_file(&t, None, &|_| String::new(), &[]);
+        assert!(!f.contains("Del-tickets") && !f.contains(PARENT_REVIEW_RULE));
     }
 }

@@ -22,16 +22,20 @@ pub enum TicketState {
     Review,
     Done,
     Rejected,
+    /// A parent whose assignee submitted it while children were still open (step 6a): it keeps
+    /// its assignee but is not "current"; it is woken when a child is done.
+    Waiting,
 }
 
 impl TicketState {
-    pub const ALL: [TicketState; 6] = [
+    pub const ALL: [TicketState; 7] = [
         TicketState::Backlog,
         TicketState::Assigned,
         TicketState::InProgress,
         TicketState::Review,
         TicketState::Done,
         TicketState::Rejected,
+        TicketState::Waiting,
     ];
 
     /// Danish UI label (same as `STATE_LABEL` in the frontend).
@@ -43,6 +47,7 @@ impl TicketState {
             TicketState::Review => "Review",
             TicketState::Done => "Done",
             TicketState::Rejected => "Afvist",
+            TicketState::Waiting => "Venter",
         }
     }
 
@@ -55,6 +60,7 @@ impl TicketState {
             TicketState::Review => "review",
             TicketState::Done => "done",
             TicketState::Rejected => "rejected",
+            TicketState::Waiting => "waiting",
         }
     }
 }
@@ -137,6 +143,13 @@ pub struct Ticket {
     /// The project the ticket belongs to (plan4b A.2); absent in step 1–5 files.
     #[serde(default)]
     pub project: Option<ProjectRef>,
+    /// The parent ticket (step 6a): this ticket is one of its children. Absent before 6a.
+    #[serde(default)]
+    pub parent_id: Option<TicketId>,
+    /// Tickets that must be Done before this one is delivered (step 6a). A missing id (deleted
+    /// ticket) does not block. Absent before 6a.
+    #[serde(default)]
+    pub blocked_by: Vec<TicketId>,
 }
 
 impl Ticket {
@@ -172,6 +185,10 @@ pub struct TicketSummary {
     pub report_count: usize,
     /// Copy of `Ticket.project` (badge and filter without `get_ticket`).
     pub project: Option<ProjectRef>,
+    /// Copy of `Ticket.parent_id` (step 6a; child counts are derived in the UI).
+    pub parent_id: Option<TicketId>,
+    /// Copy of `Ticket.blocked_by` (step 6a).
+    pub blocked_by: Vec<TicketId>,
 }
 
 impl From<&Ticket> for TicketSummary {
@@ -196,6 +213,8 @@ impl From<&Ticket> for TicketSummary {
             reviewer_agent_id: t.reviewer_agent_id.clone(),
             report_count: t.reports.len(),
             project: t.project.clone(),
+            parent_id: t.parent_id.clone(),
+            blocked_by: t.blocked_by.clone(),
         }
     }
 }
@@ -391,6 +410,24 @@ pub enum TicketError {
     },
     #[error("Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent")]
     ProjectChangeNotAllowed,
+    // ---- step 6a (forløb) ----
+    #[error("Forælderen findes ikke")]
+    ParentNotFound,
+    #[error("Forælderen er allerede færdig (Done)")]
+    ParentDone,
+    #[error("Del-ticketen hører til «{child}», men forælderen til «{parent}»")]
+    ParentProjectMismatch { parent: String, child: String },
+    #[error("Blokeringen {0} findes ikke")]
+    BlockerNotFound(String),
+    #[error("En ticket kan ikke blokeres af sin egen forælder")]
+    BlockedByAncestor,
+    #[error("Relationen ville danne en cyklus")]
+    Cycle,
+    /// The ticket has open blockers (short ids, comma-separated).
+    #[error("Ticketen venter på {0}")]
+    Blocked(String),
+    #[error("Højst 10 blokeringer pr. ticket")]
+    TooManyBlockers,
 }
 
 /// The rules of this workspace (plan5 C5.1): the "Regler" section of every profile's system
@@ -473,6 +510,8 @@ pub(crate) mod test_support {
             reviewer_agent_id: None,
             reports: Vec::new(),
             project: None,
+            parent_id: None,
+            blocked_by: Vec::new(),
         }
     }
 }
@@ -497,8 +536,15 @@ mod tests {
                 json!("inProgress"),
                 json!("review"),
                 json!("done"),
-                json!("rejected")
+                json!("rejected"),
+                json!("waiting")
             ]
+        );
+        assert_eq!(TicketState::ALL.len(), 7);
+        assert_eq!(TicketState::Waiting.label_da(), "Venter");
+        assert_eq!(
+            serde_json::from_value::<TicketState>(json!("waiting")).unwrap(),
+            TicketState::Waiting
         );
         for s in TicketState::ALL {
             assert_eq!(serde_json::to_value(s).unwrap(), json!(s.as_str()));
@@ -570,6 +616,8 @@ mod tests {
             "createdAt",
             "updatedAt",
             "history",
+            "parentId",
+            "blockedBy",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
         }
@@ -614,6 +662,35 @@ mod tests {
                 t.project
             );
         }
+
+        // step 6a: relations in both.
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(v["parentId"], json!(null));
+        assert_eq!(v["blockedBy"], json!([]));
+        assert_eq!(s["parentId"], json!(null));
+        assert_eq!(s["blockedBy"], json!([]));
+        t.parent_id = Some("p1".into());
+        t.blocked_by = vec!["b1".into(), "b2".into()];
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["parentId"], json!("p1"));
+        assert_eq!(v["blockedBy"], json!(["b1", "b2"]));
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(s["parentId"], json!("p1"));
+        assert_eq!(s["blockedBy"], json!(["b1", "b2"]));
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+    }
+
+    #[test]
+    fn file_without_relations_loads_with_defaults() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Assigned)).unwrap();
+        let o = v.as_object_mut().unwrap();
+        assert!(o.remove("parentId").is_some());
+        assert!(o.remove("blockedBy").is_some());
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!(t.parent_id, None);
+        assert!(t.blocked_by.is_empty());
+        assert_eq!(t, ticket("t1", TicketState::Assigned));
     }
 
     #[test]
@@ -686,6 +763,14 @@ mod tests {
             "Kan ikke flytte en ticket fra Done til I gang"
         );
         assert_eq!(
+            TicketError::IllegalTransition {
+                from: TicketState::Waiting,
+                to: TicketState::Review
+            }
+            .to_string(),
+            "Kan ikke flytte en ticket fra Venter til Review"
+        );
+        assert_eq!(
             TicketError::Validation("Titel må ikke være tom".into()).to_string(),
             "Titel må ikke være tom"
         );
@@ -730,6 +815,41 @@ mod tests {
             TicketError::ProjectChangeNotAllowed.to_string(),
             "Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent"
         );
+        // step 6a
+        let table = [
+            (TicketError::ParentNotFound, "Forælderen findes ikke"),
+            (
+                TicketError::ParentDone,
+                "Forælderen er allerede færdig (Done)",
+            ),
+            (
+                TicketError::ParentProjectMismatch {
+                    parent: "a".into(),
+                    child: "b".into(),
+                },
+                "Del-ticketen hører til «b», men forælderen til «a»",
+            ),
+            (
+                TicketError::BlockerNotFound("abc".into()),
+                "Blokeringen abc findes ikke",
+            ),
+            (
+                TicketError::BlockedByAncestor,
+                "En ticket kan ikke blokeres af sin egen forælder",
+            ),
+            (TicketError::Cycle, "Relationen ville danne en cyklus"),
+            (
+                TicketError::Blocked("a1b2c3d4, e5f6a7b8".into()),
+                "Ticketen venter på a1b2c3d4, e5f6a7b8",
+            ),
+            (
+                TicketError::TooManyBlockers,
+                "Højst 10 blokeringer pr. ticket",
+            ),
+        ];
+        for (e, text) in table {
+            assert_eq!(e.to_string(), text);
+        }
     }
 
     #[test]

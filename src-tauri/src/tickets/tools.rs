@@ -33,12 +33,12 @@ use serde_json::{json, Map, Value};
 
 use super::model::{ReportAuthor, Ticket, TicketError, TicketReport, TicketState};
 use super::prompt::{clean_body, one_line};
-use super::service::TicketService;
+use super::service::{norm_title, TicketService};
 use super::{validate_report, TicketsCtx};
 use crate::agent::roles::{wire_names, Role};
 use crate::agent::{AgentInfo, SeatKind};
 use crate::config::{
-    AGENT_NOTE_MAX_CHARS, CREATE_TICKET_RATE_LIMIT, CREATE_TICKET_RATE_WINDOW_MS,
+    AGENT_NOTE_MAX_CHARS, BLOCKED_BY_MAX, CREATE_TICKET_RATE_LIMIT, CREATE_TICKET_RATE_WINDOW_MS,
     REPORT_ON_SUBMIT_TITLE, REVIEW_NOTE_MAX_CHARS,
 };
 use crate::hooks::status::AgentStatus;
@@ -59,6 +59,8 @@ pub const SPAWN_UNAVAILABLE: &str = "Start af agenter er ikke tilgængelig";
 /// `mira_get_ticket` has the full text. Keeps a list of any realistic length far below
 /// mira-mcp's `MAX_REPLY` (N1); the UI's `tickets-changed` still carries the full summary.
 pub const LIST_SUMMARY_MAX_CHARS: usize = 160;
+/// `blockedBy` on `mira_create_ticket` is not a list of ids (or too long; step 6a).
+pub const BLOCKED_BY_ERROR: &str = "blockedBy skal være en liste af ticket-id'er (højst 10)";
 
 /// `mira_spawn_agent`'s request to the app's spawn path (`commands::spawn_for_tool`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,12 +123,37 @@ fn opt_id<'a>(args: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>
     )
 }
 
+/// An optional list of ids (`blockedBy`, step 6a): absent/`null` = empty; every entry a
+/// non-blank string (trimmed), at most [`BLOCKED_BY_MAX`]; otherwise [`BLOCKED_BY_ERROR`].
+fn opt_id_list(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
+    let items = match args.get(key) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(BLOCKED_BY_ERROR.into()),
+    };
+    if items.len() > BLOCKED_BY_MAX {
+        return Err(BLOCKED_BY_ERROR.into());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for v in items {
+        let s = v.as_str().map(str::trim).unwrap_or_default();
+        if s.is_empty() || s.chars().count() > 64 {
+            return Err(BLOCKED_BY_ERROR.into());
+        }
+        if !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// A required id argument, trimmed.
 fn req_id<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
     opt_id(args, key)?.ok_or_else(|| format!("{key} skal være en tekst på 1–64 tegn"))
 }
 
-/// `{"id","shortId","title","state","skipReview","project"}` (C4.4 + step 4b).
+/// `{"id","shortId","title","state","skipReview","project","parentId","blockedBy"}` (C4.4 +
+/// step 4b + step 6a C6.2).
 fn created_json(t: &Ticket) -> Value {
     json!({
         "id": t.id,
@@ -135,6 +162,8 @@ fn created_json(t: &Ticket) -> Value {
         "state": t.state,
         "skipReview": t.skip_review,
         "project": t.project,
+        "parentId": t.parent_id,
+        "blockedBy": t.blocked_by,
     })
 }
 
@@ -405,31 +434,68 @@ impl ToolsCtx {
             None => None,
         };
         let assign_to = target.as_ref().map(|t| t.id.clone());
-        // The project: explicit (checked), else the assignTo agent's, else the creator's
-        // (plan4b A.2).
+        // Step 6a (plan A.3): `parentId` (full or short id; "none" = no parent); absent = the
+        // creator's ticket in progress, but only for the coordinator role.
+        let parent: Option<Ticket> = match opt_id(args, "parentId")? {
+            Some(p) if p.eq_ignore_ascii_case("none") => None,
+            Some(p) => Some(
+                self.tickets
+                    .read(|s| s.get_by_any_id(p))
+                    .ok_or(TicketError::ParentNotFound)?,
+            ),
+            None if agent.roles.contains(&Role::Coordinator) => {
+                self.tickets.read(|s| s.current_for_agent(agent_id))
+            }
+            None => None,
+        };
+        // `blockedBy`: every id must exist (stored as full ids).
+        let mut blocked_by: Vec<String> = Vec::new();
+        for b in opt_id_list(args, "blockedBy")? {
+            let t = self
+                .tickets
+                .read(|s| s.get_by_any_id(&b))
+                .ok_or(TicketError::BlockerNotFound(b))?;
+            if !blocked_by.contains(&t.id) {
+                blocked_by.push(t.id);
+            }
+        }
+        // The project: explicit (checked), else the parent's (step 6a), else the assignTo
+        // agent's, else the creator's (plan4b A.2).
         let mut project = match parse_project(args)? {
             Some(p) => self.agent_project(p)?,
-            None => target
-                .as_ref()
-                .and_then(|t| t.project.clone())
-                .or_else(|| agent.project.clone())
-                .map(ProjectRef::Existing),
+            None => parent.as_ref().and_then(|p| p.project.clone()).or_else(|| {
+                target
+                    .as_ref()
+                    .and_then(|t| t.project.clone())
+                    .or_else(|| agent.project.clone())
+                    .map(ProjectRef::Existing)
+            }),
         };
         if let Some(t) = &target {
             if let Some(p) = self.target_project(project.as_ref(), t)? {
                 project = Some(ProjectRef::Existing(p));
             }
         }
+        // Duplicate guard (plan A.8): an open ticket with the same normalised title in the same
+        // project; the ticket is created anyway, the answer warns.
+        let duplicate = self
+            .tickets
+            .read(|s| s.find_open_by_title(&norm_title(&title), project.as_ref()))
+            .into_iter()
+            .next();
         if self.recent_creates(agent_id, now) >= CREATE_TICKET_RATE_LIMIT {
             return Err(TicketError::RateLimited.into());
         }
+        let parent_id = parent.as_ref().map(|p| p.id.clone());
         let t = self.tickets.mutate(|s| {
-            s.create_by_agent(
+            s.create_by_agent_related(
                 &title,
                 body.trim(),
                 skip_review,
                 assign_to.as_deref().map(|a| (a, agent.name.as_str())),
                 project,
+                parent_id,
+                blocked_by,
                 now,
             )
         })?;
@@ -437,8 +503,26 @@ impl ToolsCtx {
             .entry(agent_id.to_string())
             .or_default()
             .push_back(now);
+        let relations = {
+            let mut r = String::new();
+            if let Some(p) = &t.parent_id {
+                r.push_str(&format!(", parent {}", super::model::short_id(p)));
+            }
+            if !t.blocked_by.is_empty() {
+                let ids: Vec<String> = t
+                    .blocked_by
+                    .iter()
+                    .map(|b| super::model::short_id(b))
+                    .collect();
+                r.push_str(&format!(", blocked by {}", ids.join(" ")));
+            }
+            if let Some(d) = &duplicate {
+                r.push_str(&format!(", duplicate of {}", d.short_id()));
+            }
+            r
+        };
         log::info!(
-            "agent {agent_id} created ticket {} (title {} chars, body {} chars){}",
+            "agent {agent_id} created ticket {} (title {} chars, body {} chars){}{relations}",
             t.short_id(),
             t.title.chars().count(),
             t.body.chars().count(),
@@ -448,9 +532,19 @@ impl ToolsCtx {
                 .unwrap_or_default()
         );
         let mut v = created_json(&t);
-        if let (Some(target), Value::Object(m)) = (&assign_to, &mut v) {
-            m.insert("assigneeAgentId".into(), Value::String(target.clone()));
-            self.tickets.notify([target.as_str()]);
+        if let Value::Object(m) = &mut v {
+            if let Some(target) = &assign_to {
+                m.insert("assigneeAgentId".into(), Value::String(target.clone()));
+                self.tickets.notify([target.as_str()]);
+            }
+            if let Some(d) = &duplicate {
+                let short = d.short_id();
+                m.insert(
+                    "warnings".into(),
+                    json!([format!("Ligner den åbne ticket {short} i samme projekt")]),
+                );
+                m.insert("duplicateOf".into(), Value::String(short));
+            }
         }
         Ok(v)
     }
@@ -550,8 +644,21 @@ impl ToolsCtx {
             "state": t.state,
             "summary": t.summary,
         });
-        if let (Some(r), Value::Object(m)) = (report_id, &mut v) {
-            m.insert("reportId".into(), Value::String(r));
+        if let Value::Object(m) = &mut v {
+            // Step 6a (C6.2): a parent with open children waits instead of going to review.
+            if t.state == TicketState::Waiting {
+                let n = self.tickets.read(|s| s.open_children_count(&t.id));
+                m.insert("openChildren".into(), json!(n));
+                m.insert(
+                    "message".into(),
+                    Value::String(format!(
+                        "Ticketen venter på {n} del-ticket(s); du får besked når de er godkendt. Du kan tage næste ticket imens."
+                    )),
+                );
+            }
+            if let Some(r) = report_id {
+                m.insert("reportId".into(), Value::String(r));
+            }
         }
         Ok(v)
     }
@@ -568,7 +675,8 @@ impl ToolsCtx {
                 if t.assignee_agent_id.as_deref() != Some(agent_id) {
                     return Err(TicketError::NotYours.into());
                 }
-                if t.state != TicketState::InProgress {
+                // Step 6a: a waiting parent of its own may be submitted again.
+                if !matches!(t.state, TicketState::InProgress | TicketState::Waiting) {
                     return Err(TicketError::NotInProgress.into());
                 }
                 t
@@ -1173,7 +1281,7 @@ mod tests {
         let tk = t.ticket(id);
         assert_eq!(
             r,
-            json!({"id":id,"shortId":tk.short_id(),"title":"Følg op på login","state":"backlog","skipReview":true,"project":"p"})
+            json!({"id":id,"shortId":tk.short_id(),"title":"Følg op på login","state":"backlog","skipReview":true,"project":"p","parentId":null,"blockedBy":[]})
         );
         assert_eq!(tk.source, TicketSource::Agent);
         assert_eq!(tk.state, TicketState::Backlog);
@@ -3120,5 +3228,282 @@ mod tests {
             ),
             Err("Ticketen er ikke i gang".into())
         );
+    }
+
+    // ---- step 6a: parentId, blockedBy, duplicates, waiting ----
+
+    /// A user ticket in project `p` in progress for the coordinator `k` (a staff seat).
+    fn coordinator_parent(t: &T, title: &str) -> Ticket {
+        t.in_progress(&t.k.clone(), title, false)
+    }
+
+    #[test]
+    fn create_with_parent_inherits_project_and_links() {
+        let mut t = setup();
+        // A parent in project "p" that the coordinator does not work on (explicit parentId).
+        let p = Some(ProjectRef::Existing("p".into()));
+        let parent =
+            t.tc.ctx
+                .mutate(|s| s.create_in("Forælder", "", false, p, 1))
+                .unwrap();
+        let blocker =
+            t.tc.ctx
+                .mutate(|s| s.create_in("Plan", "", false, None, 1))
+                .unwrap();
+        t.tc.sent();
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_create_ticket",
+                json!({"title":"Byg","parentId": parent.short_id(),"blockedBy":[blocker.short_id()]}),
+                2,
+            )
+            .unwrap();
+        let tk = t.ticket(r["id"].as_str().unwrap());
+        assert_eq!(tk.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(tk.blocked_by, vec![blocker.id.clone()]);
+        assert_eq!(tk.project, Some(ProjectRef::Existing("p".into())));
+        assert_eq!(r["project"], "p");
+        assert_eq!(r["parentId"], json!(parent.id));
+        assert_eq!(r["blockedBy"], json!([blocker.id]));
+        assert!(r.get("warnings").is_none() && r.get("duplicateOf").is_none());
+        // No assignTo: nobody to notify.
+        assert!(t.tc.sent().is_empty());
+    }
+
+    #[test]
+    fn create_defaults_parent_only_for_coordinator() {
+        let t = setup();
+        // A coder with a ticket in progress: no default parent (research fund 6).
+        t.in_progress(&t.a.clone(), "Koderens", false);
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_create_ticket",
+                json!({"title":"Opfølger"}),
+                4,
+            )
+            .unwrap();
+        assert_eq!(r["parentId"], Value::Null);
+        // The coordinator: its ticket in progress is the parent.
+        let parent = coordinator_parent(&t, "Koordinering");
+        let r = t
+            .call(Some(&t.k), "mira_create_ticket", json!({"title":"Del"}), 5)
+            .unwrap();
+        assert_eq!(r["parentId"], json!(parent.id));
+        assert_eq!(r["project"], "p", "inherited from the parent");
+        // "none" (any case) = no parent.
+        for none in ["none", "NONE"] {
+            let r = t
+                .call(
+                    Some(&t.k),
+                    "mira_create_ticket",
+                    json!({"title":"Løs","parentId": none,"project":"p"}),
+                    6,
+                )
+                .unwrap();
+            assert_eq!(r["parentId"], Value::Null, "{none}");
+        }
+        // A coder may name a parent explicitly.
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_create_ticket",
+                json!({"title":"Del 2","parentId": parent.short_id()}),
+                7,
+            )
+            .unwrap();
+        assert_eq!(r["parentId"], json!(parent.id));
+    }
+
+    #[test]
+    fn create_rejects_project_mismatch_and_unknown_blocker() {
+        let t = setup();
+        std::fs::create_dir_all(t.tc.ctx.workspace.root().join("q")).unwrap();
+        let parent = coordinator_parent(&t, "Koordinering");
+        let err = |args: Value| {
+            t.call(Some(&t.k), "mira_create_ticket", args, 5)
+                .unwrap_err()
+        };
+        assert_eq!(
+            err(json!({"title":"x","project":"q"})),
+            "Del-ticketen hører til «q», men forælderen til «p»"
+        );
+        assert_eq!(
+            err(json!({"title":"x","parentId":"nope"})),
+            "Forælderen findes ikke"
+        );
+        assert_eq!(
+            err(json!({"title":"x","blockedBy":["nope"]})),
+            "Blokeringen nope findes ikke"
+        );
+        assert_eq!(
+            err(json!({"title":"x","blockedBy":[parent.short_id()]})),
+            "En ticket kan ikke blokeres af sin egen forælder"
+        );
+        assert_eq!(
+            err(json!({"title":"x","blockedBy":"abc"})),
+            BLOCKED_BY_ERROR
+        );
+        assert_eq!(err(json!({"title":"x","blockedBy":[""]})), BLOCKED_BY_ERROR);
+        assert_eq!(err(json!({"title":"x","blockedBy":[5]})), BLOCKED_BY_ERROR);
+        let eleven: Vec<String> = (0..11).map(|i| format!("id{i}")).collect();
+        assert_eq!(
+            err(json!({"title":"x","blockedBy": eleven})),
+            BLOCKED_BY_ERROR
+        );
+        // Nothing but the parent was created.
+        assert_eq!(t.tc.ctx.read(TicketService::len), 1);
+    }
+
+    #[test]
+    fn create_warns_on_duplicate_title_but_creates() {
+        let t = setup();
+        let first = t
+            .call(
+                Some(&t.a),
+                "mira_create_ticket",
+                json!({"title":"  Byg  SPIL "}),
+                1,
+            )
+            .unwrap();
+        assert!(first.get("warnings").is_none());
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_create_ticket",
+                json!({"title":"byg spil"}),
+                2,
+            )
+            .unwrap();
+        let short = first["shortId"].as_str().unwrap();
+        assert_eq!(
+            r["warnings"],
+            json!([format!("Ligner den åbne ticket {short} i samme projekt")])
+        );
+        assert_eq!(r["duplicateOf"], json!(short));
+        assert_eq!(r["state"], "backlog", "created anyway");
+        assert_eq!(t.tc.ctx.read(TicketService::len), 2);
+        // Another project: no warning.
+        let q = t.agent_in_project("q");
+        let r = t
+            .call(
+                Some(&q),
+                "mira_create_ticket",
+                json!({"title":"Byg spil"}),
+                3,
+            )
+            .unwrap();
+        assert!(r.get("warnings").is_none(), "{r}");
+        // A Done ticket does not count.
+        let done = t.in_progress(&t.b.clone(), "Færdig sag", true);
+        t.tc.ctx
+            .mutate(|s| s.submit_by_agent(&t.b, None, "ok", 4))
+            .unwrap();
+        assert_eq!(t.ticket(&done.id).state, TicketState::Done);
+        let r = t
+            .call(
+                Some(&t.a),
+                "mira_create_ticket",
+                json!({"title":"færdig  sag"}),
+                5,
+            )
+            .unwrap();
+        assert!(r.get("duplicateOf").is_none(), "{r}");
+    }
+
+    #[test]
+    fn submit_parent_with_open_children_reports_waiting() {
+        let mut t = setup();
+        let parent = coordinator_parent(&t, "Koordinering");
+        let child = t
+            .call(Some(&t.k), "mira_create_ticket", json!({"title":"Del"}), 4)
+            .unwrap();
+        assert_eq!(child["parentId"], json!(parent.id));
+        t.tc.sent();
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_submit_for_review",
+                json!({"summary":"Fordelt"}),
+                5,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "waiting");
+        assert_eq!(r["openChildren"], 1);
+        assert_eq!(
+            r["message"],
+            "Ticketen venter på 1 del-ticket(s); du får besked når de er godkendt. Du kan tage næste ticket imens."
+        );
+        assert_eq!(r["summary"], "Fordelt");
+        let tk = t.ticket(&parent.id);
+        assert_eq!(tk.state, TicketState::Waiting);
+        assert_eq!(tk.assignee_agent_id.as_deref(), Some(t.k.as_str()));
+        // The agent is free for its queue; nothing went to review.
+        assert_eq!(
+            t.tc.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: t.k.clone()
+            }]
+        );
+        assert_eq!(t.tc.ctx.read(|s| s.current_for_agent(&t.k)), None);
+        // Submitting the waiting parent again (by ticketId) keeps it waiting.
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_submit_for_review",
+                json!({"summary":"Stadig","ticketId": parent.short_id()}),
+                6,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "waiting");
+        // A plain submit has no waiting fields.
+        let other = t.in_progress(&t.b.clone(), "Alene", false);
+        let r = t
+            .call(
+                Some(&t.b),
+                "mira_submit_for_review",
+                json!({"summary":"ok"}),
+                7,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "review");
+        assert!(r.get("openChildren").is_none() && r.get("message").is_none());
+        assert_eq!(t.ticket(&other.id).state, TicketState::Review);
+    }
+
+    #[test]
+    fn list_mine_includes_waiting() {
+        let t = setup();
+        let parent = coordinator_parent(&t, "Koordinering");
+        t.call(Some(&t.k), "mira_create_ticket", json!({"title":"Del"}), 4)
+            .unwrap();
+        t.call(
+            Some(&t.k),
+            "mira_submit_for_review",
+            json!({"summary":"Fordelt"}),
+            5,
+        )
+        .unwrap();
+        let r = t
+            .call(Some(&t.k), "mira_list_tickets", json!({}), 6)
+            .unwrap();
+        let mine = r["tickets"].as_array().unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["id"], json!(parent.id));
+        assert_eq!(mine[0]["state"], "waiting");
+        // `all` shows the relations.
+        let r = t
+            .call(Some(&t.k), "mira_list_tickets", json!({"filter":"all"}), 6)
+            .unwrap();
+        let child = r["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] != json!(parent.id))
+            .unwrap()
+            .clone();
+        assert_eq!(child["parentId"], json!(parent.id));
+        assert_eq!(child["blockedBy"], json!([]));
     }
 }

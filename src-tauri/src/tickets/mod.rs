@@ -44,7 +44,10 @@ use model::{
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
 pub use service::RejectReturn;
-use service::{ReviewCounts, TicketLinks, TicketService, REVIEWER_REMOVED_NOTE};
+use service::{
+    relation_effects, RelationEffects, ReviewCounts, TicketLinks, TicketService,
+    REVIEWER_REMOVED_NOTE,
+};
 use store::JsonFileStore;
 
 /// History note when an agent's process ended on its own.
@@ -149,8 +152,9 @@ impl TicketsCtx {
 
     /// Runs `f` under the service lock (which also saves). On success: syncs every agent's
     /// ticket link, emits `tickets-changed` (full list without history) and, if a link changed,
-    /// `agents-changed`. On error nothing is emitted. Does NOT notify the dispatcher; callers
-    /// use [`Self::notify`] for the agents whose queue they touched.
+    /// `agents-changed`. On error nothing is emitted. Callers use [`Self::notify`] for the agents
+    /// whose queue they touched; the only notifications sent from here are the relation effects
+    /// (step 6a, [`Self::mutate_if`]).
     pub fn mutate<T>(
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
@@ -159,25 +163,79 @@ impl TicketsCtx {
     }
 
     /// `mutate`, but emits only when `changed(&result)` (a no-op mutation stays silent).
+    ///
+    /// Step 6a hook (plan A.5): a relations snapshot is taken before and after `f` (under the
+    /// lock); after the lock is released and the emits are done, [`relation_effects`] decides
+    /// whom to wake ([`Self::after_relations`]). So every way a child becomes Done (reviewer,
+    /// user, manual move, skipReview) or a ticket is deleted reaches the same path without
+    /// changing the callers.
     fn mutate_if<T>(
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
         changed: impl FnOnce(&T) -> bool,
     ) -> Result<T, String> {
-        let (result, list, links, reviews) = {
+        let (result, list, links, reviews, before, after) = {
             let mut svc = lock(&self.service);
+            let before = svc.relations_snapshot();
             let result = f(&mut svc).map_err(String::from)?;
             if !changed(&result) {
                 return Ok(result);
             }
-            (result, svc.list(), svc.links(), svc.open_review_counts())
+            let after = svc.relations_snapshot();
+            (
+                result,
+                svc.list(),
+                svc.links(),
+                svc.open_review_counts(),
+                before,
+                after,
+            )
         };
         let agents_changed = self.apply_links(&links, &reviews);
         emit_json(&self.emit, TICKETS_CHANGED, &list);
         if agents_changed {
             self.emit_agents();
         }
+        let fx = relation_effects(&before, &after);
+        if !fx.is_empty() {
+            self.after_relations(fx);
+        }
         Ok(result)
+    }
+
+    /// Acts on a mutation's relation effects (plan A.5), without any lock held: the assignees
+    /// of woken parents and of unblocked tickets get `QueueChanged` (the dispatcher's
+    /// `consider` then types the wake line or delivers the freed ticket), and a backlog parent
+    /// whose last open child went away gets [`crate::config::CHILDREN_DONE_NOTE`] (a history
+    /// entry only: its own effects are empty, so this does not recurse).
+    fn after_relations(&self, fx: RelationEffects) {
+        for (parent, agent) in &fx.woken {
+            log::info!(
+                "forløb: forælder {} vækkes hos {agent}",
+                model::short_id(parent)
+            );
+        }
+        for (ticket, agent) in &fx.freed {
+            log::info!(
+                "forløb: ticket {} er ikke længere blokeret (agent {agent})",
+                model::short_id(ticket)
+            );
+        }
+        self.notify(fx.wake.iter().chain(&fx.unblocked).cloned());
+        for p in &fx.children_done {
+            let now = now_ms();
+            match self.mutate_if(|s| s.note_children_done(p, now), Option::is_some) {
+                Ok(Some(_)) => log::info!(
+                    "forløb: alle del-tickets til {} er afsluttet (ingen ejer)",
+                    model::short_id(p)
+                ),
+                Ok(None) => {}
+                Err(e) => log::warn!(
+                    "forløb: noting the children of {} failed: {e}",
+                    model::short_id(p)
+                ),
+            }
+        }
     }
 
     /// Read-only access under the service lock.
@@ -622,6 +680,10 @@ impl ManagerPort {
 }
 
 impl AgentPort for ManagerPort {
+    fn has_live_coordinator(&self) -> bool {
+        lock(&self.manager).has_live_coordinator()
+    }
+
     fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
         let (a, last_user_input_at) = {
             let m = lock(&self.manager);
@@ -1570,5 +1632,209 @@ mod tests {
         let r = t.ctx.rules();
         assert!(r.auto_review_on_stop && r.user_input_grace_ms == 0);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- step 6a: the relation hook in mutate_if (plan A.5) ----
+
+    /// A parent in progress for `k` with one child per `child_agents` entry, each submitted to
+    /// review by its agent; then the parent is submitted and waits. Returns (parent, children).
+    fn waiting_family(t: &TestCtx, k: &str, child_agents: &[&str]) -> (Ticket, Vec<Ticket>) {
+        let c = &t.ctx;
+        let p = c.mutate(|s| s.create("Forælder", "", false, 1)).unwrap();
+        c.mutate(|s| s.assign(&p.id, k, 2)).unwrap();
+        c.mutate(|s| s.mark_dispatched(&p.id, "k", 3)).unwrap();
+        let mut kids = Vec::new();
+        for (i, a) in child_agents.iter().enumerate() {
+            let ch = c
+                .mutate(|s| {
+                    s.create_by_agent_related(
+                        &format!("Del {i}"),
+                        "",
+                        false,
+                        None,
+                        None,
+                        Some(p.id.clone()),
+                        vec![],
+                        4,
+                    )
+                })
+                .unwrap();
+            c.mutate(|s| s.assign(&ch.id, a, 5)).unwrap();
+            c.mutate(|s| s.mark_dispatched(&ch.id, a, 6)).unwrap();
+            kids.push(c.mutate(|s| s.submit_by_agent(a, None, "klar", 7)).unwrap());
+        }
+        let p = c
+            .mutate(|s| s.submit_by_agent(k, None, "fordelt", 8))
+            .unwrap();
+        assert_eq!(p.state, TicketState::Waiting);
+        (p, kids)
+    }
+
+    #[test]
+    fn approve_of_child_notifies_parent_assignee() {
+        let (m, ids) = manager_with(3);
+        let mut t = test_ctx(Arc::clone(&m));
+        let (k, a, b) = (ids[0].as_str(), ids[1].as_str(), ids[2].as_str());
+        let (p, kids) = waiting_family(&t, k, &[a, b]);
+        t.sent();
+        // The reviewer's/user's approval of one child: the parent's assignee is told (once).
+        t.ctx.mutate(|s| s.approve(&kids[0].id, 10)).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: k.to_string()
+            }]
+        );
+        let due = t.ctx.read(|s| s.due_wake_for(k)).expect("wake due");
+        assert_eq!(due.parent.id, p.id);
+        assert_eq!(due.open_left, 1);
+        assert_eq!(due.newly_done.len(), 1);
+        // The last child via the user's manual move (Review → Done): told again, nothing open.
+        t.ctx
+            .mutate(|s| s.set_state(&kids[1].id, TicketState::Done, None, true, 11))
+            .unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: k.to_string()
+            }]
+        );
+        let due = t.ctx.read(|s| s.due_wake_for(k)).unwrap();
+        assert_eq!(due.open_left, 0, "the 'aflever' variant");
+        assert_eq!(due.newly_done.len(), 2);
+        // The parent stays waiting until the dispatcher typed the line (P2).
+        assert_eq!(
+            t.ctx.read(|s| s.get(&p.id)).unwrap().state,
+            TicketState::Waiting
+        );
+    }
+
+    #[test]
+    fn rejected_child_does_not_wake_and_deleted_last_child_does() {
+        let (m, ids) = manager_with(2);
+        let mut t = test_ctx(Arc::clone(&m));
+        let (k, a) = (ids[0].as_str(), ids[1].as_str());
+        let (p, kids) = waiting_family(&t, k, &[a]);
+        t.sent();
+        // Rejected (back to the backlog): still open, nobody woken.
+        t.ctx
+            .mutate(|s| s.reject(&kids[0].id, "mangler", RejectReturn::Backlog, 10))
+            .unwrap();
+        assert!(t.sent().is_empty());
+        // Deleted: no open child left → the parent's assignee is told.
+        t.ctx.delete_ticket(&kids[0].id).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: k.to_string()
+            }]
+        );
+        let due = t.ctx.read(|s| s.due_wake_for(k)).unwrap();
+        assert_eq!((due.parent.id, due.open_left), (p.id, 0));
+        assert!(due.newly_done.is_empty());
+    }
+
+    #[test]
+    fn unblocked_ticket_notifies_its_agent() {
+        let (m, ids) = manager_with(3);
+        let mut t = test_ctx(Arc::clone(&m));
+        let (x, a, b) = (ids[0].as_str(), ids[1].as_str(), ids[2].as_str());
+        let c = &t.ctx;
+        let blocker = c.mutate(|s| s.create("Plan", "", false, 1)).unwrap();
+        c.mutate(|s| s.assign(&blocker.id, x, 2)).unwrap();
+        c.mutate(|s| s.mark_dispatched(&blocker.id, "x", 3))
+            .unwrap();
+        c.mutate(|s| s.submit_by_agent(x, None, "plan", 4)).unwrap();
+        let mk = |agent: &str, title: &str| {
+            let q = c
+                .mutate(|s| {
+                    s.create_by_agent_related(
+                        title,
+                        "",
+                        false,
+                        None,
+                        None,
+                        None,
+                        vec![blocker.id.clone()],
+                        5,
+                    )
+                })
+                .unwrap();
+            c.mutate(|s| s.assign(&q.id, agent, 6)).unwrap()
+        };
+        let qa = mk(a, "Byg");
+        // b's ticket is blocked by `blocker` and by another open ticket: stays blocked.
+        let other = c.mutate(|s| s.create("Andet", "", false, 7)).unwrap();
+        let qb = c
+            .mutate(|s| {
+                s.create_by_agent_related(
+                    "Test",
+                    "",
+                    false,
+                    None,
+                    None,
+                    None,
+                    vec![blocker.id.clone(), other.id.clone()],
+                    8,
+                )
+            })
+            .unwrap();
+        c.mutate(|s| s.assign(&qb.id, b, 9)).unwrap();
+        assert_eq!(c.read(|s| s.next_for_agent(a)), None, "blocked");
+        t.sent();
+        t.ctx.mutate(|s| s.approve(&blocker.id, 10)).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: a.to_string()
+            }]
+        );
+        assert_eq!(t.ctx.read(|s| s.next_for_agent(a)).unwrap().id, qa.id);
+        assert_eq!(t.ctx.read(|s| s.next_for_agent(b)), None);
+        // Deleting the other blocker frees b's ticket.
+        t.ctx.delete_ticket(&other.id).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::QueueChanged {
+                agent_id: b.to_string()
+            }]
+        );
+        assert_eq!(t.ctx.read(|s| s.next_for_agent(b)).unwrap().id, qb.id);
+    }
+
+    #[test]
+    fn dead_assignee_parent_goes_to_backlog_with_note() {
+        let (m, ids) = manager_with(2);
+        let mut t = test_ctx(Arc::clone(&m));
+        let (k, a) = (ids[0].as_str(), ids[1].as_str());
+        let (p, kids) = waiting_family(&t, k, &[a]);
+        // The coordinator stops: the waiting parent goes to the backlog (plan A.1).
+        assert_eq!(t.ctx.release_agent(k, AGENT_STOPPED_NOTE), Ok(1));
+        let tk = t.ctx.read(|s| s.get(&p.id)).unwrap();
+        assert_eq!(
+            (tk.state, tk.assignee_agent_id),
+            (TicketState::Backlog, None)
+        );
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some(AGENT_STOPPED_NOTE)
+        );
+        t.sent();
+        t.clear();
+        // Its last child is approved: no wake (nobody to wake), a history note instead.
+        t.ctx.mutate(|s| s.approve(&kids[0].id, 20)).unwrap();
+        assert!(t.sent().is_empty());
+        let tk = t.ctx.read(|s| s.get(&p.id)).unwrap();
+        let last = tk.history.last().unwrap();
+        assert_eq!(
+            last.note.as_deref(),
+            Some(crate::config::CHILDREN_DONE_NOTE)
+        );
+        assert_eq!(last.by, TicketActor::System);
+        assert_eq!(tk.state, TicketState::Backlog);
+        // The approve and the note: two saves, two emits.
+        assert_eq!(t.emitted(TICKETS_CHANGED).len(), 2);
+        let n = tk.history.len();
+        assert_eq!(t.ctx.read(|s| s.get(&p.id)).unwrap().history.len(), n);
     }
 }

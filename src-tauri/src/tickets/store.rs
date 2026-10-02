@@ -286,11 +286,16 @@ mod tests {
     }
 
     fn sample_doc() -> TicketDoc {
+        // Step 6a: a child of the first ticket, blocked by the second.
+        let mut child = ticket("33333333-0000-4000-8000-000000000000", TicketState::Backlog);
+        child.parent_id = Some("11111111-0000-4000-8000-000000000000".into());
+        child.blocked_by = vec!["22222222-0000-4000-8000-000000000000".into()];
         TicketDoc {
             schema_version: 1,
             tickets: vec![
                 ticket("11111111-0000-4000-8000-000000000000", TicketState::Backlog),
                 ticket("22222222-0000-4000-8000-000000000000", TicketState::Done),
+                child,
             ],
             review_assignments: Vec::new(),
         }
@@ -387,6 +392,43 @@ mod tests {
         assert!(!doc.tickets.is_empty());
         assert!(doc.tickets.iter().all(|t| t.project.is_none()));
         assert_eq!(doc, sample_doc());
+    }
+
+    #[test]
+    fn version_1_file_without_relations_loads() {
+        // A step 1–5 `tickets.json`: no `parentId`/`blockedBy` on any ticket (plan6a punkt 4).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        for t in v["tickets"].as_array_mut().unwrap() {
+            let o = t.as_object_mut().unwrap();
+            assert!(o.remove("parentId").is_some());
+            assert!(o.remove("blockedBy").is_some());
+        }
+        let dir = TempDir::new();
+        let path = dir.0.join("tickets.json");
+        fs::write(&path, v.to_string()).unwrap();
+        let r = JsonFileStore::new(path).load().unwrap();
+        assert_eq!(r.warning, None);
+        assert_eq!(r.doc.schema_version, 1);
+        assert!(r
+            .doc
+            .tickets
+            .iter()
+            .all(|t| t.parent_id.is_none() && t.blocked_by.is_empty()));
+        let mut want = sample_doc();
+        for t in want.tickets.iter_mut() {
+            t.parent_id = None;
+            t.blocked_by.clear();
+        }
+        assert_eq!(r.doc, want);
+        // The relations and a waiting ticket survive a save in this build (schema stays 1).
+        let mut doc = sample_doc();
+        doc.tickets[0].state = TicketState::Waiting;
+        doc.tickets[0].assignee_agent_id = Some("k".into());
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["schemaVersion"], json!(1));
+        assert_eq!(v["tickets"][0]["state"], json!("waiting"));
+        assert_eq!(v["tickets"][2]["parentId"], json!(doc.tickets[0].id));
+        assert_eq!(migrate(v).unwrap(), doc);
     }
 
     #[test]

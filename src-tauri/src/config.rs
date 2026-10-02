@@ -221,6 +221,20 @@ pub const REVIEW_BY_DEFAULT: bool = true;
 /// Default of `agentsMayCreateProjects`.
 pub const AGENTS_MAY_CREATE_PROJECTS: bool = false;
 
+// --- forløb: parent tickets and dependencies (step 6a) ---
+
+/// Most `blockedBy` entries per ticket.
+pub const BLOCKED_BY_MAX: usize = 10;
+/// History note when a parent is submitted while it still has open children (`Wait`); the
+/// service appends ` (<n>)`.
+pub const WAITING_NOTE: &str = "venter på del-tickets";
+/// History note when a waiting parent is resumed after the wake line was typed.
+pub const WOKEN_NOTE: &str = "vækket: del-ticket godkendt";
+/// History note when the last open child of a parent is gone (Done or deleted).
+pub const CHILDREN_DONE_NOTE: &str = "alle del-tickets er afsluttet";
+/// History note on a child whose parent was deleted (its `parentId` is cleared).
+pub const PARENT_DELETED_NOTE: &str = "forælder slettet";
+
 // --- macOS / unix (step 7) ---
 
 /// Unix: time between SIGTERM and SIGKILL to an agent's process group.
@@ -360,6 +374,17 @@ mod tests {
         assert_eq!(MAX_AGENTS_PER_PROJECT, 0);
         const { assert!(REVIEW_BY_DEFAULT) };
         const { assert!(!AGENTS_MAY_CREATE_PROJECTS) };
+    }
+
+    #[test]
+    fn step6a_constants() {
+        assert_eq!(BLOCKED_BY_MAX, 10);
+        assert_eq!(WAITING_NOTE, "venter på del-tickets");
+        assert_eq!(WOKEN_NOTE, "vækket: del-ticket godkendt");
+        assert_eq!(CHILDREN_DONE_NOTE, "alle del-tickets er afsluttet");
+        assert_eq!(PARENT_DELETED_NOTE, "forælder slettet");
+        // A.1: no schema bump (an older build would discard every newer file).
+        assert_eq!(TICKETS_SCHEMA_VERSION, 1);
     }
 
     #[test]

@@ -4,27 +4,29 @@
 //! Invariants (checked by `normalize_queues` / the mutations):
 //! - a ticket is in at most one queue (`assignee_agent_id` while `assigned`);
 //! - per agent the `assigned` tickets have positions `0..n` without gaps; nothing else has one;
-//! - at most one `inProgress` ticket per agent.
+//! - at most one `inProgress` ticket per agent;
+//! - a `waiting` ticket (step 6a) has an assignee and no queue position.
 //!
 //! The service is meant to sit behind a `std::sync::Mutex`; it never blocks on anything but the
 //! store's small synchronous write.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 
 use super::model::{
     short_id, ReviewAssignment, Ticket, TicketActor, TicketDoc, TicketError, TicketHistoryEntry,
     TicketId, TicketIssue, TicketPatch, TicketReport, TicketSource, TicketState, TicketSummary,
 };
+use super::prompt::{one_line, ChildLine, ChildReview};
 use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
 use crate::config::{
-    MAX_REVIEW_ROUNDS, MOVED_NOTE, REPORTS_PER_TICKET_MAX, RESTART_NOTE,
-    REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
-    TICKET_TITLE_MAX_CHARS,
+    BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, MAX_REVIEW_ROUNDS, MOVED_NOTE, PARENT_DELETED_NOTE,
+    REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS,
+    TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
 };
-use crate::projects::{validate_project_id, ProjectId, ProjectRef};
+use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
 
 /// History note when a turn ended normally (Stop hook).
 pub const TURN_ENDED_NOTE: &str = "auto: turn afsluttet";
@@ -70,6 +72,122 @@ pub type ReviewCounts = HashMap<String, usize>;
 /// Per agent: the `inProgress` ticket (if any) and the number of queued (`assigned`) tickets.
 /// Agents without any ticket are absent.
 pub type TicketLinks = HashMap<String, (Option<TicketId>, usize)>;
+
+/// How deep the relation walks go (parents, blockers); deeper chains are cut off (step 6a).
+const RELATION_DEPTH_MAX: usize = 64;
+
+/// A waiting parent whose assignee is due a wake line (step 6a, plan A.2): children became Done
+/// since the parent was last in progress, or no child is open any more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DueWake {
+    pub parent: Ticket,
+    /// Children that became Done after the parent was last in progress, in Done order.
+    pub newly_done: Vec<Ticket>,
+    /// Children still open (not Done).
+    pub open_left: usize,
+}
+
+/// The relation-relevant part of one ticket (step 6a): compared before/after a mutation to find
+/// whom to wake or unblock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelSnap {
+    pub id: TicketId,
+    pub state: TicketState,
+    pub parent_id: Option<TicketId>,
+    pub blocked_by: Vec<TicketId>,
+    pub assignee: Option<String>,
+}
+
+/// What a mutation changed in the relations (step 6a, plan A.5): computed by
+/// [`relation_effects`] from two [`RelSnap`] lists, acted on by `TicketsCtx::mutate_if` after the
+/// lock is released.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelationEffects {
+    /// Assignees of waiting parents that lost an open child (it became Done or was deleted).
+    pub wake: BTreeSet<String>,
+    /// Assignees of queued tickets that were blocked before and are not any more.
+    pub unblocked: BTreeSet<String>,
+    /// Backlog parents without an assignee whose last open child went away.
+    pub children_done: Vec<TicketId>,
+    /// `(parent, assignee)` behind [`Self::wake`] (for the log; Batch 2 addition to C6.1).
+    pub woken: Vec<(TicketId, String)>,
+    /// `(ticket, assignee)` behind [`Self::unblocked`] (for the log; Batch 2 addition to C6.1).
+    pub freed: Vec<(TicketId, String)>,
+}
+
+impl RelationEffects {
+    /// Nothing to do.
+    pub fn is_empty(&self) -> bool {
+        self.wake.is_empty() && self.unblocked.is_empty() && self.children_done.is_empty()
+    }
+}
+
+/// The relation effects of a mutation (plan A.5; pure). `before`/`after` are
+/// [`TicketService::relations_snapshot`]s taken around it:
+/// - `wake`: the assignee of a ticket waiting after the mutation, when one of its children was
+///   open before and is Done or gone after (or its open-children count went from > 0 to 0);
+/// - `unblocked`: the assignee of a queued (`assigned`) ticket that was blocked before and is
+///   not after (its blocker became Done or was deleted);
+/// - `children_done`: a backlog ticket without an assignee whose open-children count went from
+///   > 0 to 0.
+///
+/// A child that is rejected, put back in the backlog or reopened stays open: no effect.
+pub fn relation_effects(before: &[RelSnap], after: &[RelSnap]) -> RelationEffects {
+    let state_b: HashMap<&str, TicketState> =
+        before.iter().map(|s| (s.id.as_str(), s.state)).collect();
+    let state_a: HashMap<&str, TicketState> =
+        after.iter().map(|s| (s.id.as_str(), s.state)).collect();
+    let open_of = |snaps: &[RelSnap], id: &str| {
+        snaps
+            .iter()
+            .filter(|s| s.parent_id.as_deref() == Some(id) && s.state != TicketState::Done)
+            .count()
+    };
+    let blocked = |states: &HashMap<&str, TicketState>, s: &RelSnap| {
+        s.blocked_by.iter().any(|b| {
+            states
+                .get(b.as_str())
+                .is_some_and(|st| *st != TicketState::Done)
+        })
+    };
+    let mut fx = RelationEffects::default();
+    for a in after {
+        match (a.state, a.assignee.as_deref()) {
+            (TicketState::Waiting, Some(agent)) => {
+                let lost_child = before.iter().any(|c| {
+                    c.parent_id.as_deref() == Some(a.id.as_str())
+                        && c.state != TicketState::Done
+                        && after.iter().find(|x| x.id == c.id).is_none_or(|x| {
+                            x.state == TicketState::Done
+                                || x.parent_id.as_deref() != Some(a.id.as_str())
+                        })
+                });
+                let emptied = open_of(before, &a.id) > 0 && open_of(after, &a.id) == 0;
+                if lost_child || emptied {
+                    fx.wake.insert(agent.to_string());
+                    fx.woken.push((a.id.clone(), agent.to_string()));
+                }
+            }
+            (TicketState::Assigned, Some(agent)) => {
+                let was_blocked = before
+                    .iter()
+                    .find(|b| b.id == a.id)
+                    .is_some_and(|b| blocked(&state_b, b));
+                if was_blocked && !blocked(&state_a, a) {
+                    fx.unblocked.insert(agent.to_string());
+                    fx.freed.push((a.id.clone(), agent.to_string()));
+                }
+            }
+            (TicketState::Backlog, None) => {
+                if open_of(before, &a.id) > 0 && open_of(after, &a.id) == 0 {
+                    fx.children_done.push(a.id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    fx
+}
 
 pub struct TicketService {
     store: Box<dyn TicketStore>,
@@ -133,6 +251,129 @@ fn apply(
     let t = find_mut(doc, id)?;
     *t = transition_noted(t, ev, by, note, now)?;
     Ok(t.clone())
+}
+
+fn find<'a>(doc: &'a TicketDoc, id: &str) -> Option<&'a Ticket> {
+    doc.tickets.iter().find(|t| t.id == id)
+}
+
+// ---- relations (step 6a): pure helpers over the document ----
+
+/// The children of `id` (tickets whose `parent_id` is `id`), oldest first.
+pub(crate) fn children_of<'a>(doc: &'a TicketDoc, id: &str) -> Vec<&'a Ticket> {
+    let mut v: Vec<&Ticket> = doc
+        .tickets
+        .iter()
+        .filter(|t| t.parent_id.as_deref() == Some(id))
+        .collect();
+    v.sort_by_key(|t| t.created_at);
+    v
+}
+
+/// The children of `id` that are not Done (a deleted child no longer exists and is not open).
+pub(crate) fn open_children<'a>(doc: &'a TicketDoc, id: &str) -> Vec<&'a Ticket> {
+    children_of(doc, id)
+        .into_iter()
+        .filter(|t| t.state != TicketState::Done)
+        .collect()
+}
+
+/// Whether `t` waits for a blocker: an id in `blocked_by` exists and is not Done (a missing id
+/// is a deleted ticket and does not block).
+pub(crate) fn is_blocked(doc: &TicketDoc, t: &Ticket) -> bool {
+    t.blocked_by
+        .iter()
+        .any(|b| find(doc, b).is_some_and(|x| x.state != TicketState::Done))
+}
+
+/// The short ids of `t`'s open blockers, in `blocked_by` order.
+pub(crate) fn open_blockers(doc: &TicketDoc, t: &Ticket) -> Vec<String> {
+    t.blocked_by
+        .iter()
+        .filter_map(|b| find(doc, b))
+        .filter(|x| x.state != TicketState::Done)
+        .map(Ticket::short_id)
+        .collect()
+}
+
+/// The parent, grandparent, … of `id` (existing tickets only), nearest first; at most
+/// [`RELATION_DEPTH_MAX`] and stopping at a repeat (a hand-edited cycle).
+pub(crate) fn ancestors(doc: &TicketDoc, id: &str) -> Vec<TicketId> {
+    let mut out: Vec<TicketId> = Vec::new();
+    let mut cur = find(doc, id).and_then(|t| t.parent_id.clone());
+    while let Some(p) = cur {
+        if out.len() >= RELATION_DEPTH_MAX || p == id || out.contains(&p) {
+            break;
+        }
+        let Some(pt) = find(doc, &p) else {
+            break;
+        };
+        cur = pt.parent_id.clone();
+        out.push(p);
+    }
+    out
+}
+
+/// Whether making `parent` the parent of `child` would form a cycle.
+pub(crate) fn would_cycle(doc: &TicketDoc, child: &str, parent: &str) -> bool {
+    parent == child || ancestors(doc, parent).iter().any(|a| a == child)
+}
+
+/// Whether `child` blocked by `blockers` would form a cycle: `child` is reachable from a blocker
+/// over `blocked_by` (depth-first, at most [`RELATION_DEPTH_MAX`] deep).
+pub(crate) fn would_block_cycle(doc: &TicketDoc, child: &str, blockers: &[TicketId]) -> bool {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<(&str, usize)> = blockers.iter().map(|b| (b.as_str(), 0)).collect();
+    while let Some((id, depth)) = stack.pop() {
+        if id == child {
+            return true;
+        }
+        if depth >= RELATION_DEPTH_MAX || !seen.insert(id) {
+            continue;
+        }
+        if let Some(t) = find(doc, id) {
+            stack.extend(t.blocked_by.iter().map(|b| (b.as_str(), depth + 1)));
+        }
+    }
+    false
+}
+
+/// The time `t` last entered `state` (its last history entry with `to == state`).
+fn entered_at(t: &Ticket, state: TicketState) -> Option<u64> {
+    t.history.iter().rev().find(|h| h.to == state).map(|h| h.at)
+}
+
+/// Normalised title for the duplicate check (plan A.8): one line, whitespace runs collapsed,
+/// lowercase (Unicode).
+pub(crate) fn norm_title(s: &str) -> String {
+    one_line(s)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The submit decision (plan A.1): a ticket with open children goes to `waiting` (also with
+/// `skip_review`), else it is submitted (review, or done with `skip_review`). A ticket already
+/// waiting that still has open children stays waiting (one history entry).
+pub(crate) fn wait_or_submit(
+    doc: &mut TicketDoc,
+    id: &str,
+    by: TicketActor,
+    summary_note: Option<String>,
+    now: u64,
+) -> Result<Ticket, TicketError> {
+    let n = open_children(doc, id).len();
+    if n == 0 {
+        return apply(doc, id, &TicketEvent::Submit, by, summary_note, now);
+    }
+    let note = format!("{WAITING_NOTE} ({n})");
+    let t = find_mut(doc, id)?;
+    if t.state == TicketState::Waiting {
+        note_entry(t, by, note, now);
+        return Ok(t.clone());
+    }
+    apply(doc, id, &TicketEvent::Wait, by, Some(note), now)
 }
 
 fn in_progress_of<'a>(doc: &'a TicketDoc, agent_id: &str) -> Option<&'a Ticket> {
@@ -243,8 +484,8 @@ impl TicketService {
         s
     }
 
-    /// Loads the store and moves `assigned`/`inProgress` tickets (whose agents no longer exist
-    /// after a restart) to the backlog with [`RESTART_NOTE`]. Saves only if something changed.
+    /// Loads the store and moves `assigned`/`inProgress`/`waiting` tickets (whose agents no
+    /// longer exist after a restart) to the backlog with [`RESTART_NOTE`]. Saves only if something changed.
     /// Returns the load warning (corrupt file etc.) for Diagnostics.
     ///
     /// A missing file is an empty list; a corrupt or unknown-version file has already been moved
@@ -277,7 +518,12 @@ impl TicketService {
             .doc
             .tickets
             .iter()
-            .filter(|t| matches!(t.state, TicketState::Assigned | TicketState::InProgress))
+            .filter(|t| {
+                matches!(
+                    t.state,
+                    TicketState::Assigned | TicketState::InProgress | TicketState::Waiting
+                )
+            })
             .map(|t| t.id.clone())
             .collect();
         if !stale.is_empty() || stale_reviews {
@@ -419,7 +665,8 @@ impl TicketService {
             .cloned()
     }
 
-    /// The agent's own tickets ("mine"): the one in progress first, then its queue in order.
+    /// The agent's own tickets ("mine"): the one in progress first, then its waiting parents
+    /// (step 6a, oldest change first), then its queue in order.
     pub fn list_for_agent(&self, agent_id: &str) -> Vec<TicketSummary> {
         let mut v: Vec<&Ticket> = self
             .doc
@@ -427,10 +674,20 @@ impl TicketService {
             .iter()
             .filter(|t| {
                 t.assignee_agent_id.as_deref() == Some(agent_id)
-                    && matches!(t.state, TicketState::Assigned | TicketState::InProgress)
+                    && matches!(
+                        t.state,
+                        TicketState::Assigned | TicketState::InProgress | TicketState::Waiting
+                    )
             })
             .collect();
-        v.sort_by_key(|t| (t.state != TicketState::InProgress, t.queue_position));
+        v.sort_by_key(|t| {
+            let rank = match t.state {
+                TicketState::InProgress => 0,
+                TicketState::Waiting => 1,
+                _ => 2,
+            };
+            (rank, t.queue_position, t.updated_at)
+        });
         v.into_iter().map(TicketSummary::from).collect()
     }
 
@@ -447,8 +704,8 @@ impl TicketService {
         v
     }
 
-    /// The ticket to deliver next: `None` while the agent has one in progress, else the queue
-    /// head.
+    /// The ticket to deliver next: `None` while the agent has one in progress, else the first
+    /// queued ticket that is not blocked (step 6a; a blocked ticket keeps its position).
     pub fn next_for_agent(&self, agent_id: &str) -> Option<Ticket> {
         if in_progress_of(&self.doc, agent_id).is_some() {
             return None;
@@ -457,10 +714,132 @@ impl TicketService {
             .tickets
             .iter()
             .filter(|t| {
-                t.state == TicketState::Assigned && t.assignee_agent_id.as_deref() == Some(agent_id)
+                t.state == TicketState::Assigned
+                    && t.assignee_agent_id.as_deref() == Some(agent_id)
+                    && !is_blocked(&self.doc, t)
             })
             .min_by_key(|t| t.queue_position)
             .cloned()
+    }
+
+    // ---- relations (step 6a) ----
+
+    /// Children of `id` that are not Done.
+    pub fn open_children_count(&self, id: &str) -> usize {
+        open_children(&self.doc, id).len()
+    }
+
+    /// The open blockers of ticket `id` as short ids (`"a1b2c3d4, e5f6a7b8"`); `None` when it is
+    /// not blocked or does not exist.
+    pub fn blocked_text(&self, id: &str) -> Option<String> {
+        let t = find(&self.doc, id)?;
+        let b = open_blockers(&self.doc, t);
+        (!b.is_empty()).then(|| b.join(", "))
+    }
+
+    /// The children of `id`, oldest first (step 6a).
+    pub fn children(&self, id: &str) -> Vec<Ticket> {
+        children_of(&self.doc, id).into_iter().cloned().collect()
+    }
+
+    /// The children of `id` for a ticket file's `## Del-tickets` (step 6a, C6.3): short id, raw
+    /// title, state and open blockers (short ids). Oldest first.
+    pub fn child_lines(&self, id: &str) -> Vec<ChildLine> {
+        children_of(&self.doc, id)
+            .into_iter()
+            .map(|c| ChildLine {
+                short: c.short_id(),
+                title: c.title.clone(),
+                state: c.state,
+                open_blockers: open_blockers(&self.doc, c),
+            })
+            .collect()
+    }
+
+    /// The children of `id` for a parent's review file (step 6a, C6.3): short id, raw title,
+    /// state and summary. Oldest first.
+    pub fn child_reviews(&self, id: &str) -> Vec<ChildReview> {
+        children_of(&self.doc, id)
+            .into_iter()
+            .map(|c| ChildReview {
+                short: c.short_id(),
+                title: c.title.clone(),
+                state: c.state,
+                summary: c.summary.clone(),
+            })
+            .collect()
+    }
+
+    /// The relation-relevant part of every ticket (for the `mutate_if` hook, plan A.5).
+    pub fn relations_snapshot(&self) -> Vec<RelSnap> {
+        self.doc
+            .tickets
+            .iter()
+            .map(|t| RelSnap {
+                id: t.id.clone(),
+                state: t.state,
+                parent_id: t.parent_id.clone(),
+                blocked_by: t.blocked_by.clone(),
+                assignee: t.assignee_agent_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Open (not Done) tickets whose [`norm_title`] is `norm`, in the same project as `project`
+    /// (both without one, or the same name per `projects::same_id`); oldest first.
+    pub fn find_open_by_title(&self, norm: &str, project: Option<&ProjectRef>) -> Vec<Ticket> {
+        let mut v: Vec<Ticket> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| t.state != TicketState::Done && norm_title(&t.title) == norm)
+            .filter(|t| match (t.project.as_ref(), project) {
+                (None, None) => true,
+                (Some(a), Some(b)) => same_id(a.name(), b.name()),
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        v.sort_by_key(|t| t.created_at);
+        v
+    }
+
+    /// The waiting parent of `agent_id` that is due a wake line (plan A.2): a child became Done
+    /// after the parent last entered `inProgress` (fallback: its creation; strictly later), or
+    /// it has no open child left. Of several, the one changed longest ago.
+    pub fn due_wake_for(&self, agent_id: &str) -> Option<DueWake> {
+        let mut parents: Vec<&Ticket> = self
+            .doc
+            .tickets
+            .iter()
+            .filter(|t| {
+                t.state == TicketState::Waiting && t.assignee_agent_id.as_deref() == Some(agent_id)
+            })
+            .collect();
+        parents.sort_by_key(|t| (t.updated_at, t.created_at));
+        parents.into_iter().find_map(|p| {
+            let since = entered_at(p, TicketState::InProgress).unwrap_or(p.created_at);
+            let children = children_of(&self.doc, &p.id);
+            let open_left = children
+                .iter()
+                .filter(|c| c.state != TicketState::Done)
+                .count();
+            let mut newly_done: Vec<(u64, &Ticket)> = children
+                .iter()
+                .filter(|c| c.state == TicketState::Done)
+                .map(|c| (entered_at(c, TicketState::Done).unwrap_or(c.updated_at), *c))
+                .filter(|(at, _)| *at > since)
+                .collect();
+            if open_left > 0 && newly_done.is_empty() {
+                return None;
+            }
+            newly_done.sort_by_key(|(at, c)| (*at, c.created_at));
+            Some(DueWake {
+                parent: p.clone(),
+                newly_done: newly_done.into_iter().map(|(_, c)| c.clone()).collect(),
+                open_left,
+            })
+        })
     }
 
     // ---- user mutations ----
@@ -566,6 +945,8 @@ impl TicketService {
             reviewer_agent_id: None,
             reports: Vec::new(),
             project,
+            parent_id: None,
+            blocked_by: Vec::new(),
         };
         Ok(t)
     }
@@ -632,7 +1013,14 @@ impl TicketService {
     }
 
     /// Only backlog and done tickets, and rejected ones without an agent, can be deleted.
+    /// [`Self::delete_at`] with the current time.
     pub fn delete(&mut self, id: &str) -> Result<(), TicketError> {
+        self.delete_at(id, crate::agent::now_ms())
+    }
+
+    /// [`Self::delete`] at `now`. In the same save (step 6a) its children lose their parent
+    /// (history note [`PARENT_DELETED_NOTE`]) and it leaves every `blocked_by` (no note).
+    pub fn delete_at(&mut self, id: &str, now: u64) -> Result<(), TicketError> {
         let t = self.get(id).ok_or(TicketError::NotFound)?;
         let deletable = match t.state {
             TicketState::Backlog | TicketState::Done => true,
@@ -644,6 +1032,13 @@ impl TicketService {
         }
         self.commit(|doc| {
             doc.tickets.retain(|t| t.id != id);
+            for t in doc.tickets.iter_mut() {
+                if t.parent_id.as_deref() == Some(id) {
+                    t.parent_id = None;
+                    note_entry(t, TicketActor::System, PARENT_DELETED_NOTE.to_string(), now);
+                }
+                t.blocked_by.retain(|b| b != id);
+            }
             Ok(())
         })
     }
@@ -752,10 +1147,10 @@ impl TicketService {
             (S::Backlog, S::Done) => TicketEvent::ToBacklog {
                 note: Some(note.unwrap_or_else(|| REOPENED_NOTE.into())),
             },
-            (S::Backlog, S::InProgress | S::Review | S::Rejected) => {
+            (S::Backlog, S::InProgress | S::Review | S::Rejected | S::Waiting) => {
                 TicketEvent::ToBacklog { note }
             }
-            (S::InProgress, S::Assigned | S::Review) => {
+            (S::InProgress, S::Assigned | S::Review | S::Waiting) => {
                 let agent = t.assignee_agent_id.as_deref().unwrap_or_default();
                 if !agent_live {
                     return Err(TicketError::AgentNotLive);
@@ -763,15 +1158,16 @@ impl TicketService {
                 if in_progress_of(&self.doc, agent).is_some() {
                     return Err(TicketError::AgentBusy);
                 }
-                if t.state == S::Assigned {
-                    TicketEvent::Dispatched
-                } else {
-                    TicketEvent::Reopen
+                match t.state {
+                    S::Assigned => TicketEvent::Dispatched,
+                    S::Waiting => TicketEvent::Resume,
+                    _ => TicketEvent::Reopen,
                 }
             }
-            (S::Review, S::InProgress) => TicketEvent::Submit,
-            (S::Done, S::InProgress) if t.skip_review => TicketEvent::Submit,
-            (S::Done, S::InProgress) => return Err(TicketError::DoneNeedsReview),
+            // The user's move is an override: no waiting for open children (plan A.1).
+            (S::Review, S::InProgress | S::Waiting) => TicketEvent::Submit,
+            (S::Done, S::InProgress | S::Waiting) if t.skip_review => TicketEvent::Submit,
+            (S::Done, S::InProgress | S::Waiting) => return Err(TicketError::DoneNeedsReview),
             (S::Done, S::Review) => TicketEvent::Approve,
             _ => return illegal,
         };
@@ -908,8 +1304,9 @@ impl TicketService {
         self.fetch(id)
     }
 
-    /// The agent's turn ended normally: its inProgress ticket → review (done with skipReview).
-    /// `Ok(None)` when the agent had no ticket in progress (nothing saved).
+    /// The agent's turn ended normally: its inProgress ticket → review (done with skipReview),
+    /// or waiting when it has open children (step 6a). `Ok(None)` when the agent had no ticket
+    /// in progress (nothing saved).
     pub fn complete_turn(
         &mut self,
         agent_id: &str,
@@ -919,16 +1316,7 @@ impl TicketService {
             return Ok(None);
         };
         let note = Some(TURN_ENDED_NOTE.to_string());
-        self.commit(|doc| {
-            apply(
-                doc,
-                &t.id,
-                &TicketEvent::Submit,
-                TicketActor::System,
-                note,
-                now,
-            )
-        })?;
+        self.commit(|doc| wait_or_submit(doc, &t.id, TicketActor::System, note, now))?;
         self.fetch(&t.id).map(Some)
     }
 
@@ -959,8 +1347,10 @@ impl TicketService {
     }
 
     /// The turn ended without `mira_submit_for_review`: the agent's inProgress ticket keeps its
-    /// state and gets `issue: notSubmitted` with [`NOT_SUBMITTED_NOTE`] (by the system).
-    /// `Ok(None)` when the agent has no ticket in progress (nothing saved).
+    /// state and gets `issue: notSubmitted` with [`NOT_SUBMITTED_NOTE`] (by the system). A
+    /// ticket with open children goes to waiting instead (step 6a; returned with
+    /// `state == Waiting`, no issue). `Ok(None)` when the agent has no ticket in progress
+    /// (nothing saved).
     pub fn mark_not_submitted(
         &mut self,
         agent_id: &str,
@@ -969,6 +1359,10 @@ impl TicketService {
         let Some(t) = self.current_for_agent(agent_id) else {
             return Ok(None);
         };
+        if self.open_children_count(&t.id) > 0 {
+            self.commit(|doc| wait_or_submit(doc, &t.id, TicketActor::System, None, now))?;
+            return self.fetch(&t.id).map(Some);
+        }
         self.set_issue(
             &t.id,
             Some(TicketIssue::NotSubmitted),
@@ -976,6 +1370,66 @@ impl TicketService {
             now,
         )
         .map(Some)
+    }
+
+    /// The wake line for a waiting parent was typed (plan A.2): waiting → inProgress by the
+    /// system with `note`. `Ok(None)` (nothing saved) when the ticket is no longer waiting with
+    /// `agent_id`, or the agent has another ticket in progress.
+    pub fn resume_after_wake(
+        &mut self,
+        parent_id: &str,
+        agent_id: &str,
+        note: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(parent_id).ok_or(TicketError::NotFound)?;
+        if t.state != TicketState::Waiting
+            || t.assignee_agent_id.as_deref() != Some(agent_id)
+            || in_progress_of(&self.doc, agent_id).is_some()
+        {
+            return Ok(None);
+        }
+        let note = Some(note.to_string());
+        self.commit(|doc| {
+            apply(
+                doc,
+                &t.id,
+                &TicketEvent::Resume,
+                TicketActor::System,
+                note,
+                now,
+            )
+        })?;
+        self.fetch(&t.id).map(Some)
+    }
+
+    /// A parent without an assignee in the backlog lost its last open child (plan A.2): a
+    /// history entry [`CHILDREN_DONE_NOTE`] by the system. `Ok(None)` (nothing saved) when it is
+    /// not such a parent any more, still has open children, or the note is already its last
+    /// history entry.
+    pub fn note_children_done(
+        &mut self,
+        id: &str,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(id).ok_or(TicketError::NotFound)?;
+        let noted = t
+            .history
+            .last()
+            .is_some_and(|h| h.note.as_deref() == Some(CHILDREN_DONE_NOTE));
+        if t.state != TicketState::Backlog
+            || t.assignee_agent_id.is_some()
+            || noted
+            || self.open_children_count(id) > 0
+        {
+            return Ok(None);
+        }
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            note_entry(t, TicketActor::System, CHILDREN_DONE_NOTE.to_string(), now);
+            Ok(())
+        })?;
+        self.fetch(id).map(Some)
     }
 
     /// Any non-backlog state → backlog by the system (delivery failure etc.).
@@ -987,8 +1441,8 @@ impl TicketService {
         self.fetch(id)
     }
 
-    /// The agent stopped/exited/was removed: all its assigned/inProgress/rejected tickets go to
-    /// the backlog with `note`. One save (none when nothing changed).
+    /// The agent stopped/exited/was removed: all its assigned/inProgress/rejected/waiting
+    /// tickets go to the backlog with `note`. One save (none when nothing changed).
     pub fn release_agent(
         &mut self,
         agent_id: &str,
@@ -1003,7 +1457,10 @@ impl TicketService {
                 t.assignee_agent_id.as_deref() == Some(agent_id)
                     && matches!(
                         t.state,
-                        TicketState::Assigned | TicketState::InProgress | TicketState::Rejected
+                        TicketState::Assigned
+                            | TicketState::InProgress
+                            | TicketState::Rejected
+                            | TicketState::Waiting
                     )
             })
             .map(|t| t.id.clone())
@@ -1035,7 +1492,83 @@ impl TicketService {
         project: Option<ProjectRef>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
-        let t = self.new_ticket(
+        self.create_by_agent_related(
+            title,
+            body,
+            skip_review,
+            assign_to,
+            project,
+            None,
+            Vec::new(),
+            now,
+        )
+    }
+
+    /// [`Self::create_by_agent`] with relations (step 6a, plan A.3). `parent_id` and the
+    /// `blocked_by` entries are full or short ids (stored as full ids). Checked in this order:
+    /// the parent exists ([`TicketError::ParentNotFound`]) and is not Done
+    /// ([`TicketError::ParentDone`]); without a project the child inherits the parent's, an
+    /// explicit one must match it ([`TicketError::ParentProjectMismatch`]; a parent without a
+    /// project accepts any); the blockers (duplicates dropped) are at most [`BLOCKED_BY_MAX`]
+    /// ([`TicketError::TooManyBlockers`]), exist ([`TicketError::BlockerNotFound`]), are not the
+    /// parent or an ancestor ([`TicketError::BlockedByAncestor`]) and form no cycle
+    /// ([`TicketError::Cycle`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_by_agent_related(
+        &mut self,
+        title: &str,
+        body: &str,
+        skip_review: bool,
+        assign_to: Option<(&str, &str)>,
+        project: Option<ProjectRef>,
+        parent_id: Option<TicketId>,
+        blocked_by: Vec<TicketId>,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        let parent = match parent_id.as_deref() {
+            Some(p) => {
+                let p = self.get_by_any_id(p).ok_or(TicketError::ParentNotFound)?;
+                if p.state == TicketState::Done {
+                    return Err(TicketError::ParentDone);
+                }
+                Some(p)
+            }
+            None => None,
+        };
+        let project = match (project, parent.as_ref().and_then(|p| p.project.clone())) {
+            (None, inherited) => inherited,
+            (Some(child), Some(pp)) if !same_id(child.name(), pp.name()) => {
+                return Err(TicketError::ParentProjectMismatch {
+                    parent: pp.name().to_string(),
+                    child: child.name().to_string(),
+                });
+            }
+            (Some(child), _) => Some(child),
+        };
+        let mut blockers: Vec<TicketId> = Vec::new();
+        for b in &blocked_by {
+            let full = match self.get_by_any_id(b) {
+                Some(t) => t.id,
+                None => b.trim().to_string(),
+            };
+            if !blockers.contains(&full) {
+                blockers.push(full);
+            }
+        }
+        if blockers.len() > BLOCKED_BY_MAX {
+            return Err(TicketError::TooManyBlockers);
+        }
+        if let Some(missing) = blockers.iter().find(|b| self.get(b).is_none()) {
+            return Err(TicketError::BlockerNotFound(missing.clone()));
+        }
+        if let Some(p) = &parent {
+            let mut line = ancestors(&self.doc, &p.id);
+            line.push(p.id.clone());
+            if blockers.iter().any(|b| line.contains(b)) {
+                return Err(TicketError::BlockedByAncestor);
+            }
+        }
+        let mut t = self.new_ticket(
             &mut || uuid::Uuid::new_v4().to_string(),
             title,
             body,
@@ -1044,6 +1577,16 @@ impl TicketService {
             (TicketSource::Agent, TicketActor::Agent),
             now,
         )?;
+        // A fresh id cannot be part of a cycle yet; checked for the rule's sake (plan A.3).
+        if parent
+            .as_ref()
+            .is_some_and(|p| would_cycle(&self.doc, &t.id, &p.id))
+            || would_block_cycle(&self.doc, &t.id, &blockers)
+        {
+            return Err(TicketError::Cycle);
+        }
+        t.parent_id = parent.map(|p| p.id);
+        t.blocked_by = blockers;
         let id = t.id.clone();
         self.commit(|doc| {
             doc.tickets.push(t);
@@ -1061,7 +1604,9 @@ impl TicketService {
 
     /// `mira_submit_for_review`: the agent's ticket (`ticket_id`, full or short id, or else its
     /// inProgress ticket) → review (done with skipReview), `summary` stored and noted in the
-    /// history by the agent. Clears `issue` (the Submit transition does).
+    /// history by the agent. Clears `issue` (the Submit transition does). Step 6a: a ticket with
+    /// open children goes to waiting instead ([`wait_or_submit`]); a waiting ticket of the
+    /// agent's own may be submitted again (by `ticket_id`).
     pub fn submit_by_agent(
         &mut self,
         agent_id: &str,
@@ -1076,7 +1621,7 @@ impl TicketService {
                 if t.assignee_agent_id.as_deref() != Some(agent_id) {
                     return Err(TicketError::NotYours);
                 }
-                if t.state != TicketState::InProgress {
+                if !matches!(t.state, TicketState::InProgress | TicketState::Waiting) {
                     return Err(TicketError::NotInProgress);
                 }
                 t
@@ -1087,14 +1632,7 @@ impl TicketService {
         };
         self.commit(|doc| {
             find_mut(doc, &t.id)?.summary = Some(summary.clone());
-            apply(
-                doc,
-                &t.id,
-                &TicketEvent::Submit,
-                TicketActor::Agent,
-                Some(summary),
-                now,
-            )
+            wait_or_submit(doc, &t.id, TicketActor::Agent, Some(summary), now)
         })?;
         self.fetch(&t.id)
     }
@@ -1738,6 +2276,14 @@ mod tests {
             }
             if t.state == S::Backlog {
                 assert_eq!(t.assignee_agent_id, None);
+            }
+            // Step 6a: a waiting parent keeps its assignee and has no queue position.
+            if t.state == S::Waiting {
+                assert!(
+                    t.assignee_agent_id.is_some(),
+                    "waiting without agent: {t:?}"
+                );
+                assert_eq!(t.queue_position, None, "{t:?}");
             }
         }
         for (_, mut p) in queues {
@@ -3097,5 +3643,963 @@ mod tests {
         // Title only: fine in any state.
         let patch: TicketPatch = serde_json::from_str(r#"{"title": "y"}"#).unwrap();
         assert!(s.update(&t.id, patch, 7).is_ok());
+    }
+
+    // ---- step 6a: relations, waiting, blocking ----
+
+    use crate::config::{BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, WOKEN_NOTE};
+
+    /// A child of `parent` created by an agent (no project, no blockers).
+    fn child_of(s: &mut TicketService, parent: &Ticket, title: &str, now: u64) -> Ticket {
+        s.create_by_agent_related(
+            title,
+            "b",
+            false,
+            None,
+            None,
+            Some(parent.id.clone()),
+            Vec::new(),
+            now,
+        )
+        .unwrap()
+    }
+
+    /// Takes backlog ticket `id` through `agent` to Done (assign, dispatch, review, approve).
+    fn finish(s: &mut TicketService, id: &str, agent: &str, now: u64) -> Ticket {
+        s.assign(id, agent, now).unwrap();
+        s.mark_dispatched(id, agent, now + 1).unwrap();
+        assert_eq!(
+            s.complete_turn(agent, now + 2).unwrap().unwrap().state,
+            S::Review
+        );
+        s.approve(id, now + 3).unwrap()
+    }
+
+    fn related(
+        s: &mut TicketService,
+        title: &str,
+        project: Option<ProjectRef>,
+        parent: Option<&str>,
+        blocked_by: &[&str],
+    ) -> Result<Ticket, TicketError> {
+        s.create_by_agent_related(
+            title,
+            "",
+            false,
+            None,
+            project,
+            parent.map(str::to_string),
+            blocked_by.iter().map(|b| b.to_string()).collect(),
+            50,
+        )
+    }
+
+    #[test]
+    fn create_related_inherits_parent_project_and_rejects_mismatch() {
+        let (mut s, m) = svc();
+        let p = s
+            .create_in(
+                "forælder",
+                "",
+                false,
+                Some(ProjectRef::Existing("p".into())),
+                1,
+            )
+            .unwrap();
+        // By short id; the child inherits the parent's project and stores the full id.
+        let c = related(
+            &mut s,
+            "barn",
+            None,
+            Some(&p.short_id().to_uppercase()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.parent_id.as_deref(), Some(p.id.as_str()));
+        assert_eq!(c.project, Some(ProjectRef::Existing("p".into())));
+        assert_eq!((c.source, c.state), (TicketSource::Agent, S::Backlog));
+        // The same project in other letters is the same project.
+        let c2 = related(
+            &mut s,
+            "barn 2",
+            Some(ProjectRef::Existing("P".into())),
+            Some(&p.id),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c2.project, Some(ProjectRef::Existing("P".into())));
+        let saves = m.saves();
+        assert_eq!(
+            related(
+                &mut s,
+                "barn 3",
+                Some(ProjectRef::New { new: "q".into() }),
+                Some(&p.id),
+                &[]
+            ),
+            Err(TicketError::ParentProjectMismatch {
+                parent: "p".into(),
+                child: "q".into()
+            })
+        );
+        assert_eq!(m.saves(), saves);
+        // A parent without a project accepts a child with one.
+        let free = mk(&mut s, "uden projekt", 2);
+        let c4 = related(
+            &mut s,
+            "barn 4",
+            Some(ProjectRef::Existing("q".into())),
+            Some(&free.id),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c4.project, Some(ProjectRef::Existing("q".into())));
+        // With assign_to the child is queued in the same save.
+        let saves = m.saves();
+        let c5 = s
+            .create_by_agent_related(
+                "barn 5",
+                "",
+                false,
+                Some(("a1", "koord-01")),
+                None,
+                Some(p.id.clone()),
+                vec![c.id.clone()],
+                60,
+            )
+            .unwrap();
+        assert_eq!(m.saves(), saves + 1);
+        assert_eq!((c5.state, c5.queue_position), (S::Assigned, Some(0)));
+        assert_eq!(c5.blocked_by, vec![c.id.clone()]);
+        assert_eq!(s.open_children_count(&p.id), 3);
+        // Plain create_by_agent keeps working without relations.
+        let plain = s.create_by_agent("x", "", false, None, None, 70).unwrap();
+        assert_eq!((plain.parent_id, plain.blocked_by.len()), (None, 0));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn create_related_rejects_unknown_parent_done_parent_and_unknown_blocker() {
+        let (mut s, m) = svc();
+        assert_eq!(
+            related(&mut s, "a", None, Some("ffffffff"), &[]),
+            Err(TicketError::ParentNotFound)
+        );
+        let done = mk(&mut s, "færdig", 1);
+        finish(&mut s, &done.id, "a1", 2);
+        assert_eq!(
+            related(&mut s, "a", None, Some(&done.id), &[]),
+            Err(TicketError::ParentDone)
+        );
+        let b = mk(&mut s, "blokering", 3);
+        assert_eq!(
+            related(&mut s, "a", None, None, &[&b.id, "ffffffff"]),
+            Err(TicketError::BlockerNotFound("ffffffff".into()))
+        );
+        // Too many blockers (after dropping duplicates).
+        let many: Vec<String> = (0..=BLOCKED_BY_MAX)
+            .map(|i| mk(&mut s, &format!("b{i}"), 10 + i as u64).id)
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let saves = m.saves();
+        assert_eq!(
+            related(&mut s, "a", None, None, &refs),
+            Err(TicketError::TooManyBlockers)
+        );
+        assert_eq!(m.saves(), saves);
+        let mut ten: Vec<&str> = refs[..BLOCKED_BY_MAX].to_vec();
+        ten.push(refs[0]);
+        let ok = related(&mut s, "a", None, None, &ten).unwrap();
+        assert_eq!(ok.blocked_by.len(), BLOCKED_BY_MAX);
+        // A done blocker is accepted (it simply does not block).
+        let d = related(&mut s, "efter færdig", None, None, &[&done.short_id()]).unwrap();
+        assert_eq!(d.blocked_by, vec![done.id.clone()]);
+        assert_eq!(s.blocked_text(&d.id), None);
+    }
+
+    #[test]
+    fn create_related_rejects_blocker_that_is_ancestor_and_cycles() {
+        let (mut s, _) = svc();
+        let p = mk(&mut s, "p", 1);
+        let c = child_of(&mut s, &p, "c", 2);
+        for blocker in [&p.id, &c.id] {
+            assert_eq!(
+                related(&mut s, "g", None, Some(&c.id), &[blocker]),
+                Err(TicketError::BlockedByAncestor),
+                "{blocker}"
+            );
+        }
+        assert_eq!(
+            related(&mut s, "g", None, Some(&p.id), &[&p.short_id()]),
+            Err(TicketError::BlockedByAncestor)
+        );
+        // A sibling may block.
+        let g = related(&mut s, "g", None, Some(&p.id), &[&c.id]).unwrap();
+        assert_eq!(g.blocked_by, vec![c.id.clone()]);
+        assert_eq!(ancestors(&s.doc, &g.id), vec![p.id.clone()]);
+
+        // The pure checks, on a document edited by hand.
+        assert!(would_cycle(&s.doc, &p.id, &p.id));
+        assert!(would_cycle(&s.doc, &p.id, &c.id), "p is c's parent");
+        assert!(!would_cycle(&s.doc, &c.id, &p.id));
+        assert!(would_block_cycle(
+            &s.doc,
+            &c.id,
+            std::slice::from_ref(&g.id)
+        ));
+        assert!(would_block_cycle(
+            &s.doc,
+            &c.id,
+            std::slice::from_ref(&c.id)
+        ));
+        assert!(!would_block_cycle(
+            &s.doc,
+            &g.id,
+            std::slice::from_ref(&c.id)
+        ));
+        // A hand-made parent cycle p ↔ c ends the walk.
+        find_mut(&mut s.doc, &p.id).unwrap().parent_id = Some(c.id.clone());
+        assert_eq!(ancestors(&s.doc, &c.id), vec![p.id.clone()]);
+        assert!(would_cycle(&s.doc, &c.id, &p.id));
+        // A hand-made blocker cycle b1 → b2 → b1.
+        let b1 = mk(&mut s, "b1", 3);
+        let b2 = mk(&mut s, "b2", 4);
+        find_mut(&mut s.doc, &b1.id).unwrap().blocked_by = vec![b2.id.clone()];
+        find_mut(&mut s.doc, &b2.id).unwrap().blocked_by = vec![b1.id.clone()];
+        assert!(would_block_cycle(
+            &s.doc,
+            &b1.id,
+            std::slice::from_ref(&b2.id)
+        ));
+        assert!(!would_block_cycle(
+            &s.doc,
+            "other",
+            std::slice::from_ref(&b1.id)
+        ));
+        // Depth limit: a parent chain longer than 64 is cut off.
+        let mut prev = mk(&mut s, "root", 5);
+        for i in 0..70 {
+            prev = child_of(&mut s, &prev, &format!("l{i}"), 6 + i);
+        }
+        assert_eq!(ancestors(&s.doc, &prev.id).len(), RELATION_DEPTH_MAX);
+    }
+
+    /// Parent `p` in progress with agent `k` and two open children.
+    fn parent_with_children(s: &mut TicketService, skip: bool) -> (Ticket, Ticket, Ticket) {
+        let p = in_progress(s, "k", "forælder", skip);
+        let c1 = child_of(s, &p, "plan", 10);
+        let c2 = child_of(s, &p, "byg", 11);
+        (p, c1, c2)
+    }
+
+    #[test]
+    fn submit_with_open_children_waits_and_keeps_summary() {
+        for skip in [false, true] {
+            let (mut s, m) = svc();
+            let (p, _c1, _c2) = parent_with_children(&mut s, skip);
+            let saves = m.saves();
+            let w = s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+            assert_eq!(m.saves(), saves + 1);
+            assert_eq!(w.state, S::Waiting, "skip {skip}");
+            assert_eq!(w.summary.as_deref(), Some("fordelt"));
+            assert_eq!(w.assignee_agent_id.as_deref(), Some("k"));
+            let h = w.history.last().unwrap();
+            assert_eq!(
+                (h.from, h.to, h.by, h.note.as_deref()),
+                (
+                    Some(S::InProgress),
+                    S::Waiting,
+                    TicketActor::Agent,
+                    Some("venter på del-tickets (2)")
+                )
+            );
+            // The agent is free: no current ticket, nothing queued.
+            assert_eq!(s.current_for_agent("k"), None);
+            assert_eq!(s.links().get("k"), None);
+            // Submitting again while children are open: still waiting, new summary, one entry.
+            let len = w.history.len();
+            let again = s
+                .submit_by_agent("k", Some(&p.short_id()), "ny plan", 21)
+                .unwrap();
+            assert_eq!(again.state, S::Waiting);
+            assert_eq!(again.summary.as_deref(), Some("ny plan"));
+            assert_eq!(again.history.len(), len + 1);
+            // Without a ticket id there is nothing in progress.
+            assert_eq!(
+                s.submit_by_agent("k", None, "x", 22),
+                Err(TicketError::NoTicketInProgress)
+            );
+            // Someone else's waiting ticket is not theirs.
+            assert_eq!(
+                s.submit_by_agent("z", Some(&p.id), "x", 22),
+                Err(TicketError::NotYours)
+            );
+            assert_invariants(&s);
+        }
+    }
+
+    #[test]
+    fn submit_without_open_children_goes_to_review_or_done() {
+        for (skip, want) in [(false, S::Review), (true, S::Done)] {
+            let (mut s, _) = svc();
+            let p = in_progress(&mut s, "k", "forælder", skip);
+            let c = child_of(&mut s, &p, "c", 10);
+            finish(&mut s, &c.id, "c1", 11);
+            let r = s.submit_by_agent("k", None, "samlet", 20).unwrap();
+            assert_eq!(r.state, want);
+            assert_eq!(r.history.last().unwrap().note.as_deref(), Some("samlet"));
+            // A ticket without any children behaves as before.
+            let t = in_progress(&mut s, "k2", "enkel", skip);
+            assert_eq!(s.submit_by_agent("k2", None, "ok", 21).unwrap().state, want);
+            assert_eq!(s.open_children_count(&t.id), 0);
+        }
+    }
+
+    #[test]
+    fn submit_waiting_parent_when_all_done_submits() {
+        let (mut s, _) = svc();
+        let (p, c1, c2) = parent_with_children(&mut s, false);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        finish(&mut s, &c1.id, "c", 30);
+        // One child still open: stays waiting.
+        let w = s.submit_by_agent("k", Some(&p.id), "delvis", 40).unwrap();
+        assert_eq!(w.state, S::Waiting);
+        assert_eq!(
+            w.history.last().unwrap().note.as_deref(),
+            Some("venter på del-tickets (1)")
+        );
+        // A deleted child no longer counts.
+        s.delete_at(&c2.id, 42).unwrap();
+        let r = s
+            .submit_by_agent("k", Some(&p.short_id()), "alt klar", 50)
+            .unwrap();
+        assert_eq!(r.state, S::Review);
+        assert_eq!(r.summary.as_deref(), Some("alt klar"));
+        assert_eq!(r.assignee_agent_id.as_deref(), Some("k"));
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn mark_not_submitted_waits_instead_of_issue() {
+        let (mut s, _) = svc();
+        let (p, c1, c2) = parent_with_children(&mut s, false);
+        let w = s.mark_not_submitted("k", 20).unwrap().unwrap();
+        assert_eq!((w.state, w.issue), (S::Waiting, None));
+        let h = w.history.last().unwrap();
+        assert_eq!(
+            (h.by, h.note.as_deref()),
+            (TicketActor::System, Some("venter på del-tickets (2)"))
+        );
+        // Nothing in progress any more: the next Stop saves nothing.
+        assert_eq!(s.mark_not_submitted("k", 21).unwrap(), None);
+        // All children done: the ordinary "not submitted".
+        finish(&mut s, &c1.id, "c", 30);
+        finish(&mut s, &c2.id, "c", 40);
+        s.resume_after_wake(&p.id, "k", WOKEN_NOTE, 50)
+            .unwrap()
+            .unwrap();
+        let n = s.mark_not_submitted("k", 60).unwrap().unwrap();
+        assert_eq!(
+            (n.state, n.issue),
+            (S::InProgress, Some(TicketIssue::NotSubmitted))
+        );
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn complete_turn_waits() {
+        for skip in [false, true] {
+            let (mut s, _) = svc();
+            let (_p, _c1, _c2) = parent_with_children(&mut s, skip);
+            let w = s.complete_turn("k", 20).unwrap().unwrap();
+            assert_eq!(w.state, S::Waiting, "skip {skip}");
+            assert_eq!(w.history.last().unwrap().by, TicketActor::System);
+            assert_eq!(s.complete_turn("k", 21).unwrap(), None);
+            assert_invariants(&s);
+        }
+    }
+
+    #[test]
+    fn next_for_agent_skips_blocked_and_keeps_positions() {
+        let (mut s, m) = svc();
+        let blocker = mk(&mut s, "plan", 1);
+        let blocked = s
+            .create_by_agent_related(
+                "byg",
+                "",
+                false,
+                Some(("c", "koord")),
+                None,
+                None,
+                vec![blocker.short_id()],
+                2,
+            )
+            .unwrap();
+        let free = s
+            .create_by_agent("test", "", false, Some(("c", "koord")), None, 3)
+            .unwrap();
+        assert_eq!(blocked.queue_position, Some(0));
+        assert_eq!(s.blocked_text(&blocked.id), Some(blocker.short_id()));
+        assert_eq!(s.blocked_text(&free.id), None);
+        assert_eq!(s.blocked_text("missing"), None);
+        // The blocked head is skipped; its position stays.
+        assert_eq!(s.next_for_agent("c").unwrap().id, free.id);
+        assert_eq!(
+            positions(&s, "c"),
+            vec![("byg".to_string(), Some(0)), ("test".to_string(), Some(1))]
+        );
+        // The queue still counts it (the agent is not idle).
+        assert_eq!(s.links().get("c"), Some(&(None, 2)));
+        s.mark_dispatched(&free.id, "c", 4).unwrap();
+        s.complete_turn("c", 5).unwrap();
+        assert_eq!(s.next_for_agent("c"), None, "only a blocked ticket left");
+        let saves = m.saves();
+        finish(&mut s, &blocker.id, "p", 10);
+        assert!(m.saves() > saves);
+        let next = s.next_for_agent("c").unwrap();
+        assert_eq!(
+            (next.id, next.queue_position),
+            (blocked.id.clone(), Some(0))
+        );
+        assert_eq!(s.blocked_text(&blocked.id), None);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn delete_clears_parent_and_blockers_in_one_save() {
+        let (mut s, m) = svc();
+        let p = mk(&mut s, "p", 1);
+        let b = mk(&mut s, "b", 2);
+        let c = related(&mut s, "c", None, Some(&p.id), &[&b.id]).unwrap();
+        let d = related(&mut s, "d", None, None, &[&b.id]).unwrap();
+        let other = mk(&mut s, "andet", 3);
+        let other_len = other.history.len();
+        let c_len = s.get(&c.id).unwrap().history.len();
+
+        let saves = m.saves();
+        s.delete_at(&p.id, 100).unwrap();
+        assert_eq!(m.saves(), saves + 1);
+        let c1 = s.get(&c.id).unwrap();
+        assert_eq!(c1.parent_id, None);
+        assert_eq!(c1.history.len(), c_len + 1);
+        let h = c1.history.last().unwrap();
+        assert_eq!(
+            (h.at, h.from, h.to, h.by, h.note.as_deref()),
+            (
+                100,
+                Some(S::Backlog),
+                S::Backlog,
+                TicketActor::System,
+                Some(PARENT_DELETED_NOTE)
+            )
+        );
+        assert_eq!(c1.blocked_by, vec![b.id.clone()]);
+
+        s.delete_at(&b.id, 101).unwrap();
+        assert_eq!(m.saves(), saves + 2);
+        let c2 = s.get(&c.id).unwrap();
+        assert!(c2.blocked_by.is_empty());
+        assert_eq!(c2.history.len(), c_len + 1, "no note for a removed blocker");
+        assert!(s.get(&d.id).unwrap().blocked_by.is_empty());
+        assert_eq!(s.get(&other.id).unwrap().history.len(), other_len);
+        let saved = m.doc().unwrap();
+        assert!(saved
+            .tickets
+            .iter()
+            .all(|t| t.parent_id.is_none() && t.blocked_by.is_empty()));
+        // A waiting parent cannot be deleted.
+        let (_, _, _) = {
+            let (pp, c1, c2) = parent_with_children(&mut s, false);
+            s.submit_by_agent("k", None, "x", 110).unwrap();
+            assert_eq!(s.delete_at(&pp.id, 111), Err(TicketError::NotDeletable));
+            (pp, c1, c2)
+        };
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn release_agent_and_recover_move_waiting_to_backlog() {
+        let (mut s, m) = svc();
+        let (p, c1, c2) = parent_with_children(&mut s, false);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        let doc = s.doc.clone();
+
+        let saves = m.saves();
+        let released = s.release_agent("k", "agent stoppet", 30).unwrap();
+        assert_eq!(m.saves(), saves + 1);
+        assert_eq!(released.len(), 1);
+        let b = s.get(&p.id).unwrap();
+        assert_eq!((b.state, b.assignee_agent_id.clone()), (S::Backlog, None));
+        assert_eq!(
+            b.history.last().unwrap().note.as_deref(),
+            Some("agent stoppet")
+        );
+        // The children are untouched and keep their parent.
+        for c in [&c1, &c2] {
+            let t = s.get(&c.id).unwrap();
+            assert_eq!(
+                (t.state, t.parent_id.as_deref()),
+                (S::Backlog, Some(p.id.as_str()))
+            );
+        }
+        assert_invariants(&s);
+
+        // A restart with a waiting parent.
+        let store = MemoryStore::with_doc(doc);
+        let (r, warning) = TicketService::load_and_recover(Box::new(store.clone()), 100);
+        assert_eq!(warning, None);
+        assert_eq!(store.saves(), 1);
+        let t = r.get(&p.id).unwrap();
+        assert_eq!((t.state, t.assignee_agent_id.clone()), (S::Backlog, None));
+        assert_eq!(
+            t.history.last().unwrap().note.as_deref(),
+            Some(RESTART_NOTE)
+        );
+        assert_eq!(
+            r.get(&c1.id).unwrap().parent_id.as_deref(),
+            Some(p.id.as_str())
+        );
+        assert_invariants(&r);
+    }
+
+    #[test]
+    fn due_wake_for_table() {
+        let (mut s, _) = svc();
+        // No waiting parent.
+        assert_eq!(s.due_wake_for("k"), None);
+        let (p, c1, c2) = parent_with_children(&mut s, false);
+        assert_eq!(s.due_wake_for("k"), None, "in progress, not waiting");
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        // Waiting, nothing done yet.
+        assert_eq!(s.due_wake_for("k"), None);
+        // One child done.
+        finish(&mut s, &c1.id, "c", 30);
+        let w = s.due_wake_for("k").unwrap();
+        assert_eq!(w.parent.id, p.id);
+        assert_eq!(
+            w.newly_done
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec![c1.id.clone()]
+        );
+        assert_eq!(w.open_left, 1);
+        assert_eq!(s.due_wake_for("other"), None);
+        // Woken (the line was typed) and waiting again: c1 no longer counts.
+        s.resume_after_wake(&p.id, "k", WOKEN_NOTE, 40)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.due_wake_for("k"), None, "in progress again");
+        s.submit_by_agent("k", None, "næste", 41).unwrap();
+        assert_eq!(s.due_wake_for("k"), None, "c1 was done before the resume");
+        // The last child done.
+        finish(&mut s, &c2.id, "c", 50);
+        let w = s.due_wake_for("k").unwrap();
+        assert_eq!(
+            (w.newly_done.len(), w.newly_done[0].id.clone(), w.open_left),
+            (1, c2.id.clone(), 0)
+        );
+
+        // Time reference: a child done at exactly the resume time is not new (strictly later).
+        let (mut s, _) = svc();
+        let (p, c1, c2) = parent_with_children(&mut s, false);
+        let _c3 = child_of(&mut s, &p, "test", 12);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        finish(&mut s, &c1.id, "c", 30);
+        s.resume_after_wake(&p.id, "k", WOKEN_NOTE, 40)
+            .unwrap()
+            .unwrap();
+        s.submit_by_agent("k", None, "næste", 41).unwrap();
+        finish(&mut s, &c2.id, "c", 37);
+        let t = find_mut(&mut s.doc, &c2.id).unwrap();
+        t.history.last_mut().unwrap().at = 40;
+        assert_eq!(s.due_wake_for("k"), None, "done at 40 is not after 40");
+        find_mut(&mut s.doc, &c2.id)
+            .unwrap()
+            .history
+            .last_mut()
+            .unwrap()
+            .at = 41;
+        assert_eq!(s.due_wake_for("k").unwrap().newly_done.len(), 1);
+
+        // The last open child deleted: due without a newly done child.
+        let (mut s, _) = svc();
+        let p = in_progress(&mut s, "k", "forælder", false);
+        let c = child_of(&mut s, &p, "c", 10);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        assert_eq!(s.due_wake_for("k"), None);
+        s.delete_at(&c.id, 30).unwrap();
+        let w = s.due_wake_for("k").unwrap();
+        assert_eq!((w.parent.id, w.newly_done.len(), w.open_left), (p.id, 0, 0));
+
+        // Two due parents: the one changed longest ago; newly done in Done order.
+        let (mut s, _) = svc();
+        let p1 = in_progress(&mut s, "k", "p1", false);
+        let a = child_of(&mut s, &p1, "a", 10);
+        let b = child_of(&mut s, &p1, "b", 11);
+        let z = child_of(&mut s, &p1, "z", 12);
+        s.submit_by_agent("k", None, "x", 20).unwrap();
+        let p2 = s.create("p2", "", false, 21).unwrap();
+        s.assign(&p2.id, "k", 22).unwrap();
+        s.mark_dispatched(&p2.id, "k", 23).unwrap();
+        let y = child_of(&mut s, &p2, "y", 24);
+        s.submit_by_agent("k", None, "y", 25).unwrap();
+        finish(&mut s, &y.id, "c", 30);
+        finish(&mut s, &b.id, "c", 40);
+        finish(&mut s, &a.id, "c", 50);
+        let w = s.due_wake_for("k").unwrap();
+        assert_eq!(w.parent.id, p1.id);
+        assert_eq!(
+            w.newly_done
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert_eq!(w.open_left, 1);
+        assert_eq!(s.get(&z.id).unwrap().state, S::Backlog);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn resume_after_wake_requires_waiting_and_free_agent() {
+        let (mut s, m) = svc();
+        let (p, c1, _c2) = parent_with_children(&mut s, false);
+        // Not waiting.
+        assert_eq!(s.resume_after_wake(&p.id, "k", WOKEN_NOTE, 15), Ok(None));
+        assert_eq!(
+            s.resume_after_wake("missing", "k", WOKEN_NOTE, 15),
+            Err(TicketError::NotFound)
+        );
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        finish(&mut s, &c1.id, "c", 30);
+        // Another agent's parent.
+        assert_eq!(s.resume_after_wake(&p.id, "z", WOKEN_NOTE, 35), Ok(None));
+        // The agent took another ticket meanwhile.
+        let other = in_progress(&mut s, "k", "andet", false);
+        let saves = m.saves();
+        assert_eq!(s.resume_after_wake(&p.id, "k", WOKEN_NOTE, 36), Ok(None));
+        assert_eq!(m.saves(), saves);
+        s.submit_by_agent("k", Some(&other.id), "ok", 37).unwrap();
+        // Free: resumed, by the system with the note.
+        let r = s
+            .resume_after_wake(&p.id, "k", WOKEN_NOTE, 40)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.state, S::InProgress);
+        let h = r.history.last().unwrap();
+        assert_eq!(
+            (h.at, h.from, h.by, h.note.as_deref()),
+            (40, Some(S::Waiting), TicketActor::System, Some(WOKEN_NOTE))
+        );
+        assert_eq!(s.current_for_agent("k").unwrap().id, p.id);
+        assert_eq!(m.saves(), saves + 2);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn note_children_done_only_for_backlog_parent_without_open_children() {
+        let (mut s, m) = svc();
+        let p = mk(&mut s, "p", 1);
+        let c = child_of(&mut s, &p, "c", 2);
+        assert_eq!(s.note_children_done(&p.id, 3), Ok(None), "open child");
+        finish(&mut s, &c.id, "a", 10);
+        let saves = m.saves();
+        let n = s.note_children_done(&p.id, 20).unwrap().unwrap();
+        assert_eq!(m.saves(), saves + 1);
+        let h = n.history.last().unwrap();
+        assert_eq!(
+            (h.from, h.to, h.by, h.note.as_deref()),
+            (
+                Some(S::Backlog),
+                S::Backlog,
+                TicketActor::System,
+                Some(CHILDREN_DONE_NOTE)
+            )
+        );
+        // Not twice in a row.
+        assert_eq!(s.note_children_done(&p.id, 21), Ok(None));
+        assert_eq!(m.saves(), saves + 1);
+        // Not for a parent with an assignee.
+        s.assign(&p.id, "a", 22).unwrap();
+        assert_eq!(s.note_children_done(&p.id, 23), Ok(None));
+    }
+
+    #[test]
+    fn set_state_from_waiting() {
+        let waiting = |skip: bool| {
+            let (mut s, _) = svc();
+            let (p, _, _) = parent_with_children(&mut s, skip);
+            s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+            (s, p.id)
+        };
+        // → Backlog with the note.
+        let (mut s, id) = waiting(false);
+        let b = s
+            .set_state(&id, S::Backlog, Some("selv".into()), true, 30)
+            .unwrap();
+        assert_eq!((b.state, b.assignee_agent_id.clone()), (S::Backlog, None));
+        assert_eq!(b.history.last().unwrap().note.as_deref(), Some("selv"));
+        // → In progress: Resume, only with a live and free agent.
+        let (mut s, id) = waiting(false);
+        assert_eq!(
+            s.set_state(&id, S::InProgress, None, false, 30),
+            Err(TicketError::AgentNotLive)
+        );
+        let other = in_progress(&mut s, "k", "andet", false);
+        assert_eq!(
+            s.set_state(&id, S::InProgress, None, true, 30),
+            Err(TicketError::AgentBusy)
+        );
+        s.submit_by_agent("k", Some(&other.id), "ok", 31).unwrap();
+        let r = s.set_state(&id, S::InProgress, None, true, 32).unwrap();
+        assert_eq!(r.state, S::InProgress);
+        assert_eq!(r.history.last().unwrap().from, Some(S::Waiting));
+        // → Review: the user's override, open children notwithstanding.
+        let (mut s, id) = waiting(false);
+        assert_eq!(
+            s.set_state(&id, S::Review, None, true, 30).unwrap().state,
+            S::Review
+        );
+        // → Done only with skipReview.
+        let (mut s, id) = waiting(false);
+        assert_eq!(
+            s.set_state(&id, S::Done, None, true, 30),
+            Err(TicketError::DoneNeedsReview)
+        );
+        let (mut s, id) = waiting(true);
+        assert_eq!(
+            s.set_state(&id, S::Done, None, true, 30).unwrap().state,
+            S::Done
+        );
+        // → Assigned / Rejected as for other states; nobody moves a ticket into waiting.
+        let (mut s, id) = waiting(false);
+        assert_eq!(
+            s.set_state(&id, S::Assigned, None, true, 30),
+            Err(TicketError::UseAssign)
+        );
+        assert_eq!(
+            s.set_state(&id, S::Rejected, None, true, 30),
+            Err(TicketError::UseReject)
+        );
+        let t = in_progress(&mut s, "k2", "i gang", false);
+        assert_eq!(
+            s.set_state(&t.id, S::Waiting, None, true, 30),
+            Err(TicketError::IllegalTransition {
+                from: S::InProgress,
+                to: S::Waiting
+            })
+        );
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn list_for_agent_includes_waiting() {
+        let (mut s, _) = svc();
+        let (p, _, _) = parent_with_children(&mut s, false);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        let cur = in_progress(&mut s, "k", "i gang", false);
+        let q = mk(&mut s, "i kø", 21);
+        s.assign(&q.id, "k", 22).unwrap();
+        let ids: Vec<String> = s.list_for_agent("k").into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![cur.id, p.id.clone(), q.id]);
+        let w = s.list_for_agent("k").remove(1);
+        assert_eq!(w.state, S::Waiting);
+        assert_eq!((w.parent_id, w.blocked_by.len()), (None, 0));
+        // The children carry their parent in the summary.
+        let kids: Vec<_> = s
+            .list()
+            .into_iter()
+            .filter(|t| t.parent_id.as_deref() == Some(p.id.as_str()))
+            .collect();
+        assert_eq!(kids.len(), 2);
+    }
+
+    #[test]
+    fn find_open_by_title_normalises() {
+        let (mut s, _) = svc();
+        assert_eq!(norm_title("  Byg \t SPIL\n "), "byg spil");
+        assert_eq!(norm_title("ÆBLE  Øl"), "æble øl");
+        let p = Some(ProjectRef::Existing("Snake".into()));
+        let a = s
+            .create_in("  Byg  SPIL ", "", false, p.clone(), 1)
+            .unwrap();
+        let b = s
+            .create_in(
+                "byg spil",
+                "",
+                false,
+                Some(ProjectRef::New {
+                    new: "snake".into(),
+                }),
+                2,
+            )
+            .unwrap();
+        let other = s
+            .create_in(
+                "byg spil",
+                "",
+                false,
+                Some(ProjectRef::Existing("andet".into())),
+                3,
+            )
+            .unwrap();
+        let none = s.create("Byg spil", "", false, 4).unwrap();
+        let done = s.create_in("byg spil", "", false, p.clone(), 5).unwrap();
+        finish(&mut s, &done.id, "a", 6);
+        let norm = norm_title("BYG   spil");
+        let ids = |v: Vec<Ticket>| v.into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(s.find_open_by_title(&norm, Some(&ProjectRef::Existing("snake".into())))),
+            vec![a.id.clone(), b.id.clone()]
+        );
+        assert_eq!(
+            ids(s.find_open_by_title(&norm, Some(&ProjectRef::Existing("andet".into())))),
+            vec![other.id]
+        );
+        assert_eq!(ids(s.find_open_by_title(&norm, None)), vec![none.id]);
+        assert!(s.find_open_by_title("byg", p.as_ref()).is_empty());
+    }
+
+    // ---- step 6a, Batch 2: relation_effects (plan A.5) ----
+
+    fn rs(
+        id: &str,
+        state: S,
+        parent: Option<&str>,
+        blocked: &[&str],
+        who: Option<&str>,
+    ) -> RelSnap {
+        RelSnap {
+            id: id.into(),
+            state,
+            parent_id: parent.map(str::to_string),
+            blocked_by: blocked.iter().map(|b| b.to_string()).collect(),
+            assignee: who.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn relation_effects_table() {
+        let set = |v: &[&str]| {
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<BTreeSet<String>>()
+        };
+        let parent = rs("p", S::Waiting, None, &[], Some("k"));
+        let open = rs("c1", S::Review, Some("p"), &[], Some("a"));
+        let done = rs("c1", S::Done, Some("p"), &[], Some("a"));
+        let other_open = rs("c2", S::Assigned, Some("p"), &[], Some("b"));
+
+        // A child Done under a waiting parent → wake its assignee (also when others are open).
+        let fx = relation_effects(
+            &[parent.clone(), open.clone(), other_open.clone()],
+            &[parent.clone(), done.clone(), other_open.clone()],
+        );
+        assert_eq!(fx.wake, set(&["k"]));
+        assert_eq!(fx.woken, vec![("p".to_string(), "k".to_string())]);
+        assert!(fx.unblocked.is_empty() && fx.children_done.is_empty());
+        // The last open child deleted → wake.
+        let fx = relation_effects(
+            &[parent.clone(), open.clone()],
+            std::slice::from_ref(&parent),
+        );
+        assert_eq!(fx.wake, set(&["k"]));
+        // A child rejected / back in the backlog / reopened stays open → nothing.
+        for after in [
+            rs("c1", S::Assigned, Some("p"), &[], Some("a")),
+            rs("c1", S::Backlog, Some("p"), &[], None),
+            rs("c1", S::Rejected, Some("p"), &[], Some("a")),
+        ] {
+            let fx = relation_effects(&[parent.clone(), open.clone()], &[parent.clone(), after]);
+            assert!(fx.is_empty(), "{fx:?}");
+            assert_eq!(fx, RelationEffects::default());
+        }
+        let fx = relation_effects(
+            &[parent.clone(), done.clone()],
+            &[parent.clone(), rs("c1", S::Backlog, Some("p"), &[], None)],
+        );
+        assert!(fx.is_empty(), "reopened child");
+        // The parent is not waiting (in progress) → no wake.
+        let busy = rs("p", S::InProgress, None, &[], Some("k"));
+        let fx = relation_effects(&[busy.clone(), open.clone()], &[busy, done.clone()]);
+        assert!(fx.is_empty());
+        // Unchanged → nothing.
+        let all = [parent.clone(), open.clone(), other_open.clone()];
+        assert!(relation_effects(&all, &all).is_empty());
+
+        // A blocker Done → the queued ticket's agent; a blocker deleted → the same.
+        let blocker = rs("b1", S::Review, None, &[], Some("x"));
+        let blocker_done = rs("b1", S::Done, None, &[], Some("x"));
+        let queued = rs("q", S::Assigned, None, &["b1"], Some("a"));
+        let fx = relation_effects(
+            &[blocker.clone(), queued.clone()],
+            &[blocker_done.clone(), queued.clone()],
+        );
+        assert_eq!(fx.unblocked, set(&["a"]));
+        assert_eq!(fx.freed, vec![("q".to_string(), "a".to_string())]);
+        assert!(fx.wake.is_empty());
+        let fx = relation_effects(
+            &[blocker.clone(), queued.clone()],
+            std::slice::from_ref(&queued),
+        );
+        assert_eq!(fx.unblocked, set(&["a"]));
+        // Still blocked by another open ticket → nothing.
+        let two = rs("q", S::Assigned, None, &["b1", "b2"], Some("a"));
+        let b2 = rs("b2", S::InProgress, None, &[], Some("y"));
+        let fx = relation_effects(
+            &[blocker.clone(), b2.clone(), two.clone()],
+            &[blocker_done.clone(), b2, two],
+        );
+        assert!(fx.is_empty());
+        // A blocked backlog ticket (no agent) → nothing to notify.
+        let loose = rs("q", S::Backlog, None, &["b1"], None);
+        let fx = relation_effects(&[blocker, loose.clone()], &[blocker_done, loose]);
+        assert!(fx.is_empty());
+
+        // A backlog parent without an assignee loses its last open child → children_done.
+        let lonely = rs("p", S::Backlog, None, &[], None);
+        let fx = relation_effects(&[lonely.clone(), open.clone()], &[lonely.clone(), done]);
+        assert_eq!(fx.children_done, vec!["p".to_string()]);
+        assert!(fx.wake.is_empty() && fx.unblocked.is_empty());
+        let fx = relation_effects(&[lonely.clone(), open], &[lonely]);
+        assert_eq!(fx.children_done, vec!["p".to_string()]);
+    }
+
+    #[test]
+    fn child_lines_and_reviews_list_children_oldest_first() {
+        let (mut s, _) = svc();
+        let p = s.create("Forælder", "", false, 1).unwrap();
+        let b = s.create("Blokering", "", false, 2).unwrap();
+        let c1 = s
+            .create_by_agent_related("Plan", "", false, None, None, Some(p.id.clone()), vec![], 3)
+            .unwrap();
+        let c2 = s
+            .create_by_agent_related(
+                "Byg",
+                "",
+                false,
+                None,
+                None,
+                Some(p.short_id()),
+                vec![b.short_id()],
+                4,
+            )
+            .unwrap();
+        let lines = s.child_lines(&p.id);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            (lines[0].short.as_str(), lines[0].title.as_str()),
+            (c1.short_id().as_str(), "Plan")
+        );
+        assert!(lines[0].open_blockers.is_empty());
+        assert_eq!(lines[1].short, c2.short_id());
+        assert_eq!(lines[1].open_blockers, vec![b.short_id()]);
+        assert_eq!(lines[1].state, S::Backlog);
+        let reviews = s.child_reviews(&p.id);
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[1].summary, None);
+        assert_eq!(s.children(&p.id).len(), 2);
+        assert!(s.child_lines(&c1.id).is_empty());
     }
 }
