@@ -23,13 +23,14 @@ pub mod tools;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::roles::Role;
 use crate::agent::{now_ms, AgentManager};
+use crate::checks::{self, CheckRunner, ChecksReport, ProcessChecks, ProjectFileReader};
 use crate::config::{
     CHANGES_REPORT_TITLE, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS,
     TURN_FAILED_TEXT,
@@ -40,14 +41,14 @@ use crate::hooks::status::AgentStatus;
 use crate::workspace::WorkspaceReader;
 use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
 use model::{
-    GitMode, ReportAuthor, Ticket, TicketActor, TicketError, TicketGit, TicketReport, TicketState,
-    TicketSummary, WorkspaceRules,
+    ChecksState, GitMode, ReportAuthor, Ticket, TicketActor, TicketChecks, TicketError, TicketGit,
+    TicketReport, TicketState, TicketSummary, WorkspaceRules,
 };
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
 pub use service::RejectReturn;
 use service::{
-    needs_changes_report, relation_effects, RelationEffects, ReviewCounts, TicketLinks,
+    checkable, needs_changes_report, relation_effects, RelationEffects, ReviewCounts, TicketLinks,
     TicketService, REVIEWER_REMOVED_NOTE,
 };
 use store::JsonFileStore;
@@ -139,6 +140,15 @@ pub struct TicketsCtx {
     /// never prepare the same worktree or add the report twice. Taken before, never inside, the
     /// service and report locks; git runs under it but never under the service lock.
     git_lock: Mutex<()>,
+    /// Runs the project checks (step 6b; [`ProcessChecks`] in the app, a fake in tests).
+    pub checks: Arc<dyn CheckRunner>,
+    /// `<project>/.mira-bots/project.json` with an `(mtime, len)` cache.
+    pub project_files: ProjectFileReader,
+    /// This context's own `Arc` (set by [`Self::shared`]): the checks thread holds it.
+    me: OnceLock<Weak<TicketsCtx>>,
+    /// The checks threads started so far (tests join them).
+    #[cfg(test)]
+    check_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl TicketsCtx {
@@ -161,6 +171,37 @@ impl TicketsCtx {
             workspace,
             git,
             git_lock: Mutex::new(()),
+            checks: Arc::new(ProcessChecks::new()),
+            project_files: ProjectFileReader::new(),
+            me: OnceLock::new(),
+            #[cfg(test)]
+            check_threads: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The context in an `Arc` that knows itself, so the project checks can run on their own
+    /// thread (step 6b). Without it the checks run inline.
+    pub fn shared(self) -> Arc<Self> {
+        let me = Arc::new(self);
+        let _ = me.me.set(Arc::downgrade(&me));
+        me
+    }
+
+    /// Replaces the check runner (tests).
+    #[cfg(test)]
+    pub fn with_check_runner(mut self, checks: Arc<dyn CheckRunner>) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    /// Waits for every checks thread started so far (tests).
+    #[cfg(test)]
+    pub fn join_checks(&self) {
+        loop {
+            let Some(h) = lock(&self.check_threads).pop() else {
+                return;
+            };
+            h.join().expect("checks thread");
         }
     }
 
@@ -485,7 +526,10 @@ impl TicketsCtx {
     // ---- review routing (plan5 A.6) ----
 
     /// Gives every ticket in review without a reviewer (and not escalated) to a reviewer, or
-    /// escalates it when it reached the workspace's `maxReviewRounds`. Candidates: live agents with the
+    /// escalates it when it reached the workspace's `maxReviewRounds`. Step 6b (plan A.3), per
+    /// ticket in this order: the «Ændringer» report · escalate (no checks; the user decides) ·
+    /// start the project checks ([`Self::ensure_checks`]) · wait while they run and
+    /// `checksGate` is on · route. Candidates: live agents with the
     /// reviewer role other than the sender; the one with the fewest open reviews wins (tie: the
     /// oldest, then the id). No candidate: the ticket waits for the user as before. Idempotent;
     /// called after every way into review and whenever reviewers come or go. Returns the number
@@ -498,7 +542,8 @@ impl TicketsCtx {
         if pending.is_empty() {
             return 0;
         }
-        let max = self.workspace.rules().max_review_rounds;
+        let rules = self.workspace.rules();
+        let (max, gate) = (rules.max_review_rounds, rules.checks_gate);
         let reviewers = lock(&self.manager).reviewers();
         let mut routed = 0;
         for t in pending {
@@ -517,6 +562,16 @@ impl TicketsCtx {
                     Ok(None) => {}
                     Err(e) => log::warn!("review: escalating {} failed: {e}", t.short_id()),
                 }
+                continue;
+            }
+            // Step 6b (plan A.3): the project checks start here (on their own thread); with
+            // `checksGate` the ticket waits for them, and the thread routes it when they pass.
+            let checks = self.ensure_checks(&t);
+            if gate && checks.is_some_and(|c| c.state == ChecksState::Pending) {
+                log::info!(
+                    "review: ticket {} waits for its project checks",
+                    t.short_id()
+                );
                 continue;
             }
             let counts = self.read(TicketService::open_review_counts);
@@ -587,11 +642,15 @@ impl TicketsCtx {
         };
         let repo = PathBuf::from(&found.path);
         let prepared = if git::is_git_repo(&repo) {
-            let base = git::resolve_base(
-                self.git.as_ref(),
-                &repo,
-                self.workspace.config().git_base.as_deref(),
-            );
+            // project.json `gitBase` → workspace `gitBase` → what the repository says.
+            let configured = self
+                .project_files
+                .read(&repo)
+                .ok()
+                .flatten()
+                .and_then(|f| f.git_base)
+                .or(self.workspace.config().git_base);
+            let base = git::resolve_base(self.git.as_ref(), &repo, configured.as_deref());
             git::prepare_worktree(self.git.as_ref(), &repo, &short, &base).map(|wt| TicketGit {
                 mode: GitMode::Worktree,
                 branch: git::branch_name(&short).unwrap_or_default(),
@@ -674,6 +733,270 @@ impl TicketsCtx {
                 false
             }
         }
+    }
+
+    // ---- project checks (step 6b, plan A.3) ----
+
+    /// The folder of the ticket's existing project.
+    fn project_dir(&self, t: &Ticket) -> Option<PathBuf> {
+        let id = t.project.as_ref().and_then(|p| p.id())?;
+        crate::projects::find_project(self.workspace.root(), id).map(|p| PathBuf::from(p.path))
+    }
+
+    /// The project's checks as "name: `run`" lines for the review file (empty: none, no project
+    /// or an unreadable file).
+    pub fn project_checks(&self, project: Option<&str>) -> Vec<String> {
+        let Some(dir) = project
+            .and_then(|p| crate::projects::find_project(self.workspace.root(), p))
+            .map(|p| PathBuf::from(p.path))
+        else {
+            return Vec::new();
+        };
+        match self.project_files.read(&dir) {
+            Ok(Some(f)) => f
+                .checks
+                .iter()
+                .map(|c| format!("{}: `{}`", c.name, c.run))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The checks state of a ticket in review for [`Self::route_reviews`]: the stored one, or —
+    /// for a [`checkable`] ticket without one — the checks are started now: an unreadable
+    /// project file gives the report "Tjek: project.json kunne ikke læses" and `skipped` (a
+    /// configuration error never sends a ticket back), no file or no checks give `skipped`,
+    /// otherwise `pending` and a "mira-checks" thread runs them in the ticket's worktree (else
+    /// the project folder) and hands the result to [`Self::finish_checks`]. `None`: not
+    /// checkable. Never runs a check under a lock.
+    pub fn ensure_checks(&self, t: &Ticket) -> Option<TicketChecks> {
+        if t.checks.is_some() {
+            return t.checks.clone();
+        }
+        let sender = t.assignee_agent_id.as_deref().and_then(|a| {
+            lock(&self.manager)
+                .get(a)
+                .filter(|i| !matches!(i.status, AgentStatus::Exited { .. }))
+        });
+        let children = self.read(|s| s.children(&t.id).len());
+        if !checkable(t, sender.as_ref(), children) {
+            return None;
+        }
+        let short = t.short_id();
+        let now = now_ms();
+        let dir = self.project_dir(t);
+        let file = match &dir {
+            Some(d) => self.project_files.read(d),
+            None => Ok(None),
+        };
+        let checks = match file {
+            Ok(Some(f)) if !f.checks.is_empty() => f.checks,
+            Ok(_) => return self.skip_checks(t, now),
+            Err(e) => {
+                log::warn!("checks: ticket {short}: {e}");
+                let (title, body) = checks::unreadable_report(&e);
+                if let Err(e) = self.add_report(&t.id, ReportAuthor::system(), &title, &body) {
+                    log::warn!("checks: adding the report to ticket {short} failed: {e}");
+                }
+                return self.skip_checks(t, now);
+            }
+        };
+        let round = t.review_round;
+        // Only one path starts them (route_reviews may run on several threads at once).
+        let started = self.mutate_if(
+            |s| match s.get(&t.id) {
+                Some(c) if c.state == TicketState::Review && c.checks.is_none() => {
+                    s.start_checks(&t.id, round, now).map(Some)
+                }
+                _ => Ok(None),
+            },
+            Option::is_some,
+        );
+        let started = match started {
+            Ok(Some(tk)) => tk,
+            Ok(None) => return self.read(|s| s.get(&t.id)).and_then(|c| c.checks),
+            Err(e) => {
+                log::warn!("checks: starting the checks of ticket {short} failed: {e}");
+                return None;
+            }
+        };
+        let cwd = t
+            .git
+            .as_ref()
+            .and_then(|g| g.worktree.as_deref())
+            .map(PathBuf::from)
+            .filter(|w| w.is_dir())
+            .or(dir)
+            .unwrap_or_default();
+        log::info!(
+            "checks: ticket {short}: {} check(s) in {}",
+            checks.len(),
+            cwd.display()
+        );
+        self.spawn_checks(t.id.clone(), round, now, checks, cwd);
+        started.checks
+    }
+
+    /// `skipped` for this review entry (only while the ticket has no checks result yet).
+    fn skip_checks(&self, t: &Ticket, now: u64) -> Option<TicketChecks> {
+        let r = self.mutate_if(
+            |s| match s.get(&t.id) {
+                Some(c) if c.state == TicketState::Review && c.checks.is_none() => {
+                    s.skip_checks(&t.id, now).map(Some)
+                }
+                _ => Ok(None),
+            },
+            Option::is_some,
+        );
+        match r {
+            Ok(Some(tk)) => tk.checks,
+            Ok(None) => self.read(|s| s.get(&t.id)).and_then(|c| c.checks),
+            Err(e) => {
+                log::warn!("checks: skipping for ticket {} failed: {e}", t.short_id());
+                None
+            }
+        }
+    }
+
+    /// Runs the checks on a "mira-checks" thread (inline when this context is not
+    /// [`Self::shared`]) and finishes with [`Self::finish_checks`].
+    fn spawn_checks(
+        &self,
+        id: String,
+        round: u32,
+        started_at: u64,
+        list: Vec<checks::Check>,
+        cwd: PathBuf,
+    ) {
+        let Some(me) = self.me.get().and_then(Weak::upgrade) else {
+            let report = checks::run_checks(self.checks.as_ref(), &list, &cwd);
+            self.finish_checks(&id, round, started_at, &report);
+            return;
+        };
+        let thread_id = id.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mira-checks".into())
+            .spawn(move || {
+                let report = checks::run_checks(me.checks.as_ref(), &list, &cwd);
+                me.finish_checks(&thread_id, round, started_at, &report);
+            });
+        match spawned {
+            Ok(_handle) => {
+                #[cfg(test)]
+                lock(&self.check_threads).push(_handle);
+            }
+            Err(e) => {
+                log::warn!("checks: could not start the checks thread: {e}");
+                let report = ChecksReport::default();
+                // Nothing ran: the ticket must not wait forever.
+                let now = now_ms();
+                let _ = self.mutate_if(
+                    |s| match s.get(&id) {
+                        Some(t) if same_checks_run(&t, round, started_at) => s
+                            .set_checks(
+                                &t.id,
+                                TicketChecks {
+                                    state: ChecksState::Skipped,
+                                    failed: report.failed,
+                                    round,
+                                    started_at,
+                                },
+                                now,
+                            )
+                            .map(Some),
+                        _ => Ok(None),
+                    },
+                    Option::is_some,
+                );
+            }
+        }
+    }
+
+    /// The checks of `id` ended (on the checks thread; no lock held). A result for another run
+    /// (the ticket left review, was submitted again, or the app restarted) is dropped. Otherwise:
+    /// the «Tjek» report (author: the app), `passed`/`failed`, and — when a check failed,
+    /// `checksGate` is on and the ticket is not escalated — the app rejects it ("Tjek fejlede:
+    /// … Se rapport nn."; the round counts towards `maxReviewRounds`) and the sender is told.
+    /// Then the reviews are routed.
+    pub fn finish_checks(&self, id: &str, round: u32, started_at: u64, report: &ChecksReport) {
+        let current = self.read(|s| s.get(id));
+        let Some(t) = current.filter(|t| same_checks_run(t, round, started_at)) else {
+            log::info!(
+                "checks: stale result for ticket {} dropped",
+                model::short_id(id)
+            );
+            // Left review while running (approved, rejected, moved): no "running" state stays.
+            let now = now_ms();
+            if let Err(e) = self.mutate_if(
+                |s| s.clear_checks_run(id, round, started_at, now),
+                Option::is_some,
+            ) {
+                log::debug!("checks: clearing the stale run failed: {e}");
+            }
+            return;
+        };
+        let short = t.short_id();
+        let (title, body) = checks::render_checks_report(report);
+        let report_id = match self.add_report(id, ReportAuthor::system(), &title, &body) {
+            Ok(r) => Some(r.id),
+            Err(e) => {
+                log::warn!("checks: adding the report to ticket {short} failed: {e}");
+                None
+            }
+        };
+        let state = if report.failed.is_some() {
+            ChecksState::Failed
+        } else {
+            ChecksState::Passed
+        };
+        let now = now_ms();
+        let stored = self.mutate_if(
+            |s| match s.get(id) {
+                Some(t) if same_checks_run(&t, round, started_at) => s
+                    .set_checks(
+                        id,
+                        TicketChecks {
+                            state,
+                            failed: report.failed.clone(),
+                            round,
+                            started_at,
+                        },
+                        now,
+                    )
+                    .map(Some),
+                _ => Ok(None),
+            },
+            Option::is_some,
+        );
+        let t = match stored {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                log::info!("checks: ticket {short} moved on while storing; result dropped");
+                return;
+            }
+            Err(e) => {
+                log::warn!("checks: storing the result of ticket {short} failed: {e}");
+                return;
+            }
+        };
+        log::info!("checks: ticket {short}: {title}");
+        let gate = self.workspace.rules().checks_gate;
+        if let (true, false, Some(line)) = (gate, t.escalated, report.first_failure()) {
+            let note = checks::gate_note(line, report_id.as_deref());
+            let sender = t.assignee_agent_id.clone();
+            let to = self.reject_return(id);
+            match self.mutate(|s| s.reject_by_system(id, &note, to, now)) {
+                Ok(tk) => {
+                    log::info!(
+                        "checks: ticket {short} rejected by the app (round {})",
+                        tk.review_round
+                    );
+                    self.notify(sender);
+                }
+                Err(e) => log::warn!("checks: rejecting ticket {short} failed: {e}"),
+            }
+        }
+        self.route_reviews();
     }
 
     /// `assign_reviewer` (C5.4): the ticket must be in review. `Some(agent)`: a live agent with
@@ -801,6 +1124,14 @@ impl TicketsCtx {
     }
 }
 
+/// The ticket is still in review with the pending checks run `(round, started_at)`.
+fn same_checks_run(t: &Ticket, round: u32, started_at: u64) -> bool {
+    t.state == TicketState::Review
+        && t.checks.as_ref().is_some_and(|c| {
+            c.state == ChecksState::Pending && c.round == round && c.started_at == started_at
+        })
+}
+
 impl TicketsHost for Arc<TicketsCtx> {
     fn reroute_reviews(&self) {
         TicketsCtx::route_reviews(self);
@@ -830,6 +1161,10 @@ impl TicketsHost for Arc<TicketsCtx> {
 
     fn prepare_git(&self, ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
         TicketsCtx::prepare_ticket_git(self, ticket)
+    }
+
+    fn project_checks(&self, project: Option<&str>) -> Vec<String> {
+        TicketsCtx::project_checks(self, project)
     }
 }
 
@@ -926,11 +1261,20 @@ pub(crate) mod test_support {
         test_ctx_with_git(manager, Arc::new(crate::git::fake::FakeGit::new()))
     }
 
-    /// [`test_ctx`] with a given git (step 6b). The workspace file (absent: the defaults) is
-    /// `ctx.workspace.path()`; its folder is the projects root.
+    /// [`test_ctx_with`] with a scripted git and the real check runner.
     pub fn test_ctx_with_git(
         manager: Arc<Mutex<AgentManager>>,
         git: Arc<dyn crate::git::GitRunner>,
+    ) -> TestCtx {
+        test_ctx_with(manager, git, Arc::new(crate::checks::ProcessChecks::new()))
+    }
+
+    /// [`test_ctx`] with a given git and check runner (step 6b). The workspace file (absent: the
+    /// defaults) is `ctx.workspace.path()`; its folder is the projects root.
+    pub fn test_ctx_with(
+        manager: Arc<Mutex<AgentManager>>,
+        git: Arc<dyn crate::git::GitRunner>,
+        checks: Arc<dyn crate::checks::CheckRunner>,
     ) -> TestCtx {
         let store = MemoryStore::new();
         let svc = TicketService::new(Box::new(store.clone()), TicketDoc::default());
@@ -949,15 +1293,9 @@ pub(crate) mod test_support {
                 .join(crate::config::WORKSPACE_FILE),
         ));
         TestCtx {
-            ctx: Arc::new(TicketsCtx::new(
-                svc,
-                manager,
-                tx,
-                emit,
-                reports_root,
-                workspace,
-                git,
-            )),
+            ctx: TicketsCtx::new(svc, manager, tx, emit, reports_root, workspace, git)
+                .with_check_runner(checks)
+                .shared(),
             rx,
             events,
             store,
@@ -1081,7 +1419,7 @@ mod tests {
             Box::new(store::MemoryStore::new()),
             model::TicketDoc::default(),
         );
-        let ctx = Arc::new(TicketsCtx::new(
+        let ctx = TicketsCtx::new(
             svc,
             Arc::clone(&m),
             tx,
@@ -1093,7 +1431,8 @@ mod tests {
                     .join(crate::config::WORKSPACE_FILE),
             )),
             Arc::new(crate::git::fake::FakeGit::new()),
-        ));
+        )
+        .shared();
         assert!(slot.set(Arc::clone(&ctx)).is_ok());
         let tk = ctx.mutate(|s| s.create("x", "", false, 1)).unwrap();
         ctx.mutate(|s| s.assign(&tk.id, &ids[0], 2)).unwrap();
@@ -2370,5 +2709,446 @@ mod tests {
         let plain = submitted(&t, a, "uden git");
         assert!(!t.ctx.attach_changes(&plain));
         cleanup(&t);
+    }
+
+    // ---- step 6b: project checks and the gate (plan6b punkt 15) ----
+
+    use crate::checks::fake::FakeChecks;
+    use crate::checks::RunOutcome;
+
+    struct ChecksSetup {
+        t: TestCtx,
+        fake: Arc<FakeChecks>,
+        proj: PathBuf,
+        coder: String,
+        reviewer: String,
+    }
+
+    /// Coder a1 (work seat in `proj`), reviewer r1 (staff); workspace file `ws`; the project
+    /// `proj` with `project` as its project.json (none when `None`).
+    fn checks_setup(ws: &str, project: Option<&str>) -> ChecksSetup {
+        let mut m = AgentManager::new(5);
+        let coder = m.insert_fake_in(
+            "s-a1",
+            "/w/a1",
+            &[Role::Coder],
+            SeatKind::Work,
+            Some("proj"),
+        );
+        let reviewer = m.insert_fake_with("s-r1", "/w/r1", &[Role::Reviewer], SeatKind::Staff);
+        let fake = Arc::new(FakeChecks::new());
+        let t = test_ctx_with(
+            Arc::new(Mutex::new(m)),
+            Arc::new(FakeGit::new()),
+            fake.clone(),
+        );
+        let proj = t.ctx.workspace.root().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(t.ctx.workspace.path(), ws).unwrap();
+        if let Some(text) = project {
+            let f = crate::checks::project_file_path(&proj);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, text).unwrap();
+        }
+        ChecksSetup {
+            t,
+            fake,
+            proj,
+            coder,
+            reviewer,
+        }
+    }
+
+    const TWO_CHECKS: &str = r#"{"checks": [{"name": "tests", "run": "npm test"}, {"name": "lint", "run": "npm run lint"}]}"#;
+
+    /// A ticket in `proj` submitted by the coder (in review, unrouted).
+    fn submit_in_proj(c: &ChecksSetup) -> Ticket {
+        let ctx = &c.t.ctx;
+        let p = Some(ProjectRef::Existing("proj".into()));
+        let tk = ctx
+            .mutate(|s| s.create_in("Ret login", "b", false, p, None, 1))
+            .unwrap();
+        ctx.mutate(|s| s.assign(&tk.id, &c.coder, 2)).unwrap();
+        ctx.mutate(|s| s.mark_dispatched(&tk.id, &c.coder, 3))
+            .unwrap();
+        ctx.mutate(|s| s.submit_by_agent(&c.coder, None, "klar", 4))
+            .unwrap()
+    }
+
+    fn get(c: &ChecksSetup, id: &str) -> Ticket {
+        c.t.ctx.read(|s| s.get(id)).unwrap()
+    }
+
+    fn checks_state(c: &ChecksSetup, id: &str) -> Option<ChecksState> {
+        get(c, id).checks.map(|k| k.state)
+    }
+
+    fn review_assigned(msgs: &[DispatchMsg]) -> usize {
+        msgs.iter()
+            .filter(|m| matches!(m, DispatchMsg::ReviewAssigned { .. }))
+            .count()
+    }
+
+    #[test]
+    fn review_without_project_file_is_skipped_and_routed() {
+        let mut c = checks_setup("{}", None);
+        let tk = submit_in_proj(&c);
+        assert_eq!(c.t.ctx.route_reviews(), 1);
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert_eq!(t.reviewer_agent_id.as_deref(), Some(c.reviewer.as_str()));
+        assert_eq!(t.checks.map(|k| k.state), Some(ChecksState::Skipped));
+        assert!(t.reports.is_empty());
+        assert!(c.fake.calls().is_empty());
+        assert_eq!(review_assigned(&c.t.sent()), 1);
+
+        // An empty list: skipped too. An unreadable file: a report by the app, skipped, routed.
+        for (text, report) in [(r#"{"checks": []}"#, false), (r#"{"checks": 3}"#, true)] {
+            let c = checks_setup("{}", Some(text));
+            let tk = submit_in_proj(&c);
+            assert_eq!(c.t.ctx.route_reviews(), 1, "{text}");
+            let t = get(&c, &tk.id);
+            assert_eq!(t.checks.map(|k| k.state), Some(ChecksState::Skipped));
+            assert_eq!(t.reports.len(), usize::from(report));
+            if report {
+                let r = &t.reports[0];
+                assert_eq!(
+                    (r.title.as_str(), r.author.clone()),
+                    (
+                        "Tjek: project.json kunne ikke læses",
+                        ReportAuthor::system()
+                    )
+                );
+                let body = c.t.ctx.get_report(&tk.id, &r.id).unwrap().body;
+                assert_eq!(body, "project.json: checks skal være en liste");
+            }
+            assert!(c.fake.calls().is_empty());
+            cleanup(&c.t);
+        }
+        // A ticket without a project is not checked at all.
+        let plain = submitted(&c.t, &c.coder, "uden projekt");
+        c.t.ctx.route_reviews();
+        assert_eq!(checks_state(&c, &plain), None);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn review_with_checks_waits_for_pending_then_routes_on_pass() {
+        let mut c = checks_setup("{}", Some(TWO_CHECKS));
+        let tk = submit_in_proj(&c);
+        c.fake.hold();
+        assert_eq!(c.t.ctx.route_reviews(), 0, "waits for the checks");
+        let pending = get(&c, &tk.id).checks.unwrap();
+        assert_eq!((pending.state, pending.round), (ChecksState::Pending, 0));
+        assert_eq!(get(&c, &tk.id).reviewer_agent_id, None);
+        // Routing again while they run: still waiting, not started twice.
+        assert_eq!(c.t.ctx.route_reviews(), 0);
+        assert_eq!(get(&c, &tk.id).checks, Some(pending));
+        assert_eq!(review_assigned(&c.t.sent()), 0);
+        c.fake.release();
+        c.t.ctx.join_checks();
+        // Both ran, in order, in the project folder (no worktree).
+        assert_eq!(
+            c.fake.calls(),
+            vec![
+                ("tests".to_string(), c.proj.clone()),
+                ("lint".to_string(), c.proj.clone())
+            ]
+        );
+        let t = get(&c, &tk.id);
+        assert_eq!(t.state, TicketState::Review);
+        assert_eq!(
+            t.checks.as_ref().map(|k| k.state),
+            Some(ChecksState::Passed)
+        );
+        assert_eq!(t.reviewer_agent_id.as_deref(), Some(c.reviewer.as_str()));
+        assert_eq!(t.reports.len(), 1);
+        let r = &t.reports[0];
+        assert_eq!(
+            (r.title.as_str(), r.author.clone()),
+            ("Tjek: OK", ReportAuthor::system())
+        );
+        let body = c.t.ctx.get_report(&tk.id, &r.id).unwrap().body;
+        assert_eq!(
+            body,
+            "Tjek: tests → OK (exit 0, 1 s)\nTjek: lint → OK (exit 0, 1 s)"
+        );
+        assert_eq!(review_assigned(&c.t.sent()), 1);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn checks_run_in_the_ticket_worktree() {
+        let c = checks_setup("{}", Some(TWO_CHECKS));
+        let tk = submit_in_proj(&c);
+        let wt = c.proj.join(".mira-bots").join("wt").join(tk.short_id());
+        std::fs::create_dir_all(&wt).unwrap();
+        let g = TicketGit {
+            mode: GitMode::Worktree,
+            branch: format!("ticket/{}", tk.short_id()),
+            base: "main".into(),
+            repo: c.proj.to_string_lossy().into_owned(),
+            worktree: Some(wt.to_string_lossy().into_owned()),
+        };
+        c.t.ctx.mutate(|s| s.set_git(&tk.id, Some(g), 5)).unwrap();
+        c.t.ctx.route_reviews();
+        c.t.ctx.join_checks();
+        assert!(
+            c.fake.calls().iter().all(|(_, d)| d == &wt),
+            "{:?}",
+            c.fake.calls()
+        );
+        assert_eq!(c.fake.calls().len(), 2);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn failed_check_rejects_by_system_with_report_reference_and_round_plus_one() {
+        let mut c = checks_setup("{}", Some(TWO_CHECKS));
+        c.fake.exit("tests", 1, "FAIL src/login.test.ts\n");
+        let tk = submit_in_proj(&c);
+        c.t.sent();
+        assert_eq!(c.t.ctx.route_reviews(), 0);
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        // Back first in the sender's queue, rejected by the app; the round counts.
+        assert_eq!(t.state, TicketState::Assigned);
+        assert_eq!(t.assignee_agent_id.as_deref(), Some(c.coder.as_str()));
+        assert_eq!(t.queue_position, Some(0));
+        assert_eq!(t.review_round, 1);
+        assert_eq!(t.reviewer_agent_id, None);
+        let note = "Tjek fejlede: tests (exit 1). Se rapport 01.";
+        assert_eq!(t.rejection_note.as_deref(), Some(note));
+        let h = t
+            .history
+            .iter()
+            .rev()
+            .find(|h| h.to == TicketState::Rejected)
+            .unwrap();
+        assert_eq!(h.by, TicketActor::System);
+        assert_eq!(
+            h.note.as_deref(),
+            Some(format!("afvist af appen: {note}").as_str())
+        );
+        let k = t.checks.clone().unwrap();
+        assert_eq!(
+            (k.state, k.failed.as_deref()),
+            (ChecksState::Failed, Some("tests"))
+        );
+        // The report: id 01, by the app, the failing output.
+        let r = &t.reports[0];
+        assert_eq!(
+            (r.id.as_str(), r.title.as_str(), r.author.clone()),
+            ("01", "Tjek: FEJL (tests)", ReportAuthor::system())
+        );
+        let body = c.t.ctx.get_report(&tk.id, "01").unwrap().body;
+        assert_eq!(
+            body,
+            "Tjek: tests → FEJL (exit 1, 2 s)\nTjek: lint → OK (exit 0, 1 s)\n\n--- tests (sidste 22 tegn) ---\nFAIL src/login.test.ts"
+        );
+        // The sender is told; nobody reviews.
+        let sent = c.t.sent();
+        assert_eq!(review_assigned(&sent), 0);
+        assert!(sent
+            .iter()
+            .any(|m| matches!(m, DispatchMsg::QueueChanged { agent_id } if agent_id == &c.coder)));
+
+        // Submitted again: checked anew (the round is 1 now).
+        c.fake.exit("tests", 0, "");
+        c.t.ctx
+            .mutate(|s| s.mark_dispatched(&tk.id, &c.coder, 10))
+            .unwrap();
+        c.t.ctx
+            .mutate(|s| s.submit_by_agent(&c.coder, None, "rettet", 11))
+            .unwrap();
+        assert_eq!(get(&c, &tk.id).checks, None, "Submit resets");
+        c.t.ctx.route_reviews();
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert_eq!(
+            t.checks.map(|k| (k.state, k.round)),
+            Some((ChecksState::Passed, 1))
+        );
+        assert_eq!(t.reviewer_agent_id.as_deref(), Some(c.reviewer.as_str()));
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn failed_check_round_counts_towards_max_and_escalates() {
+        let c = checks_setup(r#"{"maxReviewRounds": 1}"#, Some(TWO_CHECKS));
+        c.fake.outcome(
+            "lint",
+            RunOutcome::TimedOut {
+                output: String::new(),
+                clipped: false,
+                elapsed_ms: 600_000,
+            },
+        );
+        let tk = submit_in_proj(&c);
+        c.t.ctx.route_reviews();
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert_eq!(
+            t.rejection_note.as_deref(),
+            Some("Tjek fejlede: lint (timeout). Se rapport 01.")
+        );
+        assert_eq!(t.review_round, 1);
+        // Back in review at the maximum: escalated, no new checks.
+        c.t.ctx
+            .mutate(|s| s.mark_dispatched(&tk.id, &c.coder, 10))
+            .unwrap();
+        c.t.ctx
+            .mutate(|s| s.submit_by_agent(&c.coder, None, "igen", 11))
+            .unwrap();
+        let calls = c.fake.calls().len();
+        assert_eq!(c.t.ctx.route_reviews(), 0);
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert!(t.escalated);
+        assert_eq!(t.checks, None);
+        assert_eq!(c.fake.calls().len(), calls);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn gate_off_routes_with_failed_badge() {
+        let mut c = checks_setup(r#"{"checksGate": false}"#, Some(TWO_CHECKS));
+        c.fake.exit("lint", 2, "error");
+        let tk = submit_in_proj(&c);
+        c.fake.hold();
+        assert_eq!(c.t.ctx.route_reviews(), 1, "routed while the checks run");
+        assert_eq!(checks_state(&c, &tk.id), Some(ChecksState::Pending));
+        c.fake.release();
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert_eq!(t.state, TicketState::Review);
+        assert_eq!(t.reviewer_agent_id.as_deref(), Some(c.reviewer.as_str()));
+        assert_eq!(t.review_round, 0);
+        assert_eq!(t.rejection_note, None);
+        assert_eq!(t.checks.map(|k| k.state), Some(ChecksState::Failed));
+        assert_eq!(t.reports[0].title, "Tjek: FEJL (lint)");
+        assert_eq!(review_assigned(&c.t.sent()), 1);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn escalated_ticket_runs_no_gate() {
+        let c = checks_setup(r#"{"maxReviewRounds": 1}"#, Some(TWO_CHECKS));
+        let tk = submit_in_proj(&c);
+        // Rejected once by the user: round 1 = the maximum.
+        c.t.ctx
+            .mutate(|s| s.reject(&tk.id, "nej", RejectReturn::Sender, 5))
+            .unwrap();
+        c.t.ctx
+            .mutate(|s| s.mark_dispatched(&tk.id, &c.coder, 6))
+            .unwrap();
+        c.t.ctx
+            .mutate(|s| s.submit_by_agent(&c.coder, None, "igen", 7))
+            .unwrap();
+        assert_eq!(c.t.ctx.route_reviews(), 0);
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert!(t.escalated);
+        assert_eq!(t.checks, None);
+        assert!(t.reports.is_empty());
+        assert!(c.fake.calls().is_empty());
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn stale_check_result_is_dropped() {
+        let c = checks_setup("{}", Some(TWO_CHECKS));
+        c.fake.exit("tests", 1, "boom");
+        let tk = submit_in_proj(&c);
+        c.fake.hold();
+        c.t.ctx.route_reviews();
+        assert_eq!(checks_state(&c, &tk.id), Some(ChecksState::Pending));
+        // The user approves while the checks run.
+        c.t.ctx.mutate(|s| s.approve(&tk.id, 8)).unwrap();
+        c.fake.release();
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert_eq!(t.state, TicketState::Done);
+        assert!(t.reports.is_empty(), "no report for a stale run");
+        assert_eq!(t.checks, None, "no running badge left behind");
+        assert_eq!(t.rejection_note, None);
+
+        // A result for another run (e.g. from before a restart) is dropped too.
+        let tk2 = submit_in_proj(&c);
+        c.t.ctx.mutate(|s| s.start_checks(&tk2.id, 0, 42)).unwrap();
+        let report = crate::checks::run_checks(
+            c.fake.as_ref(),
+            &[crate::checks::Check {
+                name: "tests".into(),
+                run: "x".into(),
+                timeout_sec: 1,
+            }],
+            &c.proj,
+        );
+        c.t.ctx.finish_checks(&tk2.id, 0, 41, &report);
+        let t2 = get(&c, &tk2.id);
+        assert_eq!(t2.state, TicketState::Review);
+        assert_eq!(
+            t2.checks.map(|k| (k.state, k.started_at)),
+            Some((ChecksState::Pending, 42))
+        );
+        assert!(t2.reports.is_empty());
+        // The matching run is taken.
+        c.t.ctx.finish_checks(&tk2.id, 0, 42, &report);
+        let t2 = get(&c, &tk2.id);
+        assert_eq!(t2.state, TicketState::Assigned);
+        assert_eq!(
+            t2.rejection_note.as_deref(),
+            Some("Tjek fejlede: tests (exit 1). Se rapport 01.")
+        );
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn recover_resets_pending_checks_and_routing_restarts_them() {
+        let c = checks_setup("{}", Some(TWO_CHECKS));
+        let tk = submit_in_proj(&c);
+        c.t.ctx.mutate(|s| s.start_checks(&tk.id, 0, 5)).unwrap();
+        // A restart: the stored document is loaded again.
+        let doc = c.t.store.doc().unwrap();
+        let m = crate::tickets::store::MemoryStore::with_doc(doc);
+        let (svc, _) = TicketService::load_and_recover(Box::new(m), 100);
+        *lock(&c.t.ctx.service) = svc;
+        let t = get(&c, &tk.id);
+        assert_eq!(t.checks, None);
+        assert_eq!(
+            t.history.last().unwrap().note.as_deref(),
+            Some(crate::config::CHECKS_INTERRUPTED_NOTE)
+        );
+        c.t.ctx.route_reviews();
+        c.t.ctx.join_checks();
+        assert_eq!(checks_state(&c, &tk.id), Some(ChecksState::Passed));
+        assert_eq!(c.fake.calls().len(), 2);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn project_checks_and_git_base_come_from_project_json() {
+        let c = checks_setup(
+            r#"{"git": "worktree", "gitBase": "develop"}"#,
+            Some(r#"{"checks": [{"name": "tests", "run": "cargo test"}], "gitBase": "release"}"#),
+        );
+        assert_eq!(
+            c.t.ctx.project_checks(Some("proj")),
+            vec!["tests: `cargo test`"]
+        );
+        assert!(c.t.ctx.project_checks(Some("nope")).is_empty());
+        assert!(c.t.ctx.project_checks(None).is_empty());
+        // project.json's gitBase wins over the workspace's.
+        std::fs::create_dir(c.proj.join(".git")).unwrap();
+        let tk = ticket_in(&c.t, Some("proj"));
+        let g = c.t.ctx.prepare_ticket_git(&tk).unwrap();
+        assert_eq!(g.base, "release");
+        // Without one in project.json: the workspace's.
+        let f = crate::checks::project_file_path(&c.proj);
+        std::fs::write(&f, r#"{"checks": []}"#).unwrap();
+        let tk2 = ticket_in(&c.t, Some("proj"));
+        assert_eq!(c.t.ctx.prepare_ticket_git(&tk2).unwrap().base, "develop");
+        cleanup(&c.t);
     }
 }

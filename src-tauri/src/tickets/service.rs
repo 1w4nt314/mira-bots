@@ -17,19 +17,21 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 
 use super::model::{
-    short_id, ReportAuthorKind, ReviewAssignment, Ticket, TicketActor, TicketDoc, TicketError,
-    TicketGit, TicketHistoryEntry, TicketId, TicketIssue, TicketPatch, TicketReport, TicketSource,
-    TicketState, TicketSummary,
+    short_id, ChecksState, ReportAuthorKind, ReviewAssignment, Ticket, TicketActor, TicketChecks,
+    TicketDoc, TicketError, TicketGit, TicketHistoryEntry, TicketId, TicketIssue, TicketPatch,
+    TicketReport, TicketSource, TicketState, TicketSummary,
 };
 use super::prompt::{one_line, ChildLine, ChildReview};
 use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
+use crate::agent::roles::has_work_role;
+use crate::agent::{AgentInfo, SeatKind};
 use crate::config::{
-    playbook_created_note, BLOCKED_BY_MAX, CHANGES_REPORT_TITLE, CHILDREN_DONE_NOTE,
-    FLOW_DONE_NOTE, MOVED_NOTE, PARENT_DELETED_NOTE, PLAYBOOK_STEPS_MAX, REPORTS_PER_TICKET_MAX,
-    RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
-    TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
+    playbook_created_note, BLOCKED_BY_MAX, CHANGES_REPORT_TITLE, CHECKS_INTERRUPTED_NOTE,
+    CHECKS_REJECT_PREFIX, CHILDREN_DONE_NOTE, FLOW_DONE_NOTE, MOVED_NOTE, PARENT_DELETED_NOTE,
+    PLAYBOOK_STEPS_MAX, REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS,
+    TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
 };
 use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
 
@@ -60,6 +62,20 @@ pub fn needs_changes_report(t: &Ticket) -> bool {
             && r.title == CHANGES_REPORT_TITLE
             && r.created_at >= since
     })
+}
+
+/// Whether the app runs the project checks for this ticket on entering review (step 6b, plan
+/// A.3): in review without a checks result for this entry, with a project, without children
+/// (a parent's review is about the whole), with an assignee, and that assignee is gone
+/// (`sender` `None`) or a work agent with a work role (a coordination or staff ticket has no
+/// code to check).
+pub fn checkable(t: &Ticket, sender: Option<&AgentInfo>, children: usize) -> bool {
+    t.state == TicketState::Review
+        && t.checks.is_none()
+        && t.project.as_ref().and_then(|p| p.id()).is_some()
+        && children == 0
+        && t.assignee_agent_id.is_some()
+        && sender.is_none_or(|a| a.seat_kind == SeatKind::Work && has_work_role(&a.roles))
 }
 
 /// `"eskaleret efter {max} runder"` (`max` = the workspace's `maxReviewRounds`).
@@ -603,12 +619,26 @@ impl TicketService {
             })
             .map(|t| t.id.clone())
             .collect();
-        if !stale.is_empty() || stale_reviews {
+        // Step 6b (plan A.3): checks that were running when the app stopped are started again
+        // by the next routing; a ticket never stays pending.
+        let pending_checks = svc.doc.tickets.iter().any(|t| {
+            t.checks
+                .as_ref()
+                .is_some_and(|c| c.state == ChecksState::Pending)
+        });
+        if !stale.is_empty() || stale_reviews || pending_checks {
             let r = svc.commit(|doc| {
                 doc.review_assignments.clear();
                 for t in doc.tickets.iter_mut() {
                     if t.state == TicketState::Review {
                         t.reviewer_agent_id = None;
+                    }
+                    if t.checks
+                        .as_ref()
+                        .is_some_and(|c| c.state == ChecksState::Pending)
+                    {
+                        t.checks = None;
+                        note_entry(t, TicketActor::System, CHECKS_INTERRUPTED_NOTE.into(), now);
                     }
                 }
                 for id in &stale {
@@ -1284,6 +1314,26 @@ impl TicketService {
         self.reject_as(id, note, to, TicketActor::User, None, now)
     }
 
+    /// The app rejects a ticket in review (step 6b: a failed project check with `checksGate`):
+    /// [`Self::reject`] by the system with [`CHECKS_REJECT_PREFIX`] ("afvist af appen: <note>")
+    /// in the history; the review round counts like any rejection.
+    pub(crate) fn reject_by_system(
+        &mut self,
+        id: &str,
+        note: &str,
+        to: RejectReturn,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.reject_as(
+            id,
+            note,
+            to,
+            TicketActor::System,
+            Some(CHECKS_REJECT_PREFIX.to_string()),
+            now,
+        )
+    }
+
     /// [`Self::reject`] by `by`, with `prefix` before the note in the history.
     fn reject_as(
         &mut self,
@@ -1889,6 +1939,84 @@ impl TicketService {
             Ok(())
         })?;
         self.fetch(id)
+    }
+
+    // ---- project checks (step 6b, plan A.3) ----
+
+    /// Marks the checks of a ticket in review as running (`round`: its review round, `now`: the
+    /// start; both guard against stale results). No history entry.
+    pub fn start_checks(&mut self, id: &str, round: u32, now: u64) -> Result<Ticket, TicketError> {
+        self.set_checks(
+            id,
+            TicketChecks {
+                state: ChecksState::Pending,
+                failed: None,
+                round,
+                started_at: now,
+            },
+            now,
+        )
+    }
+
+    /// Stores the checks result of a ticket in review. No history entry.
+    pub fn set_checks(
+        &mut self,
+        id: &str,
+        checks: TicketChecks,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            if t.state != TicketState::Review {
+                return Err(TicketError::NotInReview);
+            }
+            t.checks = Some(checks);
+            t.updated_at = now;
+            Ok(())
+        })?;
+        self.fetch(id)
+    }
+
+    /// A pending checks run `(round, started_at)` whose ticket left review before it ended (the
+    /// result is stale): the state is cleared, so no "running" badge stays behind. `Ok(None)`
+    /// when the ticket carries another (or no) run.
+    pub fn clear_checks_run(
+        &mut self,
+        id: &str,
+        round: u32,
+        started_at: u64,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(id).ok_or(TicketError::NotFound)?;
+        let same = t.checks.as_ref().is_some_and(|c| {
+            c.state == ChecksState::Pending && c.round == round && c.started_at == started_at
+        });
+        if !same {
+            return Ok(None);
+        }
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            t.checks = None;
+            t.updated_at = now;
+            Ok(())
+        })?;
+        self.fetch(id).map(Some)
+    }
+
+    /// Nothing to check (no project file, no checks or an unreadable file): `skipped` for this
+    /// review entry.
+    pub fn skip_checks(&mut self, id: &str, now: u64) -> Result<Ticket, TicketError> {
+        let round = self.get(id).ok_or(TicketError::NotFound)?.review_round;
+        self.set_checks(
+            id,
+            TicketChecks {
+                state: ChecksState::Skipped,
+                failed: None,
+                round,
+                started_at: now,
+            },
+            now,
+        )
     }
 
     /// A history entry by the system (state unchanged), e.g. why the ticket got no git branch.
@@ -5350,5 +5478,186 @@ mod tests {
         let o = in_review(&mut s, "a2", "normal");
         let b = s.reject(&o.id, "nej", RejectReturn::Backlog, 8).unwrap();
         assert_eq!((b.state, b.review_round), (S::Backlog, 0));
+    }
+}
+
+#[cfg(test)]
+mod checks_tests {
+    use super::*;
+    use crate::agent::roles::Role;
+    use crate::agent::AgentManager;
+    use crate::tickets::model::test_support::ticket;
+    use crate::tickets::store::MemoryStore;
+    use TicketState as S;
+
+    fn svc() -> (TicketService, MemoryStore) {
+        let m = MemoryStore::new();
+        (
+            TicketService::new(Box::new(m.clone()), TicketDoc::default()),
+            m,
+        )
+    }
+
+    fn in_review(s: &mut TicketService) -> Ticket {
+        let p = Some(ProjectRef::Existing("proj".into()));
+        let t = s.create_in("Ret", "b", false, p, None, 1).unwrap();
+        s.assign(&t.id, "a1", 2).unwrap();
+        s.mark_dispatched(&t.id, "a1", 3).unwrap();
+        s.submit_by_agent("a1", None, "klar", 4).unwrap()
+    }
+
+    #[test]
+    fn checkable_table() {
+        let mut m = AgentManager::new(5);
+        let coder = m.insert_fake_with("s1", "/w/c", &[Role::Coder], SeatKind::Work);
+        let plain = m.insert_fake_with("s2", "/w/p", &[], SeatKind::Work);
+        let staff = m.insert_fake_with("s3", "/w/s", &[Role::Planner], SeatKind::Staff);
+        let (coder, plain, staff) = (
+            m.get(&coder).unwrap(),
+            m.get(&plain).unwrap(),
+            m.get(&staff).unwrap(),
+        );
+        let mut t = ticket("t1", S::Review);
+        t.project = Some(ProjectRef::Existing("proj".into()));
+        t.assignee_agent_id = Some(coder.id.clone());
+        assert!(checkable(&t, Some(&coder), 0));
+        assert!(checkable(&t, None, 0), "sender gone");
+        assert!(!checkable(&t, Some(&plain), 0), "no work role");
+        assert!(!checkable(&t, Some(&staff), 0), "staff seat");
+        assert!(!checkable(&t, Some(&coder), 1), "a parent");
+        let mut c = t.clone();
+        c.checks = Some(TicketChecks {
+            state: ChecksState::Skipped,
+            failed: None,
+            round: 0,
+            started_at: 1,
+        });
+        assert!(!checkable(&c, Some(&coder), 0), "already checked");
+        let mut c = t.clone();
+        c.project = None;
+        assert!(!checkable(&c, Some(&coder), 0), "no project");
+        let mut c = t.clone();
+        c.assignee_agent_id = None;
+        assert!(!checkable(&c, None, 0), "flow parent without assignee");
+        for state in [S::Backlog, S::Assigned, S::InProgress, S::Done, S::Rejected] {
+            let mut c = t.clone();
+            c.state = state;
+            assert!(!checkable(&c, Some(&coder), 0), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn start_set_skip_and_submit_reset() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s);
+        let p = s.start_checks(&t.id, 0, 10).unwrap();
+        assert_eq!(
+            p.checks,
+            Some(TicketChecks {
+                state: ChecksState::Pending,
+                failed: None,
+                round: 0,
+                started_at: 10
+            })
+        );
+        assert_eq!(p.history.len(), t.history.len(), "no history entry");
+        let done = TicketChecks {
+            state: ChecksState::Failed,
+            failed: Some("tests".into()),
+            round: 0,
+            started_at: 10,
+        };
+        assert_eq!(
+            s.set_checks(&t.id, done.clone(), 11).unwrap().checks,
+            Some(done)
+        );
+        // The app rejects: round + 1, by the system with its prefix; Submit clears the checks.
+        let r = s
+            .reject_by_system(
+                &t.id,
+                "Tjek fejlede: tests (exit 1). Se rapport 01.",
+                RejectReturn::Sender,
+                12,
+            )
+            .unwrap();
+        assert_eq!((r.state, r.review_round), (S::Assigned, 1));
+        assert_eq!(
+            r.rejection_note.as_deref(),
+            Some("Tjek fejlede: tests (exit 1). Se rapport 01.")
+        );
+        let h = r
+            .history
+            .iter()
+            .rev()
+            .find(|h| h.to == S::Rejected)
+            .unwrap();
+        assert_eq!(h.by, TicketActor::System);
+        assert_eq!(
+            h.note.as_deref(),
+            Some("afvist af appen: Tjek fejlede: tests (exit 1). Se rapport 01.")
+        );
+        // Not in review: no checks can be set.
+        assert_eq!(
+            s.skip_checks(&t.id, 13).unwrap_err(),
+            TicketError::NotInReview
+        );
+        s.mark_dispatched(&t.id, "a1", 14).unwrap();
+        let again = s.submit_by_agent("a1", None, "igen", 15).unwrap();
+        assert_eq!(again.checks, None);
+        let sk = s.skip_checks(&t.id, 16).unwrap();
+        assert_eq!(
+            sk.checks.map(|c| (c.state, c.round)),
+            Some((ChecksState::Skipped, 1))
+        );
+    }
+
+    #[test]
+    fn clear_checks_run_only_for_the_same_pending_run() {
+        let (mut s, _) = svc();
+        let t = in_review(&mut s);
+        s.start_checks(&t.id, 0, 10).unwrap();
+        s.approve(&t.id, 11).unwrap();
+        assert_eq!(s.clear_checks_run(&t.id, 0, 9, 12).unwrap(), None);
+        assert_eq!(s.clear_checks_run(&t.id, 1, 10, 12).unwrap(), None);
+        let c = s.clear_checks_run(&t.id, 0, 10, 12).unwrap().unwrap();
+        assert_eq!((c.state, c.checks), (S::Done, None));
+        assert_eq!(s.clear_checks_run(&t.id, 0, 10, 13).unwrap(), None);
+    }
+
+    #[test]
+    fn recover_resets_pending_checks() {
+        let (mut s, _) = svc();
+        let pending = in_review(&mut s);
+        s.start_checks(&pending.id, 0, 10).unwrap();
+        let p2 = Some(ProjectRef::Existing("proj".into()));
+        let other = s.create_in("Andet", "b", false, p2, None, 20).unwrap();
+        s.assign(&other.id, "a2", 21).unwrap();
+        s.mark_dispatched(&other.id, "a2", 22).unwrap();
+        s.submit_by_agent("a2", None, "klar", 23).unwrap();
+        s.skip_checks(&other.id, 24).unwrap();
+        let doc = s.doc.clone();
+        let m = MemoryStore::with_doc(doc.clone());
+        let (r, warning) = TicketService::load_and_recover(Box::new(m.clone()), 100);
+        assert_eq!(warning, None);
+        assert_eq!(m.saves(), 1);
+        let t = r.get(&pending.id).unwrap();
+        assert_eq!((t.state, t.checks.clone()), (S::Review, None));
+        let last = t.history.last().unwrap();
+        assert_eq!(
+            (last.note.as_deref(), last.by, last.to, last.at),
+            (
+                Some(CHECKS_INTERRUPTED_NOTE),
+                TicketActor::System,
+                S::Review,
+                100
+            )
+        );
+        // A finished result survives the restart.
+        let o = r.get(&other.id).unwrap();
+        assert_eq!(o.checks.map(|c| c.state), Some(ChecksState::Skipped));
+        // Nothing pending (and nothing else) → no save.
+        let m2 = MemoryStore::with_doc(m.doc().unwrap());
+        TicketService::load_and_recover(Box::new(m2.clone()), 200);
+        assert_eq!(m2.saves(), 0);
     }
 }

@@ -28,8 +28,8 @@ pub fn role_text(role: Role) -> &'static str {
     match role {
         Role::Coder => "Du er koder: du implementerer tickets i din arbejdsmappe, kører tests og afleverer med en rapport der beskriver ændringerne.",
         Role::Researcher => "Du er researcher: du undersøger og dokumenterer; dine afleveringer er tekst (rapport), ikke kodeændringer, medmindre ticketen siger andet.",
-        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report. Reviewer du en forældre-ticket, er del-ticketsene allerede reviewet; vurdér helheden.",
-        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Hver ticket skal have et projekt (`project`: et id fra mira_list_projects); en arbejdsagent kan kun få tickets fra sit eget projekt, så vælg agent efter projekt eller start en ny i det rigtige projekt (mira_spawn_agent med project). Del-tickets opretter du med `parentId` (standard: din igangværende ticket) og `blockedBy` for rækkefølge; afleverer du en ticket med åbne del-tickets, venter den automatisk, og du får besked i terminalen, når en del-ticket er godkendt. Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op.",
+        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets som kritisk modpart. Læs review-filen, rapporterne («Ændringer», «Tjek», afsenderens rapport) og selve diffen (`git -C <mappe> diff <base>...<branch>`; du må ikke committe eller pushe). Rapportér fund som CRITICAL / WARNING / NICE-TO-HAVE med fil:linje, scenarie og rettelse; mindst ét CRITICAL eller WARNING betyder mira_reject_ticket med listen som note (læg den fulde liste som rapport først), ellers mira_approve_ticket med én linje om hvad du tjekkede. Vurdér aldrig på afsenderens opsummering alene. Reviewer du en forældre-ticket, er del-ticketsene allerede reviewet; vurdér helheden.",
+        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Hver ticket skal have et projekt (`project`: et id fra mira_list_projects); en arbejdsagent kan kun få tickets fra sit eget projekt, så vælg agent efter projekt eller start en ny i det rigtige projekt (mira_spawn_agent med project). Del-tickets opretter du med `parentId` (standard: din igangværende ticket) og `blockedBy` for rækkefølge; afleverer du en ticket med åbne del-tickets, venter den automatisk, og du får besked i terminalen, når en del-ticket er godkendt. Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op. Har ticketen en type med et forløb (fx feature eller bug), kan du i stedet starte forløbet med mira_start_playbook: appen opretter del-ticketsene i rækkefølge og tildeler dem efter rolle.",
         Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede del-opgaver med klare acceptkriterier. Er der en koordinator i staben, afleverer du planen som rapport (mira_add_report) og opretter ikke tickets selv; ellers opretter du del-ticketsene med mira_create_ticket (med parentId), men tildeler dem ikke.",
         Role::Debugger => "Du er debugger: du reproducerer fejl, finder årsagen og retter eller dokumenterer den; skriv altid reproduktion og årsag i rapporten.",
     }
@@ -344,10 +344,25 @@ mod tests {
         );
         assert!(coord.find("Hver ticket skal have et projekt").unwrap() < at);
         assert!(coord.ends_with(
-            "En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op."
+            "En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op. Har ticketen en type med et forløb (fx feature eller bug), kan du i stedet starte forløbet med mira_start_playbook: appen opretter del-ticketsene i rækkefølge og tildeler dem efter rolle."
         ));
-        assert!(role_text(Role::Reviewer).ends_with(
-            "læg gerne en review-rapport med mira_add_report. Reviewer du en forældre-ticket, er del-ticketsene allerede reviewet; vurdér helheden."
-        ));
+    }
+
+    // ---- step 6b (C6b.5) ----
+
+    #[test]
+    fn reviewer_text_mentions_critical_warning_and_reject() {
+        assert_eq!(
+            role_text(Role::Reviewer),
+            "Du er reviewer: appen beder dig reviewe andres tickets som kritisk modpart. Læs review-filen, rapporterne («Ændringer», «Tjek», afsenderens rapport) og selve diffen (`git -C <mappe> diff <base>...<branch>`; du må ikke committe eller pushe). Rapportér fund som CRITICAL / WARNING / NICE-TO-HAVE med fil:linje, scenarie og rettelse; mindst ét CRITICAL eller WARNING betyder mira_reject_ticket med listen som note (læg den fulde liste som rapport først), ellers mira_approve_ticket med én linje om hvad du tjekkede. Vurdér aldrig på afsenderens opsummering alene. Reviewer du en forældre-ticket, er del-ticketsene allerede reviewet; vurdér helheden."
+        );
+        // Only the coordinator is told about mira_start_playbook (its tool, plan6b C6b.3).
+        for role in Role::ALL {
+            assert_eq!(
+                role_text(role).contains("mira_start_playbook"),
+                role == Role::Coordinator,
+                "{role:?}"
+            );
+        }
     }
 }

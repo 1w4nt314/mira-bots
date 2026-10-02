@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod app_settings;
+pub mod checks;
 pub mod commands;
 pub mod config;
 pub mod diagnostics;
@@ -488,7 +489,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let tickets_file = data_dir.join(TICKETS_FILE);
     let (service, tickets_warning) = tickets::load_tickets(tickets_file.clone(), now_ms());
     let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMsg>();
-    let tickets = Arc::new(TicketsCtx::new(
+    // `shared`: the project checks run on their own thread with the context (step 6b).
+    let tickets = TicketsCtx::new(
         service,
         Arc::clone(&manager),
         dispatch_tx.clone(),
@@ -497,7 +499,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&workspace),
         // git is looked up (and probed) on first use, not at startup.
         Arc::new(git::SystemGit::new()),
-    ));
+    )
+    .shared();
     let sink = tauri_sink(
         handle.clone(),
         Arc::clone(&manager),
@@ -708,7 +711,7 @@ pub fn run() {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 lock(&state.manager).kill_all();
             }
-            // Step 6b: git (and, from B4, check) children still running.
+            // Step 6b: git and project-check children still running (with their trees).
             proc::registry().kill_running();
         }
         // The process exits without dropping the pipe server task (and its SocketGuard).

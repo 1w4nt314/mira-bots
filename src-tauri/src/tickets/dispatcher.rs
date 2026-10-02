@@ -119,6 +119,11 @@ pub trait TicketsHost: Send {
     fn prepare_git(&self, _ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
         None
     }
+    /// Step 6b (plan punkt 16): the project's checks as "name: `run`" lines for the review file
+    /// (`TicketsCtx` reads `<project>/.mira-bots/project.json`). Empty by default.
+    fn project_checks(&self, _project: Option<&str>) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Schedules `msg` to be fed back into the dispatcher after `delay_ms`, and tells the time the
@@ -1376,15 +1381,29 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             .and_then(|a| self.port.snapshot(a))
             .map(|s| ReviewSender {
                 name: s.name,
-                cwd: s.cwd.to_string_lossy().into_owned(),
+                // Step 6b: the ticket's worktree (or repository) is where the work is, not the
+                // sender's current folder.
+                cwd: match &ticket.git {
+                    Some(g) => g.worktree.clone().unwrap_or_else(|| g.repo.clone()),
+                    None => s.cwd.to_string_lossy().into_owned(),
+                },
             });
         let author = |a: &ReportAuthor| self.author_name(a);
         // Step 6a: a parent's review file lists its children (already reviewed).
         let children = self.host.read(|s| s.child_reviews(&ticket.id));
         let max = self.host.rules().max_review_rounds;
-        if let Err(e) =
-            prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author, &children, max)
-        {
+        let checks = self
+            .host
+            .project_checks(ticket.project.as_ref().and_then(|p| p.id()));
+        if let Err(e) = prompt::write_review_file(
+            &snap.cwd,
+            ticket,
+            sender.as_ref(),
+            &author,
+            &children,
+            max,
+            &checks,
+        ) {
             log::warn!("dispatch {agent_id}: writing the review file failed: {e}");
             self.review_failed(agent_id, &ticket.id);
             return;

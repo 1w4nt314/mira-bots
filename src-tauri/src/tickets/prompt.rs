@@ -697,21 +697,30 @@ fn child_summary(summary: Option<&str>) -> String {
 /// Content of `<reviewer cwd>/.mira-bots/reviews/<short>.md` (C5.12). `author_name` turns a
 /// report author into a display name. A parent (`children` not empty, step 6a) gets
 /// `## Del-tickets (allerede reviewet)` before `## Opgaven` and [`PARENT_REVIEW_RULE`]. `max` is
-/// the workspace's `maxReviewRounds` ("Runde r af max").
+/// the workspace's `maxReviewRounds` ("Runde r af max"). Step 6b (plan6b punkt 16, C6b.4): a
+/// ticket with `git` gets `## Git` after `## Rapporter` (from `ticket.git`, never the sender's
+/// cwd), and `## Regler` is the Refuter template; `checks` are the project's checks as
+/// "name: `run`" lines (empty: "(ingen tjek defineret)").
 pub fn render_review_file(
     t: &Ticket,
     sender: Option<&ReviewSender>,
     author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
     children: &[ChildReview],
     max: u32,
+    checks: &[String],
 ) -> String {
     let short = t.short_id();
-    let (sender_line, git_dir) = match sender {
+    let (sender_line, sender_dir) = match sender {
         Some(s) => (
             format!("{} ({})", one_line(&s.name), one_line(&s.cwd)),
             one_line(&s.cwd),
         ),
         None => (SENDER_DIR_UNKNOWN.to_string(), "<afsenderens mappe>".into()),
+    };
+    // The folder for `git -C`: the worktree, else the repository, else the sender's cwd.
+    let git_dir = match &t.git {
+        Some(g) => one_line(g.worktree.as_deref().unwrap_or(&g.repo)),
+        None => sender_dir,
     };
     let summary = t
         .summary
@@ -750,6 +759,9 @@ pub fn render_review_file(
             at = iso_utc(r.created_at),
         ));
     }
+    if let Some(g) = &t.git {
+        out.push_str(&review_git_section(g));
+    }
     if !children.is_empty() {
         out.push_str("## Del-tickets (allerede reviewet)\n");
         for c in children {
@@ -762,19 +774,44 @@ pub fn render_review_file(
             ));
         }
     }
-    out.push_str(&format!(
-        "## Opgaven\n\
-         {body}\n\
-         ## Regler\n\
-         - Læs ændringerne med git -C \"{git_dir}\" diff/log/status/show; ret ikke selv i afsenderens mappe, og commit/push aldrig.\n\
-         - Afgør med mira_approve_ticket {short} (note: hvad du tjekkede) eller mira_reject_ticket {short} (note: hvad der mangler, konkret).\n\
-         - Læg gerne en review-rapport med mira_add_report før du afgør.\n"
-    ));
+    out.push_str(&format!("## Opgaven\n{body}\n"));
+    out.push_str(&review_rules(&short, &git_dir, checks));
     if !children.is_empty() {
         out.push_str(PARENT_REVIEW_RULE);
         out.push('\n');
     }
     out
+}
+
+/// `## Git` of a review file (C6b.4): branch, base, repository (and worktree), and the diff,
+/// stat and log commands on `base...branch` / `base..branch` in the repository.
+pub fn review_git_section(g: &TicketGit) -> String {
+    let (branch, base, repo) = (one_line(&g.branch), one_line(&g.base), one_line(&g.repo));
+    let wt = g
+        .worktree
+        .as_deref()
+        .map(|w| format!(" · worktree: {}", one_line(w)))
+        .unwrap_or_default();
+    format!(
+        "## Git\n- branch: {branch} (fra {base}) i {repo}{wt}\n- diff: git -C \"{repo}\" diff {base}...{branch}   stat: git -C \"{repo}\" diff --stat {base}...{branch}   commits: git -C \"{repo}\" log --oneline {base}..{branch}\n"
+    )
+}
+
+/// `## Regler` of a review file: the Refuter template (C6b.4, verbatim). `dir`: the folder for
+/// `git -C`; `checks`: "name: `run`" lines.
+pub fn review_rules(short: &str, dir: &str, checks: &[String]) -> String {
+    let checks = if checks.is_empty() {
+        "(ingen tjek defineret)".to_string()
+    } else {
+        checks
+            .iter()
+            .map(|c| format!("- {}", one_line(c)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "## Regler\n- Gennemgå selve ændringerne (diffen ovenfor eller `git -C \"{dir}\" diff/log/show`) og rapporterne «Ændringer» og «Tjek» (mira_get_report). Vurdér aldrig på afsenderens opsummering alene.\n- Projektets tjek er kørt af appen (se rapporten «Tjek»); kør kun yderligere tjek hvis du har adgang. Projektets tjek:\n{checks}\n- Rapportér fund som CRITICAL / WARNING / NICE-TO-HAVE, hvert med fil:linje, et konkret scenarie der går galt, og en foreslået rettelse.\n- Mindst ét CRITICAL eller WARNING ⇒ læg den fulde liste som rapport med mira_add_report, og afvis med mira_reject_ticket {short} med en kort liste som note (højst 2000 tegn; henvis til rapporten).\n- Ellers godkend med mira_approve_ticket {short} med én linje om hvad du tjekkede.\n- Ret ikke selv i afsenderens mappe, og commit/push aldrig.\n"
+    )
 }
 
 /// `<cwd>/.mira-bots/reviews`, joined component by component.
@@ -793,6 +830,7 @@ pub fn write_review_file(
     author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
     children: &[ChildReview],
     max: u32,
+    checks: &[String],
 ) -> io::Result<PathBuf> {
     let dir = review_dir(cwd);
     fs::create_dir_all(&dir)?;
@@ -800,7 +838,7 @@ pub fn write_review_file(
     let path = dir.join(format!("{}.md", t.short_id()));
     fs::write(
         &path,
-        render_review_file(t, sender, author_name, children, max),
+        render_review_file(t, sender, author_name, children, max, checks),
     )?;
     Ok(path)
 }
@@ -1270,6 +1308,7 @@ mod tests {
             &|a| a.agent_id.clone().unwrap_or_else(|| "dig".into()),
             &[],
             3,
+            &[],
         );
         assert!(f.starts_with("# Review af ticket abcdef01: Ret @login /nu\n"));
         assert!(f.contains(
@@ -1279,28 +1318,29 @@ mod tests {
         assert!(f.contains(
             "- 01 Ændringer (a1, 1970-01-01T00:00:01Z) → mira_get_report abcdef01 01\n## Opgaven\n"
         ));
-        assert!(f.contains("- Læs ændringerne med git -C \"/w/coder-01\" diff/log/status/show;"));
-        assert!(f.ends_with("- Læg gerne en review-rapport med mira_add_report før du afgør.\n"));
+        assert!(f.contains("eller `git -C \"/w/coder-01\" diff/log/show`)"));
+        assert!(f.ends_with("- Ret ikke selv i afsenderens mappe, og commit/push aldrig.\n"));
         let f = render_review_file(
             &ticket(ID, TicketState::Review),
             None,
             &|_| String::new(),
             &[],
             3,
+            &[],
         );
         assert!(f.contains("Afsender: afsenderens mappe kendes ikke længere   Runde: 1 af 3"));
         assert!(f.contains("## Opsummering fra afsenderen\n(ingen)\n## Rapporter\n(ingen)\n"));
         // An escalated ticket with a hand-picked reviewer: capped at the last round.
         let mut t = ticket(ID, TicketState::Review);
         t.review_round = 3;
-        let f = render_review_file(&t, None, &|_| String::new(), &[], 3);
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 3, &[]);
         assert!(f.contains("Runde: 3 af 3   "), "{f}");
         // Step 6b: the workspace's maxReviewRounds.
         let mut t = ticket(ID, TicketState::Review);
-        let f = render_review_file(&t, None, &|_| String::new(), &[], 2);
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 2, &[]);
         assert!(f.contains("Runde: 1 af 2   "), "{f}");
         t.review_round = 2;
-        let f = render_review_file(&t, None, &|_| String::new(), &[], 2);
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 2, &[]);
         assert!(f.contains("Runde: 2 af 2   "), "{f}");
     }
 
@@ -1309,7 +1349,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mira-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let t = review_ticket();
-        let p = write_review_file(&dir, &t, None, &|_| String::new(), &[], 3).unwrap();
+        let p = write_review_file(&dir, &t, None, &|_| String::new(), &[], 3, &[]).unwrap();
         assert_eq!(
             p,
             dir.join(".mira-bots").join("reviews").join("abcdef01.md")
@@ -1618,7 +1658,7 @@ mod tests {
                 summary: None,
             },
         ];
-        let f = render_review_file(&t, None, &|_| String::new(), &children, 3);
+        let f = render_review_file(&t, None, &|_| String::new(), &children, 3, &[]);
         let cut = format!("{}…", "æ".repeat(CHILD_SUMMARY_MAX_CHARS));
         let section = format!(
             "## Del-tickets (allerede reviewet)\n- aaaaaaaa Plan spil — Done: Planen  er skrevet\n- bbbbbbbb Byg — Done: {cut}\n- cccccccc Test — I kø: (ingen opsummering)\n## Opgaven\n"
@@ -1628,7 +1668,7 @@ mod tests {
         let rules = f.find("## Regler").unwrap();
         assert!(f.find(PARENT_REVIEW_RULE).unwrap() > rules);
         // Without children: unchanged.
-        let f = render_review_file(&t, None, &|_| String::new(), &[], 3);
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 3, &[]);
         assert!(!f.contains("Del-tickets") && !f.contains(PARENT_REVIEW_RULE));
     }
 
@@ -1692,5 +1732,115 @@ mod tests {
         // The user's own .gitignore next to .mira-bots is never created.
         assert!(!dir.join(".gitignore").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- step 6b: review file as Refuter (plan6b punkt 16, C6b.4) ----
+
+    /// C6b.4 `## Regler`, verbatim (with `{dir}`, `{checks}`, `{short}` filled in).
+    fn contract_rules(dir: &str, checks: &str, short: &str) -> String {
+        format!(
+            "## Regler\n- Gennemgå selve ændringerne (diffen ovenfor eller `git -C \"{dir}\" diff/log/show`) og rapporterne «Ændringer» og «Tjek» (mira_get_report). Vurdér aldrig på afsenderens opsummering alene.\n- Projektets tjek er kørt af appen (se rapporten «Tjek»); kør kun yderligere tjek hvis du har adgang. Projektets tjek:\n{checks}\n- Rapportér fund som CRITICAL / WARNING / NICE-TO-HAVE, hvert med fil:linje, et konkret scenarie der går galt, og en foreslået rettelse.\n- Mindst ét CRITICAL eller WARNING ⇒ læg den fulde liste som rapport med mira_add_report, og afvis med mira_reject_ticket {short} med en kort liste som note (højst 2000 tegn; henvis til rapporten).\n- Ellers godkend med mira_approve_ticket {short} med én linje om hvad du tjekkede.\n- Ret ikke selv i afsenderens mappe, og commit/push aldrig.\n"
+        )
+    }
+
+    #[test]
+    fn review_file_has_refuter_rules_in_order() {
+        let t = review_ticket();
+        let sender = ReviewSender {
+            name: "coder-01".into(),
+            cwd: "/w/coder-01".into(),
+        };
+        let f = render_review_file(&t, Some(&sender), &|_| String::new(), &[], 3, &[]);
+        let rules = contract_rules("/w/coder-01", "(ingen tjek defineret)", "abcdef01");
+        assert!(
+            f.ends_with(&format!("## Opgaven\n{}\n{rules}", t.body.trim_end())),
+            "{f}"
+        );
+        assert_eq!(f.matches("## Regler").count(), 1);
+        // The order of the findings, the reject and the approve rule.
+        let at = |needle: &str| f.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("CRITICAL / WARNING / NICE-TO-HAVE") < at("Mindst ét CRITICAL eller WARNING ⇒"));
+        assert!(at("Mindst ét CRITICAL eller WARNING ⇒") < at("Ellers godkend med"));
+        assert!(at("Vurdér aldrig på afsenderens opsummering alene") < at("Projektets tjek:"));
+        // A parent keeps PARENT_REVIEW_RULE after the template.
+        let children = [ChildReview {
+            short: "aaaaaaaa".into(),
+            title: "Del".into(),
+            state: TicketState::Done,
+            summary: None,
+        }];
+        let f = render_review_file(&t, None, &|_| String::new(), &children, 3, &[]);
+        assert!(f.ends_with(&format!(
+            "{}{PARENT_REVIEW_RULE}\n",
+            contract_rules("<afsenderens mappe>", "(ingen tjek defineret)", "abcdef01")
+        )));
+    }
+
+    #[test]
+    fn review_file_git_section_uses_ticket_git_not_sender_cwd() {
+        let mut t = review_ticket();
+        t.git = Some(tgit(Some("/p/proj/.mira-bots/wt/abcdef01")));
+        t.reports.push(crate::tickets::model::TicketReport {
+            id: "01".into(),
+            title: "Ændringer".into(),
+            author: crate::tickets::model::ReportAuthor::system(),
+            created_at: 1_000,
+            path: "reports/01-aendringer.md".into(),
+            size: 4,
+        });
+        let sender = ReviewSender {
+            name: "coder-01".into(),
+            cwd: "/w/somewhere-else".into(),
+        };
+        let f = render_review_file(&t, Some(&sender), &|_| "appen".into(), &[], 3, &[]);
+        let section = "## Git\n- branch: ticket/abcdef01 (fra main) i /p/proj · worktree: /p/proj/.mira-bots/wt/abcdef01\n- diff: git -C \"/p/proj\" diff main...ticket/abcdef01   stat: git -C \"/p/proj\" diff --stat main...ticket/abcdef01   commits: git -C \"/p/proj\" log --oneline main..ticket/abcdef01\n";
+        assert!(
+            f.contains(&format!(
+                "- 01 Ændringer (appen, 1970-01-01T00:00:01Z) → mira_get_report abcdef01 01\n{section}## Opgaven\n"
+            )),
+            "{f}"
+        );
+        assert!(f.contains(&contract_rules(
+            "/p/proj/.mira-bots/wt/abcdef01",
+            "(ingen tjek defineret)",
+            "abcdef01"
+        )));
+        assert!(!f.contains("git -C \"/w/somewhere-else\""), "{f}");
+        // Without a worktree (branch mode): the repository, no worktree part.
+        t.git = Some(tgit(None));
+        let f = render_review_file(&t, Some(&sender), &|_| String::new(), &[], 3, &[]);
+        assert!(f.contains("## Git\n- branch: ticket/abcdef01 (fra main) i /p/proj\n- diff: "));
+        assert!(f.contains("eller `git -C \"/p/proj\" diff/log/show`)"));
+        // No git: no section.
+        t.git = None;
+        assert!(!render_review_file(&t, None, &|_| String::new(), &[], 3, &[]).contains("## Git"));
+    }
+
+    #[test]
+    fn review_file_round_uses_max() {
+        let mut t = review_ticket();
+        t.review_round = 0;
+        for (max, want) in [(1, "Runde: 1 af 1   "), (5, "Runde: 1 af 5   ")] {
+            let f = render_review_file(&t, None, &|_| String::new(), &[], max, &[]);
+            assert!(f.contains(want), "{f}");
+        }
+        t.review_round = 9;
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 10, &[]);
+        assert!(f.contains("Runde: 10 af 10   "), "{f}");
+    }
+
+    #[test]
+    fn review_file_lists_project_checks() {
+        let t = review_ticket();
+        let checks = [
+            "tests: `npm test`".to_string(),
+            "lint: `npm run lint`".into(),
+        ];
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 3, &checks);
+        assert!(f.contains(&contract_rules(
+            "<afsenderens mappe>",
+            "- tests: `npm test`\n- lint: `npm run lint`",
+            "abcdef01"
+        )));
     }
 }

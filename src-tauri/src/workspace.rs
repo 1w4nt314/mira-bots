@@ -84,7 +84,7 @@ impl WorkspaceConfig {
 
 /// `gitBase`: trimmed, 1–[`GIT_BASE_MAX_CHARS`] chars, no whitespace and no leading `-` (it ends
 /// up as a git argument); otherwise `None`.
-fn valid_git_base(v: &str) -> Option<String> {
+pub(crate) fn valid_git_base(v: &str) -> Option<String> {
     let v = v.trim();
     let ok = !v.is_empty()
         && v.chars().count() <= GIT_BASE_MAX_CHARS

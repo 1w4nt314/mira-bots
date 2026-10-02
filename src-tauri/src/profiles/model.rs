@@ -458,6 +458,12 @@ pub fn locked_file_rules(root: &Path) -> Vec<String> {
 }
 
 /// Reviewer: read-only git in other folders (research5 Q6) …
+///
+/// Step 6b (plan6b A.6, kept on purpose): a staff reviewer runs in the projects root and can only
+/// read a ticket's repository/worktree with `git -C <folder> …`. Known gap: `*` also matches
+/// options put between `-C <folder>` and the subcommand (`-c …`, `--exec-path …`); the rule
+/// language cannot exclude them. Mitigated by the commit/push deny rules below and documented in
+/// the README; the app's «Ændringer»/«Tjek» reports mean the reviewer rarely needs Bash at all.
 const REVIEWER_ALLOW: [&str; 4] = [
     "Bash(git -C * diff *)",
     "Bash(git -C * log *)",
