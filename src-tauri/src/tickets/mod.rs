@@ -13,6 +13,7 @@
 
 pub mod dispatcher;
 pub mod model;
+pub mod playbook;
 pub mod prompt;
 pub mod reports;
 pub mod service;
@@ -30,8 +31,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::roles::Role;
 use crate::agent::{now_ms, AgentManager};
 use crate::config::{
-    MAX_REVIEW_ROUNDS, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS,
-    TURN_FAILED_TEXT,
+    NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS, TURN_FAILED_TEXT,
 };
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::hooks::status::AgentStatus;
@@ -455,7 +455,7 @@ impl TicketsCtx {
     // ---- review routing (plan5 A.6) ----
 
     /// Gives every ticket in review without a reviewer (and not escalated) to a reviewer, or
-    /// escalates it when it reached [`MAX_REVIEW_ROUNDS`]. Candidates: live agents with the
+    /// escalates it when it reached the workspace's `maxReviewRounds`. Candidates: live agents with the
     /// reviewer role other than the sender; the one with the fewest open reviews wins (tie: the
     /// oldest, then the id). No candidate: the ticket waits for the user as before. Idempotent;
     /// called after every way into review and whenever reviewers come or go. Returns the number
@@ -468,12 +468,13 @@ impl TicketsCtx {
         if pending.is_empty() {
             return 0;
         }
+        let max = self.workspace.rules().max_review_rounds;
         let reviewers = lock(&self.manager).reviewers();
         let mut routed = 0;
         for t in pending {
             let now = now_ms();
-            if t.review_round >= MAX_REVIEW_ROUNDS {
-                match self.mutate_if(|s| s.escalate(&t.id, now), Option::is_some) {
+            if t.review_round >= max {
+                match self.mutate_if(|s| s.escalate(&t.id, max, now), Option::is_some) {
                     Ok(Some(_)) => log::info!(
                         "review: ticket {} escalated after {} rounds",
                         t.short_id(),
@@ -522,7 +523,8 @@ impl TicketsCtx {
     /// the reviewer role other than the sender replaces any current reviewer (an escalation is
     /// cleared for this round; the round count is unchanged). `None`: the reviewer is removed
     /// ("reviewer fjernet") and the ticket is routed again, unless it reached
-    /// [`MAX_REVIEW_ROUNDS`]: then it stays escalated (no new escalation note, review5 N5).
+    /// the workspace's `maxReviewRounds`: then it stays escalated (no new escalation note,
+    /// review5 N5).
     pub fn assign_reviewer(
         &self,
         ticket_id: &str,
@@ -554,8 +556,9 @@ impl TicketsCtx {
                 Ok(TicketSummary::from(&tk))
             }
             None => {
+                let max = self.workspace.rules().max_review_rounds;
                 self.mutate_if(
-                    |s| s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, now),
+                    |s| s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, max, now),
                     Option::is_some,
                 )?;
                 self.route_reviews();
@@ -1318,7 +1321,7 @@ mod tests {
     fn route_escalates_at_three_rounds() {
         let (mut t, _m, a1, r1, _r2) = review_setup();
         let id = submitted(&t, &a1, "x");
-        for round in 0..MAX_REVIEW_ROUNDS {
+        for round in 0..t.ctx.workspace.rules().max_review_rounds {
             assert_eq!(t.ctx.route_reviews(), 1, "round {round}");
             let rev = reviewer_of(&t, &id).unwrap();
             t.ctx
@@ -1381,6 +1384,40 @@ mod tests {
             Some("reviewer fjernet")
         );
         assert_eq!(t.ctx.route_reviews(), 0);
+    }
+
+    /// Step 6b: `maxReviewRounds` from the workspace file decides when routing escalates (and
+    /// the escalation note names it); "Fjern reviewer" keeps the escalation at that round.
+    #[test]
+    fn route_reviews_escalates_at_workspace_max() {
+        let (mut t, _m, a1, r1, _r2) = review_setup();
+        let path = t.ctx.workspace.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"maxReviewRounds": 1}"#).unwrap();
+        assert_eq!(t.ctx.workspace.rules().max_review_rounds, 1);
+        let id = submitted(&t, &a1, "x");
+        assert_eq!(t.ctx.route_reviews(), 1);
+        let rev = reviewer_of(&t, &id).unwrap();
+        t.ctx
+            .mutate(|s| s.reject_by_agent(&rev, "r", &id, "mere", RejectReturn::Sender, 10))
+            .unwrap();
+        t.ctx.mutate(|s| s.mark_dispatched(&id, "a1", 11)).unwrap();
+        t.ctx
+            .mutate(|s| s.submit_by_agent(&a1, None, "igen", 12))
+            .unwrap();
+        t.sent();
+        assert_eq!(t.ctx.route_reviews(), 0);
+        let tk = t.ctx.read(|s| s.get(&id)).unwrap();
+        assert_eq!((tk.review_round, tk.escalated), (1, true));
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some("eskaleret efter 1 runder")
+        );
+        assert!(t.sent().is_empty(), "no review line");
+        t.ctx.assign_reviewer(&id, Some(&r1)).unwrap();
+        let s = t.ctx.assign_reviewer(&id, None).unwrap();
+        assert_eq!((s.escalated, s.reviewer_agent_id), (true, None));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

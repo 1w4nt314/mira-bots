@@ -141,6 +141,8 @@ pub struct AppInfo {
     pub projects_root: String,
     /// The effective workspace rules (plan4b A.4).
     pub rules: WorkspaceRules,
+    /// The playbook names, sorted (step 6b): the kind dropdown and "Start forløb".
+    pub playbook_kinds: Vec<String>,
 }
 
 /// `get_agent_output` result: same shape as the `agent-output` event payload.
@@ -157,7 +159,8 @@ fn path_string(p: &Option<PathBuf>) -> Option<String> {
 impl AppState {
     /// Recomputes the `claude` lookup on every call.
     pub fn app_info(&self) -> AppInfo {
-        let rules = self.workspace.snapshot().rules;
+        let snap = self.workspace.snapshot();
+        let rules = snap.rules;
         AppInfo {
             claude_path: path_string(&find_claude()),
             hook_exe: path_string(&self.paths.hook_exe),
@@ -169,6 +172,7 @@ impl AppState {
             max_staff_agents: rules.max_staff_agents,
             projects_root: self.paths.projects_root.to_string_lossy().into_owned(),
             rules,
+            playbook_kinds: snap.config.playbook_kinds(),
         }
     }
 
@@ -730,7 +734,8 @@ pub fn spawn_request(
 }
 
 /// Writes the profile's `settings.json` and `system-prompt.md` under `<data_dir>/profiles/<id>/`
-/// (the hook exe placeholder when it was not found). Returns both paths.
+/// (the hook exe placeholder when it was not found; the deny rules lock the user's files under
+/// the projects root, step 6b). Returns both paths.
 pub fn write_profile_files(
     paths: &AppPaths,
     profile: &AgentProfile,
@@ -740,7 +745,8 @@ pub fn write_profile_files(
         .hook_exe
         .clone()
         .unwrap_or_else(|| PathBuf::from("mira-hook-not-found"));
-    let settings = write_profile_settings(&paths.data_dir, &hook, profile)?;
+    let settings =
+        write_profile_settings(&paths.data_dir, &hook, profile, Some(&paths.projects_root))?;
     let prompt = write_profile_prompt(&paths.data_dir, profile, rules)?;
     Ok((settings, prompt))
 }
@@ -764,8 +770,13 @@ pub fn spawn_context(
     let io = |e: std::io::Error| String::from(AgentError::Io(e));
     let (settings_json, prompt_file) = match profile {
         Some(p) => {
-            let settings =
-                write_profile_settings(&state.paths.data_dir, hook_exe, p).map_err(io)?;
+            let settings = write_profile_settings(
+                &state.paths.data_dir,
+                hook_exe,
+                p,
+                Some(&state.paths.projects_root),
+            )
+            .map_err(io)?;
             let rules = state.workspace.rules();
             let prompt = write_profile_prompt(&state.paths.data_dir, p, &rules).map_err(io)?;
             (settings, prompt)
@@ -2082,6 +2093,7 @@ mod tests {
             max_staff_agents: 3,
             projects_root: "/h/mira-bots/projects".into(),
             rules: WorkspaceRules::defaults(),
+            playbook_kinds: vec!["bug".into(), "feature".into()],
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
@@ -2093,7 +2105,10 @@ mod tests {
                             "ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,
                             "reportsPerTicketMax":20,"reviewByDefault":true,
                             "userInputGraceMs":5000,"agentsMayCreateProjects":false,
-                            "maxAgentsPerProject":0}})
+                            "maxAgentsPerProject":0,"git":"off","checksGate":true,
+                            "autoSpawnForPlaybook":false,"freshSessionPerTicket":true,
+                            "cleanupWorktreesOnDone":false},
+                   "playbookKinds":["bug","feature"]})
         );
     }
 
@@ -2217,17 +2232,22 @@ mod tests {
         assert_eq!(info.max_staff_agents, 3);
         assert_eq!(info.projects_root, d.projects_root);
         assert_eq!(info.rules, WorkspaceRules::defaults());
+        assert_eq!(info.playbook_kinds, ["bug", "feature"]);
 
         // The workspace file decides the limits and the auto review; projects are counted.
         std::fs::write(
             dir.join("projects").join(crate::config::WORKSPACE_FILE),
-            r#"{"maxWorkAgents": 2, "maxStaffAgents": 1, "autoReviewOnStop": true}"#,
+            r#"{"maxWorkAgents": 2, "maxStaffAgents": 1, "autoReviewOnStop": true,
+                "maxReviewRounds": 2, "playbooks": {"docs": {"steps": [
+                    {"role": "researcher", "title": "Skriv: {title}"}]}}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("projects").join("demo")).unwrap();
         let info = state.app_info();
         assert_eq!((info.max_agents, info.max_staff_agents), (2, 1));
         assert_eq!(info.rules.max_work_agents, 2);
+        assert_eq!(info.rules.max_review_rounds, 2);
+        assert_eq!(info.playbook_kinds, ["bug", "docs", "feature"]);
         let d = state.diagnostics();
         assert!(d.workspace_file_exists && d.auto_review_on_stop);
         assert_eq!(d.projects_total, 1);
@@ -2454,6 +2474,11 @@ mod tests {
             v["statusLine"]["command"], "mira-hook-not-found",
             "placeholder without a hook exe"
         );
+        // Step 6b: the user's files are locked under the projects root; push is denied.
+        let root = crate::profiles::model::permission_path(&state.paths.projects_root);
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert!(deny.contains(&json!(format!("Edit({root}/mira-bots.workspace.json)"))));
+        assert!(deny.contains(&json!("Bash(git push *)")));
         let bad = AgentProfile {
             name: " ".into(),
             ..saved

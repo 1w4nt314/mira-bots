@@ -2239,6 +2239,7 @@ mod tests {
         assert_eq!(
             r,
             json!({"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0,
+                   "git":"off","checksGate":true,"autoSpawnForPlaybook":false,"freshSessionPerTicket":true,"cleanupWorktreesOnDone":false,
                    "projectsRoot":root,"workspaceFile":file,"projects":["p"],"notes":[]})
         );
     }
@@ -2255,19 +2256,34 @@ mod tests {
         let t = setup();
         workspace_file(
             &t,
-            r#"{"maxWorkAgents": 2, "agentsMayCreateProjects": true, "maxReviewRounds": 5}"#,
+            r#"{"maxWorkAgents": 2, "agentsMayCreateProjects": true, "maxReviewRounds": 2,
+                "git": "worktree", "freshSessionPerTicket": false}"#,
         );
         let r = t
             .call(Some(&t.a), "mira_get_workspace_rules", json!({}), 1)
             .unwrap();
         assert_eq!(r["maxWorkAgents"], 2);
         assert_eq!(r["agentsMayCreateProjects"], true);
-        // Read, not enforced yet: the note says so.
-        assert_eq!(r["maxReviewRounds"], 3);
-        assert!(r["notes"].as_array().unwrap()[0]
-            .as_str()
-            .unwrap()
-            .contains("maxReviewRounds"));
+        // Step 6b: enforced, without a note; the new rules are part of the answer.
+        assert_eq!(r["maxReviewRounds"], 2);
+        assert_eq!(r["git"], "worktree");
+        assert_eq!(r["freshSessionPerTicket"], false);
+        assert_eq!(r["notes"], json!([]));
+        workspace_file(&t, r#"{"maxReviewRounds": 0, "git": "nope"}"#);
+        let r = t
+            .call(Some(&t.a), "mira_get_workspace_rules", json!({}), 1)
+            .unwrap();
+        assert_eq!(
+            (r["maxReviewRounds"].clone(), r["git"].clone()),
+            (json!(1), json!("off"))
+        );
+        assert_eq!(
+            r["notes"],
+            json!([
+                "maxReviewRounds 0 er sat op til 1 (1–10)",
+                "git «nope» er ukendt (off, branch eller worktree); off bruges"
+            ])
+        );
         std::fs::create_dir_all(t.tc.ctx.workspace.root().join("Alpha")).unwrap();
         // A broken file: the defaults and the warning first in the notes.
         workspace_file(&t, "{nope");

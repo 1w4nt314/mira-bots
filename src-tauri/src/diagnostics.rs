@@ -318,7 +318,7 @@ pub struct Diagnostics {
     pub profiles_warning: Option<String>,
     /// Open review assignments (plan5 A.6).
     pub review_assignments_open: usize,
-    /// Tickets escalated after [`crate::config::MAX_REVIEW_ROUNDS`] rejections.
+    /// Tickets escalated after the workspace's `maxReviewRounds` rejections.
     pub tickets_escalated: usize,
     /// Reports on all tickets.
     pub reports_total: usize,

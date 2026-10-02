@@ -153,6 +153,7 @@ function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
   const theme = useTheme();
   const reviewer =
     ticket.reviewerAgentId === null ? null : state.agents.find((a) => a.id === ticket.reviewerAgentId);
+  const maxRounds = state.appInfo?.rules.maxReviewRounds ?? 3;
   return (
     <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
       <span className="opacity-80">Reviewer:</span>
@@ -174,11 +175,11 @@ function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
           <span className="truncate font-medium">{reviewer.name}</span>
         </span>
       )}
-      <span className="opacity-70">· {reviewRoundText(ticket)}</span>
+      <span className="opacity-70">· {reviewRoundText(ticket, maxRounds)}</span>
       {ticket.escalated && (
         <span
           className="rounded bg-rose-500/20 px-1 text-[10px] font-medium text-rose-700 dark:text-rose-300"
-          title="3 afvisninger — afgør selv"
+          title={`${maxRounds} afvisninger — afgør selv`}
         >
           Eskaleret til dig
         </span>

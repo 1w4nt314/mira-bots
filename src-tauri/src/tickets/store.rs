@@ -257,7 +257,9 @@ impl TicketStore for MemoryStore {
 mod tests {
     use super::*;
     use crate::tickets::model::test_support::ticket;
-    use crate::tickets::model::TicketState;
+    use crate::tickets::model::{
+        ChecksState, GitMode, ReportAuthor, TicketChecks, TicketGit, TicketReport, TicketState,
+    };
     use serde_json::json;
 
     struct TempDir(PathBuf);
@@ -290,12 +292,39 @@ mod tests {
         let mut child = ticket("33333333-0000-4000-8000-000000000000", TicketState::Backlog);
         child.parent_id = Some("11111111-0000-4000-8000-000000000000".into());
         child.blocked_by = vec!["22222222-0000-4000-8000-000000000000".into()];
+        // Step 6b: a feature ticket in review with failed checks, a worktree and an app report.
+        let mut feature = ticket("44444444-0000-4000-8000-000000000000", TicketState::Review);
+        feature.assignee_agent_id = Some("a1".into());
+        feature.kind = Some("feature".into());
+        feature.playbook_started_at = Some(1_700_000_000_000);
+        feature.checks = Some(TicketChecks {
+            state: ChecksState::Failed,
+            failed: Some("tests".into()),
+            round: 1,
+            started_at: 2_000,
+        });
+        feature.git = Some(TicketGit {
+            mode: GitMode::Worktree,
+            branch: "ticket/44444444".into(),
+            base: "main".into(),
+            repo: "/p".into(),
+            worktree: Some("/p/.mira-bots/wt/44444444".into()),
+        });
+        feature.reports.push(TicketReport {
+            id: "01".into(),
+            title: "Tjek: FEJL (tests)".into(),
+            author: ReportAuthor::system(),
+            created_at: 2_500,
+            path: "reports/01-tjek-fejl-tests.md".into(),
+            size: 12,
+        });
         TicketDoc {
             schema_version: 1,
             tickets: vec![
                 ticket("11111111-0000-4000-8000-000000000000", TicketState::Backlog),
                 ticket("22222222-0000-4000-8000-000000000000", TicketState::Done),
                 child,
+                feature,
             ],
             review_assignments: Vec::new(),
         }
@@ -429,6 +458,35 @@ mod tests {
         assert_eq!(v["tickets"][0]["state"], json!("waiting"));
         assert_eq!(v["tickets"][2]["parentId"], json!(doc.tickets[0].id));
         assert_eq!(migrate(v).unwrap(), doc);
+    }
+
+    #[test]
+    fn version_1_file_without_6b_fields_loads() {
+        // A step 1–6a `tickets.json`: no kind/playbookStartedAt/checks/git (plan6b punkt 1).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        assert_eq!(
+            v["tickets"][3]["reports"][0]["author"]["kind"],
+            json!("system")
+        );
+        for t in v["tickets"].as_array_mut().unwrap() {
+            let o = t.as_object_mut().unwrap();
+            for k in ["kind", "playbookStartedAt", "checks", "git"] {
+                assert!(o.remove(k).is_some(), "{k}");
+            }
+        }
+        let doc = migrate(v).unwrap();
+        assert_eq!(doc.schema_version, 1);
+        let mut want = sample_doc();
+        for t in want.tickets.iter_mut() {
+            t.kind = None;
+            t.playbook_started_at = None;
+            t.checks = None;
+            t.git = None;
+        }
+        assert_eq!(doc, want);
+        // The 6b fields survive a save in this build (schema stays 1).
+        let doc = sample_doc();
+        assert_eq!(migrate(serde_json::to_value(&doc).unwrap()).unwrap(), doc);
     }
 
     #[test]

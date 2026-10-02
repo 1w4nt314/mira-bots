@@ -22,9 +22,9 @@ use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
 use crate::config::{
-    BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, MAX_REVIEW_ROUNDS, MOVED_NOTE, PARENT_DELETED_NOTE,
-    REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS,
-    TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
+    BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, MOVED_NOTE, PARENT_DELETED_NOTE, REPORTS_PER_TICKET_MAX,
+    RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
+    TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
 };
 use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
 
@@ -38,9 +38,9 @@ pub const REVIEW_UNDELIVERED_NOTE: &str = "review kunne ikke leveres";
 /// History note when the user removed the reviewer.
 pub const REVIEWER_REMOVED_NOTE: &str = "reviewer fjernet";
 
-/// `"eskaleret efter 3 runder"`.
-pub fn escalated_note() -> String {
-    format!("eskaleret efter {MAX_REVIEW_ROUNDS} runder")
+/// `"eskaleret efter {max} runder"` (`max` = the workspace's `maxReviewRounds`).
+pub fn escalated_note(max: u32) -> String {
+    format!("eskaleret efter {max} runder")
 }
 
 /// Where a rejected ticket goes (plan5 C.9, W1).
@@ -968,6 +968,10 @@ impl TicketService {
             project,
             parent_id: None,
             blocked_by: Vec::new(),
+            kind: None,
+            playbook_started_at: None,
+            checks: None,
+            git: None,
         };
         Ok(t)
     }
@@ -1829,9 +1833,15 @@ impl TicketService {
         self.fetch(ticket_id)
     }
 
-    /// The ticket reached [`MAX_REVIEW_ROUNDS`]: `escalated`, note "eskaleret efter 3 runder",
-    /// no routing. `Ok(None)` when it is not an unrouted review ticket (idempotent).
-    pub fn escalate(&mut self, ticket_id: &str, now: u64) -> Result<Option<Ticket>, TicketError> {
+    /// The ticket reached `max` rounds (the workspace's `maxReviewRounds`): `escalated`, note
+    /// "eskaleret efter {max} runder", no routing. `Ok(None)` when it is not an unrouted review
+    /// ticket (idempotent).
+    pub fn escalate(
+        &mut self,
+        ticket_id: &str,
+        max: u32,
+        now: u64,
+    ) -> Result<Option<Ticket>, TicketError> {
         let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
         if t.state != TicketState::Review || t.escalated {
             return Ok(None);
@@ -1840,7 +1850,7 @@ impl TicketService {
             let t = find_mut(doc, ticket_id)?;
             t.escalated = true;
             t.reviewer_agent_id = None;
-            note_entry(t, TicketActor::System, escalated_note(), now);
+            note_entry(t, TicketActor::System, escalated_note(max), now);
             Ok(())
         })?;
         self.fetch(ticket_id).map(Some)
@@ -1929,7 +1939,7 @@ impl TicketService {
     }
 
     /// Removes the ticket's reviewer and assignment (stays in review; routed again) and clears an
-    /// escalation, with `note` by `by`. A ticket that reached [`MAX_REVIEW_ROUNDS`] stays (or
+    /// escalation, with `note` by `by`. A ticket that reached `max` rounds stays (or
     /// becomes again) escalated without a new escalation note, so routing leaves it to the user
     /// (review5 N5). `Ok(None)` when there is nothing to remove.
     pub fn clear_reviewer(
@@ -1937,13 +1947,14 @@ impl TicketService {
         ticket_id: &str,
         note: &str,
         by: TicketActor,
+        max: u32,
         now: u64,
     ) -> Result<Option<Ticket>, TicketError> {
         let t = self.get(ticket_id).ok_or(TicketError::NotFound)?;
         if t.state != TicketState::Review {
             return Err(TicketError::NotInReview);
         }
-        let keep_escalated = t.review_round >= MAX_REVIEW_ROUNDS;
+        let keep_escalated = t.review_round >= max;
         if t.reviewer_agent_id.is_none() && (!t.escalated || keep_escalated) {
             return Ok(None);
         }
@@ -2258,6 +2269,7 @@ impl TicketService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MAX_REVIEW_ROUNDS;
     use crate::tickets::store::MemoryStore;
     use TicketState as S;
 
@@ -3253,13 +3265,17 @@ mod tests {
     fn escalate_and_clear_reviewer() {
         let (mut s, _) = svc();
         let t = in_review(&mut s, "a1", "x");
-        let e = s.escalate(&t.id, 5).unwrap().unwrap();
+        let e = s.escalate(&t.id, MAX_REVIEW_ROUNDS, 5).unwrap().unwrap();
         assert!(e.escalated);
         assert_eq!(
             e.history.last().unwrap().note.as_deref(),
             Some("eskaleret efter 3 runder")
         );
-        assert_eq!(s.escalate(&t.id, 6).unwrap(), None, "idempotent");
+        assert_eq!(
+            s.escalate(&t.id, MAX_REVIEW_ROUNDS, 6).unwrap(),
+            None,
+            "idempotent"
+        );
         assert!(s.unrouted_reviews().is_empty(), "escalated: no routing");
         assert_eq!(s.escalated_count(), 1);
         // The user picks a reviewer anyway.
@@ -3271,13 +3287,25 @@ mod tests {
             Err(TicketError::SenderCannotReview)
         );
         let c = s
-            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 8)
+            .clear_reviewer(
+                &t.id,
+                REVIEWER_REMOVED_NOTE,
+                TicketActor::User,
+                MAX_REVIEW_ROUNDS,
+                8,
+            )
             .unwrap()
             .unwrap();
         assert_eq!((c.reviewer_agent_id, c.escalated), (None, false));
         assert!(s.review_assignments().is_empty());
         assert_eq!(
-            s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 9),
+            s.clear_reviewer(
+                &t.id,
+                REVIEWER_REMOVED_NOTE,
+                TicketActor::User,
+                MAX_REVIEW_ROUNDS,
+                9
+            ),
             Ok(None)
         );
     }
@@ -3294,15 +3322,27 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        s.escalate(&t.id, 5).unwrap().unwrap();
+        s.escalate(&t.id, MAX_REVIEW_ROUNDS, 5).unwrap().unwrap();
         assert_eq!(
-            s.clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 6),
+            s.clear_reviewer(
+                &t.id,
+                REVIEWER_REMOVED_NOTE,
+                TicketActor::User,
+                MAX_REVIEW_ROUNDS,
+                6
+            ),
             Ok(None)
         );
         let r = s.set_reviewer(&t.id, "rev", "r", 7).unwrap();
         assert_eq!((r.escalated, r.review_round), (false, MAX_REVIEW_ROUNDS));
         let c = s
-            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 8)
+            .clear_reviewer(
+                &t.id,
+                REVIEWER_REMOVED_NOTE,
+                TicketActor::User,
+                MAX_REVIEW_ROUNDS,
+                8,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3315,7 +3355,45 @@ mod tests {
             c.history.last().unwrap().note.as_deref(),
             Some(REVIEWER_REMOVED_NOTE)
         );
-        assert_eq!(s.escalate(&t.id, 9).unwrap(), None, "no second escalation");
+        assert_eq!(
+            s.escalate(&t.id, MAX_REVIEW_ROUNDS, 9).unwrap(),
+            None,
+            "no second escalation"
+        );
+    }
+
+    /// Step 6b: the round limit is the workspace's `maxReviewRounds`, given by the caller.
+    #[test]
+    fn escalation_and_clear_reviewer_use_the_given_max() {
+        assert_eq!(escalated_note(2), "eskaleret efter 2 runder");
+        assert_eq!(escalated_note(10), "eskaleret efter 10 runder");
+        let (mut s, _) = svc();
+        let t = in_review(&mut s, "a1", "x");
+        s.commit(|doc| {
+            find_mut(doc, &t.id)?.review_round = 2;
+            Ok(())
+        })
+        .unwrap();
+        let e = s.escalate(&t.id, 2, 5).unwrap().unwrap();
+        assert_eq!(
+            e.history.last().unwrap().note.as_deref(),
+            Some("eskaleret efter 2 runder")
+        );
+        s.set_reviewer(&t.id, "rev", "r", 6).unwrap();
+        // Round 2 of max 2: removing the reviewer keeps the escalation …
+        let c = s
+            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 2, 7)
+            .unwrap()
+            .unwrap();
+        assert!(c.escalated);
+        // … while with max 3 the same round is routed again.
+        s.set_reviewer(&t.id, "rev", "r", 8).unwrap();
+        let c = s
+            .clear_reviewer(&t.id, REVIEWER_REMOVED_NOTE, TicketActor::User, 3, 9)
+            .unwrap()
+            .unwrap();
+        assert!(!c.escalated);
+        assert_eq!(s.unrouted_reviews().len(), 1);
     }
 
     #[test]

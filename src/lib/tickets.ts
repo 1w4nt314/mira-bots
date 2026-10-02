@@ -596,22 +596,20 @@ export function parseWorkplaceTab(tab: string | null): WorkplaceTab | null {
 
 // --- review between agents, coordination (plan5 A.6/A.7) --------------------------------------
 
-/** Mirrors `MAX_REVIEW_ROUNDS` in Rust: after this many rejections the user decides. */
-export const MAX_REVIEW_ROUNDS = 3;
-
 /**
  * The review round shown on the card (`reviewRound` counts rejections so far; the review file
- * says "Runde r+1 af 3"), capped at the maximum once escalated.
+ * says "Runde r+1 af max"), capped at the maximum once escalated. `max` is the workspace's
+ * `maxReviewRounds` (`appInfo.rules.maxReviewRounds`; 3 is Rust's default before appInfo loads).
  *
- * | reviewRound | reviewRoundText   |
- * |-------------|-------------------|
- * | 0           | "Runde 1 af 3"    |
- * | 2           | "Runde 3 af 3"    |
- * | 3           | "Runde 3 af 3"    |
- * | 7           | "Runde 3 af 3"    |
+ * | reviewRound | max | reviewRoundText   |
+ * |-------------|-----|-------------------|
+ * | 0           | 3   | "Runde 1 af 3"    |
+ * | 2           | 3   | "Runde 3 af 3"    |
+ * | 7           | 3   | "Runde 3 af 3"    |
+ * | 1           | 2   | "Runde 2 af 2"    |
  */
-export function reviewRoundText(t: Pick<TicketSummary, "reviewRound">): string {
-  return `Runde ${Math.min(t.reviewRound + 1, MAX_REVIEW_ROUNDS)} af ${MAX_REVIEW_ROUNDS}`;
+export function reviewRoundText(t: Pick<TicketSummary, "reviewRound">, max = 3): string {
+  return `Runde ${Math.min(t.reviewRound + 1, max)} af ${max}`;
 }
 
 /**

@@ -58,7 +58,16 @@ for (const [r, want] of [
   [7, "Runde 3 af 3"],
 ])
   eq(k.reviewRoundText({ reviewRound: r }), want, `reviewRoundText ${r}`);
-eq(k.MAX_REVIEW_ROUNDS, 3, "MAX_REVIEW_ROUNDS");
+// Step 6b: the workspace's maxReviewRounds (appInfo.rules.maxReviewRounds).
+for (const [r, max, want] of [
+  [0, 2, "Runde 1 af 2"],
+  [1, 2, "Runde 2 af 2"],
+  [5, 2, "Runde 2 af 2"],
+  [0, 1, "Runde 1 af 1"],
+  [3, 10, "Runde 4 af 10"],
+])
+  eq(k.reviewRoundText({ reviewRound: r }, max), want, `reviewRoundText ${r} af ${max}`);
+eq(k.MAX_REVIEW_ROUNDS, undefined, "MAX_REVIEW_ROUNDS is gone (the workspace decides)");
 
 // reviewerCandidates
 const agents = [

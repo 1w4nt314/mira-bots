@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use super::model::{Ticket, TicketState};
 use crate::agent::roles::{self, Role};
 use crate::agent::SeatKind;
-use crate::config::{MAX_REVIEW_ROUNDS, REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
+use crate::config::{REVIEW_DIR, TICKET_DIR, TICKET_LINE_TITLE_MAX_CHARS};
 
 /// Title used when nothing is left after sanitising.
 pub const EMPTY_TITLE: &str = "(uden titel)";
@@ -660,12 +660,14 @@ fn child_summary(summary: Option<&str>) -> String {
 
 /// Content of `<reviewer cwd>/.mira-bots/reviews/<short>.md` (C5.12). `author_name` turns a
 /// report author into a display name. A parent (`children` not empty, step 6a) gets
-/// `## Del-tickets (allerede reviewet)` before `## Opgaven` and [`PARENT_REVIEW_RULE`].
+/// `## Del-tickets (allerede reviewet)` before `## Opgaven` and [`PARENT_REVIEW_RULE`]. `max` is
+/// the workspace's `maxReviewRounds` ("Runde r af max").
 pub fn render_review_file(
     t: &Ticket,
     sender: Option<&ReviewSender>,
     author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
     children: &[ChildReview],
+    max: u32,
 ) -> String {
     let short = t.short_id();
     let (sender_line, git_dir) = match sender {
@@ -690,14 +692,14 @@ pub fn render_review_file(
     };
     let mut out = format!(
         "# Review af ticket {short}: {title}\n\
-         Afsender: {sender_line}   Runde: {round} af {MAX_REVIEW_ROUNDS}   Afleveret: {at}\n\
+         Afsender: {sender_line}   Runde: {round} af {max}   Afleveret: {at}\n\
          ## Opsummering fra afsenderen\n\
          {summary}\n\
          ## Rapporter\n",
         title = one_line(&t.title),
         // Capped like the card: a hand-picked reviewer of an escalated ticket (review_round = 3)
         // reads "3 af 3", not "4 af 3" (review5 N5).
-        round = (t.review_round + 1).min(MAX_REVIEW_ROUNDS),
+        round = (t.review_round + 1).min(max),
         at = iso_utc(submitted_at(t)),
     );
     if t.reports.is_empty() {
@@ -754,6 +756,7 @@ pub fn write_review_file(
     sender: Option<&ReviewSender>,
     author_name: &dyn Fn(&super::model::ReportAuthor) -> String,
     children: &[ChildReview],
+    max: u32,
 ) -> io::Result<PathBuf> {
     let dir = review_dir(cwd);
     fs::create_dir_all(&dir)?;
@@ -764,7 +767,10 @@ pub fn write_review_file(
         }
     }
     let path = dir.join(format!("{}.md", t.short_id()));
-    fs::write(&path, render_review_file(t, sender, author_name, children))?;
+    fs::write(
+        &path,
+        render_review_file(t, sender, author_name, children, max),
+    )?;
     Ok(path)
 }
 
@@ -1232,6 +1238,7 @@ mod tests {
             Some(&sender),
             &|a| a.agent_id.clone().unwrap_or_else(|| "dig".into()),
             &[],
+            3,
         );
         assert!(f.starts_with("# Review af ticket abcdef01: Ret @login /nu\n"));
         assert!(f.contains(
@@ -1248,14 +1255,22 @@ mod tests {
             None,
             &|_| String::new(),
             &[],
+            3,
         );
         assert!(f.contains("Afsender: afsenderens mappe kendes ikke længere   Runde: 1 af 3"));
         assert!(f.contains("## Opsummering fra afsenderen\n(ingen)\n## Rapporter\n(ingen)\n"));
         // An escalated ticket with a hand-picked reviewer: capped at the last round.
         let mut t = ticket(ID, TicketState::Review);
-        t.review_round = MAX_REVIEW_ROUNDS;
-        let f = render_review_file(&t, None, &|_| String::new(), &[]);
+        t.review_round = 3;
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 3);
         assert!(f.contains("Runde: 3 af 3   "), "{f}");
+        // Step 6b: the workspace's maxReviewRounds.
+        let mut t = ticket(ID, TicketState::Review);
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 2);
+        assert!(f.contains("Runde: 1 af 2   "), "{f}");
+        t.review_round = 2;
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 2);
+        assert!(f.contains("Runde: 2 af 2   "), "{f}");
     }
 
     #[test]
@@ -1263,7 +1278,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mira-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let t = review_ticket();
-        let p = write_review_file(&dir, &t, None, &|_| String::new(), &[]).unwrap();
+        let p = write_review_file(&dir, &t, None, &|_| String::new(), &[], 3).unwrap();
         assert_eq!(
             p,
             dir.join(".mira-bots").join("reviews").join("abcdef01.md")
@@ -1572,7 +1587,7 @@ mod tests {
                 summary: None,
             },
         ];
-        let f = render_review_file(&t, None, &|_| String::new(), &children);
+        let f = render_review_file(&t, None, &|_| String::new(), &children, 3);
         let cut = format!("{}…", "æ".repeat(CHILD_SUMMARY_MAX_CHARS));
         let section = format!(
             "## Del-tickets (allerede reviewet)\n- aaaaaaaa Plan spil — Done: Planen  er skrevet\n- bbbbbbbb Byg — Done: {cut}\n- cccccccc Test — I kø: (ingen opsummering)\n## Opgaven\n"
@@ -1582,7 +1597,7 @@ mod tests {
         let rules = f.find("## Regler").unwrap();
         assert!(f.find(PARENT_REVIEW_RULE).unwrap() > rules);
         // Without children: unchanged.
-        let f = render_review_file(&t, None, &|_| String::new(), &[]);
+        let f = render_review_file(&t, None, &|_| String::new(), &[], 3);
         assert!(!f.contains("Del-tickets") && !f.contains(PARENT_REVIEW_RULE));
     }
 }

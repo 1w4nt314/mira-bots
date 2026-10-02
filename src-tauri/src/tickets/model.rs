@@ -3,7 +3,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::{
-    AGENTS_MAY_CREATE_PROJECTS, AUTO_REVIEW_ON_STOP, CREATE_TICKET_RATE_LIMIT,
+    AGENTS_MAY_CREATE_PROJECTS, AUTO_REVIEW_ON_STOP, AUTO_SPAWN_FOR_PLAYBOOK, CHECKS_GATE,
+    CLEANUP_WORKTREES_ON_DONE, CREATE_TICKET_RATE_LIMIT, FRESH_SESSION_PER_TICKET, GIT_DEFAULT,
     MAX_AGENTS_PER_PROJECT, MAX_REVIEW_ROUNDS, MAX_STAFF_AGENTS, MAX_WORK_AGENTS,
     REPORTS_PER_TICKET_MAX, REPORT_BODY_MAX_CHARS, REVIEW_BY_DEFAULT, TICKETS_SCHEMA_VERSION,
     TICKET_BODY_MAX_CHARS, TICKET_SHORT_ID_LEN, USER_INPUT_GRACE_MS,
@@ -94,6 +95,77 @@ pub enum TicketIssue {
     NotSubmitted,
 }
 
+/// How the app gives a work ticket its own git branch (step 6b, workspace rule `git`).
+/// Wire: `"off"|"branch"|"worktree"`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitMode {
+    #[default]
+    Off,
+    /// `git switch ticket/<short>` in the project folder.
+    Branch,
+    /// A worktree `<project>/.mira-bots/wt/<short>` on branch `ticket/<short>`.
+    Worktree,
+}
+
+impl GitMode {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitMode::Off => "off",
+            GitMode::Branch => "branch",
+            GitMode::Worktree => "worktree",
+        }
+    }
+
+    /// Wire name → mode, ASCII-case-insensitive and trimmed (the workspace file).
+    pub fn parse(s: &str) -> Option<GitMode> {
+        let s = s.trim();
+        [GitMode::Off, GitMode::Branch, GitMode::Worktree]
+            .into_iter()
+            .find(|m| m.as_str().eq_ignore_ascii_case(s))
+    }
+}
+
+/// State of a ticket's project checks (step 6b).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ChecksState {
+    Pending,
+    Passed,
+    Failed,
+    /// No project file, no checks or an unreadable file: nothing ran.
+    Skipped,
+}
+
+/// The project checks of the ticket's current review entry (step 6b); reset on Submit.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketChecks {
+    pub state: ChecksState,
+    /// Name of the first failed check.
+    pub failed: Option<String>,
+    /// The ticket's `review_round` when the checks started.
+    pub round: u32,
+    /// Unix ms.
+    pub started_at: u64,
+}
+
+/// The ticket's git branch, prepared by the app at delivery (step 6b). Kept on the ticket so the
+/// review file and the checks do not depend on the sender's cwd.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketGit {
+    pub mode: GitMode,
+    /// `ticket/<short id>`.
+    pub branch: String,
+    pub base: String,
+    /// The project's repository folder.
+    pub repo: String,
+    /// The worktree folder (`worktree` mode only).
+    pub worktree: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TicketHistoryEntry {
@@ -131,7 +203,8 @@ pub struct Ticket {
     /// Review rejections so far (plan5 A.6); reset when the ticket goes back to the backlog.
     #[serde(default)]
     pub review_round: u32,
-    /// Reached [`MAX_REVIEW_ROUNDS`] on entering review: no automatic routing, the user decides.
+    /// Reached the workspace's `maxReviewRounds` on entering review: no automatic routing, the
+    /// user decides.
     #[serde(default)]
     pub escalated: bool,
     /// The reviewer agent while in review (kept after approval for display).
@@ -150,6 +223,20 @@ pub struct Ticket {
     /// ticket) does not block. Absent before 6a.
     #[serde(default)]
     pub blocked_by: Vec<TicketId>,
+    /// Ticket type (step 6b): `None` = a plain task, otherwise a playbook name (`feature`, `bug`
+    /// or one from the workspace file). Absent before 6b.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Unix ms when the playbook was rolled out on this ticket (the "forløb" marker). Absent
+    /// before 6b.
+    #[serde(default)]
+    pub playbook_started_at: Option<u64>,
+    /// Project checks of the current review entry (step 6b). Absent before 6b.
+    #[serde(default)]
+    pub checks: Option<TicketChecks>,
+    /// The ticket's git branch/worktree (step 6b). Absent before 6b.
+    #[serde(default)]
+    pub git: Option<TicketGit>,
 }
 
 impl Ticket {
@@ -189,6 +276,11 @@ pub struct TicketSummary {
     pub parent_id: Option<TicketId>,
     /// Copy of `Ticket.blocked_by` (step 6a).
     pub blocked_by: Vec<TicketId>,
+    /// Copies of the step 6b fields.
+    pub kind: Option<String>,
+    pub playbook_started_at: Option<u64>,
+    pub checks: Option<TicketChecks>,
+    pub git: Option<TicketGit>,
 }
 
 impl From<&Ticket> for TicketSummary {
@@ -215,6 +307,10 @@ impl From<&Ticket> for TicketSummary {
             project: t.project.clone(),
             parent_id: t.parent_id.clone(),
             blocked_by: t.blocked_by.clone(),
+            kind: t.kind.clone(),
+            playbook_started_at: t.playbook_started_at,
+            checks: t.checks.clone(),
+            git: t.git.clone(),
         }
     }
 }
@@ -242,12 +338,15 @@ where
     Option::<ProjectRef>::deserialize(d).map(Some)
 }
 
-/// Who wrote a report: an agent (`agentId`) or the user.
+/// Who wrote a report: an agent (`agentId`), the user or the app itself (step 6b: the
+/// «Tjek»/«Ændringer» reports; shown as "appen"). An older build does not know `system` and
+/// would quarantine a `tickets.json` containing it (same class as `waiting` in 6a).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ReportAuthorKind {
     Agent,
     User,
+    System,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -269,6 +368,14 @@ impl ReportAuthor {
         ReportAuthor {
             kind: ReportAuthorKind::Agent,
             agent_id: Some(agent_id.to_string()),
+        }
+    }
+
+    /// The app itself (step 6b).
+    pub fn system() -> Self {
+        ReportAuthor {
+            kind: ReportAuthorKind::System,
+            agent_id: None,
         }
     }
 }
@@ -428,6 +535,15 @@ pub enum TicketError {
     Blocked(String),
     #[error("Højst 10 blokeringer pr. ticket")]
     TooManyBlockers,
+    // ---- step 6b (playbooks) ----
+    #[error("Ingen playbook for «{0}»")]
+    NoPlaybook(String),
+    #[error("Forløbet er allerede startet (ticketen har del-tickets)")]
+    PlaybookAlreadyStarted,
+    #[error("kind skal være task, feature, bug eller et playbook-navn fra workspace-filen")]
+    InvalidKind,
+    #[error("Playbooken kan ikke udrulles: {0}")]
+    PlaybookStepsInvalid(String),
 }
 
 /// The rules of this workspace (plan5 C5.1): the "Regler" section of every profile's system
@@ -450,6 +566,13 @@ pub struct WorkspaceRules {
     pub agents_may_create_projects: bool,
     /// 0 = unlimited.
     pub max_agents_per_project: usize,
+    // step 6b (the playbooks map and `gitBase` are in `workspace::WorkspaceConfig`, so the rules
+    // stay `Copy`)
+    pub git: GitMode,
+    pub checks_gate: bool,
+    pub auto_spawn_for_playbook: bool,
+    pub fresh_session_per_ticket: bool,
+    pub cleanup_worktrees_on_done: bool,
 }
 
 impl WorkspaceRules {
@@ -468,6 +591,11 @@ impl WorkspaceRules {
             user_input_grace_ms: USER_INPUT_GRACE_MS,
             agents_may_create_projects: AGENTS_MAY_CREATE_PROJECTS,
             max_agents_per_project: MAX_AGENTS_PER_PROJECT,
+            git: GIT_DEFAULT,
+            checks_gate: CHECKS_GATE,
+            auto_spawn_for_playbook: AUTO_SPAWN_FOR_PLAYBOOK,
+            fresh_session_per_ticket: FRESH_SESSION_PER_TICKET,
+            cleanup_worktrees_on_done: CLEANUP_WORKTREES_ON_DONE,
         }
     }
 }
@@ -512,6 +640,10 @@ pub(crate) mod test_support {
             project: None,
             parent_id: None,
             blocked_by: Vec::new(),
+            kind: None,
+            playbook_started_at: None,
+            checks: None,
+            git: None,
         }
     }
 }
@@ -589,6 +721,31 @@ mod tests {
             serde_json::to_value(None::<TicketIssue>).unwrap(),
             json!(null)
         );
+        // step 6b
+        for (m, wire) in [
+            (GitMode::Off, "off"),
+            (GitMode::Branch, "branch"),
+            (GitMode::Worktree, "worktree"),
+        ] {
+            assert_eq!(serde_json::to_value(m).unwrap(), json!(wire));
+            assert_eq!(serde_json::from_value::<GitMode>(json!(wire)).unwrap(), m);
+            assert_eq!(m.as_str(), wire);
+            assert_eq!(GitMode::parse(&wire.to_uppercase()), Some(m));
+        }
+        assert_eq!(GitMode::default(), GitMode::Off);
+        assert_eq!(GitMode::parse("foo"), None);
+        for (c, wire) in [
+            (ChecksState::Pending, "pending"),
+            (ChecksState::Passed, "passed"),
+            (ChecksState::Failed, "failed"),
+            (ChecksState::Skipped, "skipped"),
+        ] {
+            assert_eq!(serde_json::to_value(c).unwrap(), json!(wire));
+        }
+        assert_eq!(
+            serde_json::to_value(ReportAuthor::system()).unwrap(),
+            json!({"kind":"system","agentId":null})
+        );
     }
 
     #[test]
@@ -618,6 +775,10 @@ mod tests {
             "history",
             "parentId",
             "blockedBy",
+            "kind",
+            "playbookStartedAt",
+            "checks",
+            "git",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
         }
@@ -679,6 +840,60 @@ mod tests {
         assert_eq!(s["parentId"], json!("p1"));
         assert_eq!(s["blockedBy"], json!(["b1", "b2"]));
         assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+
+        // step 6b: kind, playbook marker, checks and git in both (C6b.2).
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        for k in ["kind", "playbookStartedAt", "checks", "git"] {
+            assert_eq!(v[k], json!(null), "{k}");
+            assert_eq!(s[k], json!(null), "{k}");
+        }
+        t.kind = Some("feature".into());
+        t.playbook_started_at = Some(1_700_000_000_000);
+        t.checks = Some(TicketChecks {
+            state: ChecksState::Pending,
+            failed: None,
+            round: 0,
+            started_at: 5,
+        });
+        t.git = Some(TicketGit {
+            mode: GitMode::Worktree,
+            branch: "ticket/ab12cd34".into(),
+            base: "main".into(),
+            repo: "/p".into(),
+            worktree: Some("/p/.mira-bots/wt/ab12cd34".into()),
+        });
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        for x in [&v, &s] {
+            assert_eq!(x["kind"], json!("feature"));
+            assert_eq!(x["playbookStartedAt"], json!(1_700_000_000_000u64));
+            assert_eq!(
+                x["checks"],
+                json!({"state":"pending","failed":null,"round":0,"startedAt":5})
+            );
+            assert_eq!(
+                x["git"],
+                json!({"mode":"worktree","branch":"ticket/ab12cd34","base":"main","repo":"/p",
+                       "worktree":"/p/.mira-bots/wt/ab12cd34"})
+            );
+        }
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+        let back = serde_json::from_value::<TicketSummary>(s).unwrap();
+        assert_eq!((back.kind, back.git), (t.kind.clone(), t.git.clone()));
+    }
+
+    #[test]
+    fn file_without_6b_fields_loads_with_defaults() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Review)).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in ["kind", "playbookStartedAt", "checks", "git"] {
+            assert!(o.remove(k).is_some(), "{k}");
+        }
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!((t.kind.as_deref(), t.playbook_started_at), (None, None));
+        assert_eq!((t.checks.as_ref(), t.git.as_ref()), (None, None));
+        assert_eq!(t, ticket("t1", TicketState::Review));
     }
 
     #[test]
@@ -735,7 +950,7 @@ mod tests {
     fn workspace_rules_defaults_wire_format() {
         assert_eq!(
             serde_json::to_string(&WorkspaceRules::defaults()).unwrap(),
-            r#"{"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0}"#
+            r#"{"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0,"git":"off","checksGate":true,"autoSpawnForPlaybook":false,"freshSessionPerTicket":true,"cleanupWorktreesOnDone":false}"#
         );
     }
 
@@ -845,6 +1060,23 @@ mod tests {
             (
                 TicketError::TooManyBlockers,
                 "Højst 10 blokeringer pr. ticket",
+            ),
+            // step 6b
+            (
+                TicketError::NoPlaybook("docs".into()),
+                "Ingen playbook for «docs»",
+            ),
+            (
+                TicketError::PlaybookAlreadyStarted,
+                "Forløbet er allerede startet (ticketen har del-tickets)",
+            ),
+            (
+                TicketError::InvalidKind,
+                "kind skal være task, feature, bug eller et playbook-navn fra workspace-filen",
+            ),
+            (
+                TicketError::PlaybookStepsInvalid("trin 1 mangler titel".into()),
+                "Playbooken kan ikke udrulles: trin 1 mangler titel",
             ),
         ];
         for (e, text) in table {

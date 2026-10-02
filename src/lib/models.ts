@@ -23,7 +23,7 @@ export const MODEL_ID_MAX_CHARS = 64;
 export const EFFORT_LEVELS: readonly Effort[] = ["low", "medium", "high", "xhigh", "max"];
 
 /** Mirrors `REPORT_*_MAX_CHARS`, `PROMPT_APPEND_MAX_CHARS` and `PROFILE_NAME_MAX_CHARS`
- *  (`MAX_REVIEW_ROUNDS` lives in lib/tickets). */
+ *  (the review round limit comes from `appInfo.rules.maxReviewRounds`). */
 export const REPORT_TITLE_MAX = 120;
 export const REPORT_BODY_MAX = 20000;
 export const PROMPT_APPEND_MAX = 4000;

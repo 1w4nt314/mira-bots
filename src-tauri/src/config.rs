@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::tickets::model::GitMode;
+
 /// Maximum number of simultaneously running work agents (seat kind `work`).
 pub const MAX_WORK_AGENTS: usize = 5;
 // TODO(windows-verify): D.69 (third staff seat: UI, mira_spawn_agent and the limit text)
@@ -241,6 +243,57 @@ pub const WAKE_UNCONFIRMED_TEXT: &str = "Vækning ikke bekræftet, se terminalen
 /// [`WAKE_UNCONFIRMED_TEXT`]: the first one and one retry at the next idle (review 6a W1).
 pub const WAKE_MAX_ATTEMPTS: u8 = 2;
 
+// --- playbooks, project checks, git per ticket, fresh session (step 6b, plan6b C6b.1/C6b.2) ---
+
+/// The project file with the checks, relative to the project folder (`/`-separated).
+pub const PROJECT_FILE: &str = ".mira-bots/project.json";
+/// App-managed worktrees, relative to the project folder: `<project>/.mira-bots/wt/<short id>`.
+pub const WORKTREE_DIR: &str = ".mira-bots/wt";
+/// Content of `<folder>/.mira-bots/.gitignore`: everything app-owned is ignored except the
+/// user's `project.json` (a file that is exactly `*\n` is upgraded to this).
+pub const MIRA_GITIGNORE: &str = "*\n!project.json\n";
+/// `timeoutSec` of a check when the project file gives none.
+pub const CHECK_TIMEOUT_DEFAULT_SEC: u64 = 600;
+/// Upper bound of `timeoutSec`.
+pub const CHECK_TIMEOUT_MAX_SEC: u64 = 3_600;
+/// Most checks per project file.
+pub const CHECKS_MAX: usize = 10;
+/// Output kept per failed check (the tail, chars).
+pub const CHECK_OUTPUT_MAX_CHARS: usize = 8_000;
+/// Most steps per playbook.
+pub const PLAYBOOK_STEPS_MAX: usize = 6;
+/// Upper bound of `maxReviewRounds` in the workspace file (lower bound 1).
+pub const MAX_REVIEW_ROUNDS_MAX: u32 = 10;
+/// Timeout of one git command run by the app.
+pub const GIT_TIMEOUT_MS: u64 = 60_000;
+/// How long the dispatcher waits for a restart before a ticket delivery before it gives up.
+pub const RESTART_TIMEOUT_MS: u64 = 60_000;
+/// Default of the workspace rule `git`.
+pub const GIT_DEFAULT: GitMode = GitMode::Off;
+/// Default of `checksGate`: a failed check rejects the ticket before review.
+pub const CHECKS_GATE: bool = true;
+/// Default of `autoSpawnForPlaybook`.
+pub const AUTO_SPAWN_FOR_PLAYBOOK: bool = false;
+/// Default of `freshSessionPerTicket`.
+pub const FRESH_SESSION_PER_TICKET: bool = true;
+/// Default of `cleanupWorktreesOnDone`.
+pub const CLEANUP_WORKTREES_ON_DONE: bool = false;
+/// History note on a child created by a playbook: "oprettet af forløb {parent}: trin {i}/{n}".
+pub fn playbook_created_note(parent_short: &str, step: usize, steps: usize) -> String {
+    format!("oprettet af forløb {parent_short}: trin {step}/{steps}")
+}
+/// History note when the last child of a playbook parent without assignee is done and the
+/// parent goes to review (or Done).
+pub const FLOW_DONE_NOTE: &str = "forløb afsluttet: alle del-tickets godkendt";
+/// History note when the app restarted while a ticket's checks were running.
+pub const CHECKS_INTERRUPTED_NOTE: &str = "tjek afbrudt af genstart";
+/// Prefix of the rejection note when the app rejects a ticket because a check failed.
+pub const CHECKS_REJECT_PREFIX: &str = "afvist af appen";
+/// Title (prefix) of the app's check report.
+pub const CHECKS_REPORT_TITLE: &str = "Tjek";
+/// Title of the app's report with the ticket's git changes.
+pub const CHANGES_REPORT_TITLE: &str = "Ændringer";
+
 // --- macOS / unix (step 7) ---
 
 /// Unix: time between SIGTERM and SIGKILL to an agent's process group.
@@ -396,6 +449,39 @@ mod tests {
         assert_eq!(WAKE_MAX_ATTEMPTS, 2);
         // A.1: no schema bump (an older build would discard every newer file).
         assert_eq!(TICKETS_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn step6b_constants() {
+        assert_eq!(PROJECT_FILE, ".mira-bots/project.json");
+        assert_eq!(WORKTREE_DIR, ".mira-bots/wt");
+        assert_eq!(MIRA_GITIGNORE, "*\n!project.json\n");
+        assert_eq!(
+            (CHECK_TIMEOUT_DEFAULT_SEC, CHECK_TIMEOUT_MAX_SEC, CHECKS_MAX),
+            (600, 3_600, 10)
+        );
+        assert_eq!(CHECK_OUTPUT_MAX_CHARS, 8_000);
+        assert_eq!(PLAYBOOK_STEPS_MAX, 6);
+        assert_eq!(MAX_REVIEW_ROUNDS_MAX, 10);
+        const { assert!(MAX_REVIEW_ROUNDS <= MAX_REVIEW_ROUNDS_MAX) };
+        assert_eq!((GIT_TIMEOUT_MS, RESTART_TIMEOUT_MS), (60_000, 60_000));
+        assert_eq!(GIT_DEFAULT, GitMode::Off);
+        const { assert!(CHECKS_GATE) };
+        const { assert!(!AUTO_SPAWN_FOR_PLAYBOOK) };
+        const { assert!(FRESH_SESSION_PER_TICKET) };
+        const { assert!(!CLEANUP_WORKTREES_ON_DONE) };
+        assert_eq!(
+            playbook_created_note("ab12cd34", 2, 3),
+            "oprettet af forløb ab12cd34: trin 2/3"
+        );
+        assert_eq!(
+            FLOW_DONE_NOTE,
+            "forløb afsluttet: alle del-tickets godkendt"
+        );
+        assert_eq!(CHECKS_INTERRUPTED_NOTE, "tjek afbrudt af genstart");
+        assert_eq!(CHECKS_REJECT_PREFIX, "afvist af appen");
+        assert_eq!(CHECKS_REPORT_TITLE, "Tjek");
+        assert_eq!(CHANGES_REPORT_TITLE, "Ændringer");
     }
 
     #[test]

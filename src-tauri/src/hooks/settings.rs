@@ -140,7 +140,8 @@ pub fn statusline_command(hook_exe: &Path) -> String {
 
 /// The settings file of `profile` (C5.10): the hooks as in [`render_hooks`], allow
 /// (`mcp__mira-bots__*` + `extraAllow`), deny (role-bound tools the roles lack + `toolDeny` +
-/// `Edit`/`Write`/`MultiEdit`/`NotebookEdit` without a work role + `extraDeny`; omitted when
+/// `Edit`/`Write`/`MultiEdit`/`NotebookEdit` without a work role + the push deny + with `root`
+/// the `Edit(//<root>/…)` rules for the user's files (step 6b) + `extraDeny`; omitted when
 /// empty), `model` when set, `effortLevel` when set and not `max`
 /// (settings files ignore `max`; it is only passed as `--effort`), and `statusLine` pointing at
 /// the hook exe when [`STATUSLINE_ENABLED`].
@@ -148,12 +149,18 @@ pub fn statusline_command(hook_exe: &Path) -> String {
 /// TODO(windows-verify): the statusLine with the quoted path to mira-hook.exe starts without an
 /// error in the TUI and the app shows the observed model (plan5 D.52); `permissions.deny` hides
 /// the role-bound tools from `/mcp` (D.51).
-pub fn profile_settings(hook_exe: &Path, profile: &AgentProfile) -> ProfileSettings {
+// TODO(windows-verify): with root `C:\Users\x\mira-bots\projects` the rules read
+// `Edit(//c/Users/x/mira-bots/projects/…)` and block a coder (plan6b D.100).
+pub fn profile_settings(
+    hook_exe: &Path,
+    profile: &AgentProfile,
+    root: Option<&Path>,
+) -> ProfileSettings {
     ProfileSettings {
         hooks: render_hooks(hook_exe),
         permissions: ProfilePermissions {
             allow: profile.allow_rules(),
-            deny: profile.deny_rules(),
+            deny: profile.deny_rules(root),
         },
         model: profile.model.clone(),
         effort_level: profile
@@ -169,12 +176,17 @@ pub fn profile_settings(hook_exe: &Path, profile: &AgentProfile) -> ProfileSetti
 }
 
 /// [`profile_settings`] as a JSON value.
-pub fn render_profile_settings(hook_exe: &Path, profile: &AgentProfile) -> Value {
-    serde_json::to_value(profile_settings(hook_exe, profile)).unwrap_or(Value::Null)
+pub fn render_profile_settings(
+    hook_exe: &Path,
+    profile: &AgentProfile,
+    root: Option<&Path>,
+) -> Value {
+    serde_json::to_value(profile_settings(hook_exe, profile, root)).unwrap_or(Value::Null)
 }
 
 /// Writes `<data_dir>/profiles/<id>/settings.json` (pretty, keys in C5.10 order) atomically and
-/// returns its path. Called before every spawn/restart and when a profile is saved.
+/// returns its path. Called before every spawn/restart and when a profile is saved; `root` is the
+/// projects root (absolute `Edit` deny rules for the user's files, step 6b).
 ///
 /// TODO(windows-verify): %APPDATA%\dk.mira.bots\profiles\<id>\settings.json exists and claude
 /// starts with `--settings` on it (plan5 D.50).
@@ -182,12 +194,13 @@ pub fn write_profile_settings(
     data_dir: &Path,
     hook_exe: &Path,
     profile: &AgentProfile,
+    root: Option<&Path>,
 ) -> io::Result<PathBuf> {
     let target = data_dir
         .join(PROFILE_FILES_DIR)
         .join(&profile.id)
         .join(SETTINGS_FILE);
-    let body = serde_json::to_string_pretty(&profile_settings(hook_exe, profile))
+    let body = serde_json::to_string_pretty(&profile_settings(hook_exe, profile, root))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     write_atomic(&target, &body)?;
     Ok(target)
@@ -312,16 +325,21 @@ mod tests {
     #[test]
     fn profile_settings_has_twelve_events() {
         for id in ["coder", "reviewer", "specialist"] {
-            let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile(id));
+            let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile(id), None);
             assert_eq!(v["hooks"].as_object().unwrap().len(), 12, "{id}");
             assert_eq!(v["hooks"], render_hooks(Path::new("/opt/mira-hook")));
         }
     }
 
-    /// The coder file exactly (C5.10): all role-bound tools denied, no model/effort keys.
+    /// The coder file exactly (C5.10): all role-bound tools denied, push denied and the user's
+    /// files locked under the projects root (step 6b), no model/effort keys.
     #[test]
     fn coder_settings_denies_role_bound_tools() {
-        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("coder"));
+        let v = render_profile_settings(
+            Path::new("/opt/mira-hook"),
+            &profile("coder"),
+            Some(Path::new("/home/ann/mira-bots/projects")),
+        );
         assert_eq!(
             v,
             json!({
@@ -334,7 +352,12 @@ mod tests {
                         "mcp__mira-bots__mira_list_profiles",
                         "mcp__mira-bots__mira_reject_ticket",
                         "mcp__mira-bots__mira_spawn_agent",
-                        "mcp__mira-bots__mira_unassign_ticket"
+                        "mcp__mira-bots__mira_unassign_ticket",
+                        "Bash(git push *)",
+                        "Bash(git -C * push *)",
+                        "Edit(//home/ann/mira-bots/projects/mira-bots.workspace.json)",
+                        "Edit(//home/ann/mira-bots/projects/**/.mira-bots/project.json)",
+                        "Edit(**/.mira-bots/project.json)"
                     ]
                 },
                 "statusLine": {"type": "command", "command": "/opt/mira-hook", "padding": 0}
@@ -346,7 +369,7 @@ mod tests {
     /// role, 5c C.2) and commit/push denied.
     #[test]
     fn reviewer_settings_allows_git_reads_and_denies_commit_push() {
-        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("reviewer"));
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("reviewer"), None);
         assert_eq!(
             v,
             json!({
@@ -368,10 +391,10 @@ mod tests {
                         "Write",
                         "MultiEdit",
                         "NotebookEdit",
-                        "Bash(git commit *)",
                         "Bash(git push *)",
-                        "Bash(git -C * commit *)",
-                        "Bash(git -C * push *)"
+                        "Bash(git -C * push *)",
+                        "Bash(git commit *)",
+                        "Bash(git -C * commit *)"
                     ]
                 },
                 "statusLine": {"type": "command", "command": "/opt/mira-hook", "padding": 0}
@@ -387,7 +410,7 @@ mod tests {
     #[test]
     fn model_and_effort_keys_only_when_set() {
         let hook = Path::new("/opt/mira-hook");
-        let v = render_profile_settings(hook, &profile("coder"));
+        let v = render_profile_settings(hook, &profile("coder"), None);
         assert!(v.get("model").is_none() && v.get("effortLevel").is_none());
         for (effort, want) in [
             (Effort::Low, Some("low")),
@@ -401,7 +424,7 @@ mod tests {
                 effort: Some(effort),
                 ..profile("coder")
             };
-            let v = render_profile_settings(hook, &p);
+            let v = render_profile_settings(hook, &p, None);
             assert_eq!(v["model"], "sonnet");
             assert_eq!(
                 v.get("effortLevel").and_then(Value::as_str),
@@ -415,7 +438,7 @@ mod tests {
             effort: Some(Effort::High),
             ..profile("reviewer")
         };
-        let text = serde_json::to_string_pretty(&profile_settings(hook, &p)).unwrap();
+        let text = serde_json::to_string_pretty(&profile_settings(hook, &p, None)).unwrap();
         let pos = |k: &str| {
             text.find(&format!("\n  \"{k}\":"))
                 .unwrap_or_else(|| panic!("{k}"))
@@ -426,11 +449,12 @@ mod tests {
 
     #[test]
     fn statusline_points_at_hook_exe() {
-        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("coder"));
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("coder"), None);
         assert_eq!(v["statusLine"]["command"], "/opt/mira-hook");
         let v = render_profile_settings(
             Path::new(r"C:\Program Files\mira-bots\resources\mira-hook.exe"),
             &profile("coder"),
+            None,
         );
         assert_eq!(
             v["statusLine"],
@@ -448,20 +472,29 @@ mod tests {
         assert_eq!(statusline_command(Path::new(r"C:\x\h.exe")), "C:/x/h.exe");
     }
 
+    /// Step 6b: even the specialist (every role, no narrowing) gets a deny key: the push rules.
     #[test]
-    fn specialist_has_no_deny_key() {
-        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("specialist"));
-        assert_eq!(v["permissions"], json!({"allow": ["mcp__mira-bots__*"]}));
-        // A profile with every role but some toolDeny does get the key.
+    fn specialist_denies_only_push() {
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &profile("specialist"), None);
+        assert_eq!(
+            v["permissions"],
+            json!({"allow": ["mcp__mira-bots__*"],
+                   "deny": ["Bash(git push *)", "Bash(git -C * push *)"]})
+        );
+        // A profile with every role and some toolDeny: the tool first.
         let p = AgentProfile {
             roles: Role::ALL.to_vec(),
             tool_deny: vec!["mira_add_report".into()],
             ..profile("coder")
         };
-        let v = render_profile_settings(Path::new("/opt/mira-hook"), &p);
+        let v = render_profile_settings(Path::new("/opt/mira-hook"), &p, None);
         assert_eq!(
             v["permissions"]["deny"],
-            json!(["mcp__mira-bots__mira_add_report"])
+            json!([
+                "mcp__mira-bots__mira_add_report",
+                "Bash(git push *)",
+                "Bash(git -C * push *)"
+            ])
         );
     }
 
@@ -469,7 +502,9 @@ mod tests {
     fn write_profile_settings_goes_to_the_profile_folder() {
         let base = temp_base();
         let p = profile("reviewer");
-        let path = write_profile_settings(&base, Path::new("/opt/mira-hook"), &p).unwrap();
+        let root = Path::new("/home/x/projects");
+        let path =
+            write_profile_settings(&base, Path::new("/opt/mira-hook"), &p, Some(root)).unwrap();
         assert_eq!(
             path,
             base.join("profiles").join("reviewer").join("settings.json")
@@ -477,8 +512,12 @@ mod tests {
         let read: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             read,
-            render_profile_settings(Path::new("/opt/mira-hook"), &p)
+            render_profile_settings(Path::new("/opt/mira-hook"), &p, Some(root))
         );
+        assert!(read["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Edit(//home/x/projects/mira-bots.workspace.json)")));
         assert_eq!(file_names(path.parent().unwrap()), ["settings.json"]);
         fs::remove_dir_all(&base).unwrap();
     }

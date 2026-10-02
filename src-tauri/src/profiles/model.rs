@@ -3,6 +3,7 @@
 //! profiles and the derived permission rules (C5.9).
 
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -10,7 +11,7 @@ use crate::agent::roles::{self, Role};
 use crate::agent::SeatKind;
 use crate::config::{
     BUILTIN_PROFILE_IDS, MCP_TOOL_PREFIX, MODEL_ALIASES, MODEL_ID_MAX_CHARS,
-    PROFILE_NAME_MAX_CHARS, PROMPT_APPEND_MAX_CHARS,
+    PROFILE_NAME_MAX_CHARS, PROJECT_FILE, PROMPT_APPEND_MAX_CHARS, WORKSPACE_FILE,
 };
 
 /// Maximum number of rules in `extraAllow` / `extraDeny`.
@@ -327,9 +328,10 @@ impl AgentProfile {
 
     /// `permissions.deny` (C5.9): the role-bound tools the roles do not allow plus `toolDeny`,
     /// each as `mcp__mira-bots__<tool>` and sorted, then [`FILE_EDIT_TOOLS`] when the profile
-    /// has no work role (5c C.2), then `extraDeny` as given. Empty for a profile with every role
-    /// and no narrowing.
-    pub fn deny_rules(&self) -> Vec<String> {
+    /// has no work role (5c C.2), then [`WORK_GIT_DENY`] for every profile (step 6b: no push; the
+    /// user merges), then with `root` (the projects root) the [`locked_file_rules`] for the
+    /// workspace file and the project files, then `extraDeny` as given (without duplicates).
+    pub fn deny_rules(&self, root: Option<&Path>) -> Vec<String> {
         let allowed = mira_mcp::tools::tools_for_roles(&roles::wire_names(&self.roles));
         let mut tools: Vec<String> = mira_mcp::tools::ROLE_BOUND_TOOLS
             .iter()
@@ -342,6 +344,10 @@ impl AgentProfile {
         tools.dedup();
         if !roles::has_work_role(&self.roles) {
             tools.extend(FILE_EDIT_TOOLS.iter().map(|t| t.to_string()));
+        }
+        tools.extend(WORK_GIT_DENY.iter().map(|t| t.to_string()));
+        if let Some(root) = root {
+            tools.extend(locked_file_rules(root));
         }
         for r in &self.extra_deny {
             if !tools.contains(r) {
@@ -393,6 +399,63 @@ pub fn validate_overrides(o: SpawnOverrides) -> Result<SpawnOverrides, ProfileEr
 /// File-editing tools denied to a profile without a work role (coder, researcher, debugger):
 /// staff agents distribute work instead of doing it (5c C.2).
 pub const FILE_EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Denied to every profile (step 6b, plan6b A.4): the app never lets an agent push; the user
+/// merges. A deny rule cannot be overridden by `extraAllow` (deny wins). `gitPush` comes later.
+pub const WORK_GIT_DENY: [&str; 2] = ["Bash(git push *)", "Bash(git -C * push *)"];
+
+/// The projects root (or any absolute path) as an absolute permission path (research6b §4.1):
+/// `//` + the POSIX form. Unix `/home/x` → `//home/x`; Windows `C:\Users\x` → `//c/Users/x`
+/// (drive letter lowercased, `\` → `/`, a `\\?\` or `\\?\UNC\` prefix stripped). No
+/// trailing slash, except for the filesystem root (`//`).
+pub fn permission_path(p: &Path) -> String {
+    permission_path_str(&p.to_string_lossy(), cfg!(windows))
+}
+
+/// The pure core of [`permission_path`], testable for both platforms on any host.
+// TODO(windows-verify): the drive form `//c/Users/…` is from the docs (research6b §4.1); a UNC
+// root (`\\server\share`) becomes `//server/share`, which is unverified (plan6b D.100).
+pub fn permission_path_str(s: &str, windows: bool) -> String {
+    let posix = if windows {
+        let s = s
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .unwrap_or_else(|| s.strip_prefix(r"\\?\").unwrap_or(s).to_string());
+        let s = s.replace('\\', "/");
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(d), Some(':')) if d.is_ascii_alphabetic() => {
+                format!(
+                    "{}/{}",
+                    d.to_ascii_lowercase(),
+                    chars.as_str().trim_start_matches('/')
+                )
+            }
+            _ => s,
+        }
+    } else {
+        s.to_string()
+    };
+    // The filesystem root itself is `//`.
+    format!("//{}", posix.trim_matches('/'))
+}
+
+/// `Edit` deny rules for the files that belong to the user (step 6b, research6b §4.2 T2/T4/T8):
+/// the workspace file in the projects root and every project's `.mira-bots/project.json`, both
+/// anchored absolutely (they can lie above the agent's cwd, e.g. from a worktree), plus the
+/// cwd-relative form for a copy under the cwd. `Edit` covers every file-editing tool; `Write(…)`
+/// path rules are never consulted (T3).
+pub fn locked_file_rules(root: &Path) -> Vec<String> {
+    let mut base = permission_path(root);
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    vec![
+        format!("Edit({base}{WORKSPACE_FILE})"),
+        format!("Edit({base}**/{PROJECT_FILE})"),
+        format!("Edit(**/{PROJECT_FILE})"),
+    ]
+}
 
 /// Reviewer: read-only git in other folders (research5 Q6) …
 const REVIEWER_ALLOW: [&str; 4] = [
@@ -729,6 +792,10 @@ mod tests {
             .collect()
     }
 
+    fn owned(v: &[&str]) -> Vec<String> {
+        v.iter().map(|t| t.to_string()).collect()
+    }
+
     #[test]
     fn deny_rules_for_each_builtin() {
         let coordinator_set = mira(&[
@@ -745,37 +812,64 @@ mod tests {
             "mira_spawn_agent",
             "mira_unassign_ticket",
         ]);
-        let edit: Vec<String> = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
-            .iter()
-            .map(|t| t.to_string())
-            .collect();
+        let edit = owned(&["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+        let push = owned(&["Bash(git push *)", "Bash(git -C * push *)"]);
+        let root = Path::new("/home/x/mira-bots/projects");
+        let locked = owned(&[
+            "Edit(//home/x/mira-bots/projects/mira-bots.workspace.json)",
+            "Edit(//home/x/mira-bots/projects/**/.mira-bots/project.json)",
+            "Edit(**/.mira-bots/project.json)",
+        ]);
+        let deny = |id: &str| builtin_profile(id).unwrap().deny_rules(None);
+        // Work roles: the role-bound tools, then the push deny (step 6b).
         for id in ["coder", "researcher", "debugger"] {
-            assert_eq!(builtin_profile(id).unwrap().deny_rules(), all_bound, "{id}");
+            let mut want = all_bound.clone();
+            want.extend(push.iter().cloned());
+            assert_eq!(deny(id), want, "{id}");
+            // With the projects root: the three locked-file rules after the push deny.
+            want.extend(locked.iter().cloned());
+            assert_eq!(
+                builtin_profile(id).unwrap().deny_rules(Some(root)),
+                want,
+                "{id}"
+            );
         }
         // Without a work role: the four file-editing tools after the MCP tools.
         let mut want = all_bound.clone();
         want.extend(edit.iter().cloned());
-        assert_eq!(builtin_profile("planner").unwrap().deny_rules(), want);
+        want.extend(push.iter().cloned());
+        assert_eq!(deny("planner"), want);
+        // The reviewer's own push rules are not repeated; commit stays.
         let mut want = coordinator_set.clone();
         want.extend(edit.iter().cloned());
-        want.extend([
-            "Bash(git commit *)".to_string(),
-            "Bash(git push *)".to_string(),
-            "Bash(git -C * commit *)".to_string(),
-            "Bash(git -C * push *)".to_string(),
-        ]);
-        assert_eq!(builtin_profile("reviewer").unwrap().deny_rules(), want);
+        want.extend(push.iter().cloned());
+        want.extend(owned(&["Bash(git commit *)", "Bash(git -C * commit *)"]));
+        assert_eq!(deny("reviewer"), want);
         let mut want = mira(&["mira_approve_ticket", "mira_reject_ticket"]);
         want.extend(edit.iter().cloned());
-        assert_eq!(builtin_profile("coordinator").unwrap().deny_rules(), want);
-        assert!(builtin_profile("specialist")
-            .unwrap()
-            .deny_rules()
-            .is_empty());
+        want.extend(push.iter().cloned());
+        assert_eq!(deny("coordinator"), want);
+        // The specialist (every role, no narrowing) is no longer empty: push deny, and with the
+        // root the three Edit rules.
+        assert_eq!(deny("specialist"), push);
+        let mut want = push.clone();
+        want.extend(locked.iter().cloned());
+        assert_eq!(
+            builtin_profile("specialist")
+                .unwrap()
+                .deny_rules(Some(root)),
+            want
+        );
         for p in builtin_profiles() {
-            let denies_edit = p.deny_rules().iter().any(|r| r == "Edit");
+            let rules = p.deny_rules(Some(root));
+            let denies_edit = rules.iter().any(|r| r == "Edit");
             let staff_only = ["reviewer", "coordinator", "planner"].contains(&p.id.as_str());
             assert_eq!(denies_edit, staff_only, "{}", p.id);
+            for r in push.iter().chain(&locked) {
+                assert_eq!(rules.iter().filter(|x| *x == r).count(), 1, "{}: {r}", p.id);
+            }
+            // Never a Write(<path>) rule (research6b T3: not consulted).
+            assert!(!rules.iter().any(|r| r.starts_with("Write(")), "{}", p.id);
         }
         // A custom profile without a work role (and without roles) gets them too, before
         // extraDeny, without duplicates.
@@ -787,15 +881,16 @@ mod tests {
         };
         let mut want = all_bound.clone();
         want.extend(edit.iter().cloned());
+        want.extend(push.iter().cloned());
         want.push("Bash(rm *)".into());
-        assert_eq!(p.deny_rules(), want);
+        assert_eq!(p.deny_rules(None), want);
         // One work role is enough.
         let p = AgentProfile {
             roles: vec![Role::Coordinator, Role::Researcher],
             tool_deny: vec![],
             ..custom()
         };
-        assert!(!p.deny_rules().iter().any(|r| edit.contains(r)));
+        assert!(!p.deny_rules(None).iter().any(|r| edit.contains(r)));
         // toolDeny is added (sorted in), extraDeny follows.
         let p = AgentProfile {
             roles: Role::ALL.to_vec(),
@@ -804,8 +899,9 @@ mod tests {
             ..custom()
         };
         let mut want = mira(&["mira_add_report", "mira_get_report"]);
+        want.extend(push.iter().cloned());
         want.push("Bash(rm *)".into());
-        assert_eq!(p.deny_rules(), want);
+        assert_eq!(p.deny_rules(None), want);
         assert_eq!(
             builtin_profile("reviewer").unwrap().allow_rules(),
             [
@@ -819,6 +915,78 @@ mod tests {
         assert_eq!(
             builtin_profile("coder").unwrap().allow_rules(),
             ["mcp__mira-bots__*"]
+        );
+    }
+
+    #[test]
+    fn deny_rules_without_root_have_no_edit_paths() {
+        for p in builtin_profiles() {
+            let rules = p.deny_rules(None);
+            assert!(
+                !rules.iter().any(|r| r.starts_with("Edit(")),
+                "{}: {rules:?}",
+                p.id
+            );
+            assert!(rules.iter().any(|r| r == "Bash(git push *)"), "{}", p.id);
+        }
+    }
+
+    #[test]
+    fn reviewer_deny_has_no_duplicate_push() {
+        let rules = builtin_profile("reviewer")
+            .unwrap()
+            .deny_rules(Some(Path::new("/r")));
+        for r in &rules {
+            assert_eq!(rules.iter().filter(|x| *x == r).count(), 1, "{r}");
+        }
+        assert!(rules.contains(&"Bash(git commit *)".to_string()));
+        assert!(rules.contains(&"Bash(git -C * commit *)".to_string()));
+        // An extraAllow for push cannot lift the deny (deny wins in Claude Code); the rule
+        // stays in the deny list.
+        let p = AgentProfile {
+            extra_allow: vec!["Bash(git push *)".into()],
+            ..builtin_profile("coder").unwrap()
+        };
+        assert!(p.deny_rules(None).contains(&"Bash(git push *)".to_string()));
+    }
+
+    #[test]
+    fn permission_path_unix_and_windows_forms() {
+        for (input, want) in [
+            ("/home/x", "//home/x"),
+            ("/home/x/", "//home/x"),
+            (
+                "/Users/Ann Lee/mira-bots/projects",
+                "//Users/Ann Lee/mira-bots/projects",
+            ),
+            ("/", "//"),
+        ] {
+            assert_eq!(permission_path_str(input, false), want, "{input}");
+        }
+        for (input, want) in [
+            (r"C:\Users\x", "//c/Users/x"),
+            (r"C:\Users\x\", "//c/Users/x"),
+            (r"d:\Projekter (x86)\mira", "//d/Projekter (x86)/mira"),
+            (r"C:\", "//c"),
+            (r"\\?\C:\Users\x", "//c/Users/x"),
+            (r"\\?\UNC\server\share\x", "//server/share/x"),
+            (r"\\server\share\x", "//server/share/x"),
+            ("C:/Users/x", "//c/Users/x"),
+        ] {
+            assert_eq!(permission_path_str(input, true), want, "{input}");
+        }
+        assert_eq!(
+            permission_path(Path::new(if cfg!(windows) { r"C:\a\b" } else { "/a/b" })),
+            if cfg!(windows) { "//c/a/b" } else { "//a/b" }
+        );
+        // The filesystem root as projects root: still absolute (`//`).
+        assert_eq!(
+            locked_file_rules(Path::new("/")),
+            [
+                "Edit(//mira-bots.workspace.json)",
+                "Edit(//**/.mira-bots/project.json)",
+                "Edit(**/.mira-bots/project.json)"
+            ]
         );
     }
 

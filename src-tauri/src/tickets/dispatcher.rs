@@ -1333,9 +1333,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         );
     }
 
-    /// A report author as a display name: "brugeren", the agent's name, or its id when gone.
+    /// A report author as a display name: "brugeren", "appen" (step 6b), the agent's name, or
+    /// its id when gone.
     fn author_name(&self, a: &ReportAuthor) -> String {
         match (a.kind, &a.agent_id) {
+            (ReportAuthorKind::System, _) => "appen".to_string(),
             (ReportAuthorKind::User, _) | (_, None) => "brugeren".to_string(),
             (ReportAuthorKind::Agent, Some(id)) => self
                 .port
@@ -1362,8 +1364,9 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         let author = |a: &ReportAuthor| self.author_name(a);
         // Step 6a: a parent's review file lists its children (already reviewed).
         let children = self.host.read(|s| s.child_reviews(&ticket.id));
+        let max = self.host.rules().max_review_rounds;
         if let Err(e) =
-            prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author, &children)
+            prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author, &children, max)
         {
             log::warn!("dispatch {agent_id}: writing the review file failed: {e}");
             self.review_failed(agent_id, &ticket.id);

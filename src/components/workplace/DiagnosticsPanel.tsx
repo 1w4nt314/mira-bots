@@ -90,7 +90,7 @@ function copyText(d: Diagnostics): string {
   return lines.join("\n");
 }
 
-function warningsFor(d: Diagnostics): string[] {
+function warningsFor(d: Diagnostics, maxReviewRounds: number): string[] {
   const out: string[] = [];
   if (d.claudeCodeArgsSupported === false) {
     out.push(
@@ -115,7 +115,7 @@ function warningsFor(d: Diagnostics): string[] {
   if (d.profilesWarning !== null) out.push(d.profilesWarning);
   if (d.ticketsEscalated > 0) {
     out.push(
-      `${d.ticketsEscalated} ${d.ticketsEscalated === 1 ? "ticket er eskaleret" : "tickets er eskaleret"} efter 3 afvisninger — afgør dem under Tickets`,
+      `${d.ticketsEscalated} ${d.ticketsEscalated === 1 ? "ticket er eskaleret" : "tickets er eskaleret"} efter ${maxReviewRounds} afvisninger — afgør dem under Tickets`,
     );
   }
   if (d.framesReceived === 0 && d.runningAgents > 0) {
@@ -205,7 +205,7 @@ export default function DiagnosticsPanel() {
 
   const btn =
     "rounded-md border border-[var(--border)] px-2.5 py-1 text-xs hover:border-[var(--accent)] disabled:opacity-50";
-  const warnings = diag === null ? [] : warningsFor(diag);
+  const warnings = diag === null ? [] : warningsFor(diag, state.appInfo?.rules.maxReviewRounds ?? 3);
   const counts = countsByProject(state.agents, state.tickets);
 
   return (

@@ -20,6 +20,7 @@ Regler:
 - Er din igangværende ticket ikke til dig, så giv den videre med mira_handoff_ticket (med agentId til en anden agent; uden agentId tilbage i backlog) og afslut dit svar.
 - mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje; mira_add_report lægger en rapport (markdown) på ticketen, så brugeren og revieweren kan se hvad du har lavet — gør det ved større opgaver, gerne som `report` i mira_submit_for_review; mira_get_workspace_rules viser reglerne; mira_list_projects viser projekterne (mapperne under projektroden).
 - Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den.
+- Filerne mira-bots.workspace.json (projektroden) og .mira-bots/project.json (projektet) er brugerens; de er låst for dig — bed brugeren om ændringer i stedet for at forsøge at redigere dem.
 ";
 
 /// The role texts (C5.7), verbatim.
@@ -313,6 +314,20 @@ mod tests {
     }
 
     // ---- step 6a (C6.3) ----
+
+    #[test]
+    fn common_prompt_mentions_locked_files() {
+        let last = COMMON_PROMPT.trim_end().lines().last().unwrap();
+        assert_eq!(
+            last,
+            "- Filerne mira-bots.workspace.json (projektroden) og .mira-bots/project.json (projektet) er brugerens; de er låst for dig — bed brugeren om ændringer i stedet for at forsøge at redigere dem."
+        );
+        for id in ["coder", "reviewer", "specialist"] {
+            let p = crate::profiles::model::builtin_profile(id).unwrap();
+            let text = render_profile_prompt(&p, &rules());
+            assert_eq!(text.matches(last).count(), 1, "{id}");
+        }
+    }
 
     #[test]
     fn planner_text_mentions_report_and_parent_id() {

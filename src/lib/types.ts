@@ -128,6 +128,8 @@ export interface AppInfo {
   projectsRoot: string;
   /** The effective workspace rules (`mira-bots.workspace.json` over the defaults). */
   rules: WorkspaceRules;
+  /** Playbook names, sorted (built-in `bug`/`feature` plus the workspace file's; step 6b). */
+  playbookKinds: string[];
 }
 
 /** The rules of the workspace (defaults overridden by `mira-bots.workspace.json`). */
@@ -144,7 +146,18 @@ export interface WorkspaceRules {
   userInputGraceMs: number;
   agentsMayCreateProjects: boolean;
   maxAgentsPerProject: number;
+  // step 6b
+  /** How a work ticket gets its own branch. */
+  git: GitMode;
+  /** A failed project check rejects the ticket before review. */
+  checksGate: boolean;
+  autoSpawnForPlaybook: boolean;
+  freshSessionPerTicket: boolean;
+  cleanupWorktreesOnDone: boolean;
 }
+
+/** Workspace rule `git` (step 6b). */
+export type GitMode = "off" | "branch" | "worktree";
 
 /** The last tool call from an agent's MCP server (mira-mcp); arguments are never included. */
 export interface LastToolCall {
@@ -217,7 +230,7 @@ export interface Diagnostics {
   profilesWarning: string | null;
   /** Open review assignments. */
   reviewAssignmentsOpen: number;
-  /** Tickets escalated after `MAX_REVIEW_ROUNDS` rejections. */
+  /** Tickets escalated after the workspace's `maxReviewRounds` rejections. */
   ticketsEscalated: number;
   reportsTotal: number;
   /** `<projectsRoot>/mira-bots.workspace.json`. */
