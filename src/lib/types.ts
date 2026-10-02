@@ -258,7 +258,14 @@ export interface HookEventPayload {
 
 // --- tickets (C3.1) ---------------------------------------------------------------------------
 
-export type TicketState = "backlog" | "assigned" | "inProgress" | "review" | "done" | "rejected";
+export type TicketState =
+  | "backlog"
+  | "assigned"
+  | "inProgress"
+  | "waiting"
+  | "review"
+  | "done"
+  | "rejected";
 export type TicketActor = "user" | "system" | "agent";
 /** Who created the ticket: the user (UI) or an agent (`mira_create_ticket`). */
 export type TicketSource = "user" | "agent";
@@ -306,6 +313,10 @@ export interface TicketSummary {
   reportCount: number;
   /** The ticket's project; null = none yet (it must get one before a work agent takes it). */
   project: ProjectRef | null;
+  /** The parent ticket's full id (step 6a); null when none or when the parent was deleted. */
+  parentId: string | null;
+  /** Full ids of the tickets that must be done before this one is delivered (step 6a). */
+  blockedBy: string[];
 }
 
 /** Who wrote a report: an agent (`agentId`) or the user. */

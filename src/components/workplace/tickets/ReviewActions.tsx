@@ -3,7 +3,7 @@ import { useTheme } from "../../../lib/bots";
 import { approveTicket, assignReviewer, rejectTicket } from "../../../lib/ipc";
 import { rolesText } from "../../../lib/roles";
 import { isExited } from "../../../lib/status";
-import { reviewerCandidates, reviewRoundText } from "../../../lib/tickets";
+import { childrenOf, progressOf, reviewerCandidates, reviewRoundText, STATE_LABEL } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 import BotFigure from "../../BotFigure";
@@ -46,6 +46,40 @@ function AgentSummary({ summary }: { summary: string | null }) {
           {expanded ? "vis mindre" : "vis mere"}
         </button>
       )}
+    </div>
+  );
+}
+
+/**
+ * For a parent ticket: the children with their summaries (they were reviewed one by one already;
+ * the reviewer here judges the whole). Nothing is rendered for a ticket without children.
+ */
+function ChildrenSummaries({ ticket }: { ticket: TicketSummary }) {
+  const { state } = useStore();
+  const children = childrenOf(ticket.id, state.tickets);
+  if (children.length === 0) return null;
+  const { done, total } = progressOf(ticket.id, state.tickets);
+  return (
+    <div>
+      <div className="text-[11px] font-medium opacity-80">
+        Del-tickets ({done}/{total}):
+      </div>
+      <ul className="mt-0.5 space-y-0.5 text-[11px]">
+        {children.map((c) => (
+          <li key={c.id} className="break-words">
+            <span>
+              • <span className="font-mono opacity-70">{c.shortId}</span> {c.title} — {STATE_LABEL[c.state]} —{" "}
+            </span>
+            {c.summary === null || c.summary.trim() === "" ? (
+              <span className="italic opacity-70">(ingen opsummering)</span>
+            ) : (
+              <span className="line-clamp-3 whitespace-pre-wrap" title={c.summary}>
+                {c.summary}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -198,6 +232,7 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
     <div className="mt-1.5 space-y-1.5">
       <ReviewerLine ticket={ticket} />
       <AgentSummary summary={ticket.summary} />
+      <ChildrenSummaries ticket={ticket} />
       <div className="flex flex-wrap gap-1.5">
         <button
           type="button"

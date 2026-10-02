@@ -40,7 +40,7 @@ import {
 } from "../../lib/office";
 import { readLocal, writeLocal } from "../../lib/persist";
 import { isMacShortcut } from "../../lib/platform";
-import { assignmentIssue, coordinatorHint, projectIdOf } from "../../lib/projects";
+import { assignmentIssue, backlogHint, coordinatorHint, projectIdOf, type SeatHint } from "../../lib/projects";
 import { assignSeats, STAFF_SEATS, WORK_SEATS } from "../../lib/seats";
 import { isExited } from "../../lib/status";
 import {
@@ -320,12 +320,30 @@ export default function Workplace() {
     }),
     [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo],
   );
-  // "n agenter, ingen koordinator" per work agent's project (the Seat badge).
-  const hintFor = useCallback(
-    (a: AgentInfo) =>
-      a.seatKind === "work" && a.project !== null ? coordinatorHint(agents, a.project) : null,
-    [agents],
-  );
+  // Office hints per work agent (step 6a): "n agenter, ingen koordinator" for the project, plus
+  // the backlog hint ("coder-01 er ledig: n tickets uden ejer") on the one idle agent it names.
+  // Computed once per project; the button that acts on it lives in the Tickets panel.
+  const hintsByAgent = useMemo(() => {
+    const out = new Map<string, SeatHint>();
+    const idleByProject = new Map<string, { id: string; text: string } | null>();
+    for (const a of agents) {
+      if (a.seatKind !== "work" || a.project === null) continue;
+      const key = a.project.toLowerCase();
+      let idle = idleByProject.get(key);
+      if (idle === undefined) {
+        const h = backlogHint(agents, tickets, a.project);
+        idle = h === null ? null : { id: h.agent.id, text: h.text };
+        idleByProject.set(key, idle);
+      }
+      const hint: SeatHint = {
+        coordinator: coordinatorHint(agents, a.project),
+        idle: idle !== null && idle.id === a.id ? idle.text : null,
+      };
+      if (hint.coordinator !== null || hint.idle !== null) out.set(a.id, hint);
+    }
+    return out;
+  }, [agents, tickets]);
+  const hintFor = useCallback((a: AgentInfo): SeatHint | null => hintsByAgent.get(a.id) ?? null, [hintsByAgent]);
 
   // --- drag-and-drop: backlog notes (sidebar) onto seats ---------------------------------------
   // TODO(windows-verify): PointerSensor in WebView2 — dragging a note from the sidebar to a seat

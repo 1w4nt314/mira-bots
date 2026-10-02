@@ -16,15 +16,22 @@ import {
   canDelete,
   canDrag,
   canHandOver,
+  BLOCKED_HINT,
+  blockersOf,
   formatAt,
   isCoordinationTask,
   ISSUE_HINT,
   ISSUE_LABEL,
+  parentOf,
+  progressOf,
+  shortId,
   STATE_BADGE_CLASS,
   STATE_LABEL,
   ticketDragId,
+  WAITING_HINT,
 } from "../../../lib/tickets";
 import type { AgentInfo, TicketHistoryEntry, TicketSummary } from "../../../lib/types";
+import { useStore } from "../../../state/store";
 import BotFigure from "../../BotFigure";
 import Markdown from "../../Markdown";
 import { smallBtn, useRun } from "./actions";
@@ -98,7 +105,15 @@ function NoteFrame(props: FrameProps) {
   const { ticket: t, agent, compact = false, interactive = true, rootRef, rootProps, dimmed, grab } =
     props;
   const theme = useTheme();
+  const { state } = useStore();
   const showActions = interactive && !compact;
+  // Relations are looked up in the whole list (not the filtered one), see tickets.ts.
+  const all = state.tickets;
+  const parent = t.parentId === null ? null : parentOf(t, all);
+  const progress = progressOf(t.id, all);
+  const blockers = t.state === "done" ? [] : blockersOf(t, all);
+  const childrenDone =
+    t.state === "backlog" && t.assigneeAgentId === null && progress.total > 0 && progress.done === progress.total;
 
   return (
     <div
@@ -131,6 +146,35 @@ function NoteFrame(props: FrameProps) {
               uden projekt
             </span>
           )
+        )}
+        {t.parentId !== null && (
+          <span
+            className="rounded bg-teal-500/15 px-1 text-[10px] text-teal-800 dark:text-teal-200"
+            title={parent !== null ? `Del-ticket af ${parent.title}` : "Del-ticket"}
+          >
+            del af {parent !== null ? parent.shortId : shortId(t.parentId)}
+          </span>
+        )}
+        {progress.total > 0 && (
+          <span className="rounded bg-teal-500/15 px-1 text-[10px] text-teal-800 dark:text-teal-200" title="Del-tickets færdige">
+            {progress.done}/{progress.total} del-tickets
+          </span>
+        )}
+        {childrenDone && (
+          <span
+            className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-800 dark:text-amber-200"
+            title="Alle del-tickets er godkendt; ticketen har ingen ejer"
+          >
+            del-tickets færdige
+          </span>
+        )}
+        {blockers.length > 0 && (
+          <span
+            className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-800 dark:text-amber-200"
+            title={BLOCKED_HINT}
+          >
+            Venter på {blockers.map((b) => b.shortId).join(", ")}
+          </span>
         )}
         {t.skipReview && (
           <span className="text-[10px] opacity-70" title="Går direkte til Done uden review">
@@ -204,6 +248,7 @@ function NoteFrame(props: FrameProps) {
               )}
             </div>
           )}
+          {t.state === "waiting" && <div className="mt-1 text-[11px] opacity-80">{WAITING_HINT}</div>}
         </>
       )}
 

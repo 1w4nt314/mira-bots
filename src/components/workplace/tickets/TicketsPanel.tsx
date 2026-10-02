@@ -2,17 +2,21 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { getDiagnostics } from "../../../lib/ipc";
 import { readLocal, writeLocal } from "../../../lib/persist";
 import {
+  backlogHint,
   matchesFilter,
   parseProjectFilter,
   PROJECT_FILTER_KEY,
   projectFilterKey,
   projectIdOf,
+  projectName,
+  type BacklogHint,
   type ProjectFilter,
 } from "../../../lib/projects";
 import { DONE_VISIBLE, groupTickets } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 import NewTicketForm from "./NewTicketForm";
+import { useTicketActions } from "./actions";
 import StickyNote from "./StickyNote";
 
 const NOTICE_VISIBLE_MS = 5000;
@@ -40,6 +44,7 @@ function Empty({ text }: { text: string }) {
  */
 export default function TicketsPanel() {
   const { state } = useStore();
+  const { assignTo } = useTicketActions();
   // Step 4b: the project filter (remembered) applies to Review, Backlog and Done.
   const [filter, setFilter] = useState<ProjectFilter>(() =>
     parseProjectFilter(readLocal(PROJECT_FILTER_KEY)),
@@ -49,11 +54,31 @@ export default function TicketsPanel() {
   const shown = useMemo(
     () => ({
       review: groups.review.filter((t) => matchesFilter(t, filter)),
+      // Parents waiting for their children (step 6a), oldest first across all agents.
+      waiting: [...groups.byAgent.values()]
+        .flatMap((s) => s.waiting)
+        .filter((t) => matchesFilter(t, filter))
+        .sort((a, b) => a.updatedAt - b.updatedAt),
       backlog: groups.backlog.filter((t) => matchesFilter(t, filter)),
       done: groups.done.filter((t) => matchesFilter(t, filter)),
     }),
     [groups, filter],
   );
+  // Banner at the top of Backlog: an idle work agent and unowned tickets in the same project.
+  // One project filtered: that project; "all": the first project with a hint; "none": no banner.
+  const hint = useMemo((): BacklogHint | null => {
+    if (filter === "none") return null;
+    if (filter !== "all") return backlogHint(state.agents, state.tickets, filter.id);
+    const seen = new Set<string>();
+    for (const t of groups.backlog) {
+      const id = projectName(t.project);
+      if (id === null || seen.has(id.toLowerCase())) continue;
+      seen.add(id.toLowerCase());
+      const h = backlogHint(state.agents, state.tickets, id);
+      if (h !== null) return h;
+    }
+    return null;
+  }, [filter, state.agents, state.tickets, groups.backlog]);
   // The projects on disk plus those named by tickets (deleted folders, other spellings).
   const filterIds = useMemo(() => {
     const ids = new Map<string, string>();
@@ -150,7 +175,31 @@ export default function TicketsPanel() {
         </Section>
       )}
 
+      {shown.waiting.length > 0 && (
+        <Section title="Venter" count={shown.waiting.length}>
+          {shown.waiting.map((t) => (
+            <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} onNotice={setNotice} />
+          ))}
+        </Section>
+      )}
+
       <Section title="Backlog" count={shown.backlog.length}>
+        {hint !== null && (
+          <div
+            className="flex items-center gap-2 rounded-lg border border-amber-400/50 bg-amber-300/20 px-2 py-1 text-xs text-amber-800 dark:text-amber-200"
+            role="status"
+          >
+            <span className="min-w-0 flex-1">{hint.text}</span>
+            <button
+              type="button"
+              onClick={() => assignTo(hint.next, hint.agent)}
+              title={`Tildeler den ældste leverbare ticket (${hint.next.shortId}) til ${hint.agent.name}`}
+              className="shrink-0 rounded-md border border-amber-500/60 px-2 py-0.5 text-[11px] hover:border-[var(--accent)]"
+            >
+              Tildel til {hint.agent.name}
+            </button>
+          </div>
+        )}
         {showForm ? (
           <NewTicketForm onClose={() => setShowForm(false)} />
         ) : (

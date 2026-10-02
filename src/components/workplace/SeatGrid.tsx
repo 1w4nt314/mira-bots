@@ -2,6 +2,7 @@ import type { Theme } from "../../lib/bots";
 import { errorMessage, removeAgent } from "../../lib/ipc";
 import type { OfficeDetail, TermMode } from "../../lib/office";
 import type { SeatAssignment } from "../../lib/seats";
+import type { SeatHint } from "../../lib/projects";
 import type { AgentInfo, BotState, SeatKind, TicketSummary } from "../../lib/types";
 import { useStore } from "../../state/store";
 import RoomDecor from "./office/RoomDecor";
@@ -23,8 +24,8 @@ interface Props {
   dragging: boolean;
   /** The dragged ticket (step 4b: seats of another project say so). */
   draggedTicket: TicketSummary | null;
-  /** "n agenter, ingen koordinator" for a work agent's project, or null. */
-  hintFor: (agent: AgentInfo) => string | null;
+  /** "n agenter, ingen koordinator" and/or the backlog hint for a work agent, or null. */
+  hintFor: (agent: AgentInfo) => SeatHint | null;
   /** "more" adds the wall strip, room furniture and desk items. */
   detail: OfficeDetail;
   /** "max" shows the narrow strip (compact seats, no wall or furniture). */
@@ -38,13 +39,24 @@ interface Props {
 export default function SeatGrid(props: Props) {
   const { seats, botStates, theme, selectedId, spawnDisabled, limits, onSelect, onSpawn } = props;
   const { tickets, dragging, draggedTicket, hintFor, detail, mode, fig } = props;
-  // The staff sign names the projects where work agents share a folder without a coordinator.
-  const hints = new Map<string, string>();
+  // The staff sign names the projects where work agents share a folder without a coordinator,
+  // and the idle agents that have unowned tickets waiting in their project's Backlog.
+  const noCoordinator = new Map<string, string>();
+  const idle: string[] = [];
   for (const a of seats.work) {
     const hint = a === null ? null : hintFor(a);
-    if (a !== null && hint !== null && a.project !== null) hints.set(a.project.toLowerCase(), `${a.project}: ${hint}`);
+    if (a === null || hint === null) continue;
+    if (hint.coordinator !== null && a.project !== null) {
+      noCoordinator.set(a.project.toLowerCase(), `${a.project}: ${hint.coordinator}`);
+    }
+    if (hint.idle !== null) idle.push(`${a.project ?? ""}: ${hint.idle}`);
   }
-  const staffHint = hints.size === 0 ? null : [...hints.values()].join("\n");
+  const signLines = [
+    ...(noCoordinator.size === 0 ? [] : ["Projekter uden koordinator:", ...noCoordinator.values()]),
+    ...(idle.length === 0 ? [] : ["Ledige agenter:", ...idle]),
+  ];
+  const signTitle = signLines.length === 0 ? undefined : signLines.join("\n");
+  const signMark = noCoordinator.size > 0 ? " ⚠" : idle.length > 0 ? " •" : "";
   const roomy = mode !== "max";
 
   const row = (kind: SeatKind, list: SeatAssignment["work"]) =>
@@ -81,9 +93,9 @@ export default function SeatGrid(props: Props) {
         <div className="office-staff" aria-label="Stabspladser">
           <span
             className="office-sign"
-            title={staffHint === null ? undefined : `Projekter uden koordinator:\n${staffHint}`}
+            title={signTitle}
           >
-            Stab{staffHint !== null && " ⚠"}
+            Stab{signMark}
           </span>
           {detail === "more" && roomy && <RoomDecor side="left" />}
           <div className="office-row3">{row("staff", seats.staff)}</div>

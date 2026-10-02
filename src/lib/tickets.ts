@@ -33,6 +33,7 @@ export const STATE_LABEL: Record<TicketState, string> = {
   backlog: "Backlog",
   assigned: "I kø",
   inProgress: "I gang",
+  waiting: "Venter",
   review: "Review",
   done: "Done",
   rejected: "Afvist",
@@ -43,10 +44,20 @@ export const STATE_BADGE_CLASS: Record<TicketState, string> = {
   backlog: "bg-neutral-500/15 text-[var(--muted)]",
   assigned: "bg-sky-500/15 text-sky-700 dark:text-sky-300",
   inProgress: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
+  waiting: "bg-teal-500/15 text-teal-700 dark:text-teal-300",
   review: "bg-amber-400/25 text-amber-800 dark:text-amber-200",
   done: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
   rejected: "bg-rose-500/15 text-rose-700 dark:text-rose-300",
 };
+
+/** Heading of the "waiting" block under a terminal (a parent whose children are still open). */
+export const WAITING_TITLE = "Venter på del-tickets";
+/** Shown on a waiting ticket: nothing to click, the app wakes the agent. */
+export const WAITING_HINT = "Venter på del-tickets — vækkes automatisk når de er godkendt";
+/** Title (tooltip) on the "Venter på …" badge of a blocked ticket. */
+export const BLOCKED_HINT = "Leveres når blokeringerne er Done";
+/** Tooltip on "Send til review" for a parent with open children. */
+export const SUBMIT_PARENT_HINT = "Sender til review selv om del-tickets er åbne";
 
 export const ISSUE_LABEL: Record<TicketIssue, string> = {
   deliveryFailed: "Levering fejlede",
@@ -115,6 +126,7 @@ export function ticketsByState(
     backlog: [],
     assigned: [],
     inProgress: [],
+    waiting: [],
     review: [],
     done: [],
     rejected: [],
@@ -176,6 +188,8 @@ export interface AgentTickets {
   current: TicketSummary | null;
   /** Ordered like `queueFor`. */
   queue: TicketSummary[];
+  /** Parents waiting for their children (step 6a), oldest `updatedAt` first. */
+  waiting: TicketSummary[];
 }
 
 export interface TicketGroups {
@@ -209,7 +223,7 @@ export function groupTickets(tickets: readonly TicketSummary[]): TicketGroups {
   const slot = (agentId: string): AgentTickets => {
     let s = byAgent.get(agentId);
     if (s === undefined) {
-      s = { current: null, queue: [] };
+      s = { current: null, queue: [], waiting: [] };
       byAgent.set(agentId, s);
     }
     return s;
@@ -229,6 +243,9 @@ export function groupTickets(tickets: readonly TicketSummary[]): TicketGroups {
       case "inProgress":
         if (t.assigneeAgentId !== null) slot(t.assigneeAgentId).current = t;
         break;
+      case "waiting":
+        if (t.assigneeAgentId !== null) slot(t.assigneeAgentId).waiting.push(t);
+        break;
       case "review":
         review.push(t);
         break;
@@ -237,7 +254,10 @@ export function groupTickets(tickets: readonly TicketSummary[]): TicketGroups {
         break;
     }
   }
-  for (const [id, s] of byAgent) s.queue = queueFor(s.queue, id);
+  for (const [id, s] of byAgent) {
+    s.queue = queueFor(s.queue, id);
+    s.waiting.sort((a, b) => a.updatedAt - b.updatedAt);
+  }
   review.sort((a, b) => a.updatedAt - b.updatedAt);
   done.sort((a, b) => b.updatedAt - a.updatedAt);
   return { backlog, review, done, byAgent };
@@ -254,6 +274,7 @@ export function groupTickets(tickets: readonly TicketSummary[]): TicketGroups {
  * | assigned   | A        | false   |
  * | inProgress | A        | false   |
  * | review     | A        | false   |
+ * | waiting    | A        | false   |
  * | done       | any      | false   |
  */
 export function canDrag(t: TicketSummary): boolean {
@@ -391,6 +412,96 @@ export function moveUp(ids: readonly string[], index: number): string[] | null {
   out[index - 1] = out[index] as string;
   out[index] = tmp;
   return out;
+}
+
+// --- parents, children and blockers (step 6a) ---------------------------------------------------
+// Derived from the full ticket list: the payload only carries `parentId` and `blockedBy` (full ids).
+// The backend counts everything but Done as an open child (a deleted child is simply gone).
+
+/**
+ * The parent of `t` in `all`, or null (no parent, or the parent is not in the list).
+ *
+ * | t.parentId | parent in all | parentOf |
+ * |------------|---------------|----------|
+ * | null       | -             | null     |
+ * | "p"        | yes           | p        |
+ * | "p"        | no            | null     |
+ */
+export function parentOf(t: TicketSummary, all: readonly TicketSummary[]): TicketSummary | null {
+  if (t.parentId === null) return null;
+  return all.find((x) => x.id === t.parentId) ?? null;
+}
+
+/**
+ * The children of the ticket with `id`, oldest `createdAt` first (ties keep input order).
+ *
+ * | all (id: parentId)       | childrenOf("p") |
+ * |--------------------------|-----------------|
+ * | a: p, b: q, c: p         | [a, c]          |
+ * | a: null                  | []              |
+ */
+export function childrenOf(id: string, all: readonly TicketSummary[]): TicketSummary[] {
+  return all.filter((t) => t.parentId === id).sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/**
+ * Finished children out of all children. Anything but `done` counts as open (like the backend).
+ *
+ * | children of p              | progressOf("p")         |
+ * |----------------------------|-------------------------|
+ * | none                       | { done: 0, total: 0 }   |
+ * | done, review, backlog      | { done: 1, total: 3 }   |
+ * | done (a deleted one is gone)| { done: 1, total: 1 }  |
+ */
+export function progressOf(
+  id: string,
+  all: readonly TicketSummary[],
+): { done: number; total: number } {
+  let done = 0;
+  let total = 0;
+  for (const t of all) {
+    if (t.parentId !== id) continue;
+    total++;
+    if (t.state === "done") done++;
+  }
+  return { done, total };
+}
+
+/**
+ * The tickets in `t.blockedBy` that exist in `all` and are not done, in `blockedBy` order. An
+ * unknown id is a deleted ticket and does not block.
+ *
+ * | blockedBy                  | blockersOf        |
+ * |----------------------------|-------------------|
+ * | []                         | []                |
+ * | [x (done)]                 | []                |
+ * | [x (review), gone]         | [x]               |
+ */
+export function blockersOf(t: TicketSummary, all: readonly TicketSummary[]): TicketSummary[] {
+  const out: TicketSummary[] = [];
+  for (const id of t.blockedBy) {
+    const b = all.find((x) => x.id === id);
+    if (b !== undefined && b.state !== "done") out.push(b);
+  }
+  return out;
+}
+
+/** Whether a blocker is still open (see `blockersOf`). */
+export function isBlocked(t: TicketSummary, all: readonly TicketSummary[]): boolean {
+  return blockersOf(t, all).length > 0;
+}
+
+/**
+ * Whether the backlog hint may offer the ticket: it can be dragged/assigned and nothing blocks it.
+ *
+ * | canDrag | blocked | isDeliverable |
+ * |---------|---------|---------------|
+ * | true    | no      | true          |
+ * | true    | yes     | false         |
+ * | false   | no      | false         |
+ */
+export function isDeliverable(t: TicketSummary, all: readonly TicketSummary[]): boolean {
+  return canDrag(t) && !isBlocked(t, all);
 }
 
 // --- drag-and-drop ids --------------------------------------------------------------------------

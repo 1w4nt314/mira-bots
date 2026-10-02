@@ -123,6 +123,66 @@ export function coordinatorHint(agents: readonly AgentInfo[], projectId: string)
   return `${n} agenter, ingen koordinator`;
 }
 
+/** A work agent that stands idle in a project while Backlog tickets without an owner wait. */
+export interface BacklogHint {
+  agent: AgentInfo;
+  /** The unowned, unblocked Backlog tickets of the project, oldest first. */
+  waiting: TicketSummary[];
+  /** The oldest deliverable ticket: what "Tildel til <agent>" assigns. */
+  next: TicketSummary;
+  /** "coder-01 er ledig: 2 tickets uden ejer". */
+  text: string;
+}
+
+/**
+ * Ids in `t.blockedBy` that exist in `tickets` and are not done. A private copy of
+ * `blockersOf` in tickets.ts: this module is transpiled alone by scripts/test-projects.mjs, so
+ * it cannot import it (both are tested).
+ */
+function openBlockers(t: Pick<TicketSummary, "blockedBy">, tickets: readonly TicketSummary[]): string[] {
+  return t.blockedBy.filter((id) => tickets.some((x) => x.id === id && x.state !== "done"));
+}
+
+/**
+ * The backlog hint of project `projectId` (step 6a): the first running work agent of the project
+ * that is idle with no ticket in progress and an empty queue, and the project's Backlog (or
+ * rejected) tickets without an assignee that nothing blocks. Null when either is missing.
+ * Tickets without a project never count. Nothing is assigned here; the UI offers a button.
+ */
+export function backlogHint(
+  agents: readonly AgentInfo[],
+  tickets: readonly TicketSummary[],
+  projectId: string,
+): BacklogHint | null {
+  const agent = liveWorkAgentsIn(agents, projectId).find(
+    (a) => a.status.kind === "idle" && a.currentTicketId === null && a.queueLength === 0,
+  );
+  if (agent === undefined) return null;
+  const waiting = tickets
+    .filter(
+      (t) =>
+        t.assigneeAgentId === null &&
+        (t.state === "backlog" || t.state === "rejected") &&
+        sameProjectId(projectName(t.project), projectId) &&
+        openBlockers(t, tickets).length === 0,
+    )
+    .sort((a, b) => a.createdAt - b.createdAt);
+  const next = waiting[0];
+  if (next === undefined) return null;
+  const n = waiting.length;
+  return { agent, waiting, next, text: `${agent.name} er ledig: ${n} ${n === 1 ? "ticket" : "tickets"} uden ejer` };
+}
+
+/**
+ * The office hints of one work agent (project badge and staff sign): `coordinator` is the
+ * "n agenter, ingen koordinator" text, `idle` the backlog hint text when this agent is the idle
+ * one. Both null never happens; callers use null instead of an empty hint.
+ */
+export interface SeatHint {
+  coordinator: string | null;
+  idle: string | null;
+}
+
 /**
  * Running work agents and tickets (any state, existing project only) per project; the key is
  * the lower-cased id (see `foldCase`).

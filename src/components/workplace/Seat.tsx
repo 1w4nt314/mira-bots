@@ -2,7 +2,7 @@ import { useDroppable } from "@dnd-kit/core";
 import type { CSSProperties } from "react";
 import type { Theme } from "../../lib/bots";
 import { COMPACT, itemsFor, type OfficeDetail } from "../../lib/office";
-import { assignmentIssue } from "../../lib/projects";
+import { assignmentIssue, type SeatHint } from "../../lib/projects";
 import { rolesText } from "../../lib/roles";
 import { isExited, statusLabel } from "../../lib/status";
 import { agentDropId, emptyDropId } from "../../lib/tickets";
@@ -26,7 +26,7 @@ interface Props {
   /** The dragged ticket, if any (step 4b: a work agent of another project says so). */
   draggedTicket: TicketSummary | null;
   /** "n agenter, ingen koordinator" for the agent's project, or null. */
-  projectHint: string | null;
+  projectHint: SeatHint | null;
   /** "more" adds desk items (deterministic per agent). */
   detail: OfficeDetail;
   /** Narrow one-row variant for the maximised terminal (no desk art). */
@@ -120,7 +120,9 @@ export default function Seat(props: Props) {
   const project = agent.seatKind === "work" ? agent.project : null;
   const projectTitle =
     project !== null
-      ? `Projekt: ${project}${projectHint !== null ? ` — ${projectHint}` : ""}`
+      ? [`Projekt: ${project}`, projectHint?.coordinator, projectHint?.idle]
+          .filter((x) => x != null)
+          .join(" — ")
       : agent.seatKind === "staff"
         ? "Projektroden"
         : "";
@@ -214,7 +216,8 @@ export default function Seat(props: Props) {
                   className="max-w-[55%] truncate rounded bg-neutral-500/15 px-1 text-[10px] leading-3"
                   title={projectTitle}
                 >
-                  {projectHint !== null ? "⚠ " : ""}
+                  {projectHint?.coordinator != null ? "⚠ " : ""}
+                  {projectHint?.idle != null ? "ledig · " : ""}
                   {project}
                 </span>
               </span>
