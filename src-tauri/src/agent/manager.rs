@@ -1673,7 +1673,7 @@ mod tests {
             ),
             (
                 AgentError::QueueNotEmpty(2),
-                "Agenten har 2 tickets i kø — flyt dem først, eller bekræft at de lægges i Backlog",
+                "Agenten har 2 tickets i kø eller i Venter — flyt dem først, eller bekræft at de lægges i Backlog",
             ),
             (
                 AgentError::ProjectLimit {

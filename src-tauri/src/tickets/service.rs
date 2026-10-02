@@ -343,6 +343,23 @@ fn entered_at(t: &Ticket, state: TicketState) -> Option<u64> {
     t.history.iter().rev().find(|h| h.to == state).map(|h| h.at)
 }
 
+/// The time a waiting parent was last submitted (review 6a N1): its last entry into `waiting`,
+/// or a new submission while it was waiting (the [`WAITING_NOTE`] entry). Other notes on a
+/// waiting ticket do not move it.
+fn waited_at(t: &Ticket) -> Option<u64> {
+    t.history
+        .iter()
+        .rev()
+        .find(|h| {
+            h.to == TicketState::Waiting
+                && (h.from != Some(TicketState::Waiting)
+                    || h.note
+                        .as_deref()
+                        .is_some_and(|n| n.starts_with(WAITING_NOTE)))
+        })
+        .map(|h| h.at)
+}
+
 /// Normalised title for the duplicate check (plan A.8): one line, whitespace runs collapsed,
 /// lowercase (Unicode).
 pub(crate) fn norm_title(s: &str) -> String {
@@ -805,8 +822,10 @@ impl TicketService {
     }
 
     /// The waiting parent of `agent_id` that is due a wake line (plan A.2): a child became Done
-    /// after the parent last entered `inProgress` (fallback: its creation; strictly later), or
-    /// it has no open child left. Of several, the one changed longest ago.
+    /// after the parent was last submitted into `waiting` (review 6a N1: a child done while the
+    /// parent was in progress is known to its agent when it submits, so it wakes nobody; fallback:
+    /// its last `inProgress`, then its creation; strictly later), or it has no open child left.
+    /// Of several, the one changed longest ago.
     pub fn due_wake_for(&self, agent_id: &str) -> Option<DueWake> {
         let mut parents: Vec<&Ticket> = self
             .doc
@@ -818,7 +837,9 @@ impl TicketService {
             .collect();
         parents.sort_by_key(|t| (t.updated_at, t.created_at));
         parents.into_iter().find_map(|p| {
-            let since = entered_at(p, TicketState::InProgress).unwrap_or(p.created_at);
+            let since = waited_at(p)
+                .or_else(|| entered_at(p, TicketState::InProgress))
+                .unwrap_or(p.created_at);
             let children = children_of(&self.doc, &p.id);
             let open_left = children
                 .iter()
@@ -4205,7 +4226,35 @@ mod tests {
             (1, c2.id.clone(), 0)
         );
 
-        // Time reference: a child done at exactly the resume time is not new (strictly later).
+        // Review 6a N1: a child done while the parent was in progress is known at its next
+        // submission; only a child done after it wakes.
+        let (mut s, _) = svc();
+        let (p, c1, c2) = parent_with_children(&mut s, false);
+        let c3 = child_of(&mut s, &p, "c3", 12);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        finish(&mut s, &c1.id, "c", 30);
+        s.resume_after_wake(&p.id, "k", WOKEN_NOTE, 40)
+            .unwrap()
+            .unwrap();
+        finish(&mut s, &c2.id, "c", 45);
+        assert_eq!(
+            s.submit_by_agent("k", None, "næste", 50).unwrap().state,
+            S::Waiting
+        );
+        assert_eq!(
+            s.due_wake_for("k"),
+            None,
+            "c2 was done before the submission"
+        );
+        finish(&mut s, &c3.id, "c", 60);
+        let w = s.due_wake_for("k").unwrap();
+        assert_eq!(
+            (w.newly_done.len(), w.newly_done[0].id.clone(), w.open_left),
+            (1, c3.id.clone(), 0)
+        );
+
+        // Time reference: a child done at exactly the submission time is not new (strictly
+        // later).
         let (mut s, _) = svc();
         let (p, c1, c2) = parent_with_children(&mut s, false);
         let _c3 = child_of(&mut s, &p, "test", 12);
@@ -4217,14 +4266,14 @@ mod tests {
         s.submit_by_agent("k", None, "næste", 41).unwrap();
         finish(&mut s, &c2.id, "c", 37);
         let t = find_mut(&mut s.doc, &c2.id).unwrap();
-        t.history.last_mut().unwrap().at = 40;
-        assert_eq!(s.due_wake_for("k"), None, "done at 40 is not after 40");
+        t.history.last_mut().unwrap().at = 41;
+        assert_eq!(s.due_wake_for("k"), None, "done at 41 is not after 41");
         find_mut(&mut s.doc, &c2.id)
             .unwrap()
             .history
             .last_mut()
             .unwrap()
-            .at = 41;
+            .at = 42;
         assert_eq!(s.due_wake_for("k").unwrap().newly_done.len(), 1);
 
         // The last open child deleted: due without a newly done child.

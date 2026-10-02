@@ -129,6 +129,15 @@ pub fn is_coordination_line_for(prompt: &str, short: &str) -> bool {
             .is_some_and(|(_, rest)| rest.starts_with(&format!("ticket {short}")))
 }
 
+/// Whether `prompt` is [`wake_line`] for the waiting parent `short` (review 6a W1): it starts
+/// with "Du har fået besked:" and names the parent as "(ticketId <short>)", which every variant
+/// of the line ends its request with. A child's short id never matches (children are named
+/// without "ticketId"), and no "Ticket …", "Koordiner ticket …" or "Review af ticket …" line does.
+pub fn is_wake_line_for(prompt: &str, short: &str) -> bool {
+    prompt.trim_start().starts_with("Du har fået besked:")
+        && prompt.contains(&format!("(ticketId {short})"))
+}
+
 /// What an agent on a staff seat is asked to do with a ticket (5c C.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoordinationKind {
@@ -1406,6 +1415,33 @@ mod tests {
         // The last-child title is sanitised too.
         let l = wake("pppppppp", &[("aaaaaaaa", "x\r\ny:z")], 0);
         assert!(l.contains("(sidst aaaaaaaa: x y: z)"), "{l}");
+    }
+
+    #[test]
+    fn wake_line_matches_only_its_parent() {
+        let variants = [
+            wake("pppppppp", &[("aaaaaaaa", "A")], 2),
+            wake("pppppppp", &[("aaaaaaaa", "A"), ("bbbbbbbb", "B")], 1),
+            wake("pppppppp", &[("aaaaaaaa", "A")], 0),
+            wake("pppppppp", &[], 0),
+        ];
+        for l in &variants {
+            assert!(is_wake_line_for(l, "pppppppp"), "{l}");
+            assert!(is_wake_line_for(&format!("  {l}"), "pppppppp"));
+            // A child named in the line is not the parent.
+            assert!(!is_wake_line_for(l, "aaaaaaaa"), "{l}");
+            assert!(!is_wake_line_for(l, "bbbbbbbb"), "{l}");
+        }
+        // Other lines never match.
+        for l in [
+            "Ticket pppppppp: x (ticketId pppppppp)",
+            "Koordiner ticket pppppppp: x",
+            "Review af ticket pppppppp: x",
+            "Du afsluttede uden at aflevere ticket pppppppp.",
+            "fix (ticketId pppppppp)",
+        ] {
+            assert!(!is_wake_line_for(l, "pppppppp"), "{l}");
+        }
     }
 
     #[test]

@@ -9,11 +9,12 @@ import {
   type SyntheticEvent,
 } from "react";
 import { useTheme } from "../../../lib/bots";
-import { deleteTicket, errorMessage, getTicket } from "../../../lib/ipc";
+import { deleteTicket, errorMessage, getTicket, unassignTicket } from "../../../lib/ipc";
 import { isExited } from "../../../lib/status";
 import {
   ACTOR_LABEL,
   canDelete,
+  canReturnWaiting,
   canDrag,
   canHandOver,
   BLOCKED_HINT,
@@ -293,6 +294,20 @@ function NoteActions({
 
   const buttons: ReactNode[] = [];
   if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
+  if (canReturnWaiting(t)) {
+    // Review 6a N3: the user frees a waiting parent (its children stay where they are).
+    buttons.push(
+      <button
+        key="return"
+        type="button"
+        onClick={() => void run(() => unassignTicket(t.id))}
+        title="Tag forælderen fra agenten og læg den i Backlog; del-tickets bliver, hvor de er"
+        className={smallBtn}
+      >
+        Læg tilbage
+      </button>,
+    );
+  }
   if (canDelete(t)) {
     buttons.push(
       <button

@@ -210,4 +210,51 @@ eq(k.isDeliverable(bt, allB), false, "isDeliverable blocked");
 eq(k.isDeliverable(tk("d2", { state: "assigned", assigneeAgentId: "A" }), allB), false, "isDeliverable assigned");
 eq(k.isDeliverable(tk("d3", { state: "rejected" }), allB), true, "isDeliverable rejected without assignee");
 
+// Review 6a W1/W2/N3: canRequestSubmission (waiting parent), canReturnWaiting, waitingCount,
+// movePendingText
+const live = (kind) => agent("A", { status: { kind } });
+for (const [state, a, want] of [
+  ["inProgress", live("idle"), true],
+  ["waiting", live("idle"), true],
+  ["inProgress", live("thinking"), false],
+  ["waiting", live("thinking"), false],
+  ["inProgress", live("exited"), false],
+  ["inProgress", null, false],
+  ["review", live("idle"), false],
+  ["assigned", live("idle"), false],
+])
+  eq(k.canRequestSubmission(ticket({ state }), a), want, `canRequestSubmission ${state} ${a?.status.kind}`);
+for (const [state, assignee, want] of [
+  ["waiting", "A", true],
+  ["waiting", null, false],
+  ["inProgress", "A", false],
+  ["assigned", "A", false],
+  ["backlog", null, false],
+])
+  eq(k.canReturnWaiting(ticket({ state, assigneeAgentId: assignee })), want, `canReturnWaiting ${state} ${assignee}`);
+eq(
+  k.waitingCount(
+    [
+      ticket({ id: "w1", state: "waiting", assigneeAgentId: "A" }),
+      ticket({ id: "w2", state: "waiting", assigneeAgentId: "B" }),
+      ticket({ id: "q1", state: "assigned", assigneeAgentId: "A" }),
+      ticket({ id: "w3", state: "waiting", assigneeAgentId: "A" }),
+    ],
+    "A",
+  ),
+  2,
+  "waitingCount counts only the agent's waiting tickets",
+);
+for (const [q, w, p, want] of [
+  [0, 0, "p", null],
+  [1, 0, "p", "1 ticket i kø til «p» lægges tilbage i Backlog"],
+  [2, 0, "p", "2 tickets i kø til «p» lægges tilbage i Backlog"],
+  [0, 1, "p", "1 ventende ticket til «p» lægges tilbage i Backlog"],
+  [0, 2, "p", "2 ventende tickets til «p» lægges tilbage i Backlog"],
+  [2, 1, "p", "2 tickets i kø og 1 ventende til «p» lægges tilbage i Backlog"],
+  [1, 2, null, "1 ticket i kø og 2 ventende lægges tilbage i Backlog"],
+])
+  eq(k.movePendingText(q, w, p), want, `movePendingText ${q} ${w} ${p}`);
+eq(k.WAKE_UNCONFIRMED_TEXT, "Vækning ikke bekræftet, se terminalen", "WAKE_UNCONFIRMED_TEXT mirrors Rust");
+
 console.log(`tickets.ts: ${n} cases ok`);

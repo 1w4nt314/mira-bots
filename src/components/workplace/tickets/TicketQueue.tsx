@@ -27,6 +27,7 @@ import {
   SUBMIT_PARENT_HINT,
   TURN_FAILED_TEXT,
   WAITING_TITLE,
+  WAKE_UNCONFIRMED_TEXT,
 } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
@@ -90,7 +91,8 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
       current: mine.find((t) => t.state === "inProgress") ?? null,
       queue: queueFor(mine, agent.id),
       review: mine.filter((t) => t.state === "review"),
-      // Parents waiting for their children, oldest first (no button: the app wakes the agent).
+      // Parents waiting for their children, oldest first (the app wakes the agent; a button only
+      // after an unconfirmed wake, review 6a W1).
       waiting: mine.filter((t) => t.state === "waiting").sort((a, b) => a.updatedAt - b.updatedAt),
     };
   }, [state.tickets, agent.id]);
@@ -105,7 +107,8 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
   const hintText =
     agent.detail === DELIVERY_FAILED_TEXT ||
     agent.detail === TURN_FAILED_TEXT ||
-    agent.detail === NOT_SUBMITTED_TEXT
+    agent.detail === NOT_SUBMITTED_TEXT ||
+    agent.detail === WAKE_UNCONFIRMED_TEXT
       ? agent.detail
       : null;
   // The hint row carries the notSubmitted buttons when the agent's detail shows the hint; the
@@ -230,6 +233,22 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
                 <span className="shrink-0 text-[10px] text-[var(--muted)]" title="Del-tickets færdige">
                   {p.done}/{p.total}
                 </span>
+              )}
+              {/* Review 6a W1: the wake line went unconfirmed; the user asks for it again. */}
+              {hintText === WAKE_UNCONFIRMED_TEXT && (
+                <button
+                  type="button"
+                  onClick={() => void run(() => requestSubmission(t.id))}
+                  disabled={!canRequestSubmission(t, agent)}
+                  title={
+                    canRequestSubmission(t, agent)
+                      ? "Taster beskeden om de godkendte del-tickets i terminalen igen"
+                      : "Virker når agenten er Klar"
+                  }
+                  className={smallBtn}
+                >
+                  Bed om aflevering
+                </button>
               )}
             </div>
           );

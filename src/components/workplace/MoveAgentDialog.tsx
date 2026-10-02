@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { errorMessage, moveAgentToProject } from "../../lib/ipc";
 import { projectName, sameProjectId } from "../../lib/projects";
-import { switchBlocked } from "../../lib/tickets";
+import { movePendingText, switchBlocked, waitingCount } from "../../lib/tickets";
 import type { AgentInfo, ProjectRef } from "../../lib/types";
-import { useRefreshProjects } from "../../state/store";
+import { useRefreshProjects, useStore } from "../../state/store";
 import { DialogFrame } from "./ProjectPrompt";
 import ProjectPicker from "./ProjectPicker";
 
@@ -20,11 +20,13 @@ interface Props {
 // after the confirmation (plan4b D.81).
 /**
  * "Flyt til projekt…" (plan4b A.3): restarts a work agent in another project's folder with
- * `--resume`. Only while it is idle without a ticket in progress; queued tickets go back to the
- * backlog when the user confirms it.
+ * `--resume`. Only while it is idle without a ticket in progress; queued tickets and waiting
+ * parents (review 6a W2: they would otherwise be woken in the new project) go back to the backlog
+ * when the user confirms it.
  */
 export default function MoveAgentDialog({ agent, preselect = null, onClose, onMoved }: Props) {
   const refreshProjects = useRefreshProjects();
+  const { state } = useStore();
   const [value, setValue] = useState<ProjectRef | null>(
     preselect !== null && !sameProjectId(projectName(preselect), agent.project) ? preselect : null,
   );
@@ -32,15 +34,17 @@ export default function MoveAgentDialog({ agent, preselect = null, onClose, onMo
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const queue = agent.queueLength;
+  const waiting = waitingCount(state.tickets, agent.id);
+  const pendingText = movePendingText(queue, waiting, agent.project);
   const blocked = switchBlocked(agent);
-  const canMove = !busy && blocked === null && value !== null && (queue === 0 || force);
+  const canMove = !busy && blocked === null && value !== null && (pendingText === null || force);
 
   const move = async () => {
     if (value === null) return;
     setBusy(true);
     setError(null);
     try {
-      const moved = await moveAgentToProject(agent.id, value, queue > 0 && force);
+      const moved = await moveAgentToProject(agent.id, value, pendingText !== null && force);
       void refreshProjects();
       onMoved(moved);
     } catch (e) {
@@ -74,12 +78,9 @@ export default function MoveAgentDialog({ agent, preselect = null, onClose, onMo
           label="Nyt projekt for agenten"
         />
       </div>
-      {queue > 0 && (
+      {pendingText !== null && (
         <div className="mt-2 rounded-lg border border-amber-400/50 bg-amber-300/20 px-2 py-1 text-xs text-amber-800 dark:text-amber-200">
-          <p>
-            {queue} {queue === 1 ? "ticket" : "tickets"} i kø til «{agent.project}» lægges tilbage i
-            Backlog
-          </p>
+          <p>{pendingText}</p>
           <label className="mt-1 flex items-center gap-2">
             <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
             <span>Ja, læg dem i Backlog</span>

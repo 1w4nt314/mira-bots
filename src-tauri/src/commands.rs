@@ -1335,22 +1335,33 @@ pub fn set_agent_effort(
 // ---- projects (plan4b C4b.4) ----
 
 /// The gate of `move_agent_to_project`, in the order of C4b.4 (without the restart, so it is
-/// unit tested): running, idle, no ticket in progress → work seat → empty queue (or `force`) →
-/// the project exists (a `New` is created: the user may) → not the agent's own → the
-/// `maxAgentsPerProject` limit (the agent itself not counted). Returns the agent and the
-/// project.
+/// unit tested): running, idle, no ticket in progress → work seat → no queued or waiting tickets
+/// (or `force`) → the project exists (a `New` is created: the user may) → not the agent's own →
+/// the `maxAgentsPerProject` limit (the agent itself not counted). Returns the agent, the
+/// project and how many of its tickets go to the backlog (queued + waiting parents).
+///
+/// Review 6a W2: a waiting parent (step 6a) counts like a queued ticket. Left in the old project
+/// it would be woken, and resumed, with the agent in the new one; so the move needs the
+/// confirmation, and [`TicketsCtx::release_queue`] puts it in the backlog with [`MOVED_NOTE`].
 pub fn move_gate(
     state: &AppState,
     agent_id: &str,
     project: &ProjectRef,
     force: bool,
-) -> Result<(AgentInfo, Project), String> {
+) -> Result<(AgentInfo, Project, usize), String> {
     let info = check_restartable(lock(&state.manager).get(agent_id).as_ref())?;
     if info.seat_kind != SeatKind::Work {
         return Err(AgentError::StaffHasNoProject.into());
     }
-    if info.queue_length > 0 && !force {
-        return Err(AgentError::QueueNotEmpty(info.queue_length).into());
+    let waiting = state.tickets.read(|s| {
+        s.list_for_agent(agent_id)
+            .iter()
+            .filter(|t| t.state == TicketState::Waiting)
+            .count()
+    });
+    let pending = info.queue_length + waiting;
+    if pending > 0 && !force {
+        return Err(AgentError::QueueNotEmpty(pending).into());
     }
     let p = projects::realize(&state.paths.projects_root, project, true)?;
     if info
@@ -1362,13 +1373,13 @@ pub fn move_gate(
     }
     let max = state.workspace.rules().max_agents_per_project;
     check_project_limit(&state.manager, &p.id, max, Some(agent_id))?;
-    Ok((info, p))
+    Ok((info, p, pending))
 }
 
 /// "Flyt til projekt…" (plan4b A.3): restarts the agent with `--resume` in the project's
 /// folder (the conversation is kept, research4b §2). Only on a work seat, idle without a ticket
-/// in progress; queued tickets go to the backlog with [`MOVED_NOTE`] when `force`, otherwise the
-/// move is refused.
+/// in progress; queued tickets and waiting parents go to the backlog with [`MOVED_NOTE`] when
+/// `force`, otherwise the move is refused.
 // TODO(windows-verify): the agent restarts with --resume in the new folder, the conversation is
 // kept, the trust dialog comes for a git project, and the next ticket file lands in the new
 // folder (plan4b D.81).
@@ -1383,8 +1394,8 @@ pub fn move_agent_to_project(
     project: ProjectRef,
     force: bool,
 ) -> Result<AgentInfo, String> {
-    let (info, p) = move_gate(&state, &agent_id, &project, force)?;
-    if info.queue_length > 0 {
+    let (_, p, pending) = move_gate(&state, &agent_id, &project, force)?;
+    if pending > 0 {
         state.tickets.release_queue(&agent_id, MOVED_NOTE)?;
     }
     restart_with(
@@ -3431,8 +3442,9 @@ mod tests {
             move_gate(&state, &work, &ProjectRef::Existing("P".into()), true).unwrap_err(),
             AgentError::SameProject("p".into()).to_string()
         );
-        let (info, proj) = move_gate(&state, &work, &q, true).unwrap();
+        let (info, proj, pending) = move_gate(&state, &work, &q, true).unwrap();
         assert_eq!((info.id.as_str(), proj.id.as_str()), (work.as_str(), "q"));
+        assert_eq!(pending, 1);
         // With force the queue goes to the backlog with the move note.
         assert_eq!(state.tickets.release_queue(&work, MOVED_NOTE).unwrap(), 1);
         let back = state.tickets.read(|s| s.get(&tk.id)).unwrap();
@@ -3452,9 +3464,76 @@ mod tests {
             move_gate(&state, &work, &q, false).unwrap_err(),
             "Loft på 1 agenter i projektet «q» nået"
         );
-        let (_, n) =
+        let (_, n, _) =
             move_gate(&state, &work, &ProjectRef::New { new: "ny".into() }, false).unwrap();
         assert!(PathBuf::from(&n.path).is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review 6a W2: a waiting parent counts like a queued ticket: the move needs the
+    /// confirmation, and with it the parent goes to the backlog with the move note.
+    #[test]
+    fn move_gate_counts_waiting_parents() {
+        let (state, dir) = temp_state();
+        let root = state.paths.projects_root.clone();
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        let work = {
+            let mut m = lock(&state.manager);
+            let w = m.insert_fake_in("mw", "/w/p", &[Role::Coder], SeatKind::Work, Some("p"));
+            m.set_status(&w, AgentStatus::Idle, None).unwrap();
+            w
+        };
+        let parent = ticket_create(&state.tickets, "forælder", "", false, p()).unwrap();
+        ticket_assign(&state.tickets, &parent.id, &work).unwrap();
+        let child = state
+            .tickets
+            .mutate(|s| {
+                s.mark_dispatched(&parent.id, "mw", 1)?;
+                let c = s.create_by_agent_related(
+                    "del",
+                    "",
+                    false,
+                    None,
+                    None,
+                    Some(parent.id.clone()),
+                    vec![],
+                    2,
+                )?;
+                s.submit_by_agent(&work, None, "fordelt", 3)?;
+                Ok(c)
+            })
+            .unwrap();
+        assert_eq!(
+            state.tickets.read(|s| s.get(&parent.id)).unwrap().state,
+            TicketState::Waiting
+        );
+        // Idle, nothing in progress, an empty queue, but a waiting parent: refused without force.
+        let q = ProjectRef::Existing("q".into());
+        assert_eq!(
+            move_gate(&state, &work, &q, false).unwrap_err(),
+            AgentError::QueueNotEmpty(1).to_string()
+        );
+        // A queued ticket as well: both counted.
+        let tk = ticket_create(&state.tickets, "x", "", false, p()).unwrap();
+        ticket_assign(&state.tickets, &tk.id, &work).unwrap();
+        assert_eq!(
+            move_gate(&state, &work, &q, false).unwrap_err(),
+            AgentError::QueueNotEmpty(2).to_string()
+        );
+        let (_, _, pending) = move_gate(&state, &work, &q, true).unwrap();
+        assert_eq!(pending, 2);
+        // Confirmed: both go to the backlog with the move note; the child is untouched.
+        assert_eq!(state.tickets.release_queue(&work, MOVED_NOTE).unwrap(), 2);
+        for id in [&parent.id, &tk.id] {
+            let t = state.tickets.read(|s| s.get(id)).unwrap();
+            assert_eq!((t.state, t.assignee_agent_id), (TicketState::Backlog, None));
+            assert_eq!(t.history.last().unwrap().note.as_deref(), Some(MOVED_NOTE));
+        }
+        let c = state.tickets.read(|s| s.get(&child.id)).unwrap();
+        assert_eq!(c.parent_id.as_deref(), Some(parent.id.as_str()));
+        let (_, _, pending) = move_gate(&state, &work, &q, false).unwrap();
+        assert_eq!(pending, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

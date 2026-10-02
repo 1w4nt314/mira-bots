@@ -22,12 +22,14 @@ export const BODY_MAX = 20000;
 /** Mirrors `TICKET_SUMMARY_MAX_CHARS` in Rust (an agent's summary; display only). */
 export const SUMMARY_MAX = 2000;
 /**
- * Mirrors `DELIVERY_FAILED_TEXT` / `TURN_FAILED_TEXT` / `NOT_SUBMITTED_TEXT` in Rust (set as the
- * agent's `detail`).
+ * Mirrors `DELIVERY_FAILED_TEXT` / `TURN_FAILED_TEXT` / `NOT_SUBMITTED_TEXT` /
+ * `WAKE_UNCONFIRMED_TEXT` in Rust (set as the agent's `detail`).
  */
 export const DELIVERY_FAILED_TEXT = "Kunne ikke aflevere ticket, se terminalen";
 export const TURN_FAILED_TEXT = "Turn fejlede, prøv igen eller skriv i terminalen";
 export const NOT_SUBMITTED_TEXT = "Turn afsluttet uden aflevering";
+/** The wake line of a waiting parent went unconfirmed twice (review 6a W1). */
+export const WAKE_UNCONFIRMED_TEXT = "Vækning ikke bekræftet, se terminalen";
 
 export const STATE_LABEL: Record<TicketState, string> = {
   backlog: "Backlog",
@@ -52,7 +54,7 @@ export const STATE_BADGE_CLASS: Record<TicketState, string> = {
 
 /** Heading of the "waiting" block under a terminal (a parent whose children are still open). */
 export const WAITING_TITLE = "Venter på del-tickets";
-/** Shown on a waiting ticket: nothing to click, the app wakes the agent. */
+/** Shown on a waiting ticket: the app wakes the agent ("Læg tilbage" is the only button). */
 export const WAITING_HINT = "Venter på del-tickets — vækkes automatisk når de er godkendt";
 /** Title (tooltip) on the "Venter på …" badge of a blocked ticket. */
 export const BLOCKED_HINT = "Leveres når blokeringerne er Done";
@@ -365,20 +367,42 @@ export function canRedispatch(t: TicketSummary, agent: AgentInfo | null): boolea
 }
 
 /**
- * Whether "Bed om aflevering" can work: the ticket is in progress and its agent is idle (the
- * dispatcher only types the line into an idle agent; `request_submission` also needs it running).
+ * Whether "Bed om aflevering" can work: the ticket is in progress (or a waiting parent, whose
+ * wake line the dispatcher then types again; review 6a W1) and its agent is idle (the dispatcher
+ * only types into an idle agent; `request_submission` also needs it running).
  *
  * | state      | agent status | canRequestSubmission |
  * |------------|--------------|----------------------|
  * | inProgress | idle         | true                 |
+ * | waiting    | idle         | true                 |
  * | inProgress | running      | false                |
+ * | waiting    | running      | false                |
  * | inProgress | exited       | false                |
  * | inProgress | (no agent)   | false                |
  * | review     | idle         | false                |
  * | assigned   | idle         | false                |
  */
 export function canRequestSubmission(t: TicketSummary, agent: AgentInfo | null): boolean {
-  return t.state === "inProgress" && isLive(agent) && agent.status.kind === "idle";
+  return (
+    (t.state === "inProgress" || t.state === "waiting") && isLive(agent) && agent.status.kind === "idle"
+  );
+}
+
+/**
+ * Whether "Læg tilbage" may put a waiting parent back in the backlog (review 6a N3: the user's
+ * `unassign_ticket`; the parent loses its agent, its children are untouched). Assigning or
+ * handing over a waiting ticket stays refused.
+ *
+ * | state      | assignee | canReturnWaiting |
+ * |------------|----------|------------------|
+ * | waiting    | A        | true             |
+ * | waiting    | –        | false            |
+ * | inProgress | A        | false            |
+ * | assigned   | A        | false            |
+ * | backlog    | –        | false            |
+ */
+export function canReturnWaiting(t: TicketSummary): boolean {
+  return t.state === "waiting" && t.assigneeAgentId !== null;
 }
 
 /**
@@ -662,4 +686,35 @@ export function switchBlocked(agent: Pick<AgentInfo, "status" | "currentTicketId
   if (agent.status.kind === "exited") return "Agenten kører ikke";
   if (agent.status.kind !== "idle" || agent.currentTicketId !== null) return AGENT_BUSY_TEXT;
   return null;
+}
+
+/** The agent's waiting parents (step 6a; not part of `queueLength`, review 6a W2). */
+export function waitingCount(tickets: readonly TicketSummary[], agentId: string): number {
+  return tickets.filter((t) => t.state === "waiting" && t.assigneeAgentId === agentId).length;
+}
+
+/**
+ * What "Flyt til projekt…" puts back in the backlog after the confirmation (review 6a W2): the
+ * agent's queued tickets and its waiting parents; null when there are none (no confirmation).
+ *
+ * | queue | waiting | project | movePendingText                                          |
+ * |-------|---------|---------|----------------------------------------------------------|
+ * | 0     | 0       | "p"     | null                                                     |
+ * | 1     | 0       | "p"     | "1 ticket i kø til «p» lægges tilbage i Backlog"          |
+ * | 2     | 0       | "p"     | "2 tickets i kø til «p» lægges tilbage i Backlog"         |
+ * | 0     | 1       | "p"     | "1 ventende ticket til «p» lægges tilbage i Backlog"      |
+ * | 2     | 1       | "p"     | "2 tickets i kø og 1 ventende til «p» lægges tilbage i Backlog" |
+ * | 1     | 2       | null    | "1 ticket i kø og 2 ventende lægges tilbage i Backlog"    |
+ */
+export function movePendingText(queue: number, waiting: number, project: string | null): string | null {
+  if (queue === 0 && waiting === 0) return null;
+  const tickets = (n: number) => `${n} ${n === 1 ? "ticket" : "tickets"}`;
+  const what =
+    queue > 0 && waiting > 0
+      ? `${tickets(queue)} i kø og ${waiting} ventende`
+      : queue > 0
+        ? `${tickets(queue)} i kø`
+        : `${waiting} ventende ${waiting === 1 ? "ticket" : "tickets"}`;
+  const where = project === null ? "" : ` til «${project}»`;
+  return `${what}${where} lægges tilbage i Backlog`;
 }

@@ -27,7 +27,7 @@ use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
     CHILDREN_DONE_NOTE, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
     ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
-    TURN_FAILED_TEXT, WOKEN_NOTE,
+    TURN_FAILED_TEXT, WAKE_MAX_ATTEMPTS, WAKE_UNCONFIRMED_TEXT, WOKEN_NOTE,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -205,18 +205,22 @@ pub fn messages_for(ev: &StatusEvent) -> Vec<DispatchMsg> {
     }
 }
 
-/// What a delivery types: a work ticket ("Ticket …" line) or a review ("Review af ticket …"
-/// line, plan5 C5.12).
+/// What a delivery types: a work ticket ("Ticket …" line), a review ("Review af ticket …"
+/// line, plan5 C5.12) or the wake line of a waiting parent ("Du har fået besked: …", review 6a
+/// W1; the parent resumes only once the line is confirmed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKind {
     Work,
     Review,
+    Wake,
 }
 
 impl DeliveryKind {
     /// Whether the submitted `prompt` is this delivery's line: a ticket goes in as
     /// "Ticket <short>" or, as a coordination task, as "Koordiner ticket <short>" (5c C.1; the
-    /// first word matched tolerantly, review 5c N1); a review as "Review af ticket <short>".
+    /// first word matched tolerantly, review 5c N1); a review as "Review af ticket <short>"; a
+    /// wake as "Du har fået besked: … (ticketId <parent short>)" ([`prompt::is_wake_line_for`]).
+    /// The prefixes exclude each other, so no kind ever confirms another kind's line.
     fn confirms(self, ticket_id: &str, prompt: &str) -> bool {
         let short = super::model::short_id(ticket_id);
         let p = prompt.trim_start();
@@ -226,6 +230,7 @@ impl DeliveryKind {
                     || prompt::is_coordination_line_for(p, &short)
             }
             DeliveryKind::Review => p.starts_with(&format!("Review af ticket {short}")),
+            DeliveryKind::Wake => prompt::is_wake_line_for(p, &short),
         }
     }
 }
@@ -251,7 +256,8 @@ enum Delivery {
         token: u64,
         kind: DeliveryKind,
     },
-    /// Enter sent, waiting for `UserPromptSubmit` or a busy status.
+    /// Enter sent, waiting for `UserPromptSubmit` or a busy status (a wake: only for the
+    /// `UserPromptSubmit` with its line, review 6a W1).
     Waiting {
         ticket_id: String,
         token: u64,
@@ -284,8 +290,36 @@ enum Nudge {
     /// [`prompt::handed_over_line`]: the ticket left the agent (review 5c W4).
     Stop,
     /// [`prompt::wake_line`]: `ticket_id` is the agent's waiting parent and a child is done
-    /// (step 6a, plan A.2). The parent goes back in progress only after the Enter.
+    /// (step 6a, plan A.2). After the Enter the dispatcher waits for the confirmation like a
+    /// delivery ([`DeliveryKind::Wake`], review 6a W1); only then the parent goes back in progress.
     Wake,
+}
+
+/// The wake a [`WakeMiss`] counts: the same parent with the same children done and open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WakeKey {
+    parent_id: String,
+    newly_done: Vec<String>,
+    open_left: usize,
+}
+
+impl WakeKey {
+    fn of(w: &DueWake) -> Self {
+        WakeKey {
+            parent_id: w.parent.id.clone(),
+            newly_done: w.newly_done.iter().map(|c| c.id.clone()).collect(),
+            open_left: w.open_left,
+        }
+    }
+}
+
+/// Unconfirmed attempts at an agent's wake line (review 6a W1). At [`WAKE_MAX_ATTEMPTS`] the
+/// wake is not typed again until it changes (another child done), the user asks ("Bed om
+/// aflevering" on the waiting parent) or the agent restarts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WakeMiss {
+    key: WakeKey,
+    misses: u8,
 }
 
 /// A pending [`prompt::handed_over_line`] for an agent (review 5c W4).
@@ -303,6 +337,8 @@ pub struct Dispatcher<H, P, T> {
     /// Agents to tell that their ticket in progress was handed on (review 5c W4), typed when
     /// they are idle, before their next delivery.
     stop_notices: HashMap<String, StopNotice>,
+    /// Per agent: unconfirmed wake attempts (review 6a W1).
+    wake_misses: HashMap<String, WakeMiss>,
     next_token: u64,
     /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
     auto_review_on_stop: Option<bool>,
@@ -316,6 +352,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             timers,
             deliveries: HashMap::new(),
             stop_notices: HashMap::new(),
+            wake_misses: HashMap::new(),
             next_token: 0,
             auto_review_on_stop: None,
         }
@@ -378,9 +415,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             DispatchMsg::AgentGone { agent_id } => {
                 self.deliveries.remove(&agent_id);
                 self.stop_notices.remove(&agent_id);
+                self.wake_misses.remove(&agent_id);
             }
             DispatchMsg::AgentRestarting { agent_id } => {
                 self.deliveries.remove(&agent_id);
+                self.wake_misses.remove(&agent_id);
             }
             DispatchMsg::SpawnedWithTicket {
                 agent_id,
@@ -447,7 +486,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     }
 
     /// The agent's due wake (step 6a, plan A.2): only while it is idle without a ticket in
-    /// progress, and a waiting parent of its own is due ([`TicketService::due_wake_for`]).
+    /// progress, and a waiting parent of its own is due ([`TicketService::due_wake_for`]). Not
+    /// once the same wake went unconfirmed [`WAKE_MAX_ATTEMPTS`] times (review 6a W1).
     fn due_wake(&self, agent_id: &str) -> Option<(AgentSnapshot, DueWake)> {
         let snap = self.port.snapshot(agent_id)?;
         if snap.status != AgentStatus::Idle {
@@ -457,6 +497,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             return None;
         }
         let w = self.host.read(|s| s.due_wake_for(agent_id))?;
+        let given_up = self
+            .wake_misses
+            .get(agent_id)
+            .is_some_and(|m| m.misses >= WAKE_MAX_ATTEMPTS && m.key == WakeKey::of(&w));
+        if given_up {
+            return None;
+        }
         Some((snap, w))
     }
 
@@ -589,6 +636,12 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
 
     fn on_busy(&mut self, agent_id: &str) {
         match self.state(agent_id).clone() {
+            // A wake is confirmed by its line only (review 6a W1): a busy status may belong to
+            // something else, and a wrongly resumed parent is never woken again.
+            Delivery::Waiting {
+                kind: DeliveryKind::Wake,
+                ..
+            } => {}
             Delivery::Waiting {
                 ticket_id, kind, ..
             } => self.confirm(agent_id, &ticket_id, kind),
@@ -610,10 +663,26 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             Delivery::AwaitingSession { ticket_id, .. } => {
                 (ticket_id.clone(), false, DeliveryKind::Work)
             }
+            Delivery::Free
+            | Delivery::Nudging {
+                nudge: Nudge::Wake, ..
+            } => {
+                // A wake line submitted outside its confirm window (late, or Enter pressed before
+                // ours) still counts (review 6a W1).
+                if let Some(p) = prompt {
+                    self.late_wake(agent_id, p);
+                }
+                return;
+            }
             _ => return,
         };
         match prompt {
             Some(p) if kind.confirms(&ticket_id, p) => self.confirm(agent_id, &ticket_id, kind),
+            None if kind == DeliveryKind::Wake => {
+                log::info!(
+                    "dispatch {agent_id}: UserPromptSubmit without prompt; wake not confirmed yet"
+                );
+            }
             Some(_) if typed_by_us => {
                 // Another prompt went in while our line was in the terminal (typically the user's
                 // own text, possibly merged with the line). A busy status that follows belongs
@@ -633,6 +702,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// counts as delivered ("review sendt til <name>").
     fn confirm(&mut self, agent_id: &str, ticket_id: &str, kind: DeliveryKind) {
         self.set(agent_id, Delivery::Free);
+        if kind == DeliveryKind::Wake {
+            self.wake_confirmed(agent_id, ticket_id);
+            return;
+        }
         let snap = self.port.snapshot(agent_id);
         let name = snap
             .as_ref()
@@ -660,6 +733,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 .host
                 .mutate(|s| s.mark_review_delivered(ticket_id, &name, now))
                 .map(|_| ()),
+            DeliveryKind::Wake => Ok(()),
         };
         if let Err(e) = r {
             log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}");
@@ -752,6 +826,18 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         };
         let agent_id = match (&t.state, &t.assignee_agent_id) {
             (TicketState::InProgress, Some(a)) => a.clone(),
+            (TicketState::Waiting, Some(a)) => {
+                // Review 6a W1: on a waiting parent the request types its wake line again, also
+                // after the dispatcher gave up on an unconfirmed one.
+                let a = a.clone();
+                self.wake_misses.remove(&a);
+                log::info!(
+                    "request submission: parent {} waits; its wake is tried again",
+                    t.short_id()
+                );
+                self.consider(&a);
+                return;
+            }
             _ => {
                 log::info!(
                     "request submission: ticket {} is not in progress",
@@ -907,7 +993,23 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         match nudge {
             Nudge::Stop => return,
             Nudge::Wake => {
-                self.wake_entered(agent_id, ticket_id);
+                // Review 6a W1: the parent stays waiting until the line is confirmed.
+                log::info!(
+                    "dispatch {agent_id}: wake line for parent {} entered; waiting for confirmation",
+                    super::model::short_id(ticket_id)
+                );
+                let token = self.token();
+                self.schedule(agent_id, token, TimerKind::Confirm, CONFIRM_TIMEOUT_MS);
+                self.set(
+                    agent_id,
+                    Delivery::Waiting {
+                        ticket_id: ticket_id.to_string(),
+                        token,
+                        retried: true,
+                        from_spawn: false,
+                        kind: DeliveryKind::Wake,
+                    },
+                );
                 return;
             }
             Nudge::Submit => {}
@@ -935,11 +1037,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
-    /// The wake line was entered (step 6a, plan P2): the parent goes waiting → in progress with
-    /// [`WOKEN_NOTE`] ([`CHILDREN_DONE_NOTE`] when no child is open any more). Nothing happens
-    /// when it is no longer the agent's waiting parent or the agent has another ticket in
-    /// progress (`Ok(None)`).
-    fn wake_entered(&mut self, agent_id: &str, parent_id: &str) {
+    /// The wake line was confirmed (step 6a, plan P2; review 6a W1: its `UserPromptSubmit`):
+    /// the parent goes waiting → in progress with [`WOKEN_NOTE`] ([`CHILDREN_DONE_NOTE`] when no
+    /// child is open any more). Nothing happens when it is no longer the agent's waiting parent
+    /// or the agent has another ticket in progress (`Ok(None)`). The attempts are forgotten and a
+    /// [`WAKE_UNCONFIRMED_TEXT`] detail is cleared.
+    fn wake_confirmed(&mut self, agent_id: &str, parent_id: &str) {
+        self.wake_misses.remove(agent_id);
         let now = now_ms();
         let r = self.host.mutate(|s| {
             let note = if s.open_children_count(parent_id) == 0 {
@@ -951,14 +1055,87 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         });
         match r {
             Ok(Some(t)) => log::info!(
-                "dispatch {agent_id}: parent {} back in progress",
+                "dispatch {agent_id}: wake confirmed; parent {} back in progress",
                 t.short_id()
             ),
             Ok(None) => log::info!(
-                "dispatch {agent_id}: parent {} not resumed (no longer waiting or agent busy)",
+                "dispatch {agent_id}: wake confirmed; parent {} not resumed (no longer waiting or agent busy)",
                 super::model::short_id(parent_id)
             ),
             Err(e) => log::warn!("dispatch {agent_id}: resuming the parent failed: {e}"),
+        }
+        let stale = self
+            .port
+            .snapshot(agent_id)
+            .is_some_and(|s| s.detail.as_deref() == Some(WAKE_UNCONFIRMED_TEXT));
+        if stale {
+            self.port.set_detail(agent_id, None);
+        }
+    }
+
+    /// A `UserPromptSubmit` outside a wake's confirm window (review 6a W1): when it is the wake
+    /// line of one of the agent's waiting parents (submitted after the timeout, or the user
+    /// pressed Enter before ours), the parent resumes as if confirmed; a pending Enter for it is
+    /// dropped, so the line is never entered twice.
+    fn late_wake(&mut self, agent_id: &str, prompt: &str) {
+        let parent = self.host.read(|s| {
+            s.list_for_agent(agent_id)
+                .into_iter()
+                .find(|t| {
+                    t.state == TicketState::Waiting && DeliveryKind::Wake.confirms(&t.id, prompt)
+                })
+                .map(|t| t.id)
+        });
+        let Some(parent_id) = parent else {
+            return;
+        };
+        log::info!(
+            "dispatch {agent_id}: wake line for parent {} submitted outside the confirm window",
+            super::model::short_id(&parent_id)
+        );
+        if matches!(self.state(agent_id), Delivery::Nudging { ticket_id, .. } if *ticket_id == parent_id)
+        {
+            self.set(agent_id, Delivery::Free);
+        }
+        self.wake_confirmed(agent_id, &parent_id);
+    }
+
+    /// The wake line was not confirmed in [`CONFIRM_TIMEOUT_MS`] after its Enter, or another
+    /// prompt went in (review 6a W1): the agent is free, the parent stays waiting and
+    /// [`TicketService::due_wake_for`] finds it again at the next idle — once; after
+    /// [`WAKE_MAX_ATTEMPTS`] unconfirmed attempts of the same wake the agent shows
+    /// [`WAKE_UNCONFIRMED_TEXT`] and the user asks again ("Bed om aflevering").
+    fn wake_unconfirmed(&mut self, agent_id: &str, parent_id: &str, why: &str) {
+        self.set(agent_id, Delivery::Free);
+        let short = super::model::short_id(parent_id);
+        let due = self
+            .host
+            .read(|s| s.due_wake_for(agent_id))
+            .filter(|w| w.parent.id == parent_id);
+        let Some(w) = due else {
+            log::info!(
+                "dispatch {agent_id}: wake for parent {short} not confirmed ({why}); no longer due"
+            );
+            self.wake_misses.remove(agent_id);
+            return;
+        };
+        let key = WakeKey::of(&w);
+        let misses = match self.wake_misses.get(agent_id) {
+            Some(m) if m.key == key => m.misses.saturating_add(1),
+            _ => 1,
+        };
+        self.wake_misses
+            .insert(agent_id.to_string(), WakeMiss { key, misses });
+        if misses >= WAKE_MAX_ATTEMPTS {
+            log::warn!(
+                "dispatch {agent_id}: wake for parent {short} not confirmed ({why}) after {misses} attempts; not typed again until the user asks"
+            );
+            self.port
+                .set_detail(agent_id, Some(WAKE_UNCONFIRMED_TEXT.to_string()));
+        } else {
+            log::info!(
+                "dispatch {agent_id}: wake for parent {short} not confirmed ({why}); typed again at the next idle"
+            );
         }
     }
 
@@ -1009,6 +1186,15 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     );
                 }
             }
+            (
+                Delivery::Waiting {
+                    ticket_id,
+                    token: t,
+                    kind: DeliveryKind::Wake,
+                    ..
+                },
+                TimerKind::Confirm,
+            ) if t == token => self.wake_unconfirmed(agent_id, &ticket_id, "timeout"),
             (
                 Delivery::Waiting {
                     ticket_id,
@@ -1238,6 +1424,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                         self.send_to_backlog(agent_id, ticket_id, TERMINAL_GONE_NOTE)
                     }
                     DeliveryKind::Review => self.review_failed(agent_id, ticket_id),
+                    DeliveryKind::Wake => self.set(agent_id, Delivery::Free),
                 }
                 false
             }
@@ -1255,6 +1442,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// No confirmation after the retry, or another prompt went in: the ticket stays first in
     /// the queue with an issue and `note` in its history (a review: see [`Self::review_failed`]).
     fn delivery_failed(&mut self, agent_id: &str, ticket_id: &str, note: &str, kind: DeliveryKind) {
+        if kind == DeliveryKind::Wake {
+            self.wake_unconfirmed(agent_id, ticket_id, note);
+            return;
+        }
         if kind == DeliveryKind::Review {
             log::info!("dispatch {agent_id}: review delivery of {ticket_id} failed ({note})");
             self.review_failed(agent_id, ticket_id);
@@ -3395,10 +3586,13 @@ mod tests {
         assert!(l.contains("1 del-ticket(s) mangler stadig"), "{l}");
         assert!(!l.contains("HEMMELIG"), "no child summary in the terminal");
         assert!(!l.contains(['\r', '\n']));
-        // P2: the parent waits until the line is entered.
+        // P2: the parent waits until the line is entered …
         assert_eq!(h.ticket(&p.id).state, S::Waiting);
         h.advance(ENTER_DELAY_MS);
         assert_eq!(h.writes()[1], enter("k1"));
+        // … and (review 6a W1) confirmed by its UserPromptSubmit.
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        h.submitted("k1", l);
         let pt = h.ticket(&p.id);
         assert_eq!(pt.state, S::InProgress);
         let last = pt.history.last().unwrap();
@@ -3461,6 +3655,8 @@ mod tests {
         h.idle("k1");
         h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
         assert_eq!(h.writes().len(), 2);
+        let l = h.writes()[0].1.clone();
+        h.submitted("k1", &l);
         assert_eq!(h.ticket(&p.id).state, S::InProgress);
     }
 
@@ -3486,6 +3682,7 @@ mod tests {
         )));
         assert!(l.contains(&format!("(ticketId {})", p.short_id())));
         h.advance(ENTER_DELAY_MS);
+        h.submitted("k1", &l);
         let pt = h.ticket(&p.id);
         assert_eq!(pt.state, S::InProgress);
         assert_eq!(
@@ -3500,7 +3697,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_is_not_confirmed_as_delivery() {
+    fn wake_is_confirmed_only_by_its_own_line() {
         let mut h = Harness::new();
         let (p, kids) = waiting_parent(&mut h, 2);
         h.svc().approve(&kids[0].id, 10).unwrap();
@@ -3511,18 +3708,146 @@ mod tests {
             assert!(!DeliveryKind::Work.confirms(id, &l));
             assert!(!DeliveryKind::Review.confirms(id, &l));
         }
-        // UserPromptSubmit with the line and a busy status change nothing.
+        // Review 6a W1: the wake kind confirms the parent's line only, and never a delivery line.
+        assert!(DeliveryKind::Wake.confirms(&p.id, &l));
+        assert!(!DeliveryKind::Wake.confirms(&kids[0].id, &l));
+        for other in [
+            format!("Ticket {}: x", p.short_id()),
+            format!("Koordiner ticket {}: x", p.short_id()),
+            format!("Review af ticket {}: x", p.short_id()),
+        ] {
+            assert!(!DeliveryKind::Wake.confirms(&p.id, &other), "{other}");
+        }
+        // Enter: a busy status and a prompt without text do not resume the parent.
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[1], enter("k1"));
         let before = h.ticket(&p.id);
-        h.submitted("k1", &l);
         h.send(DispatchMsg::AgentBusy {
             agent_id: "k1".into(),
         });
+        h.send(DispatchMsg::PromptSubmitted {
+            agent_id: "k1".into(),
+            prompt: None,
+        });
         assert_eq!(h.ticket(&p.id), before);
         assert_eq!(h.ticket(&kids[1].id).state, S::Review);
-        // The Enter still follows, and only then the parent resumes.
-        h.advance(ENTER_DELAY_MS);
-        assert_eq!(h.writes()[1], enter("k1"));
+        // The line's UserPromptSubmit does.
+        h.submitted("k1", &l);
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::InProgress);
+        assert_eq!(pt.history.last().unwrap().note.as_deref(), Some(WOKEN_NOTE));
+        // The confirm timer is stale now: nothing more happens.
+        h.set_status("k1", AgentStatus::Idle);
+        h.idle("k1");
+        h.advance(CONFIRM_TIMEOUT_MS + 10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.detail("k1"), None);
+    }
+
+    /// Review 6a W1: Esc (or an Enter that sends nothing) after the wake line: no confirmation,
+    /// so the parent stays waiting, the line is typed once more at the next idle, and after that
+    /// the agent shows the hint until the user asks again.
+    #[test]
+    fn unconfirmed_wake_keeps_parent_waiting_and_retries_once() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 2);
+        let l = h.writes()[0].1.clone();
+        // No prompt: still waiting while the confirmation may come …
+        h.advance(CONFIRM_TIMEOUT_MS - 1);
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        // … and after the timeout: no extra Enter, nothing typed until the next idle.
+        h.advance(1);
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.detail("k1"), None, "the first miss shows nothing");
+        // Next idle: the same line once more (still derived from the data).
+        h.idle("k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let w = h.writes();
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[2].1, l);
+        assert_eq!(w[3], enter("k1"));
+        h.advance(CONFIRM_TIMEOUT_MS);
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        assert_eq!(h.detail("k1").as_deref(), Some(WAKE_UNCONFIRMED_TEXT));
+        // Given up: no more lines at idle or queue changes.
+        h.idle("k1");
+        queue_changed(&mut h, "k1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 4);
+        // "Bed om aflevering" on the waiting parent types it again; confirmed, the hint goes.
+        h.send(DispatchMsg::RequestSubmission {
+            ticket_id: p.id.clone(),
+        });
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 6);
+        h.submitted("k1", &l);
         assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        assert_eq!(h.detail("k1"), None);
+    }
+
+    /// Review 6a W1: a changed wake (another child done) is typed again after a give-up, and a
+    /// stop/restart forgets the attempts.
+    #[test]
+    fn new_child_done_after_give_up_wakes_again() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 3);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        for _ in 0..WAKE_MAX_ATTEMPTS {
+            h.idle("k1");
+            h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS);
+        }
+        assert_eq!(h.writes().len(), 4);
+        assert_eq!(h.detail("k1").as_deref(), Some(WAKE_UNCONFIRMED_TEXT));
+        h.svc().approve(&kids[1].id, 20).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 6);
+        let l = h.writes()[4].1.clone();
+        assert!(l.contains(&kids[1].short_id()), "{l}");
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+    }
+
+    /// Review 6a W1: the wake line is never entered twice: not while its confirmation is
+    /// pending, not when it is confirmed late, and not when the user pressed Enter before ours.
+    #[test]
+    fn wake_line_is_never_typed_twice() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        // Pending confirmation: idle and queue changes start nothing.
+        h.idle("k1");
+        queue_changed(&mut h, "k1");
+        h.advance(CONFIRM_TIMEOUT_MS - 1);
+        assert_eq!(h.writes().len(), 2);
+        // The confirmation arrives after the timeout: still counts, nothing typed again.
+        h.advance(1);
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        h.idle("k1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+
+        // The user pressed Enter on the line before the app did: our Enter is dropped.
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        h.advance(ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS + 10_000);
+        assert_eq!(h.writes().len(), 1, "no Enter after the line went in");
     }
 
     #[test]

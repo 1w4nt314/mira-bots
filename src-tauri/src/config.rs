@@ -234,6 +234,12 @@ pub const WOKEN_NOTE: &str = "vækket: del-ticket godkendt";
 pub const CHILDREN_DONE_NOTE: &str = "alle del-tickets er afsluttet";
 /// History note on a child whose parent was deleted (its `parentId` is cleared).
 pub const PARENT_DELETED_NOTE: &str = "forælder slettet";
+/// Agent detail when the wake line of a waiting parent was not confirmed (no UserPromptSubmit
+/// with the line) in [`WAKE_MAX_ATTEMPTS`] attempts (review 6a W1).
+pub const WAKE_UNCONFIRMED_TEXT: &str = "Vækning ikke bekræftet, se terminalen";
+/// Attempts at typing the same wake line before the dispatcher gives up and shows
+/// [`WAKE_UNCONFIRMED_TEXT`]: the first one and one retry at the next idle (review 6a W1).
+pub const WAKE_MAX_ATTEMPTS: u8 = 2;
 
 // --- macOS / unix (step 7) ---
 
@@ -383,6 +389,11 @@ mod tests {
         assert_eq!(WOKEN_NOTE, "vækket: del-ticket godkendt");
         assert_eq!(CHILDREN_DONE_NOTE, "alle del-tickets er afsluttet");
         assert_eq!(PARENT_DELETED_NOTE, "forælder slettet");
+        assert_eq!(
+            WAKE_UNCONFIRMED_TEXT,
+            "Vækning ikke bekræftet, se terminalen"
+        );
+        assert_eq!(WAKE_MAX_ATTEMPTS, 2);
         // A.1: no schema bump (an older build would discard every newer file).
         assert_eq!(TICKETS_SCHEMA_VERSION, 1);
     }
