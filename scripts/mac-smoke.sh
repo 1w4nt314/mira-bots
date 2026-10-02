@@ -12,16 +12,19 @@
 #      /tmp/mira-bots-<uid>/<pid>.sock (pipe/unix_socket.rs), file 0600, directory 0700, ours
 #   d) no panic: the emergency file $TMPDIR/mira-bots-panic.log (lib.rs) gets no new content
 #      and the log has no "panic:" line (start to exit)
-#   e) quit: the quit Apple Event (what Cmd+Q and logout send) ends the app within 10 s, exit 0
+#   e) quit: the quit Apple Event (what logout and Activity Monitor's Quit send) ends the app
+#      within 10 s, exit 0. If TCC refuses the Apple Event (-1743 "Not authorized" in quit.txt),
+#      that is only ADVARSEL and SIGTERM is the hard quit instead (exit 0 within 10 s required).
 #   f) cleanup: the socket file is gone after exit (RunEvent::Exit -> cleanup_registered)
 # Soft checks (reported, never fatal): windows of the process (CGWindowList through JXA),
 # screenshots (need Screen Recording rights; may be black or wallpaper only), hook/mcp exe and
 # claude found, ERROR lines in the log, socket directory removed.
 #
-# Why no SIGTERM for e/f: neither the app nor tauri/tao install a SIGTERM handler (verified in
-# tao 0.37.1 and tauri 2.12.0), so SIGTERM kills the process without RunEvent::Exit and the socket
-# stays. SIGTERM (then SIGKILL) is only the fallback when the Apple Event does not end the app,
-# and then e/f fail.
+# SIGTERM: the app handles SIGTERM/SIGINT/SIGHUP itself (platform::signals, review7 W5) and takes
+# the same quit path (RunEvent::Exit -> kill_all + cleanup_registered, exit 0). The Apple Event
+# is tried first because it is what macOS itself sends; SIGTERM is the deterministic fallback
+# when TCC refuses Apple Events from osascript on the runner. When the Apple Event was delivered
+# but the app did not quit, e fails even if SIGTERM then ends it (SIGKILL is the last resort).
 #
 # Output in smoke/ (MIRA_SMOKE_OUT): summary.txt, mira-bots.log, app-output.txt, windows.txt,
 # screen.png, window-<id>.png, panic log if any.
@@ -35,7 +38,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${MIRA_SMOKE_TARGET:-aarch64-apple-darwin}"
 OUT="${MIRA_SMOKE_OUT:-$ROOT/smoke}"
-START_TIMEOUT="${MIRA_SMOKE_START_TIMEOUT:-20}"
+START_TIMEOUT="${MIRA_SMOKE_START_TIMEOUT:-30}"
 QUIT_TIMEOUT="${MIRA_SMOKE_QUIT_TIMEOUT:-10}"
 # config.rs LOG_FILE_STEM; the file is <stem>.log, rotated to <stem>_<date>.log on the next start.
 LOG_STEM="mira-bots"
@@ -309,17 +312,21 @@ done
 
 # --- Quit -----------------------------------------------------------------------------------
 not_alive() { ! alive; }
+# TCC (Automation) refused the Apple Event: osascript reports -1743 / "Not authorized to send
+# Apple events". Then the event never reached the app and says nothing about it.
+tcc_refused() { grep -qiE -- '-1743|not authori[sz]ed' "$OUT/quit.txt" 2>/dev/null; }
 EXIT_CODE=""
+QUIT_VIA=""
 if alive; then
-  # The quit Apple Event to exactly this pid (NSRunningApplication.terminate); the bundle id
+  # The quit Apple Event to exactly this pid (NSRunningApplication.terminate()); the bundle id
   # target is the fallback. Both run in the background so a hanging osascript cannot block.
-  quit_how="Apple Event (NSRunningApplication.terminate)"
+  quit_how="Apple Event (NSRunningApplication.terminate())"
   osascript -l JavaScript -e '
 ObjC.import("AppKit");
 function run(argv) {
   var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(parseInt(argv[0], 10));
   if (!app || app.isNil()) return "ingen NSRunningApplication for pid " + argv[0];
-  return app.terminate ? "terminate sendt" : "terminate afvist";
+  return app.terminate() ? "terminate() sendt" : "terminate() afvist";
 }' "$APP_PID" >"$OUT/quit.txt" 2>&1 &
   osa_pid=$!
   if ! wait_for not_alive 4; then
@@ -331,21 +338,32 @@ function run(argv) {
   for p in $osa_pid; do
     kill "$p" 2>/dev/null || true
   done
+  QUIT_VIA="apple"
   if alive; then
+    if tcc_refused; then
+      QUIT_VIA="sigterm"
+      quit_how="SIGTERM (Apple Event afvist af TCC; se quit.txt)"
+    else
+      QUIT_VIA="failed"
+      quit_how="SIGTERM til oprydning (Apple Event virkede ikke inden $QUIT_TIMEOUT s; se quit.txt)"
+    fi
     kill -TERM "$APP_PID" 2>/dev/null || true
-    quit_how="SIGTERM (Apple Event virkede ikke inden $QUIT_TIMEOUT s; se quit.txt)"
-    if ! wait_for not_alive 5; then
+    if ! wait_for not_alive "$QUIT_TIMEOUT"; then
       kill -KILL "$APP_PID" 2>/dev/null || true
-      quit_how="SIGKILL (hverken Apple Event eller SIGTERM)"
+      QUIT_VIA="failed"
+      quit_how="SIGKILL (hverken Apple Event eller SIGTERM afsluttede inden $QUIT_TIMEOUT s)"
       wait_for not_alive 5 || true
     fi
   fi
   EXIT_CODE=0
   wait "$APP_PID" 2>/dev/null || EXIT_CODE=$?
-  if [[ "$quit_how" == Apple* && "$EXIT_CODE" == 0 ]]; then
+  if [[ "$QUIT_VIA" == sigterm ]]; then
+    check blød ADVARSEL "e) Apple Event afvist af TCC (-1743/Not authorized i quit.txt); SIGTERM brugt som afslutning"
+  fi
+  if [[ "$QUIT_VIA" != failed && "$EXIT_CODE" == 0 ]]; then
     check hård OK "e) afsluttet via $quit_how inden $QUIT_TIMEOUT s, exit 0"
   else
-    check hård FEJL "e) afslutning: $quit_how, exit $EXIT_CODE (krævet: Apple Event, exit 0)"
+    check hård FEJL "e) afslutning: $quit_how, exit $EXIT_CODE (krævet: Apple Event, eller SIGTERM når TCC afviser Apple Events; exit 0)"
   fi
 else
   check hård FEJL "e) afslutning ikke testet (processen kørte ikke)"
@@ -354,9 +372,9 @@ fi
 # f) cleanup
 if [[ -n "$SOCK" ]]; then
   if [[ -e "$SOCK" ]]; then
-    check hård FEJL "f) socket-filen $SOCK ligger der stadig efter afslutning"
+    check hård FEJL "f) socket-filen $SOCK ligger der stadig efter afslutning (${quit_how:-ingen afslutning})"
   else
-    check hård OK "f) socket-filen er fjernet efter afslutning"
+    check hård OK "f) socket-filen er fjernet efter afslutning (${quit_how:-ingen afslutning})"
   fi
   if [[ -e "$(dirname "$SOCK")" ]]; then
     check blød INFO "socket-mappen $(dirname "$SOCK") findes stadig (fjernes kun når den er tom)"

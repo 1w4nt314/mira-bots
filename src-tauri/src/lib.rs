@@ -583,6 +583,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         profiles_migrated,
     });
 
+    // After `manage`: the exit handler's `kill_all` needs `AppState` (review7 W5).
+    #[cfg(unix)]
+    platform::signals::install(app.handle().clone());
+
     if let Some(window) = app.get_webview_window(island::LABEL) {
         let (w, h) = island::COLLAPSED;
         if let Err(e) = island::place(&window, w, h) {

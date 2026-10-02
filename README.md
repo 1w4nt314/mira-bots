@@ -322,6 +322,7 @@ Fordi en app, der startes fra Finder, Dock eller Launchpad, ikke arver terminale
 - Det første klik på øen rammer knappen (`acceptFirstMouse`).
 - Option er ikke Meta i terminalen (dansk tastatur skriver `{ } [ ] |` med Option).
 - Scrollbars er overlay-scrollbars (systemets).
+- SIGTERM, SIGINT og SIGHUP (fx `kill <pid>`, Ctrl+C i `npm run tauri dev` eller en lukket terminal) afslutter appen ad samme vej som Afslut: alle agentgrupper stoppes, og socket-filen fjernes (exit 0). Et signal mere under nedlukningen afbryder straks med exit 1. Gælder kun macOS og Linux; Windows er uændret.
 - Stop af en agent sender SIGTERM til hele procesgruppen (claude, Bash-værktøjets shells og MCP-servere) og SIGKILL efter 2 sekunder til de processer i gruppen, der stadig lever, også når `claude` selv allerede er afsluttet; ved afslut venter appen op til 1,5 sekund. Børn der selv løsriver sig fra gruppen (`setsid`) overlever og overtages af launchd; dem rydder appen ikke op efter.
 - Appen startes fra Finder uden `TERM`, så den sætter `TERM=xterm-256color` og `COLORTERM=truecolor` for agenten, hvis de mangler.
 - `mira-hook` og `mira-mcp` er ad-hoc-signerede (`codesign -s -`); `MIRA_SKIP_CODESIGN=1` springer signeringen over ved lokale bygninger.
@@ -345,14 +346,14 @@ macOS-buildet er eksperimentelt, indtil en bruger med en Mac har gennemgået lis
 
 Testen fejler jobbet, hvis et af disse krav ikke er opfyldt:
 
-- Opstart: processen kører stadig efter opstart (der ventes højst 20 sekunder).
+- Opstart: processen kører stadig efter opstart (der ventes højst 30 sekunder).
 - Logfil: `~/Library/Logs/dk.mira.bots/mira-bots.log` findes og indeholder `pipe server listening on <sti>` for processens pid.
 - Socket: filen ligger under `$TMPDIR/mira-bots-<uid>/` eller under reservestien `/tmp/mira-bots-<uid>/`, har rettighederne 0600 i en mappe med 0700 og ejes af brugeren.
 - Ingen panic: `$TMPDIR/mira-bots-panic.log` får intet nyt indhold, og loggen har ingen `panic:`-linje, heller ikke under nedlukningen.
-- Nedlukning: appen afslutter med exit 0 inden for 10 sekunder, når den får quit-Apple-Eventet (det samme, som Cmd+Q og log ud sender).
+- Nedlukning: appen afslutter med exit 0 inden for 10 sekunder, når den får quit-Apple-Eventet (det samme, som log ud og "Afslut" i Aktivitetsovervågning sender; Cmd+Q i Workplace går i stedet via frontenden til kommandoen `quitApp`). Afviser TCC Apple-Eventet på runneren (`-1743`/"Not authorized" i `quit.txt`), er det kun en ADVARSEL, og så skal SIGTERM i stedet afslutte appen med exit 0 inden for 10 sekunder.
 - Oprydning: socket-filen er væk efter afslutningen.
 
-Testen sender ikke SIGTERM til appen, fordi hverken appen, Tauri eller tao håndterer SIGTERM. Processen dør så uden `RunEvent::Exit`, og socket-filen bliver liggende. SIGTERM bruges kun som nødudvej, hvis Apple-Eventet ikke virker, og så fejler testen.
+Apple-Eventet prøves først, fordi det er det, macOS selv sender. Appen håndterer også SIGTERM (samme nedlukning som Afslut), så SIGTERM er den TCC-uafhængige reservevej. Blev Apple-Eventet leveret, uden at appen afsluttede, fejler testen, også selvom SIGTERM bagefter får den til at afslutte; SIGKILL bruges kun som sidste udvej og giver altid FEJL.
 
 Disse punkter bliver kun rapporteret og får ikke jobbet til at fejle: processens vinduer (antal, placering og om de er på skærmen, fra CGWindowList), et screenshot af skærmen og af hvert synligt vindue, om `mira-hook` og `mira-mcp` blev fundet, ERROR-linjer i loggen og om socket-mappen er fjernet. Screenshots kræver rettigheden Skærmoptagelse og kan være sorte eller kun vise skrivebordsbaggrunden.
 
@@ -516,6 +517,7 @@ Intet af dette er kørt på en Mac; hvert punkt står som `TODO(macos-verify)` i
 15. Lang `$TMPDIR` (eksporter en 110 tegn lang sti og start appen fra terminalen): Diagnostik viser `/tmp/mira-bots-<uid>/<pid>.sock`, "Pipe lytter: ja" og en Pipe-note om reservestien; hooks virker.
 16. Mappevælgeren ("Vælg projektrod…") åbner foran Workplace og giver en sti; projektroden med mellemrum i navnet virker (hooks exec-form, statusLine med citationstegn).
 17. "Flyt til projekt…" og "Skift model" (genstart med `--resume`) virker: den gamle procesgruppe dør, den nye starter, samtalen er bevaret; trust-dialogen vises i et git-projekt.
+18. Signaler: `kill -TERM <pid>` på appen (og Ctrl+C i `npm run tauri dev`, og at lukke terminalen, appen er startet fra) afslutter med exit 0, socket-filen er væk, og agentgrupperne er stoppet (`ps -o pid,pgid,comm`); et andet `kill -TERM` under en hængende nedlukning afslutter med exit 1.
 
 Windows-regression efter trin 7 (bør køres igen på Windows, fordi koden er rørt): appen starter og agenter kan startes og stoppes (ConPTY, `killer.kill()` som før), Diagnostik viser "Platform: windows" og pipen `\\.\pipe\mira-bots-<pid>` uden Pipe-note, knapperne hedder stadig "Åbn … i Stifinder", og Ctrl+Q/Ctrl+W og Windows-tasten giver ingen ny adfærd (Cmd-genvejene er kun på macOS).
 

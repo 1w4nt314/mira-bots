@@ -102,7 +102,8 @@ jobs:
       # beforeBuildCommand builds, copies and ad-hoc signs mira-hook/mira-mcp and the frontend.
       - run: npm run tauri -- build --target aarch64-apple-darwin --bundles app
       # Runtime smoke test without user interaction and without claude: start, log file, socket
-      # (0600/0700), quit via Apple Event, socket removed; screenshots are best effort.
+      # (0600/0700), quit via Apple Event (SIGTERM if TCC refuses it), socket removed; screenshots
+      # are best effort.
       - name: Smoke test the .app
         run: bash scripts/mac-smoke.sh
       - name: Upload the smoke test results
