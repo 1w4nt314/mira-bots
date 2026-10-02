@@ -606,12 +606,12 @@ pub fn ticket_redispatch(t: &TicketsCtx, id: &str) -> Result<(), String> {
     }
 }
 
-/// "Bed om aflevering": the ticket must be in progress with a live agent; the dispatcher then
-/// types the nudge line (C4.7) once the agent is idle and no delivery runs (otherwise it only
-/// logs).
+/// "Bed om aflevering": the ticket must be in progress (or a waiting parent, whose wake line is
+/// then typed again; review 6a R2-1) with a live agent; the dispatcher types the line once the
+/// agent is idle and no delivery runs (otherwise it only logs).
 pub fn ticket_request_submission(t: &TicketsCtx, id: &str) -> Result<(), String> {
     let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
-    if tk.state != TicketState::InProgress {
+    if !matches!(tk.state, TicketState::InProgress | TicketState::Waiting) {
         return Err(TicketError::NotInProgress.into());
     }
     let live = tk
@@ -3007,6 +3007,51 @@ mod tests {
         assert_eq!(got.state, TicketState::Assigned);
         assert_eq!(got.queue_position, Some(0));
         assert_eq!(lock(&t.ctx.manager).get(&live).unwrap().queue_length, 1);
+    }
+
+    #[test]
+    fn request_submission_accepts_a_waiting_parent() {
+        // Review 6a R2-1: "Bed om aflevering" on a waiting parent types the wake line again.
+        let (mut t, live, _dead) = tickets_setup();
+        let parent = ticket_create(&t.ctx, "forælder", "", false, p()).unwrap();
+        t.ctx
+            .mutate(|s| {
+                s.assign(&parent.id, &live, 2)?;
+                s.mark_dispatched(&parent.id, "bot", 3)
+            })
+            .unwrap();
+        t.ctx
+            .mutate(|s| {
+                s.create_by_agent_related(
+                    "barn",
+                    "",
+                    false,
+                    None,
+                    None,
+                    Some(parent.id.clone()),
+                    vec![],
+                    4,
+                )
+            })
+            .unwrap();
+        let waiting = t
+            .ctx
+            .mutate(|s| s.submit_by_agent(&live, None, "fordelt", 5))
+            .unwrap();
+        assert_eq!(waiting.state, TicketState::Waiting);
+        t.sent();
+        ticket_request_submission(&t.ctx, &parent.id).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::RequestSubmission {
+                ticket_id: parent.id.clone()
+            }]
+        );
+        // Still waiting: the command only asks the dispatcher.
+        assert_eq!(
+            t.ctx.read(|s| s.get(&parent.id)).unwrap().state,
+            TicketState::Waiting
+        );
     }
 
     #[test]

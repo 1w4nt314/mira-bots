@@ -234,22 +234,23 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
                   {p.done}/{p.total}
                 </span>
               )}
-              {/* Review 6a W1: the wake line went unconfirmed; the user asks for it again. */}
-              {hintText === WAKE_UNCONFIRMED_TEXT && (
-                <button
-                  type="button"
-                  onClick={() => void run(() => requestSubmission(t.id))}
-                  disabled={!canRequestSubmission(t, agent)}
-                  title={
-                    canRequestSubmission(t, agent)
-                      ? "Taster beskeden om de godkendte del-tickets i terminalen igen"
-                      : "Virker når agenten er Klar"
-                  }
-                  className={smallBtn}
-                >
-                  Bed om aflevering
-                </button>
-              )}
+              {/* Review 6a W1/R2-2: always offered (the detail text is overwritten by the next
+                  hook event); harmless when no wake is due, types the wake line again otherwise. */}
+              <button
+                type="button"
+                onClick={() => void run(() => requestSubmission(t.id))}
+                disabled={!canRequestSubmission(t, agent)}
+                title={
+                  !canRequestSubmission(t, agent)
+                    ? "Virker når agenten er Klar"
+                    : hintText === WAKE_UNCONFIRMED_TEXT
+                      ? "Vækningen blev ikke bekræftet: taster beskeden om de godkendte del-tickets igen"
+                      : "Taster beskeden om de godkendte del-tickets i terminalen igen, hvis vækningen udeblev"
+                }
+                className={smallBtn}
+              >
+                Bed om aflevering
+              </button>
             </div>
           );
         })}
