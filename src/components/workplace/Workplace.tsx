@@ -234,6 +234,10 @@ export default function Workplace() {
   );
 
   // The project rule before an assignment (plan4b A.2): the backend checks it again.
+  // TODO(windows-verify): a seat in another project shows "Andet projekt: kan ikke få ticketen"
+  // while dragging and the drop opens the explanation; "Tildel…" opens the same dialog; a ticket
+  // without a project on a work agent asks "Hvilket projekt?"; a staff seat takes it directly
+  // (plan4b D.82).
   const assignTo = useCallback(
     (ticket: TicketSummary, agent: AgentInfo) => {
       const issue = assignmentIssue(ticket, agent);

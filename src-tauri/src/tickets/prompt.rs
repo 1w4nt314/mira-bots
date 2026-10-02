@@ -219,6 +219,9 @@ impl TicketDelivery {
 }
 
 /// `## Delt projekt` (plan4b C4b.6); `{project}` and `{others}` are filled in.
+// TODO(windows-verify): with two work agents in one project the second agent's ticket file has
+// the "Delt projekt" section naming the first, the project name on the desk shows "⚠" until a
+// coordinator runs, and maxAgentsPerProject refuses the next agent (plan4b D.84).
 pub const SHARED_PROJECT_TEXT: &str = "Andre agenter arbejder i samme mappe (projekt «{project}»): {others}. Hold dig til de filer din ticket handler om. Brug `git add <stier>` på netop dine filer — aldrig `git add -A` eller `git add .`. Kør ikke `git reset`, `git checkout -- <fil>`, `git stash` eller andet, der rører de andres ændringer; opdager du ændringer, du ikke selv har lavet, så lad dem stå. Skriv i din rapport, hvilke filer du har rørt.";
 
 /// The `## Delt projekt` text for `shared`.
@@ -230,6 +233,9 @@ pub fn shared_project_text(shared: &SharedProject) -> String {
 }
 
 /// The project line of a coordination task (plan4b C4b.6).
+// TODO(windows-verify): the staff agent (in the projects root) can read and `ls`/`git -C`
+// `projects\<p>\…` without extra directory flags or permission prompts, mira_list_projects lists the
+// folders and the coordination file shows "Projekter lige nu: …" (plan4b D.80).
 pub fn project_list_text(list: &ProjectList) -> String {
     let ids = if list.ids.is_empty() {
         "ingen".to_string()

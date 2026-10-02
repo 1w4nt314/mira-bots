@@ -439,6 +439,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Profiles: one JSON file each under <projects_root>/.mira-bots/profiles; the built-ins are
     // generated on first start. The rendered per-profile files are written at spawn/save. The
     // first time, the step 1–5 profiles are copied from <home>/mira-bots/agents (never moved).
+    // TODO(windows-verify): on the first start after the upgrade %USERPROFILE%\mira-bots\projects\
+    // exists, the seven profiles are copied from agents\.mira-bots\profiles\ (source untouched) and
+    // Diagnostik shows the root, the workspace file and "Profiler kopieret ved start: 7" (plan4b D.77).
     let profiles_dir = profiles_dir(&projects_root);
     let legacy_profiles = profiles::store::profiles_dir(&legacy_agents_root(&home));
     let profiles_migrated = match migrate_legacy_profiles(&legacy_profiles, &profiles_dir) {

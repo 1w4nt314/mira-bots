@@ -189,6 +189,9 @@ pub fn find_project(root: &Path, name: &str) -> Option<Project> {
         .find(|p| same_id(&p.id, name))
 }
 
+// TODO(windows-verify): a 64-char project under a ~60-char root keeps
+// `<root>\<project>\.mira-bots\tickets\<id>.md` under 260 chars and Claude Code starts there;
+// `a_b` and `a-b` can both be used (their transcripts share one folder, plan4b D.87).
 /// Creates `<root>/<name>` (and the root if missing). Refuses invalid names, existing projects
 /// (case-insensitive) and paths longer than [`PROJECT_PATH_MAX_CHARS`].
 pub fn create_project(root: &Path, name: &str) -> Result<Project, ProjectError> {
