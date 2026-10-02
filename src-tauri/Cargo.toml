@@ -13,7 +13,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `macos-private-api` must match `app.macOSPrivateApi` in tauri.conf.json (tauri-build checks it;
+# plan7 A.5). It only changes macOS builds (transparent island).
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"

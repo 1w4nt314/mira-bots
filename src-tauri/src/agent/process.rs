@@ -28,7 +28,13 @@ pub fn spawn_env_extra() -> Vec<(String, String)> {
     #[cfg(unix)]
     {
         let has = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-        terminal_env_defaults_for(has("TERM"), has("COLORTERM"))
+        let mut out = terminal_env_defaults_for(has("TERM"), has("COLORTERM"));
+        if super::login_env::source() == super::login_env::SOURCE_LOGIN_SHELL {
+            if let Some(path) = super::login_env::path() {
+                out.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
+            }
+        }
+        out
     }
     #[cfg(windows)]
     {

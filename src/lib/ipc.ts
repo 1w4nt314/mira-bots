@@ -44,6 +44,7 @@ export const COMMANDS = {
   quitApp: "quit_app",
   getDiagnostics: "get_diagnostics",
   openWorkplace: "open_workplace",
+  closeWorkplace: "close_workplace",
   takeWorkplaceSelection: "take_workplace_selection",
   openAgentFolder: "open_agent_folder",
   openLogDir: "open_log_dir",
@@ -138,6 +139,8 @@ export const openWorkplace = (
   tab: WorkplaceTab | null = null,
   spawn: SeatKind | null = null,
 ) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn });
+/** Closes the workplace window (Cmd+W on macOS); `true` when a window was open. */
+export const closeWorkplace = () => invoke<boolean>(COMMANDS.closeWorkplace);
 /** Takes the selection stored by `openWorkplace` for a newly created window (once). */
 export const takeWorkplaceSelection = () =>
   invoke<WorkplaceSelection | null>(COMMANDS.takeWorkplaceSelection);

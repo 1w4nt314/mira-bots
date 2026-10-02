@@ -324,6 +324,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         log::max_level()
     );
+    platform::apply_activation_policy(app);
     let handle = app.handle().clone();
 
     let data_dir = app.path().app_data_dir().unwrap_or_else(|e| {
@@ -345,6 +346,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => log::info!("mcp exe: {}", p.display()),
         None => log::warn!("mira-mcp not found; agents get no tools (set MIRA_MCP_EXE)"),
     }
+    // The login shell's PATH (unix; at most LOGIN_SHELL_TIMEOUT) before the first claude lookup
+    // and before the version probe; children get it through process::spawn_env_extra.
+    agent::login_env::init();
     // Only logged: the lookup is repeated on every get_app_info/spawn_agent.
     match find_claude() {
         Some(p) => log::info!("claude: {}", p.display()),
@@ -631,6 +635,7 @@ pub fn run() {
             commands::quit_app,
             commands::get_diagnostics,
             commands::open_workplace,
+            commands::close_workplace,
             commands::take_workplace_selection,
             commands::open_agent_folder,
             commands::open_log_dir,
@@ -751,10 +756,10 @@ mod tests {
         }
     }
 
-    /// The Tauri command list (plan4b punkt 9: 44 → 49). Counted from the source so a command
-    /// added without a handler (or the other way round) is noticed.
+    /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50). Counted from the
+    /// source so a command added without a handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_49_commands() {
+    fn generate_handler_lists_50_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -763,8 +768,9 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 49, "{names:?}");
+        assert_eq!(names.len(), 50, "{names:?}");
         for n in [
+            "close_workplace",
             "list_projects",
             "create_project",
             "open_project_folder",
@@ -777,6 +783,34 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "duplicates");
+    }
+
+    /// plan7 punkt 8: the macOS keys in tauri.conf.json and the platform file merged on macOS.
+    #[test]
+    fn tauri_configs_carry_the_macos_settings() {
+        let main: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let island = main["app"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["label"] == island::LABEL)
+            .expect("island window");
+        assert_eq!(island["acceptFirstMouse"], true);
+        assert_eq!(main["app"]["macOSPrivateApi"], true);
+        // The Windows bundle targets stay as they were.
+        assert_eq!(
+            main["bundle"]["targets"],
+            serde_json::json!(["nsis", "msi"])
+        );
+
+        let mac: serde_json::Value = serde_json::from_str(include_str!("../tauri.macos.conf.json"))
+            .expect("tauri.macos.conf.json");
+        assert_eq!(mac["bundle"]["targets"], serde_json::json!(["app", "dmg"]));
+        let mac_bundle = &mac["bundle"]["macOS"];
+        assert_eq!(mac_bundle["minimumSystemVersion"], "13.0");
+        assert_eq!(mac_bundle["signingIdentity"], "-");
+        assert_eq!(mac_bundle["hardenedRuntime"], false);
     }
 
     #[test]

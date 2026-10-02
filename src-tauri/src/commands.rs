@@ -1,8 +1,8 @@
 //! Tauri commands (contracts C.1 + C2.1 + C3.2) and the managed [`AppState`].
 //!
-//! All commands except `open_workplace` (async: window creation) are synchronous and return
-//! `Result<T, String>`; errors are Danish, user-facing text. Locks are held briefly and never
-//! while emitting.
+//! All commands except `open_workplace`/`close_workplace` (async: window operations) are
+//! synchronous and return `Result<T, String>`; errors are Danish, user-facing text. Locks are
+//! held briefly and never while emitting.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1668,6 +1668,15 @@ pub async fn open_workplace(
         }
     }
     Ok(())
+}
+
+/// Closes the workplace window (Cmd+W on macOS). `true` when a window was open. Async like
+/// `open_workplace`: window operations from a synchronous command can deadlock on Windows.
+#[tauri::command]
+pub async fn close_workplace(app: AppHandle) -> Result<bool, String> {
+    let closed = workplace::close(&app).map_err(|e| format!("Kunne ikke lukke Workplace: {e}"))?;
+    log::info!("workplace close requested (window open: {closed})");
+    Ok(closed)
 }
 
 #[tauri::command]

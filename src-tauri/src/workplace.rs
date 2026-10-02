@@ -36,6 +36,20 @@ pub fn open_or_focus(app: &AppHandle) -> tauri::Result<bool> {
     Ok(true)
 }
 
+/// Closes the workplace window like its close button (the app keeps running; the island stays).
+/// Returns whether there was a window. Used by Cmd+W on macOS (plan7 A.5).
+// TODO(macos-verify): Cmd+W closes the workplace and the red close button closes it without
+// ending the app (plan7 M.6).
+pub fn close(app: &AppHandle) -> tauri::Result<bool> {
+    match app.get_webview_window(LABEL) {
+        Some(window) => {
+            window.close()?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,6 +5,23 @@ pub fn name() -> &'static str {
     std::env::consts::OS
 }
 
+/// macOS: `ActivationPolicy::Accessory` (no Dock icon, no menu bar, not in Cmd+Tab; windows
+/// still become key). Other platforms: nothing. Tauri's default menu stays on (Cmd+C/V may
+/// depend on it).
+// TODO(macos-verify): Accessory: no Dock icon, workplace still gets keyboard focus, Cmd+Q/W/C/V
+// (plan7 M.2, M.6)
+pub fn apply_activation_policy(app: &mut tauri::App) {
+    #[cfg(target_os = "macos")]
+    {
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        log::info!("macOS activation policy: Accessory");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

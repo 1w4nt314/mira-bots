@@ -3,6 +3,14 @@
 //!
 //! Hover is handled with JS events (`mouseenter`/`mouseleave`) in a permanent 8 px window, so
 //! there is no Win32 code, no cursor polling and no click-through state in step 1.
+//!
+//! macOS: work_area = NSScreen.visibleFrame (under the menu bar and the notch); always_on_top =
+//! NSFloatingWindowLevel (not above full-screen spaces); `skipTaskbar` is a no-op there (the
+//! Accessory activation policy keeps the app out of the Dock and Cmd+Tab, see `platform.rs`);
+//! `acceptFirstMouse` lets the first click on an inactive island reach the buttons.
+// TODO(macos-verify): the island sits top-centred just under the menu bar/notch, stays above other
+// windows in normal spaces only, the first click hits Tillad/Afvis (does it activate the app and
+// raise the workplace?), and the transparent window shows no white flash (plan7 M.2, M.3, M.4, M.5).
 
 use std::sync::Mutex;
 
