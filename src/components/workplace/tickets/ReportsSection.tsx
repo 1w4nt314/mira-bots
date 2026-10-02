@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useTheme } from "../../../lib/bots";
 import { addReport, errorMessage, getReport, getTicket, openReportDir } from "../../../lib/ipc";
 import { REPORT_BODY_MAX, REPORT_TITLE_MAX } from "../../../lib/models";
+import { openFolderTitle } from "../../../lib/platform";
 import { isExited } from "../../../lib/status";
 import { formatAt } from "../../../lib/tickets";
 import type { TicketReport, TicketSummary } from "../../../lib/types";
@@ -152,7 +153,7 @@ interface Props {
  * adds a report as the user; "Åbn mappe" opens the ticket's report folder.
  */
 // TODO(windows-verify): "Rapporter (1)" on the note, unfolding renders the markdown with æøå,
-// "Åbn mappe" opens Explorer in %APPDATA%\dk.mira.bots\tickets\<id>\reports (plan D.58).
+// "Åbn mappe" opens the file manager in %APPDATA%\dk.mira.bots\tickets\<id>\reports (plan D.58).
 export default function ReportsSection({ ticket: t, defaultOpen = false }: Props) {
   const run = useRun();
   const [open, setOpen] = useState(defaultOpen);
@@ -209,7 +210,7 @@ export default function ReportsSection({ ticket: t, defaultOpen = false }: Props
             <button
               type="button"
               onClick={() => void run(() => openReportDir(t.id))}
-              title="Åbn ticketens rapportmappe i Stifinder"
+              title={openFolderTitle("ticketens rapportmappe")}
               className={smallBtn}
             >
               Åbn mappe

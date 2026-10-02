@@ -227,7 +227,7 @@ export const addReport = (ticketId: string, title: string, body: string) =>
   invoke<TicketReport>(COMMANDS.addReport, { ticketId, title, body });
 export const getReport = (ticketId: string, reportId: string) =>
   invoke<ReportContent>(COMMANDS.getReport, { ticketId, reportId });
-/** Opens the ticket's report folder in Explorer (created first if needed). */
+/** Opens the ticket's report folder in the file manager (created first if needed). */
 export const openReportDir = (ticketId: string) =>
   invoke<void>(COMMANDS.openReportDir, { ticketId });
 /** Picks the reviewer of a ticket in review; `null` removes it and routes the ticket again. */
@@ -242,7 +242,7 @@ export const listProjects = () => invoke<Project[]>(COMMANDS.listProjects);
 /** Creates a project folder (Windows folder-name rules; existing names are refused). */
 export const createProject = (name: string) =>
   invoke<Project>(COMMANDS.createProject, { name });
-/** Opens a project folder (`null` = the projects root) in Explorer. */
+/** Opens a project folder (`null` = the projects root) in the file manager. */
 export const openProjectFolder = (project: string | null) =>
   invoke<void>(COMMANDS.openProjectFolder, { project });
 /** Stores a new projects root; it applies after a restart of mira-bots. Returns the path. */

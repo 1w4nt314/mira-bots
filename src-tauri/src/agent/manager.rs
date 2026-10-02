@@ -599,6 +599,8 @@ impl AgentManager {
     /// Returns the result and the old PTY handle, which the caller must drop after releasing the
     /// manager lock (see [`Self::mark_exited`]). If the new child cannot be started the agent is
     /// marked exited (the caller releases its tickets).
+    // TODO(macos-verify): the old process group dies (no stray claude/node/mira-mcp), the new one
+    // resumes the conversation (plan7 M.17)
     pub fn restart(
         &mut self,
         id: &str,

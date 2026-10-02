@@ -10,6 +10,7 @@ import {
   writeAgentInput,
 } from "../lib/ipc";
 import { XTERM_MIN } from "../lib/office";
+import { isWindows } from "../lib/platform";
 import { classifyInput } from "../lib/terminalInput";
 import { decodeBase64, planChunk } from "../lib/terminalSeq";
 import type { AgentOutputPayload } from "../lib/types";
@@ -18,8 +19,6 @@ import { useStore } from "../state/store";
 // Smallest size ever sent to the PTY; smaller boxes keep the last good size (see fitNow).
 const MIN_PTY_ROWS = 2;
 const MIN_PTY_COLS = 20;
-
-const isWindows = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
 /** xterm colours from the `--term-*` CSS tokens (styles.css), so both themes stay in one place. */
 function readTermTheme(): ITheme {
@@ -86,7 +85,10 @@ export default function AgentTerminal({ agentId, exited }: { agentId: string; ex
       fontSize: 13,
       fontFamily: '"Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace',
       theme: readTermTheme(),
-      windowsPty: isWindows ? { backend: "conpty" } : undefined,
+      windowsPty: isWindows() ? { backend: "conpty" } : undefined,
+      // `macOptionIsMeta` is deliberately off: Danish keyboards type { } [ ] | with Option.
+      // TODO(macos-verify): Option+7/8/9 give { [ ] on a Danish keyboard, æøå arrive, and Claude
+      // Code's TUI shows colours, Enter/arrows/Esc/Ctrl+C work (plan7 M.8)
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

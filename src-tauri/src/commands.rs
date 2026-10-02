@@ -1324,6 +1324,9 @@ pub fn move_gate(
 // TODO(windows-verify): the agent restarts with --resume in the new folder, the conversation is
 // kept, the trust dialog comes for a git project, and the next ticket file lands in the new
 // folder (plan4b D.81).
+// TODO(macos-verify): "Flyt til projekt…" and "Skift model" restart with --resume: the old process
+// group dies, the new one starts, the conversation is kept, the trust dialog shows in a git project
+// (plan7 M.17).
 #[tauri::command]
 pub fn move_agent_to_project(
     app: AppHandle,
@@ -1415,6 +1418,9 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
 
 // TODO(windows-verify): the path is stored in %APPDATA%\dk.mira.bots\app-settings.json and
 // only used after a restart (plan4b D.86).
+// TODO(macos-verify): the folder picker ("Vælg projektrod…") opens in front of the workplace and
+// returns a path; a project root with spaces in its name works (hooks exec form, quoted statusLine)
+// (plan7 M.16).
 #[tauri::command]
 pub fn set_projects_root(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let stored = store_projects_root(&state.paths.data_dir, &path)?;
@@ -1689,6 +1695,7 @@ pub fn take_workplace_selection(
 /// Opens the agent's working folder in the file manager (opener plugin, called from Rust: no JS
 /// capability needed).
 // TODO(windows-verify): opens Explorer on the right folder (plan D.22).
+// TODO(macos-verify): "Åbn mappe" opens Finder on the folder (plan7 M.13).
 #[tauri::command]
 pub fn open_agent_folder(
     app: AppHandle,
@@ -1706,6 +1713,7 @@ pub fn open_agent_folder(
 
 /// Opens the log folder (created first if needed).
 // TODO(windows-verify): opens Explorer on %LOCALAPPDATA%\dk.mira.bots\logs (plan D.18/D.22).
+// TODO(macos-verify): "Åbn logmappe" opens Finder on ~/Library/Logs/dk.mira.bots (plan7 M.13).
 #[tauri::command]
 pub fn open_log_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let dir = match state

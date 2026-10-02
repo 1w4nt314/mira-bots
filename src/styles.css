@@ -180,6 +180,9 @@ html[data-window="island"] body,
 html[data-window="island"] #root {
   background: transparent;
   overflow: hidden;
+  /* TODO(macos-verify): WKWebView draws the office/figures/SVG gradients, follows dark/light live,
+     has overlay scrollbars, and no text in the island can be selected (plan7 M.14) */
+  -webkit-user-select: none; /* WKWebView (Safari) needs the prefix */
   user-select: none;
 }
 

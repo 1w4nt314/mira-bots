@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Theme } from "../../lib/bots";
 import { errorMessage, openAgentFolder, removeAgent, stopAgent } from "../../lib/ipc";
 import { effortLabel, modelLabel } from "../../lib/models";
+import { openFolderTitle } from "../../lib/platform";
 import type { TermMode } from "../../lib/office";
 import { rolesText } from "../../lib/roles";
 import { isExited, isStartingHint, statusLabel } from "../../lib/status";
@@ -245,7 +246,7 @@ export default function TerminalPanel(props: Props) {
           <button
             type="button"
             onClick={() => void run(() => openAgentFolder(agent.id))}
-            title="Åbn agentens mappe i Stifinder"
+            title={openFolderTitle("agentens mappe")}
             aria-label={`Åbn mappen for ${agent.name}`}
             className={btn}
           >

@@ -282,6 +282,9 @@ fn resolve_home(app: &AppHandle, fallback: &Path) -> PathBuf {
 
 /// The projects root (plan4b A.1): the app setting when set and not blank, otherwise
 /// `<home>/mira-bots/projects`. Created if missing (a failure is only logged).
+// TODO(macos-verify): profiles in ~/mira-bots/projects/.mira-bots/profiles/, app data in
+// ~/Library/Application Support/dk.mira.bots/ (settings.json, mcp.json, tickets.json, profiles/)
+// and the log in ~/Library/Logs/dk.mira.bots/mira-bots.log (plan7 M.13)
 fn resolve_projects_root(home: &Path, settings: &AppSettings) -> PathBuf {
     let root = settings
         .projects_root()
