@@ -679,6 +679,7 @@ pub fn run() {
             commands::open_project_folder,
             commands::set_projects_root,
             commands::move_agent_to_project,
+            commands::ticket_start_playbook,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -769,10 +770,11 @@ mod tests {
         }
     }
 
-    /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50). Counted from the
-    /// source so a command added without a handler (or the other way round) is noticed.
+    /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50; plan6b punkt 6:
+    /// → 51). Counted from the source so a command added without a handler (or the other way
+    /// round) is noticed.
     #[test]
-    fn generate_handler_lists_50_commands() {
+    fn generate_handler_lists_51_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -781,8 +783,9 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 50, "{names:?}");
+        assert_eq!(names.len(), 51, "{names:?}");
         for n in [
+            "ticket_start_playbook",
             "close_workplace",
             "list_projects",
             "create_project",

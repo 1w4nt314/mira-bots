@@ -4,6 +4,9 @@
 //! Events: Assign, Unassign, Dispatched, Submit, Approve, Reject, Requeue, ToBacklog, Reopen,
 //! Handoff, and (step 6a) Wait / Resume. Whether a submit becomes `Wait` (open children) or
 //! `Submit` is decided by the service, which knows the other tickets.
+//!
+//! Step 6b: `(Backlog, Submit)` exists only for the system and a flow parent (playbook started,
+//! no assignee); it is the one way into review without an assignee.
 
 use super::model::{Ticket, TicketActor, TicketError, TicketHistoryEntry, TicketState};
 
@@ -21,7 +24,8 @@ pub enum TicketEvent {
     Unassign,
     /// assigned → inProgress (delivered to the agent).
     Dispatched,
-    /// inProgress | waiting → review, or done when `skip_review`.
+    /// inProgress | waiting → review, or done when `skip_review`; backlog → review/done only by
+    /// the system for a flow parent without an assignee (step 6b).
     Submit,
     /// review → done.
     Approve,
@@ -130,13 +134,19 @@ pub fn transition_noted(
             S::InProgress
         }
         // Step 6a: a waiting parent is submitted by the user (override) or by its assignee once
-        // all children are done; same rules as from in progress.
-        (S::InProgress | S::Waiting, E::Submit) => {
+        // all children are done; same rules as from in progress. Step 6b (plan A.2): a flow
+        // parent (playbook started, no assignee) in the backlog is submitted by the system when
+        // its last child is done; it enters review without an assignee (only the user decides).
+        (S::InProgress | S::Waiting | S::Backlog, E::Submit)
+            if from != S::Backlog || is_flow_parent_submit(t, by) =>
+        {
             // A finished turn supersedes an earlier turn failure.
             n.issue = None;
             // A new review starts without a reviewer; routing decides (plan5 A.6).
             n.reviewer_agent_id = None;
             n.escalated = false;
+            // Step 6b: every entry into review is checked anew.
+            n.checks = None;
             if t.skip_review {
                 n.rejection_note = None;
                 S::Done
@@ -213,6 +223,13 @@ pub fn transition_noted(
         note,
     });
     Ok(n)
+}
+
+/// The guard of the `(Backlog, Submit)` cell (step 6b, plan A.2): only the system, only for a
+/// flow parent — a ticket whose playbook was started and that has no assignee. (The service
+/// checks that no child is open.)
+fn is_flow_parent_submit(t: &Ticket, by: TicketActor) -> bool {
+    by == TicketActor::System && t.assignee_agent_id.is_none() && t.playbook_started_at.is_some()
 }
 
 fn clear_assignment(t: &mut Ticket) {
@@ -399,33 +416,154 @@ mod tests {
         ];
         let evs = events();
         let mut cases = 0;
-        for (from, row) in table {
-            for (ev, want) in evs.iter().zip(row) {
-                cases += 1;
-                let t = in_state(from);
-                let got = transition(&t, ev, TicketActor::User, 5_000);
-                match want {
-                    Some(to) => {
-                        let n = got.unwrap_or_else(|e| panic!("{from:?} {ev:?}: {e}"));
-                        assert_eq!(n.state, to, "{from:?} {ev:?}");
-                        assert_eq!(n.updated_at, 5_000);
-                        assert_eq!(n.created_at, t.created_at);
-                        assert_eq!(n.history.len(), t.history.len() + 1);
-                        let h = n.history.last().unwrap();
-                        assert_eq!((h.from, h.to, h.at), (Some(from), to, 5_000));
-                    }
-                    None => assert_eq!(
-                        got,
-                        Err(TicketError::IllegalTransition {
-                            from,
-                            to: ev.nominal_target()
-                        }),
-                        "{from:?} {ev:?}"
-                    ),
+        // Step 6b: the same table per actor; the system never unassigns a ticket in progress or
+        // waiting and never hands off (5c/6a guards).
+        let system_refuses = |from: S, ev: &TicketEvent| {
+            matches!(
+                (from, ev),
+                (S::InProgress | S::Waiting, TicketEvent::Unassign)
+                    | (S::InProgress, TicketEvent::Handoff { .. })
+            )
+        };
+        let check = |t: &Ticket, ev: &TicketEvent, by: TicketActor, want: Option<S>| {
+            let from = t.state;
+            let got = transition(t, ev, by, 5_000);
+            match want {
+                Some(to) => {
+                    let n = got.unwrap_or_else(|e| panic!("{from:?} {ev:?} {by:?}: {e}"));
+                    assert_eq!(n.state, to, "{from:?} {ev:?} {by:?}");
+                    assert_eq!(n.updated_at, 5_000);
+                    assert_eq!(n.created_at, t.created_at);
+                    assert_eq!(n.history.len(), t.history.len() + 1);
+                    let h = n.history.last().unwrap();
+                    assert_eq!((h.from, h.to, h.at, h.by), (Some(from), to, 5_000, by));
+                }
+                None => assert_eq!(
+                    got,
+                    Err(TicketError::IllegalTransition {
+                        from,
+                        to: ev.nominal_target()
+                    }),
+                    "{from:?} {ev:?} {by:?}"
+                ),
+            }
+        };
+        for by in [TicketActor::User, TicketActor::Agent, TicketActor::System] {
+            for (from, row) in table {
+                for (ev, want) in evs.iter().zip(row) {
+                    cases += 1;
+                    let want =
+                        want.filter(|_| by != TicketActor::System || !system_refuses(from, ev));
+                    check(&in_state(from), ev, by, want);
                 }
             }
+            // Step 6b (plan A.2): a flow parent in the backlog (playbook started, no assignee)
+            // has the backlog row plus `Submit` → review, for the system only.
+            let flow = flow_parent();
+            for (ev, want) in evs.iter().zip(table[0].1) {
+                cases += 1;
+                let want = match ev {
+                    TicketEvent::Submit if by == TicketActor::System => Some(S::Review),
+                    _ => want,
+                };
+                check(&flow, ev, by, want);
+            }
         }
-        assert_eq!(cases, 84);
+        assert_eq!(cases, 3 * (84 + 12));
+    }
+
+    /// A backlog ticket whose playbook was started (step 6b), without an assignee.
+    fn flow_parent() -> Ticket {
+        let mut t = in_state(S::Backlog);
+        t.playbook_started_at = Some(3);
+        t
+    }
+
+    #[test]
+    fn system_submits_backlog_flow_parent_to_review_or_done() {
+        let mut t = flow_parent();
+        t.rejection_note = Some("old".into());
+        t.checks = Some(crate::tickets::model::TicketChecks {
+            state: crate::tickets::model::ChecksState::Failed,
+            failed: Some("tests".into()),
+            round: 0,
+            started_at: 1,
+        });
+        let r = transition_noted(
+            &t,
+            &TicketEvent::Submit,
+            TicketActor::System,
+            Some("forløb afsluttet".into()),
+            4,
+        )
+        .unwrap();
+        assert_eq!(r.state, S::Review);
+        assert_eq!(r.assignee_agent_id, None);
+        assert_eq!(
+            (r.reviewer_agent_id, r.escalated, r.checks),
+            (None, false, None)
+        );
+        assert_eq!(r.playbook_started_at, Some(3));
+        let h = r.history.last().unwrap();
+        assert_eq!(
+            (h.from, h.to, h.by, h.note.as_deref()),
+            (
+                Some(S::Backlog),
+                S::Review,
+                TicketActor::System,
+                Some("forløb afsluttet")
+            )
+        );
+        t.skip_review = true;
+        let d = transition(&t, &TicketEvent::Submit, TicketActor::System, 4).unwrap();
+        assert_eq!(d.state, S::Done);
+        assert_eq!(d.rejection_note, None);
+    }
+
+    #[test]
+    fn user_and_agent_cannot_submit_backlog() {
+        let illegal = Err(TicketError::IllegalTransition {
+            from: S::Backlog,
+            to: S::Review,
+        });
+        for by in [TicketActor::User, TicketActor::Agent] {
+            assert_eq!(
+                transition(&flow_parent(), &TicketEvent::Submit, by, 4),
+                illegal,
+                "{by:?}"
+            );
+        }
+        // Not a flow parent: a plain backlog ticket, or one with an assignee.
+        assert_eq!(
+            transition(
+                &in_state(S::Backlog),
+                &TicketEvent::Submit,
+                TicketActor::System,
+                4
+            ),
+            illegal
+        );
+        let mut owned = flow_parent();
+        owned.assignee_agent_id = Some("a1".into());
+        assert_eq!(
+            transition(&owned, &TicketEvent::Submit, TicketActor::System, 4),
+            illegal
+        );
+    }
+
+    #[test]
+    fn submit_resets_checks() {
+        for from in [S::InProgress, S::Waiting] {
+            let mut t = in_state(from);
+            t.checks = Some(crate::tickets::model::TicketChecks {
+                state: crate::tickets::model::ChecksState::Passed,
+                failed: None,
+                round: 1,
+                started_at: 2,
+            });
+            let r = transition(&t, &TicketEvent::Submit, TicketActor::Agent, 5).unwrap();
+            assert_eq!((r.state, r.checks), (S::Review, None), "{from:?}");
+        }
     }
 
     #[test]

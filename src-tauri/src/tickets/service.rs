@@ -5,7 +5,10 @@
 //! - a ticket is in at most one queue (`assignee_agent_id` while `assigned`);
 //! - per agent the `assigned` tickets have positions `0..n` without gaps; nothing else has one;
 //! - at most one `inProgress` ticket per agent;
-//! - a `waiting` ticket (step 6a) has an assignee and no queue position.
+//! - a `waiting` ticket (step 6a) has an assignee and no queue position;
+//! - a `review` ticket has an assignee, unless it is a flow parent (step 6b, plan A.2: playbook
+//!   started, entered review by the system when its last child was done); such a ticket is
+//!   never routed to a reviewer and only the user approves or rejects it.
 //!
 //! The service is meant to sit behind a `std::sync::Mutex`; it never blocks on anything but the
 //! store's small synchronous write.
@@ -22,8 +25,9 @@ use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
 use crate::config::{
-    BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, MOVED_NOTE, PARENT_DELETED_NOTE, REPORTS_PER_TICKET_MAX,
-    RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
+    playbook_created_note, BLOCKED_BY_MAX, CHILDREN_DONE_NOTE, FLOW_DONE_NOTE, MOVED_NOTE,
+    PARENT_DELETED_NOTE, PLAYBOOK_STEPS_MAX, REPORTS_PER_TICKET_MAX, RESTART_NOTE,
+    REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
     TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
 };
 use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
@@ -41,6 +45,42 @@ pub const REVIEWER_REMOVED_NOTE: &str = "reviewer fjernet";
 /// `"eskaleret efter {max} runder"` (`max` = the workspace's `maxReviewRounds`).
 pub fn escalated_note(max: u32) -> String {
     format!("eskaleret efter {max} runder")
+}
+
+/// A ticket's `kind` (step 6b, plan A.2): absent, blank or `task` → `None` (a plain ticket);
+/// otherwise trimmed and lowercased it must be `feature`, `bug` or one of `known` (the
+/// workspace's playbook names), else [`TicketError::InvalidKind`].
+pub fn validate_kind(kind: Option<&str>, known: &[String]) -> Result<Option<String>, TicketError> {
+    let Some(k) = kind.map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(None);
+    };
+    let k = k.to_lowercase();
+    if k == super::playbook::TASK_KIND {
+        return Ok(None);
+    }
+    let ok = super::playbook::is_playbook_name(&k)
+        && (k == "feature" || k == "bug" || known.contains(&k));
+    if ok {
+        Ok(Some(k))
+    } else {
+        Err(TicketError::InvalidKind)
+    }
+}
+
+/// One child ticket of a playbook rollout (step 6b; rendered by
+/// [`super::playbook::render_step`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildSpec {
+    pub title: String,
+    pub body: String,
+    /// Blocked by the child created just before it (ignored for the first).
+    pub blocked_by_previous: bool,
+}
+
+/// Whether `t` is a flow parent (step 6b, plan A.2): its playbook was started and it has no
+/// assignee. Such a ticket enters review without an assignee and only the user decides there.
+pub fn is_flow_parent(t: &Ticket) -> bool {
+    t.playbook_started_at.is_some() && t.assignee_agent_id.is_none()
 }
 
 /// Where a rejected ticket goes (plan5 C.9, W1).
@@ -872,17 +912,20 @@ impl TicketService {
         skip_review: bool,
         now: u64,
     ) -> Result<Ticket, TicketError> {
-        self.create_in(title, body, skip_review, None, now)
+        self.create_in(title, body, skip_review, None, None, now)
     }
 
     /// [`Self::create`] with a project (validated against the folder-name rules; a `New` name is
     /// only created when the ticket is assigned or spawned with, plan4b A.2).
+    ///
+    /// `kind` (step 6b) is stored as given; the caller validated it ([`validate_kind`]).
     pub fn create_in(
         &mut self,
         title: &str,
         body: &str,
         skip_review: bool,
         project: Option<ProjectRef>,
+        kind: Option<String>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
         self.create_with_id_source(
@@ -892,6 +935,7 @@ impl TicketService {
             skip_review,
             project,
             (TicketSource::User, TicketActor::User),
+            kind,
             now,
         )
     }
@@ -907,9 +951,11 @@ impl TicketService {
         skip_review: bool,
         project: Option<ProjectRef>,
         origin: (TicketSource, TicketActor),
+        kind: Option<String>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
-        let t = self.new_ticket(next_id, title, body, skip_review, project, origin, now)?;
+        let mut t = self.new_ticket(next_id, title, body, skip_review, project, origin, now)?;
+        t.kind = kind;
         let id = t.id.clone();
         self.commit(|doc| {
             doc.tickets.push(t);
@@ -1233,6 +1279,7 @@ impl TicketService {
         };
         self.commit(|doc| {
             let t = apply(doc, id, &ev, by, prefix, now)?;
+            let (flow, round) = (is_flow_parent(&t), t.review_round);
             match (to, t.assignee_agent_id) {
                 (RejectReturn::Moved, Some(_)) => {
                     // W1: the sender moved to another project; the ticket must not follow it
@@ -1277,6 +1324,11 @@ impl TicketService {
                         None,
                         now,
                     )?;
+                    // Step 6b (plan A.2): a rejected flow parent keeps counting its rounds (the
+                    // user decides; it is never routed or escalated).
+                    if flow {
+                        find_mut(doc, id)?.review_round = round;
+                    }
                 }
             }
             Ok(())
@@ -1457,6 +1509,116 @@ impl TicketService {
         self.fetch(id).map(Some)
     }
 
+    /// A flow parent (step 6b, plan A.2: playbook started, no assignee) in the backlog whose
+    /// children are all Done is submitted by the system with [`FLOW_DONE_NOTE`]: review without
+    /// an assignee (only the user decides), or done with `skip_review`. `Ok(None)` (nothing
+    /// saved) when it is not such a parent, has an open child, has no Done child (all deleted:
+    /// [`Self::note_children_done`] applies instead) or the note is already its last entry.
+    pub fn finish_flow(&mut self, id: &str, now: u64) -> Result<Option<Ticket>, TicketError> {
+        let t = self.get(id).ok_or(TicketError::NotFound)?;
+        let noted = t
+            .history
+            .last()
+            .is_some_and(|h| h.note.as_deref() == Some(FLOW_DONE_NOTE));
+        let children = children_of(&self.doc, id);
+        let all_done =
+            !children.is_empty() && children.iter().all(|c| c.state == TicketState::Done);
+        if t.state != TicketState::Backlog || !is_flow_parent(&t) || noted || !all_done {
+            return Ok(None);
+        }
+        self.commit(|doc| {
+            apply(
+                doc,
+                id,
+                &TicketEvent::Submit,
+                TicketActor::System,
+                Some(FLOW_DONE_NOTE.to_string()),
+                now,
+            )
+        })?;
+        self.fetch(id).map(Some)
+    }
+
+    /// Creates a playbook's children of `parent_id` (full or short id) in one save (step 6b,
+    /// plan A.2, research §7.3): each child gets the parent as `parent_id`, the parent's project
+    /// and `skip_review`, `blocked_by` = the previous child when `blocked_by_previous`, and its
+    /// creation entry carries [`playbook_created_note`]; the parent gets `playbook_started_at`
+    /// in the same save. `origin` is the children's source and the creation entries' actor.
+    ///
+    /// Refused when the parent is Done ([`TicketError::ParentDone`]) or in review, already
+    /// started or already has children ([`TicketError::PlaybookAlreadyStarted`]: starting twice
+    /// never duplicates), or `steps` is empty or longer than [`PLAYBOOK_STEPS_MAX`]. Not
+    /// rate-limited and no duplicate check (the app creates them, plan A.2).
+    pub fn create_playbook_children(
+        &mut self,
+        parent_id: &str,
+        steps: &[ChildSpec],
+        origin: (TicketSource, TicketActor),
+        now: u64,
+    ) -> Result<Vec<Ticket>, TicketError> {
+        let parent = self.get_by_any_id(parent_id).ok_or(TicketError::NotFound)?;
+        match parent.state {
+            TicketState::Done => return Err(TicketError::ParentDone),
+            TicketState::Review => {
+                return Err(TicketError::Validation(
+                    "Forløbet kan ikke startes, mens ticketen er i Review".into(),
+                ))
+            }
+            _ => {}
+        }
+        if parent.playbook_started_at.is_some() || !children_of(&self.doc, &parent.id).is_empty() {
+            return Err(TicketError::PlaybookAlreadyStarted);
+        }
+        if steps.is_empty() || steps.len() > PLAYBOOK_STEPS_MAX {
+            return Err(TicketError::PlaybookStepsInvalid(format!(
+                "{} trin (1–{PLAYBOOK_STEPS_MAX})",
+                steps.len()
+            )));
+        }
+        let short = parent.short_id();
+        let mut children: Vec<Ticket> = Vec::with_capacity(steps.len());
+        let mut taken: HashSet<String> = HashSet::new();
+        for (i, step) in steps.iter().enumerate() {
+            // Short ids must also differ between the new children.
+            let mut next_id = || loop {
+                let id = uuid::Uuid::new_v4().to_string();
+                if taken.insert(short_id(&id)) {
+                    break id;
+                }
+            };
+            let mut c = self
+                .new_ticket(
+                    &mut next_id,
+                    &step.title,
+                    &step.body,
+                    parent.skip_review,
+                    parent.project.clone(),
+                    origin,
+                    now,
+                )
+                .map_err(|e| TicketError::PlaybookStepsInvalid(format!("trin {}: {e}", i + 1)))?;
+            c.parent_id = Some(parent.id.clone());
+            if step.blocked_by_previous {
+                if let Some(prev) = children.last() {
+                    c.blocked_by = vec![prev.id.clone()];
+                }
+            }
+            if let Some(h) = c.history.first_mut() {
+                h.note = Some(playbook_created_note(&short, i + 1, steps.len()));
+            }
+            children.push(c);
+        }
+        let ids: Vec<TicketId> = children.iter().map(|c| c.id.clone()).collect();
+        self.commit(|doc| {
+            let p = find_mut(doc, &parent.id)?;
+            p.playbook_started_at = Some(now);
+            p.updated_at = now;
+            doc.tickets.extend(children);
+            Ok(())
+        })?;
+        ids.iter().map(|id| self.fetch(id)).collect()
+    }
+
     /// Any non-backlog state → backlog by the system (delivery failure etc.).
     pub fn to_backlog(&mut self, id: &str, note: &str, now: u64) -> Result<Ticket, TicketError> {
         let ev = TicketEvent::ToBacklog {
@@ -1525,6 +1687,7 @@ impl TicketService {
             project,
             None,
             Vec::new(),
+            None,
             now,
         )
     }
@@ -1548,6 +1711,7 @@ impl TicketService {
         project: Option<ProjectRef>,
         parent_id: Option<TicketId>,
         blocked_by: Vec<TicketId>,
+        kind: Option<String>,
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let parent = match parent_id.as_deref() {
@@ -1612,6 +1776,7 @@ impl TicketService {
         }
         t.parent_id = parent.map(|p| p.id);
         t.blocked_by = blockers;
+        t.kind = kind;
         let id = t.id.clone();
         self.commit(|doc| {
             doc.tickets.push(t);
@@ -1736,14 +1901,19 @@ impl TicketService {
             .find_map(|a| self.get(&a.ticket_id).map(|t| (a, t)))
     }
 
-    /// Tickets in review without a reviewer and not escalated, oldest first.
+    /// Tickets in review without a reviewer and not escalated, oldest first. Step 6b: a ticket
+    /// in review without an assignee (a finished flow parent, plan A.2) is never routed — it
+    /// waits for the user, and there is no sender for a review file.
     pub fn unrouted_reviews(&self) -> Vec<Ticket> {
         let mut v: Vec<Ticket> = self
             .doc
             .tickets
             .iter()
             .filter(|t| {
-                t.state == TicketState::Review && t.reviewer_agent_id.is_none() && !t.escalated
+                t.state == TicketState::Review
+                    && t.reviewer_agent_id.is_none()
+                    && !t.escalated
+                    && t.assignee_agent_id.is_some()
             })
             .cloned()
             .collect();
@@ -2315,6 +2485,13 @@ mod tests {
             if t.state == S::Backlog {
                 assert_eq!(t.assignee_agent_id, None);
             }
+            // Step 6b (plan A.2): review ⇒ an assignee, or a flow parent (playbook started).
+            if t.state == S::Review {
+                assert!(
+                    t.assignee_agent_id.is_some() || t.playbook_started_at.is_some(),
+                    "review without agent: {t:?}"
+                );
+            }
             // Step 6a: a waiting parent keeps its assignee and has no queue position.
             if t.state == S::Waiting {
                 assert!(
@@ -2376,6 +2553,7 @@ mod tests {
                 false,
                 None,
                 (TicketSource::User, TicketActor::User),
+                None,
                 1,
             )
             .unwrap();
@@ -2392,6 +2570,7 @@ mod tests {
                 false,
                 None,
                 (TicketSource::User, TicketActor::User),
+                None,
                 2,
             )
             .unwrap();
@@ -3647,6 +3826,7 @@ mod tests {
                 "",
                 false,
                 Some(ProjectRef::New { new: "CON".into() }),
+                None,
                 1,
             )
             .unwrap_err();
@@ -3656,7 +3836,14 @@ mod tests {
         );
         assert!(s.is_empty());
         let t = s
-            .create_in("t", "", false, Some(ProjectRef::Existing("p".into())), 2)
+            .create_in(
+                "t",
+                "",
+                false,
+                Some(ProjectRef::Existing("p".into())),
+                None,
+                2,
+            )
             .unwrap();
         assert_eq!(t.project, Some(ProjectRef::Existing("p".into())));
         assert_eq!(s.create("u", "", false, 3).unwrap().project, None);
@@ -3695,7 +3882,14 @@ mod tests {
     fn assign_in_sets_the_project_and_assigns_in_one_save() {
         let (mut s, store) = svc();
         let t = s
-            .create_in("t", "", false, Some(ProjectRef::New { new: "P".into() }), 1)
+            .create_in(
+                "t",
+                "",
+                false,
+                Some(ProjectRef::New { new: "P".into() }),
+                None,
+                1,
+            )
             .unwrap();
         let before = store.saves();
         let a = s.assign_in(&t.id, "a1", Some("p".into()), 2).unwrap();
@@ -3763,6 +3957,7 @@ mod tests {
             None,
             Some(parent.id.clone()),
             Vec::new(),
+            None,
             now,
         )
         .unwrap()
@@ -3794,6 +3989,7 @@ mod tests {
             project,
             parent.map(str::to_string),
             blocked_by.iter().map(|b| b.to_string()).collect(),
+            None,
             50,
         )
     }
@@ -3807,6 +4003,7 @@ mod tests {
                 "",
                 false,
                 Some(ProjectRef::Existing("p".into())),
+                None,
                 1,
             )
             .unwrap();
@@ -3869,6 +4066,7 @@ mod tests {
                 None,
                 Some(p.id.clone()),
                 vec![c.id.clone()],
+                None,
                 60,
             )
             .unwrap();
@@ -4136,6 +4334,7 @@ mod tests {
                 None,
                 None,
                 vec![blocker.short_id()],
+                None,
                 2,
             )
             .unwrap();
@@ -4573,7 +4772,7 @@ mod tests {
         assert_eq!(norm_title("ÆBLE  Øl"), "æble øl");
         let p = Some(ProjectRef::Existing("Snake".into()));
         let a = s
-            .create_in("  Byg  SPIL ", "", false, p.clone(), 1)
+            .create_in("  Byg  SPIL ", "", false, p.clone(), None, 1)
             .unwrap();
         let b = s
             .create_in(
@@ -4583,6 +4782,7 @@ mod tests {
                 Some(ProjectRef::New {
                     new: "snake".into(),
                 }),
+                None,
                 2,
             )
             .unwrap();
@@ -4592,11 +4792,14 @@ mod tests {
                 "",
                 false,
                 Some(ProjectRef::Existing("andet".into())),
+                None,
                 3,
             )
             .unwrap();
         let none = s.create("Byg spil", "", false, 4).unwrap();
-        let done = s.create_in("byg spil", "", false, p.clone(), 5).unwrap();
+        let done = s
+            .create_in("byg spil", "", false, p.clone(), None, 5)
+            .unwrap();
         finish(&mut s, &done.id, "a", 6);
         let norm = norm_title("BYG   spil");
         let ids = |v: Vec<Ticket>| v.into_iter().map(|t| t.id).collect::<Vec<_>>();
@@ -4723,7 +4926,17 @@ mod tests {
         let p = s.create("Forælder", "", false, 1).unwrap();
         let b = s.create("Blokering", "", false, 2).unwrap();
         let c1 = s
-            .create_by_agent_related("Plan", "", false, None, None, Some(p.id.clone()), vec![], 3)
+            .create_by_agent_related(
+                "Plan",
+                "",
+                false,
+                None,
+                None,
+                Some(p.id.clone()),
+                vec![],
+                None,
+                3,
+            )
             .unwrap();
         let c2 = s
             .create_by_agent_related(
@@ -4734,6 +4947,7 @@ mod tests {
                 None,
                 Some(p.short_id()),
                 vec![b.short_id()],
+                None,
                 4,
             )
             .unwrap();
@@ -4752,5 +4966,331 @@ mod tests {
         assert_eq!(reviews[1].summary, None);
         assert_eq!(s.children(&p.id).len(), 2);
         assert!(s.child_lines(&c1.id).is_empty());
+    }
+
+    // ---- step 6b: kind, playbook children, flow parents ----
+
+    #[test]
+    fn validate_kind_table() {
+        let known: Vec<String> = ["bug", "docs", "feature"].map(String::from).to_vec();
+        for (input, want) in [
+            (None, Ok(None)),
+            (Some(""), Ok(None)),
+            (Some("  "), Ok(None)),
+            (Some("task"), Ok(None)),
+            (Some(" TASK "), Ok(None)),
+            (Some("feature"), Ok(Some("feature"))),
+            (Some(" Bug "), Ok(Some("bug"))),
+            (Some("docs"), Ok(Some("docs"))),
+            (Some("nope"), Err(TicketError::InvalidKind)),
+            (Some("do cs"), Err(TicketError::InvalidKind)),
+            (Some("æøå"), Err(TicketError::InvalidKind)),
+        ] {
+            assert_eq!(
+                validate_kind(input, &known),
+                want.map(|o| o.map(str::to_string)),
+                "{input:?}"
+            );
+        }
+        // feature and bug are always known.
+        assert_eq!(validate_kind(Some("bug"), &[]), Ok(Some("bug".into())));
+        assert_eq!(
+            validate_kind(Some("docs"), &[]),
+            Err(TicketError::InvalidKind)
+        );
+    }
+
+    fn specs(n: usize) -> Vec<ChildSpec> {
+        (0..n)
+            .map(|i| ChildSpec {
+                title: format!("Trin {}", i + 1),
+                body: format!("tekst {i}"),
+                blocked_by_previous: i > 0,
+            })
+            .collect()
+    }
+
+    fn feature_parent(s: &mut TicketService, now: u64) -> Ticket {
+        s.create_in(
+            "Login",
+            "",
+            false,
+            Some(ProjectRef::Existing("p".into())),
+            Some("feature".into()),
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_playbook_children_is_atomic_and_chains_blockers() {
+        let (mut s, m) = svc();
+        let p = feature_parent(&mut s, 1);
+        assert_eq!(p.kind.as_deref(), Some("feature"));
+        let saves = m.saves();
+        let origin = (TicketSource::User, TicketActor::User);
+        let kids = s
+            .create_playbook_children(&p.short_id(), &specs(3), origin, 7)
+            .unwrap();
+        assert_eq!(m.saves(), saves + 1, "one save for all children");
+        assert_eq!(kids.len(), 3);
+        for (i, k) in kids.iter().enumerate() {
+            assert_eq!(k.parent_id.as_deref(), Some(p.id.as_str()));
+            assert_eq!(k.project, p.project, "project inherited");
+            assert_eq!(
+                (k.state, k.source, k.kind.clone()),
+                (S::Backlog, TicketSource::User, None)
+            );
+            assert_eq!(k.title, format!("Trin {}", i + 1));
+            assert!(!k.skip_review);
+            let h = &k.history[0];
+            assert_eq!(
+                (h.by, h.note.clone()),
+                (
+                    TicketActor::User,
+                    Some(format!(
+                        "oprettet af forløb {}: trin {}/3",
+                        p.short_id(),
+                        i + 1
+                    ))
+                )
+            );
+        }
+        assert!(kids[0].blocked_by.is_empty());
+        assert_eq!(kids[1].blocked_by, vec![kids[0].id.clone()]);
+        assert_eq!(kids[2].blocked_by, vec![kids[1].id.clone()]);
+        let parent = s.get(&p.id).unwrap();
+        assert_eq!(parent.playbook_started_at, Some(7));
+        assert_eq!(parent.state, S::Backlog);
+        // The stored document has them too (same save).
+        assert_eq!(m.doc().unwrap().tickets.len(), 4);
+        // An unchained step stays unblocked; an agent origin marks agent work.
+        let q = feature_parent(&mut s, 8);
+        let mut free = specs(2);
+        free[1].blocked_by_previous = false;
+        let kids = s
+            .create_playbook_children(&q.id, &free, (TicketSource::Agent, TicketActor::Agent), 9)
+            .unwrap();
+        assert!(kids[1].blocked_by.is_empty());
+        assert_eq!(kids[0].source, TicketSource::Agent);
+        assert_invariants(&s);
+    }
+
+    #[test]
+    fn create_playbook_children_refuses_second_start_and_done_parent() {
+        let (mut s, m) = svc();
+        let origin = (TicketSource::User, TicketActor::User);
+        let p = feature_parent(&mut s, 1);
+        s.create_playbook_children(&p.id, &specs(2), origin, 2)
+            .unwrap();
+        let saves = m.saves();
+        assert_eq!(
+            s.create_playbook_children(&p.id, &specs(2), origin, 3),
+            Err(TicketError::PlaybookAlreadyStarted)
+        );
+        // A ticket that already has children (made by hand) counts as started.
+        let q = feature_parent(&mut s, 4);
+        s.create_by_agent_related(
+            "barn",
+            "",
+            false,
+            None,
+            None,
+            Some(q.id.clone()),
+            vec![],
+            None,
+            5,
+        )
+        .unwrap();
+        let saves2 = m.saves();
+        assert_eq!(
+            s.create_playbook_children(&q.id, &specs(1), origin, 6),
+            Err(TicketError::PlaybookAlreadyStarted)
+        );
+        // Done and review parents, missing parents, bad step counts.
+        let d = feature_parent(&mut s, 7);
+        s.assign(&d.id, "a1", 8).unwrap();
+        s.mark_dispatched(&d.id, "a1", 9).unwrap();
+        s.submit_by_agent("a1", Some(&d.id), "klar", 10).unwrap();
+        assert!(matches!(
+            s.create_playbook_children(&d.id, &specs(1), origin, 11),
+            Err(TicketError::Validation(_))
+        ));
+        s.approve(&d.id, 12).unwrap();
+        assert_eq!(
+            s.create_playbook_children(&d.id, &specs(1), origin, 13),
+            Err(TicketError::ParentDone)
+        );
+        assert_eq!(
+            s.create_playbook_children("nope", &specs(1), origin, 13),
+            Err(TicketError::NotFound)
+        );
+        let e = feature_parent(&mut s, 14);
+        let saves3 = m.saves();
+        assert!(matches!(
+            s.create_playbook_children(&e.id, &[], origin, 15),
+            Err(TicketError::PlaybookStepsInvalid(_))
+        ));
+        assert!(matches!(
+            s.create_playbook_children(&e.id, &specs(PLAYBOOK_STEPS_MAX + 1), origin, 15),
+            Err(TicketError::PlaybookStepsInvalid(_))
+        ));
+        // A bad step (blank title) refuses the whole rollout: nothing is saved.
+        let mut bad = specs(2);
+        bad[1].title = "  ".into();
+        assert!(matches!(
+            s.create_playbook_children(&e.id, &bad, origin, 15),
+            Err(TicketError::PlaybookStepsInvalid(_))
+        ));
+        assert_eq!(m.saves(), saves3);
+        assert!(s.children(&e.id).is_empty());
+        assert_eq!(s.get(&e.id).unwrap().playbook_started_at, None);
+        assert!(saves2 > saves);
+    }
+
+    /// `id` (assigned to nobody) through `agent` to Done.
+    fn to_done(s: &mut TicketService, id: &str, agent: &str, now: u64) {
+        s.assign(id, agent, now).unwrap();
+        s.mark_dispatched(id, agent, now).unwrap();
+        s.submit_by_agent(agent, Some(id), "klar", now).unwrap();
+        s.approve(id, now).unwrap();
+    }
+
+    #[test]
+    fn finish_flow_submits_backlog_flow_parent_once() {
+        let (mut s, _m) = svc();
+        let origin = (TicketSource::User, TicketActor::User);
+        let p = feature_parent(&mut s, 1);
+        let kids = s
+            .create_playbook_children(&p.id, &specs(2), origin, 2)
+            .unwrap();
+        // Not yet: a child is open.
+        to_done(&mut s, &kids[0].id, "a1", 3);
+        assert_eq!(s.finish_flow(&p.id, 4), Ok(None));
+        to_done(&mut s, &kids[1].id, "a1", 5);
+        let r = s.finish_flow(&p.id, 6).unwrap().unwrap();
+        assert_eq!(r.state, S::Review);
+        assert_eq!(r.assignee_agent_id, None);
+        let h = r.history.last().unwrap();
+        assert_eq!(
+            (h.from, h.to, h.by, h.note.as_deref()),
+            (
+                Some(S::Backlog),
+                S::Review,
+                TicketActor::System,
+                Some(FLOW_DONE_NOTE)
+            )
+        );
+        assert_invariants(&s);
+        // Once only.
+        assert_eq!(s.finish_flow(&p.id, 7), Ok(None));
+        // The user decides: approve → done.
+        assert_eq!(s.approve(&p.id, 8).unwrap().state, S::Done);
+
+        // skip_review → Done directly.
+        let mut q = feature_parent(&mut s, 9);
+        q = s
+            .update(
+                &q.id,
+                TicketPatch {
+                    skip_review: Some(true),
+                    ..Default::default()
+                },
+                9,
+            )
+            .unwrap();
+        assert!(q.skip_review);
+        let kids = s
+            .create_playbook_children(&q.id, &specs(1), origin, 10)
+            .unwrap();
+        assert!(kids[0].skip_review, "children inherit skip_review");
+        s.assign(&kids[0].id, "a1", 11).unwrap();
+        s.mark_dispatched(&kids[0].id, "a1", 11).unwrap();
+        s.submit_by_agent("a1", Some(&kids[0].id), "klar", 11)
+            .unwrap();
+        assert_eq!(s.get(&kids[0].id).unwrap().state, S::Done);
+        assert_eq!(s.finish_flow(&q.id, 12).unwrap().unwrap().state, S::Done);
+
+        // Not a flow parent: no playbook started.
+        let plain = mk(&mut s, "plain", 13);
+        let c = s
+            .create_by_agent_related(
+                "c",
+                "",
+                false,
+                None,
+                None,
+                Some(plain.id.clone()),
+                vec![],
+                None,
+                13,
+            )
+            .unwrap();
+        to_done(&mut s, &c.id, "a1", 14);
+        assert_eq!(s.finish_flow(&plain.id, 15), Ok(None));
+        // All children deleted: no "godkendt" note.
+        let e = feature_parent(&mut s, 16);
+        let kids = s
+            .create_playbook_children(&e.id, &specs(1), origin, 17)
+            .unwrap();
+        s.delete_at(&kids[0].id, 18).unwrap();
+        assert_eq!(s.finish_flow(&e.id, 19), Ok(None));
+        assert_invariants(&s);
+    }
+
+    /// A flow parent in review (its one child done).
+    fn flow_in_review(s: &mut TicketService) -> Ticket {
+        let origin = (TicketSource::User, TicketActor::User);
+        let p = feature_parent(s, 1);
+        let kids = s
+            .create_playbook_children(&p.id, &specs(1), origin, 2)
+            .unwrap();
+        to_done(s, &kids[0].id, "a1", 3);
+        s.finish_flow(&p.id, 4).unwrap().unwrap()
+    }
+
+    #[test]
+    fn unrouted_reviews_skips_flow_parent() {
+        let (mut s, _m) = svc();
+        let flow = flow_in_review(&mut s);
+        let other = in_review(&mut s, "a2", "normal");
+        let ids: Vec<String> = s.unrouted_reviews().into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![other.id]);
+        assert!(!ids.contains(&flow.id));
+    }
+
+    #[test]
+    fn reject_of_flow_parent_goes_to_backlog_with_round() {
+        let (mut s, _m) = svc();
+        let flow = flow_in_review(&mut s);
+        // The sender is nobody: the backlog (TicketsCtx::reject_return gives Backlog too).
+        let r = s
+            .reject(&flow.id, "mangler test", RejectReturn::Sender, 5)
+            .unwrap();
+        assert_eq!(r.state, S::Backlog);
+        assert_eq!(r.assignee_agent_id, None);
+        assert_eq!(r.review_round, 1, "the round is kept");
+        assert_eq!(r.rejection_note.as_deref(), Some("mangler test"));
+        assert_eq!(r.playbook_started_at, flow.playbook_started_at);
+        // Starting again is refused (children exist). A follow-up child that becomes done would
+        // send it to the user again (finish_flow applies to the backlog flow parent).
+        assert_eq!(
+            s.create_playbook_children(
+                &flow.id,
+                &specs(1),
+                (TicketSource::User, TicketActor::User),
+                6
+            ),
+            Err(TicketError::PlaybookAlreadyStarted)
+        );
+        assert_eq!(
+            s.finish_flow(&flow.id, 7).unwrap().map(|t| t.state),
+            Some(S::Review)
+        );
+        assert_invariants(&s);
+        // An ordinary ticket rejected to the backlog still starts afresh (round 0).
+        let o = in_review(&mut s, "a2", "normal");
+        let b = s.reject(&o.id, "nej", RejectReturn::Backlog, 8).unwrap();
+        assert_eq!((b.state, b.review_round), (S::Backlog, 0));
     }
 }

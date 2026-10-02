@@ -1,17 +1,26 @@
 //! Playbooks (step 6b, plan6b A.2): a ticket's `kind` names a playbook whose steps become child
 //! tickets. This file holds the playbook types, the two built-in playbooks (`feature`, `bug`,
-//! C6b.2 verbatim) and the validation of the workspace file's `playbooks` object. The rollout
-//! itself (`start_playbook`) comes in batch 2.
+//! C6b.2 verbatim), the validation of the workspace file's `playbooks` object and the rollout
+//! ([`start_playbook`], shared by the UI's "Start forløb" and `mira_start_playbook`).
 //!
 //! Validation never rejects the workspace file: a malformed playbook or an unknown role gives a
 //! note and drops only that playbook (the built-in one of the same name, if any, stays).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
 use serde_json::Value;
 
+use super::model::{Ticket, TicketActor, TicketError, TicketSource, TicketSummary};
+use super::prompt::one_line;
+use super::service::ChildSpec;
+use super::tools::{SpawnByProfile, SpawnPort};
+use super::TicketsCtx;
 use crate::agent::roles::Role;
-use crate::config::{PLAYBOOK_STEPS_MAX, TICKET_BODY_MAX_CHARS};
+use crate::agent::{now_ms, AgentInfo, SeatKind};
+use crate::config::{PLAYBOOK_STEPS_MAX, TICKET_BODY_MAX_CHARS, TICKET_TITLE_MAX_CHARS};
+use crate::hooks::status::AgentStatus;
+use crate::projects::same_id;
 
 /// Most chars of a step title (one line).
 pub const PLAYBOOK_TITLE_MAX_CHARS: usize = 200;
@@ -202,6 +211,253 @@ pub fn validate_playbooks(v: &Value, notes: &mut Vec<String>) -> BTreeMap<String
         }
     }
     out
+}
+
+// ---- rollout (step 6b, plan A.2 / punkt 6) ----
+
+/// `template` with `{title}`, `{body}` and `{parent}` replaced in one pass (a value that itself
+/// contains a placeholder is not expanded again).
+fn fill(template: &str, title: &str, body: &str, parent: &str) -> String {
+    let mut out = String::with_capacity(template.len() + body.len());
+    let mut rest = template;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let hit = [("{title}", title), ("{body}", body), ("{parent}", parent)]
+            .into_iter()
+            .find(|(k, _)| tail.starts_with(k));
+        match hit {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &tail[k.len()..];
+            }
+            None => {
+                out.push('{');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn clip(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// A step rendered for `parent` (C6b.1): `{title}` = the parent's title on one line, `{body}` =
+/// its text, `{parent}` = its short id. The title is one line, the body trimmed at the end;
+/// both are clipped to the ticket limits, so a long parent title never refuses the rollout.
+pub fn render_step(step: &PlaybookStep, parent: &Ticket) -> ChildSpec {
+    let short = parent.short_id();
+    let title = one_line(&parent.title);
+    let title_line = one_line(&fill(&step.title, &title, &one_line(&parent.body), &short));
+    let body = fill(&step.body, &title, &parent.body, &short);
+    ChildSpec {
+        title: clip(title_line.trim(), TICKET_TITLE_MAX_CHARS),
+        body: clip(body.trim_end(), TICKET_BODY_MAX_CHARS),
+        blocked_by_previous: step.blocked_by_previous,
+    }
+}
+
+/// The best live agent for a step with `role` in `project` (plan A.2, research §7.2): first a
+/// work agent in that project (`projects::same_id`), else a staff agent with the role (a staff
+/// seat takes any ticket); among them the fewest tickets (`queue_length` + one in progress),
+/// then the oldest, then the id. `None`: nobody — the child stays in the backlog.
+pub fn pick_agent(agents: &[AgentInfo], role: Role, project: Option<&str>) -> Option<AgentInfo> {
+    let live =
+        |a: &&AgentInfo| !matches!(a.status, AgentStatus::Exited { .. }) && a.roles.contains(&role);
+    let load = |a: &AgentInfo| {
+        (
+            a.queue_length + usize::from(a.current_ticket_id.is_some()),
+            a.created_at,
+            a.id.clone(),
+        )
+    };
+    let in_project = |a: &&AgentInfo| {
+        a.seat_kind == SeatKind::Work
+            && matches!((project, a.project.as_deref()), (Some(p), Some(ap)) if same_id(p, ap))
+    };
+    let best = |pred: &dyn Fn(&&AgentInfo) -> bool| {
+        agents
+            .iter()
+            .filter(live)
+            .filter(|a| pred(a))
+            .min_by_key(|a| load(a))
+            .cloned()
+    };
+    best(&in_project).or_else(|| best(&|a: &&AgentInfo| a.seat_kind == SeatKind::Staff))
+}
+
+/// Who starts the playbook: the user ("Start forløb") or an agent (`mira_start_playbook`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartedBy {
+    User,
+    Agent { id: String, name: String },
+}
+
+impl StartedBy {
+    /// The children's origin (plan A.2: no new enum variants).
+    fn origin(&self) -> (TicketSource, TicketActor) {
+        match self {
+            StartedBy::User => (TicketSource::User, TicketActor::User),
+            StartedBy::Agent { .. } => (TicketSource::Agent, TicketActor::Agent),
+        }
+    }
+}
+
+/// One created child and whom it went to.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StartedChild {
+    pub ticket: TicketSummary,
+    pub role: Role,
+    /// The agent it was assigned to; `None` = it waits in the backlog.
+    pub assignee: Option<String>,
+}
+
+/// The result of [`start_playbook`] (`ticket_start_playbook`'s answer; the tool renders C6b.3).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookStarted {
+    pub parent: TicketSummary,
+    pub children: Vec<StartedChild>,
+    /// Ids of agents started for the playbook (`autoSpawnForPlaybook`).
+    pub spawned: Vec<String>,
+    /// What could not be done (no agent, refused assignment, failed spawn); Danish.
+    pub notes: Vec<String>,
+}
+
+/// Rolls out the playbook of ticket `parent_id` (full or short id; plan A.2): looks up the
+/// playbook of its `kind` ([`TicketError::NoPlaybook`]; `task`/none has none), creates all
+/// children in one save ([`super::service::TicketService::create_playbook_children`]: refused
+/// when already started), then gives each child to [`pick_agent`]'s choice through the user's
+/// assignment path (`commands::ticket_assign_in`). A child nobody can take stays in the
+/// backlog; with `autoSpawnForPlaybook` and a `spawn` port at most one agent per role is
+/// started from the built-in profile of that role (with the child as its first ticket unless
+/// the child is blocked, then assigned afterwards). Failures after the save become `notes` —
+/// the children always exist.
+pub fn start_playbook(
+    ctx: &TicketsCtx,
+    parent_id: &str,
+    by: StartedBy,
+    spawn: Option<&SpawnPort>,
+) -> Result<PlaybookStarted, String> {
+    let parent = ctx
+        .read(|s| s.get_by_any_id(parent_id))
+        .ok_or(TicketError::NotFound)?;
+    let kind = parent.kind.clone().unwrap_or_else(|| TASK_KIND.to_string());
+    let playbook = ctx
+        .workspace
+        .config()
+        .playbooks
+        .get(&kind)
+        .cloned()
+        .ok_or_else(|| TicketError::NoPlaybook(kind.clone()))?;
+    let specs: Vec<ChildSpec> = playbook
+        .steps
+        .iter()
+        .map(|st| render_step(st, &parent))
+        .collect();
+    let now = now_ms();
+    let origin = by.origin();
+    let children = ctx.mutate(|s| s.create_playbook_children(&parent.id, &specs, origin, now))?;
+    let short = parent.short_id();
+    match &by {
+        StartedBy::User => log::info!(
+            "forløb: {short} ({kind}) startet af brugeren: {} del-tickets",
+            children.len()
+        ),
+        StartedBy::Agent { id, .. } => log::info!(
+            "forløb: {short} ({kind}) startet af agent {id}: {} del-tickets",
+            children.len()
+        ),
+    }
+    let auto_spawn = ctx.workspace.rules().auto_spawn_for_playbook;
+    let mut spawned_roles: BTreeSet<Role> = BTreeSet::new();
+    let mut spawned: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut started: Vec<(Ticket, Role, Option<String>)> = Vec::new();
+    for (i, (child, step)) in children.iter().zip(&playbook.steps).enumerate() {
+        let n = i + 1;
+        let role = step.role;
+        let cshort = child.short_id();
+        let project = child.project.as_ref().map(|p| p.name().to_string());
+        let agents = super::lock(&ctx.manager).list();
+        let mut assignee = None;
+        if let Some(a) = pick_agent(&agents, role, project.as_deref()) {
+            match crate::commands::ticket_assign_in(ctx, &child.id, &a.id, None) {
+                Ok(_) => assignee = Some(a.id.clone()),
+                Err(e) => notes.push(format!(
+                    "trin {n}: {cshort} kunne ikke tildeles {}: {e}",
+                    a.name
+                )),
+            }
+        } else if let (true, Some(port)) = (auto_spawn, spawn) {
+            if spawned_roles.insert(role) {
+                let blocked = !child.blocked_by.is_empty();
+                let req = SpawnByProfile {
+                    profile_id: role.as_str().to_string(),
+                    seat_kind: None,
+                    first_ticket_id: (!blocked).then(|| child.id.clone()),
+                    project: child.project.clone(),
+                };
+                match port(req) {
+                    Ok(info) => {
+                        spawned.push(info.id.clone());
+                        if blocked {
+                            match crate::commands::ticket_assign_in(ctx, &child.id, &info.id, None)
+                            {
+                                Ok(_) => assignee = Some(info.id.clone()),
+                                Err(e) => notes.push(format!(
+                                    "trin {n}: {cshort} kunne ikke tildeles {}: {e}",
+                                    info.name
+                                )),
+                            }
+                        } else {
+                            assignee = Some(info.id.clone());
+                        }
+                    }
+                    Err(e) => notes.push(format!(
+                        "trin {n}: kunne ikke starte en agent med rollen {}: {e}; {cshort} venter i backlog",
+                        role.as_str()
+                    )),
+                }
+            } else {
+                notes.push(no_agent_note(n, role, &cshort));
+            }
+        } else {
+            notes.push(no_agent_note(n, role, &cshort));
+        }
+        started.push((child.clone(), role, assignee));
+    }
+    let (parent, children) = ctx.read(|s| {
+        let fresh = |t: &Ticket| TicketSummary::from(&s.get(&t.id).unwrap_or_else(|| t.clone()));
+        (
+            fresh(&parent),
+            started
+                .iter()
+                .map(|(t, role, assignee)| StartedChild {
+                    ticket: fresh(t),
+                    role: *role,
+                    assignee: assignee.clone(),
+                })
+                .collect(),
+        )
+    });
+    Ok(PlaybookStarted {
+        parent,
+        children,
+        spawned,
+        notes,
+    })
+}
+
+fn no_agent_note(n: usize, role: Role, short: &str) -> String {
+    format!(
+        "trin {n}: ingen kørende agent med rollen {} kan tage {short}; den venter i backlog",
+        role.as_str()
+    )
 }
 
 #[cfg(test)]
@@ -396,5 +652,352 @@ mod tests {
         }));
         assert_eq!(m.keys().collect::<Vec<_>>(), ["docs"]);
         assert_eq!(notes, ["playbooks.bad: ukendt rolle «x»"]);
+    }
+
+    // ---- rollout ----
+
+    use crate::agent::AgentManager;
+    use crate::projects::ProjectRef;
+    use crate::tickets::model::{short_id, TicketState};
+    use crate::tickets::test_support::{test_ctx, TestCtx};
+    use std::sync::{Arc, Mutex};
+
+    fn parent_ticket(title: &str, body: &str) -> Ticket {
+        let mut t = crate::tickets::model::test_support::ticket(
+            "ab12cd34-0000-4000-8000-000000000001",
+            TicketState::Backlog,
+        );
+        t.title = title.into();
+        t.body = body.into();
+        t
+    }
+
+    #[test]
+    fn render_step_substitutes_and_one_lines_title() {
+        let b = builtin_playbooks();
+        let p = parent_ticket("Login\nmed  2FA", "Brug {title} og {parent} ordret.");
+        let c = render_step(&b["feature"].steps[0], &p);
+        assert_eq!(c.title, "Plan: Login med  2FA");
+        assert!(!c.blocked_by_previous);
+        assert!(c
+            .body
+            .starts_with("Lav en plan for «Login med  2FA» (forældre-ticket ab12cd34)."));
+        // The parent's text goes in as is; its placeholders are not expanded again.
+        assert!(c.body.ends_with("\n\nBrug {title} og {parent} ordret."));
+        let c2 = render_step(&b["feature"].steps[1], &p);
+        assert!(c2.blocked_by_previous);
+        assert!(c2.body.contains("mira_get_ticket ab12cd34"));
+        // Without a parent text the body ends without blank lines.
+        let empty = render_step(&b["bug"].steps[0], &parent_ticket("Nedbrud", ""));
+        assert_eq!(empty.title, "Find årsag: Nedbrud");
+        assert!(empty.body.ends_with("lille og sikker."));
+        // Long titles and texts are clipped to the ticket limits.
+        let long = parent_ticket(
+            &"x".repeat(TICKET_TITLE_MAX_CHARS),
+            &"y".repeat(TICKET_BODY_MAX_CHARS),
+        );
+        let c = render_step(&b["feature"].steps[1], &long);
+        assert_eq!(c.title.chars().count(), TICKET_TITLE_MAX_CHARS);
+        assert!(c.title.starts_with("Byg: x"));
+        assert_eq!(c.body.chars().count(), TICKET_BODY_MAX_CHARS);
+        // Unknown braces stay.
+        let st = PlaybookStep {
+            role: Role::Coder,
+            title: "{x} {title}".into(),
+            body: "{body}{".into(),
+            blocked_by_previous: false,
+        };
+        let c = render_step(&st, &parent_ticket("T", "B"));
+        assert_eq!((c.title.as_str(), c.body.as_str()), ("{x} T", "B{"));
+    }
+
+    fn info(
+        m: &mut AgentManager,
+        roles: &[Role],
+        seat: SeatKind,
+        project: Option<&str>,
+    ) -> AgentInfo {
+        let id = m.insert_fake_in(
+            &uuid::Uuid::new_v4().to_string(),
+            "/w/x",
+            roles,
+            seat,
+            project,
+        );
+        m.get(&id).unwrap()
+    }
+
+    #[test]
+    fn pick_agent_prefers_project_work_agent_with_fewest_queue_then_staff() {
+        let mut m = AgentManager::new(5);
+        let mut busy = info(&mut m, &[Role::Coder], SeatKind::Work, Some("p"));
+        busy.queue_length = 1;
+        busy.created_at = 1;
+        let mut working = info(&mut m, &[Role::Coder], SeatKind::Work, Some("P"));
+        working.current_ticket_id = Some("t".into());
+        working.created_at = 2;
+        let mut free_new = info(&mut m, &[Role::Coder], SeatKind::Work, Some("p"));
+        free_new.created_at = 9;
+        let mut free_old = info(&mut m, &[Role::Coder], SeatKind::Work, Some("p"));
+        free_old.created_at = 3;
+        let mut gone = info(&mut m, &[Role::Coder], SeatKind::Work, Some("p"));
+        gone.status = AgentStatus::Exited { code: Some(0) };
+        gone.created_at = 0;
+        let other_project = info(&mut m, &[Role::Coder], SeatKind::Work, Some("q"));
+        let staff_coder = info(&mut m, &[Role::Coder, Role::Planner], SeatKind::Staff, None);
+        let staff_planner = info(&mut m, &[Role::Planner], SeatKind::Staff, None);
+        let reviewer = info(&mut m, &[Role::Reviewer], SeatKind::Staff, None);
+        let all = vec![
+            busy.clone(),
+            working.clone(),
+            free_new.clone(),
+            free_old.clone(),
+            gone.clone(),
+            other_project.clone(),
+            staff_coder.clone(),
+            staff_planner.clone(),
+            reviewer.clone(),
+        ];
+        let pick =
+            |agents: &[AgentInfo], role, project| pick_agent(agents, role, project).map(|a| a.id);
+        // Project work agents first; fewest tickets, then the oldest (the exited one never).
+        assert_eq!(
+            pick(&all, Role::Coder, Some("p")),
+            Some(free_old.id.clone())
+        );
+        assert_eq!(
+            pick(&all, Role::Coder, Some("q")),
+            Some(other_project.id.clone())
+        );
+        // Ties on load: the oldest; queued and in progress weigh the same.
+        let two = [busy.clone(), working.clone()];
+        assert_eq!(pick(&two, Role::Coder, Some("p")), Some(busy.id.clone()));
+        // No work agent in the project (or no project): a staff agent with the role.
+        let mut staff_first = staff_planner.clone();
+        staff_first.queue_length = 3;
+        let staff = [staff_coder.clone(), staff_first.clone(), reviewer.clone()];
+        assert_eq!(
+            pick(&all, Role::Coder, Some("z")),
+            Some(staff_coder.id.clone())
+        );
+        assert_eq!(pick(&all, Role::Coder, None), Some(staff_coder.id.clone()));
+        assert_eq!(
+            pick(&staff, Role::Planner, None),
+            Some(staff_coder.id.clone())
+        );
+        assert_eq!(pick(&all, Role::Debugger, Some("p")), None);
+        assert_eq!(pick(&[gone], Role::Coder, Some("p")), None);
+        assert_eq!(pick(&[], Role::Coder, Some("p")), None);
+    }
+
+    fn ctx_with(agents: &[(&[Role], SeatKind, Option<&str>)]) -> (TestCtx, Vec<String>) {
+        let mut m = AgentManager::new(5);
+        let ids = agents
+            .iter()
+            .map(|(roles, seat, project)| {
+                m.insert_fake_in(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "/w/x",
+                    roles,
+                    *seat,
+                    *project,
+                )
+            })
+            .collect();
+        (test_ctx(Arc::new(Mutex::new(m))), ids)
+    }
+
+    fn feature(t: &TestCtx, title: &str) -> Ticket {
+        t.ctx
+            .mutate(|s| {
+                s.create_in(
+                    title,
+                    "detaljer",
+                    false,
+                    Some(ProjectRef::Existing("p".into())),
+                    Some("feature".into()),
+                    1,
+                )
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn start_playbook_creates_assigns_and_leaves_unassignable_in_backlog() {
+        // A coder in p (the build step); no planner runs.
+        let (mut t, ids) = ctx_with(&[(&[Role::Coder], SeatKind::Work, Some("p"))]);
+        let parent = feature(&t, "Login");
+        t.sent();
+        let r = start_playbook(&t.ctx, &parent.short_id(), StartedBy::User, None).unwrap();
+        assert_eq!(r.parent.id, parent.id);
+        assert!(r.parent.playbook_started_at.is_some());
+        assert_eq!(r.children.len(), 2);
+        let (plan, build) = (&r.children[0], &r.children[1]);
+        assert_eq!((plan.role, plan.assignee.clone()), (Role::Planner, None));
+        assert_eq!(plan.ticket.state, TicketState::Backlog);
+        assert_eq!(plan.ticket.title, "Plan: Login");
+        assert_eq!(
+            (build.role, build.assignee.clone()),
+            (Role::Coder, Some(ids[0].clone()))
+        );
+        assert_eq!(build.ticket.state, TicketState::Assigned);
+        assert_eq!(build.ticket.blocked_by, vec![plan.ticket.id.clone()]);
+        assert_eq!(build.ticket.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(build.ticket.project, parent.project);
+        assert!(r.spawned.is_empty());
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "trin 1: ingen kørende agent med rollen planner kan tage {}; den venter i backlog",
+                short_id(&plan.ticket.id)
+            )]
+        );
+        // The coder heard about its queue (the assignment path notifies).
+        assert!(t
+            .sent()
+            .contains(&crate::tickets::dispatcher::DispatchMsg::QueueChanged {
+                agent_id: ids[0].clone()
+            }));
+        // The user is the creator.
+        let c = t.ctx.read(|s| s.get(&plan.ticket.id)).unwrap();
+        assert_eq!(
+            (c.source, c.history[0].by),
+            (TicketSource::User, TicketActor::User)
+        );
+    }
+
+    #[test]
+    fn start_playbook_twice_is_refused() {
+        let (t, _) = ctx_with(&[]);
+        let parent = feature(&t, "Login");
+        start_playbook(&t.ctx, &parent.id, StartedBy::User, None).unwrap();
+        let by = StartedBy::Agent {
+            id: "k".into(),
+            name: "koordinator-01".into(),
+        };
+        assert_eq!(
+            start_playbook(&t.ctx, &parent.id, by, None),
+            Err(String::from(TicketError::PlaybookAlreadyStarted))
+        );
+        assert_eq!(t.ctx.read(|s| s.children(&parent.id)).len(), 2);
+    }
+
+    #[test]
+    fn start_playbook_without_kind_or_playbook_is_refused() {
+        let (t, _) = ctx_with(&[]);
+        let plain = t.ctx.mutate(|s| s.create("Opgave", "", false, 1)).unwrap();
+        assert_eq!(
+            start_playbook(&t.ctx, &plain.id, StartedBy::User, None),
+            Err("Ingen playbook for «task»".into())
+        );
+        // A kind whose playbook is no longer in the workspace file.
+        let gone = t
+            .ctx
+            .mutate(|s| s.create_in("Docs", "", false, None, Some("docs".into()), 1))
+            .unwrap();
+        assert_eq!(
+            start_playbook(&t.ctx, &gone.id, StartedBy::User, None),
+            Err("Ingen playbook for «docs»".into())
+        );
+        assert_eq!(
+            start_playbook(&t.ctx, "nope", StartedBy::User, None),
+            Err(String::from(TicketError::NotFound))
+        );
+        assert!(t.ctx.read(|s| s.children(&plain.id)).is_empty());
+    }
+
+    #[test]
+    fn auto_spawn_starts_one_agent_per_role_only_when_enabled() {
+        let (t, _) = ctx_with(&[]);
+        let ws = &t.ctx.workspace;
+        std::fs::create_dir_all(ws.root()).unwrap();
+        // Two coder steps: the second goes to the coder spawned for the first.
+        std::fs::write(
+            ws.path(),
+            r#"{"autoSpawnForPlaybook": true, "playbooks": {"dobbelt": {"steps": [
+                {"role": "coder", "title": "A: {title}"},
+                {"role": "coder", "title": "B: {title}"},
+                {"role": "planner", "title": "C: {title}", "blockedByPrevious": false}]}}}"#,
+        )
+        .unwrap();
+        let requests: Arc<Mutex<Vec<SpawnByProfile>>> = Arc::default();
+        let manager = Arc::clone(&t.ctx.manager);
+        let ctx = Arc::clone(&t.ctx);
+        let log = Arc::clone(&requests);
+        let port: SpawnPort = Arc::new(move |req: SpawnByProfile| {
+            log.lock().unwrap().push(req.clone());
+            if req.profile_id == "planner" {
+                return Err("Højst 3 stabsagenter".into());
+            }
+            let id = manager.lock().unwrap().insert_fake_in(
+                "s-new",
+                "/w/new",
+                &[Role::Coder],
+                SeatKind::Work,
+                Some("p"),
+            );
+            // The real path assigns the first ticket while spawning.
+            if let Some(first) = &req.first_ticket_id {
+                ctx.mutate(|s| s.assign(first, &id, 5)).unwrap();
+            }
+            Ok(manager.lock().unwrap().get(&id).unwrap())
+        });
+        let parent = t
+            .ctx
+            .mutate(|s| {
+                s.create_in(
+                    "Søg",
+                    "",
+                    false,
+                    Some(ProjectRef::Existing("p".into())),
+                    Some("dobbelt".into()),
+                    1,
+                )
+            })
+            .unwrap();
+        let r = start_playbook(&t.ctx, &parent.id, StartedBy::User, Some(&port)).unwrap();
+        let reqs = requests.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert_eq!(
+            reqs[0],
+            SpawnByProfile {
+                profile_id: "coder".into(),
+                seat_kind: None,
+                first_ticket_id: Some(r.children[0].ticket.id.clone()),
+                project: Some(ProjectRef::Existing("p".into())),
+            }
+        );
+        assert_eq!(reqs[1].profile_id, "planner");
+        assert_eq!(
+            reqs[1].first_ticket_id,
+            Some(r.children[2].ticket.id.clone())
+        );
+        assert_eq!(r.spawned.len(), 1);
+        let coder = r.spawned[0].clone();
+        assert_eq!(r.children[0].assignee.as_deref(), Some(coder.as_str()));
+        // The blocked second step was not spawned for; it queues at the spawned coder.
+        assert_eq!(r.children[1].assignee.as_deref(), Some(coder.as_str()));
+        assert_eq!(r.children[1].ticket.state, TicketState::Assigned);
+        assert_eq!(r.children[2].assignee, None);
+        assert_eq!(r.notes.len(), 1);
+        assert!(r.notes[0].starts_with(
+            "trin 3: kunne ikke starte en agent med rollen planner: Højst 3 stabsagenter;"
+        ));
+
+        // Without the rule: no spawn at all.
+        std::fs::write(
+            ws.path(),
+            r#"{"playbooks": {"dobbelt": {"steps": [{"role": "debugger", "title": "A: {title}"}]}}}"#,
+        )
+        .unwrap();
+        let q = t
+            .ctx
+            .mutate(|s| s.create_in("Q", "", false, None, Some("dobbelt".into()), 9))
+            .unwrap();
+        requests.lock().unwrap().clear();
+        let r = start_playbook(&t.ctx, &q.id, StartedBy::User, Some(&port)).unwrap();
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(r.children[0].assignee, None);
+        let _ = std::fs::remove_dir_all(ws.root());
     }
 }

@@ -45,7 +45,9 @@ use crate::tickets::model::{
     ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
     TicketSummary, WorkspaceRules,
 };
-use crate::tickets::tools::{ticket_has_project, SpawnByProfile, SPAWN_UNAVAILABLE};
+use crate::tickets::playbook::{self, PlaybookStarted, StartedBy};
+use crate::tickets::service::validate_kind;
+use crate::tickets::tools::{ticket_has_project, SpawnByProfile, SpawnPort, SPAWN_UNAVAILABLE};
 use crate::tickets::{prompt, ReportContent, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
 use crate::workplace;
 use crate::workspace::WorkspaceReader;
@@ -433,8 +435,23 @@ pub fn ticket_create(
     skip_review: bool,
     project: Option<ProjectRef>,
 ) -> Result<TicketSummary, String> {
+    ticket_create_kind(t, title, body, skip_review, project, None)
+}
+
+/// [`ticket_create`] with a `kind` (step 6b): task, feature, bug or a playbook name of the
+/// workspace file (absent/`task` = a plain ticket), checked with [`validate_kind`] against the
+/// workspace's playbooks.
+pub fn ticket_create_kind(
+    t: &TicketsCtx,
+    title: &str,
+    body: &str,
+    skip_review: bool,
+    project: Option<ProjectRef>,
+    kind: Option<&str>,
+) -> Result<TicketSummary, String> {
+    let kind = validate_kind(kind, &t.workspace.config().playbook_kinds())?;
     let now = now_ms();
-    t.mutate(|s| s.create_in(title, body, skip_review, project, now))
+    t.mutate(|s| s.create_in(title, body, skip_review, project, kind, now))
         .map(|tk| TicketSummary::from(&tk))
 }
 
@@ -1826,8 +1843,31 @@ pub fn create_ticket(
     body: String,
     skip_review: bool,
     project: Option<ProjectRef>,
+    kind: Option<String>,
 ) -> Result<TicketSummary, String> {
-    ticket_create(&state.tickets, &title, &body, skip_review, project)
+    ticket_create_kind(
+        &state.tickets,
+        &title,
+        &body,
+        skip_review,
+        project,
+        kind.as_deref(),
+    )
+}
+
+/// "Start forløb" (step 6b, plan punkt 6): rolls out the playbook of the ticket's kind as the
+/// user ([`playbook::start_playbook`]); with `autoSpawnForPlaybook` agents are started through
+/// the same path as `mira_spawn_agent`.
+// TODO(windows-verify): "Start forløb" on a feature ticket creates "Plan: …" and "Byg: …" as
+// children, the second blocked by the first, each assigned to a running agent with the role.
+#[tauri::command]
+pub fn ticket_start_playbook(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ticket_id: String,
+) -> Result<PlaybookStarted, String> {
+    let port: SpawnPort = Arc::new(move |req| spawn_for_tool(&app, req));
+    playbook::start_playbook(&state.tickets, &ticket_id, StartedBy::User, Some(&port))
 }
 
 #[tauri::command]
@@ -2631,6 +2671,23 @@ mod tests {
     }
 
     #[test]
+    fn create_with_kind_is_validated_against_the_playbooks() {
+        let (t, _, _) = tickets_setup();
+        let f = ticket_create_kind(&t.ctx, "Login", "", false, p(), Some(" Feature ")).unwrap();
+        assert_eq!(f.kind.as_deref(), Some("feature"));
+        let plain = ticket_create_kind(&t.ctx, "x", "", false, p(), Some("task")).unwrap();
+        assert_eq!(plain.kind, None);
+        assert_eq!(
+            ticket_create(&t.ctx, "y", "", false, p()).unwrap().kind,
+            None
+        );
+        assert_eq!(
+            ticket_create_kind(&t.ctx, "z", "", false, p(), Some("docs")).unwrap_err(),
+            String::from(TicketError::InvalidKind)
+        );
+    }
+
+    #[test]
     fn assign_needs_a_live_agent_and_notifies_the_dispatcher() {
         let (mut t, live, dead) = tickets_setup();
         let tk = ticket_create(&t.ctx, "  Opgave  ", "", false, p()).unwrap();
@@ -2996,6 +3053,7 @@ mod tests {
                     p(),
                     None,
                     vec![blocker.id.clone()],
+                    None,
                     2,
                 )
             })
@@ -3055,6 +3113,7 @@ mod tests {
                     None,
                     Some(parent.id.clone()),
                     vec![],
+                    None,
                     4,
                 )
             })
@@ -3568,6 +3627,7 @@ mod tests {
                     None,
                     Some(parent.id.clone()),
                     vec![],
+                    None,
                     2,
                 )?;
                 s.submit_by_agent(&work, None, "fordelt", 3)?;

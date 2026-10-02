@@ -3535,6 +3535,7 @@ mod tests {
                 None,
                 Some(parent.id.clone()),
                 vec![],
+                None,
                 3,
             )
             .unwrap();
@@ -3917,6 +3918,7 @@ mod tests {
                     None,
                     None,
                     vec![blocker.id.clone()],
+                    None,
                     5,
                 )
                 .unwrap();
@@ -3991,6 +3993,7 @@ mod tests {
                     None,
                     Some(parent.id.clone()),
                     vec![],
+                    None,
                     3,
                 )
                 .unwrap();

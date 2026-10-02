@@ -56,6 +56,9 @@ pub const AGENT_EXITED_NOTE: &str = "agent afsluttet";
 pub const AGENT_STOPPED_NOTE: &str = "agent stoppet";
 /// History note when a turn ended without `mira_submit_for_review` (step 4).
 pub const NOT_SUBMITTED_NOTE: &str = "turn afsluttet uden aflevering";
+/// `assign_reviewer` on a ticket in review without an assignee (a finished flow parent, step 6b).
+pub const FLOW_REVIEW_IS_USERS: &str =
+    "Et afsluttet forløb uden ejer reviewes af dig: godkend eller afvis det selv";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -224,6 +227,22 @@ impl TicketsCtx {
         self.notify(fx.wake.iter().chain(&fx.unblocked).cloned());
         for p in &fx.children_done {
             let now = now_ms();
+            // Step 6b (plan A.2): a flow parent goes to review for the user (never routed).
+            match self.mutate_if(|s| s.finish_flow(p, now), Option::is_some) {
+                Ok(Some(t)) => {
+                    log::info!(
+                        "forløb: {} afsluttet; {} til brugeren",
+                        model::short_id(p),
+                        t.state.label_da()
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("forløb: finishing {} failed: {e}", model::short_id(p));
+                    continue;
+                }
+            }
             match self.mutate_if(|s| s.note_children_done(p, now), Option::is_some) {
                 Ok(Some(_)) => log::info!(
                     "forløb: alle del-tickets til {} er afsluttet (ingen ejer)",
@@ -535,6 +554,10 @@ impl TicketsCtx {
             .ok_or(TicketError::NotFound)?;
         if t.state != TicketState::Review {
             return Err(TicketError::NotInReview.into());
+        }
+        // Step 6b (plan A.2/F): a finished flow parent has no sender; only the user decides.
+        if t.assignee_agent_id.is_none() {
+            return Err(FLOW_REVIEW_IS_USERS.into());
         }
         let now = now_ms();
         match agent_id {
@@ -1692,6 +1715,7 @@ mod tests {
                         None,
                         Some(p.id.clone()),
                         vec![],
+                        None,
                         4,
                     )
                 })
@@ -1793,6 +1817,7 @@ mod tests {
                         None,
                         None,
                         vec![blocker.id.clone()],
+                        None,
                         5,
                     )
                 })
@@ -1812,6 +1837,7 @@ mod tests {
                     None,
                     None,
                     vec![blocker.id.clone(), other.id.clone()],
+                    None,
                     8,
                 )
             })
@@ -1873,5 +1899,74 @@ mod tests {
         assert_eq!(t.emitted(TICKETS_CHANGED).len(), 2);
         let n = tk.history.len();
         assert_eq!(t.ctx.read(|s| s.get(&p.id)).unwrap().history.len(), n);
+    }
+
+    #[test]
+    fn last_child_done_sends_flow_parent_to_review() {
+        use crate::agent::SeatKind;
+        use crate::tickets::model::{TicketSource, TicketState as S};
+        use crate::tickets::service::ChildSpec;
+        let mut mgr = AgentManager::new(5);
+        let a = mgr.insert_fake("s-a", "/w/a");
+        let r = mgr.insert_fake_with("s-r", "/w/r", &[Role::Reviewer], SeatKind::Staff);
+        let mut t = test_ctx(Arc::new(Mutex::new(mgr)));
+        let c = Arc::clone(&t.ctx);
+        let p = Some(crate::projects::ProjectRef::Existing("p".into()));
+        let parent = c
+            .mutate(|s| s.create_in("Login", "", false, p, Some("feature".into()), 1))
+            .unwrap();
+        let specs: Vec<ChildSpec> = (0..2)
+            .map(|i| ChildSpec {
+                title: format!("trin {i}"),
+                body: String::new(),
+                blocked_by_previous: i > 0,
+            })
+            .collect();
+        let kids = c
+            .mutate(|s| {
+                s.create_playbook_children(
+                    &parent.id,
+                    &specs,
+                    (TicketSource::User, TicketActor::User),
+                    2,
+                )
+            })
+            .unwrap();
+        let done = |id: &str, now: u64| {
+            c.mutate(|s| {
+                s.assign(id, &a, now)?;
+                s.mark_dispatched(id, &a, now)?;
+                s.submit_by_agent(&a, Some(id), "klar", now)?;
+                s.approve(id, now)
+            })
+            .unwrap();
+        };
+        done(&kids[0].id, 3);
+        assert_eq!(c.read(|s| s.get(&parent.id)).unwrap().state, S::Backlog);
+        done(&kids[1].id, 4);
+        let tk = c.read(|s| s.get(&parent.id)).unwrap();
+        assert_eq!((tk.state, tk.assignee_agent_id.clone()), (S::Review, None));
+        let last = tk.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some(crate::config::FLOW_DONE_NOTE))
+        );
+        // Never routed: no reviewer, no ReviewAssigned, the user decides.
+        t.sent();
+        assert_eq!(c.route_reviews(), 0);
+        assert!(t
+            .sent()
+            .iter()
+            .all(|m| !matches!(m, DispatchMsg::ReviewAssigned { .. })));
+        assert_eq!(
+            c.read(|s| s.get(&parent.id)).unwrap().reviewer_agent_id,
+            None
+        );
+        assert_eq!(
+            c.assign_reviewer(&parent.id, Some(&r)),
+            Err(FLOW_REVIEW_IS_USERS.to_string())
+        );
+        // The user rejects: back to the backlog (nobody to return it to).
+        assert_eq!(c.reject_return(&parent.id), RejectReturn::Backlog);
     }
 }

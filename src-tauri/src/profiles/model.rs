@@ -802,6 +802,7 @@ mod tests {
             "mira_assign_ticket",
             "mira_list_profiles",
             "mira_spawn_agent",
+            "mira_start_playbook",
             "mira_unassign_ticket",
         ]);
         let all_bound = mira(&[
@@ -810,6 +811,7 @@ mod tests {
             "mira_list_profiles",
             "mira_reject_ticket",
             "mira_spawn_agent",
+            "mira_start_playbook",
             "mira_unassign_ticket",
         ]);
         let edit = owned(&["Edit", "Write", "MultiEdit", "NotebookEdit"]);

@@ -143,6 +143,8 @@ pub fn mira_tool_label(tool_name: &str) -> Option<&'static str> {
         "mira_get_report" => Some("Læser rapport"),
         // Step 5c.
         "mira_handoff_ticket" => Some("Giver ticket videre"),
+        // Step 6b.
+        "mira_start_playbook" => Some("Starter forløb"),
         _ => None,
     }
 }
@@ -384,6 +386,7 @@ mod tests {
             ("mira_add_report", "Skriver rapport"),
             ("mira_get_report", "Læser rapport"),
             ("mira_handoff_ticket", "Giver ticket videre"),
+            ("mira_start_playbook", "Starter forløb"),
         ];
         // Every tool of the MCP server has a label (and only those).
         let mut names: Vec<&str> = table.iter().map(|(t, _)| *t).collect();
