@@ -178,10 +178,10 @@ pub fn relation_effects(before: &[RelSnap], after: &[RelSnap]) -> RelationEffect
                     fx.freed.push((a.id.clone(), agent.to_string()));
                 }
             }
-            (TicketState::Backlog, None) => {
-                if open_of(before, &a.id) > 0 && open_of(after, &a.id) == 0 {
-                    fx.children_done.push(a.id.clone());
-                }
+            (TicketState::Backlog, None)
+                if open_of(before, &a.id) > 0 && open_of(after, &a.id) == 0 =>
+            {
+                fx.children_done.push(a.id.clone());
             }
             _ => {}
         }
