@@ -98,6 +98,9 @@ pub struct AppState {
     /// Set by the pipe server once the pipe/socket exists; cleared if the server stops for good.
     /// While false, `spawn_agent` refuses to start agents (their hooks would reach nothing).
     pub pipe_ready: Arc<AtomicBool>,
+    /// The pipe server's error once it stopped (e.g. the socket directory is not private);
+    /// Diagnostik's Pipe-note on unix.
+    pub pipe_error: Arc<Mutex<Option<String>>>,
     /// Receives PTY output/exit from the manager's threads (see `lib.rs::tauri_sink`).
     pub sink: EventSink,
     /// Hook frame counters, shared with the pipe handler.
@@ -197,7 +200,7 @@ impl AppState {
             auto_review_on_stop: ws.rules.auto_review_on_stop,
             pipe_name: self.paths.pipe_name.clone(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
-            pipe_note: pipe_note(&self.paths.pipe_name),
+            pipe_note: pipe_note(&self.paths.pipe_name, lock(&self.pipe_error).as_deref()),
             frames_received: self.hook_stats.received(),
             frames_unknown_session: self.hook_stats.unknown(),
             last_hook_event: self.hook_stats.last_event(),
@@ -334,16 +337,25 @@ pub fn check_spawn(spawn: Option<&str>) -> Result<(), String> {
     }
 }
 
-/// Diagnostik's `pipeNote`: unix: the too-long-socket-path text (the server did not start);
-/// Windows: `None`.
-fn pipe_note(name: &str) -> Option<String> {
+/// Diagnostik's `pipeNote`. Unix: the server's error (`error`, e.g. "Socket-mappen … er ikke
+/// privat"), else the too-long-socket-path text, plus a note when the `/tmp` fallback is in use
+/// (joined with "; "). Windows: `None`.
+fn pipe_note(name: &str, error: Option<&str>) -> Option<String> {
     #[cfg(unix)]
     {
-        crate::pipe::unix_socket::check_length(std::path::Path::new(name)).err()
+        use crate::pipe::unix_socket;
+        let path = std::path::Path::new(name);
+        let problem = error
+            .map(str::to_string)
+            .or_else(|| unix_socket::check_length(path).err());
+        match (problem, unix_socket::fallback_note(path)) {
+            (Some(p), Some(f)) => Some(format!("{p}; {f}")),
+            (p, f) => p.or(f),
+        }
     }
     #[cfg(windows)]
     {
-        let _ = name;
+        let _ = (name, error);
         None
     }
 }
@@ -2067,6 +2079,7 @@ mod tests {
             },
             island: IslandState::default(),
             pipe_ready: Arc::new(AtomicBool::new(true)),
+            pipe_error: Arc::new(Mutex::new(None)),
             sink: Arc::new(|_| {}),
             hook_stats: Arc::new(HookStats::default()),
             claude_version: Arc::new(Mutex::new(VersionProbe::Ok("2.1.286 (Claude Code)".into()))),
@@ -2116,7 +2129,7 @@ mod tests {
         assert!(!d.auto_review_on_stop);
         assert!(d.pipe_ready);
         assert_eq!(d.platform, std::env::consts::OS);
-        assert_eq!(d.pipe_note, pipe_note(&d.pipe_name));
+        assert_eq!(d.pipe_note, pipe_note(&d.pipe_name, None));
         assert_eq!((d.frames_received, d.frames_unknown_session), (1, 1));
         assert_eq!(d.last_hook_event.unwrap().name, "Stop");
         assert!(d.log_path.unwrap().ends_with("mira-bots.log"));
@@ -3413,6 +3426,29 @@ mod tests {
         assert!(String::from(err).starts_with("Hook-forbindelsen"));
         ready.store(true, Ordering::Release);
         assert!(check_pipe_ready(&ready).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_note_covers_errors_length_and_the_fallback() {
+        let normal = "/var/folders/ab/T/mira-bots-501/mira-bots-42.sock";
+        assert_eq!(pipe_note(normal, None), None);
+        // A prepare failure stored by the server.
+        let err = "Socket-mappen /x er ikke privat (rettigheder 755); slet den og start appen igen";
+        assert_eq!(pipe_note(normal, Some(err)).as_deref(), Some(err));
+        // Too long (both too long; nothing stored yet): the length text.
+        let long = format!("/{}/mira-bots-42.sock", "l".repeat(100));
+        assert!(pipe_note(&long, None)
+            .unwrap()
+            .starts_with("Socket-stien er for lang ("));
+        // The /tmp fallback is named, alone or after an error.
+        let fb = "/tmp/mira-bots-501/42.sock";
+        assert_eq!(
+            pipe_note(fb, None).as_deref(),
+            Some("Socket-stien under TMPDIR ville være over 100 tegn; bruger /tmp/mira-bots-501 i stedet")
+        );
+        let both = pipe_note(fb, Some(err)).unwrap();
+        assert!(both.starts_with(err) && both.ends_with("bruger /tmp/mira-bots-501 i stedet"));
     }
 
     // ---- step 5: review routing from the commands, report folder on delete ----

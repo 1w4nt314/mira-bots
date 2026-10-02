@@ -1,5 +1,5 @@
 //! Client side of the pipe: Windows named pipe via `std::fs::OpenOptions`, Unix domain socket
-//! elsewhere (Unix domain socket: Linux til test, macOS i produktion).
+//! elsewhere (Unix domain socket: Linux for tests, macOS in production).
 //!
 //! Copy of `crates/mira-hook/src/transport.rs`, kept in sync BY HAND (plan4 A: duplicated on
 //! purpose instead of a shared crate). Change both files together; never change the hook side
@@ -51,7 +51,7 @@ pub fn connect(name: &str, deadline: Instant) -> io::Result<Box<dyn ReadWrite>> 
 }
 
 /// Connects to the app's Unix socket (the "pipe name" is a socket path in the app's private
-/// `mira-bots-<uid>` directory; Linux til test, macOS i produktion). `deadline` is unused:
+/// `mira-bots-<uid>` directory; Linux for tests, macOS in production). `deadline` is unused:
 /// a Unix connect either succeeds or fails immediately.
 #[cfg(unix)]
 pub fn connect(name: &str, _deadline: Instant) -> io::Result<Box<dyn ReadWrite>> {

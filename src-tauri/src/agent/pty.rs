@@ -30,7 +30,8 @@ pub struct PtyHandle {
     killer: Box<dyn ChildKiller + Send + Sync>,
     pid: Option<u32>,
     /// Set by the waiter thread once the child was reaped, BEFORE `on_exit` runs (so never under
-    /// the manager lock). Contract of `process::terminate`/`finish_all` (plan7 C7.1).
+    /// the manager lock). `process::terminate` skips portable-pty's killer once it is set; the
+    /// group signals themselves are gated on the group still having members (plan7 C7.1).
     exited: Arc<AtomicBool>,
 }
 
@@ -350,13 +351,53 @@ mod tests {
     }
 
     #[test]
-    fn kill_after_exit_sends_nothing() {
+    fn kill_sends_nothing_when_the_group_is_empty() {
         let mut c = start("exit 0", vec![]);
         c.exit.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(c.handle.exit_flag().load(Ordering::SeqCst));
+        assert!(!process::group_alive(c.handle.pid().unwrap()));
         assert!(
             c.handle.kill().is_ok(),
-            "already reaped: no signal, no error"
+            "already reaped, group empty: no signal, no error"
         );
+    }
+
+    /// The leader dies on SIGTERM (and is reaped); a member that ignores TERM and HUP (the
+    /// session leader's exit sends SIGHUP) keeps the group alive and must get the SIGKILL.
+    const LEADER_EXITS_MEMBER_SURVIVES: &str =
+        r#"sh -c 'trap "" TERM HUP; exec sleep 30' & echo "P1=$!"; sleep 30"#;
+
+    #[test]
+    fn reaper_kills_survivors_after_the_leader_exited() {
+        let mut c = start(LEADER_EXITS_MEMBER_SURVIVES, vec![]);
+        let p1 = read_pid(&c, "P1");
+        // Let the inner sh install its traps before the signal.
+        std::thread::sleep(Duration::from_millis(200));
+        c.handle
+            .kill_with_grace(Duration::from_millis(500))
+            .unwrap();
+        c.exit
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the leader exits on SIGTERM");
+        assert!(c.handle.exit_flag().load(Ordering::SeqCst));
+        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
+    }
+
+    #[test]
+    fn finish_all_kills_survivors_after_the_leader_exited() {
+        let mut c = start(LEADER_EXITS_MEMBER_SURVIVES, vec![]);
+        let p1 = read_pid(&c, "P1");
+        let pid = c.handle.pid().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // SIGTERM only (the reaper would wait a minute): finish_all must do the SIGKILL.
+        c.handle.kill_with_grace(Duration::from_secs(60)).unwrap();
+        c.exit
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the leader exits on SIGTERM");
+        assert!(!pid_is_dead(p1), "P1 ignores SIGTERM");
+        let t = Instant::now();
+        process::finish_all(&[(pid, c.handle.exit_flag())], Duration::from_millis(300));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
     }
 }

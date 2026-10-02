@@ -3,9 +3,13 @@
 //! group and SIGKILL follows after a grace period. Windows: portable-pty's killer
 //! (TerminateProcess) as before; a Job Object for the tree is backlog.
 //!
-//! PID reuse: `killpg` is only sent while `exited` is false, i.e. before the waiter thread has
-//! reaped the leader, so its pid (= the group id) cannot have been reused yet. The window
-//! between reading the flag and the SIGKILL is microseconds; accepted (plan7 G.1). Children that
+//! PID reuse: signals go to the group only while it still has members (`group_alive`, i.e.
+//! `kill(-pgid, 0)` succeeds). POSIX does not reuse a process group id while the group has a
+//! member (XNU and Linux keep the pid reserved), so this is safe even after the leader itself
+//! has exited and been reaped; that is exactly the case where a child that ignores SIGTERM
+//! (an MCP server, a Bash-tool child) must still get the SIGKILL. Only an empty group's id can
+//! be reused, and an empty group is never signalled. The window between the check and the
+//! signal is microseconds; accepted (plan7 G.1). `exited` is a fast path only. Children that
 //! call `setsid` themselves leave the group and survive (plan7 G.2, descendant walk is backlog).
 // TODO(macos-verify): stopping an agent ends claude, node, mira-mcp and Bash-tool children
 // (`ps -o pid,pgid,comm`), also during `sleep 60`; SIGKILL after 2 s for a child that ignores
@@ -56,10 +60,11 @@ pub fn terminal_env_defaults_for(has_term: bool, has_colorterm: bool) -> Vec<(St
 }
 
 /// Starts ending the child. Never blocks.
-/// Unix: `killpg(pid, SIGTERM)`; ESRCH or `pid == None` → `killer.kill()`; then a detached
-/// thread `pty-reaper-<pid>` sleeps `grace` and sends `killpg(pid, SIGKILL)` unless `exited`
-/// is set (set by the waiter thread BEFORE on_exit, i.e. never under the manager lock).
-/// Nothing is sent once `exited` is set (the pid may be reused).
+/// Unix: `killpg(pid, SIGTERM)` if the group still has members; ESRCH (empty group) or
+/// `pid == None` → `killer.kill()` unless `exited` is set (set by the waiter thread BEFORE
+/// on_exit, i.e. never under the manager lock); then a detached thread `pty-reaper-<pid>` sleeps
+/// `grace` and sends `killpg(pid, SIGKILL)` if the group still has members — also when the
+/// leader has exited meanwhile. Nothing is sent to an empty group (its id may be reused).
 /// Windows: `killer.kill()`.
 pub fn terminate(
     pid: Option<u32>,
@@ -80,8 +85,9 @@ pub fn terminate(
 }
 
 /// Quit path, after `terminate` was called for every child: unix polls every 50 ms up to
-/// `budget` until each `exited` is set or the group is gone, then SIGKILLs the rest.
-/// Windows: returns at once. May be called under the manager lock (see `exited` above).
+/// `budget` until every group is empty (leader and all members gone), then SIGKILLs the groups
+/// that still have members, whether or not their leader has exited. Windows: returns at once.
+/// May be called under the manager lock (it never waits for the waiter threads).
 pub fn finish_all(children: &[(u32, Arc<AtomicBool>)], budget: Duration) {
     #[cfg(unix)]
     {
@@ -94,15 +100,10 @@ pub fn finish_all(children: &[(u32, Arc<AtomicBool>)], budget: Duration) {
 }
 
 #[cfg(unix)]
-/// `kill(-pid, 0)`: false on ESRCH, true otherwise (EPERM counts as alive).
+/// `kill(-pid, 0)`: false on ESRCH, true otherwise (EPERM counts as alive). False for the ids
+/// `unix::group_id` excludes (0, 1, our own group, > i32::MAX).
 pub(crate) fn group_alive(pid: u32) -> bool {
-    match unix::group_id(Some(pid)) {
-        Some(pgid) => match unix::signal_group(pgid, 0) {
-            Ok(()) => true,
-            Err(e) => e.raw_os_error() != Some(libc::ESRCH),
-        },
-        None => false,
-    }
+    unix::group_id(Some(pid)).is_some_and(unix::group_has_members)
 }
 
 #[cfg(unix)]
@@ -127,6 +128,14 @@ mod unix {
         (pgid > 1 && pgid != own).then_some(pgid)
     }
 
+    /// `kill(-pgid, 0)` succeeds or fails with something other than ESRCH.
+    pub(super) fn group_has_members(pgid: i32) -> bool {
+        match signal_group(pgid, 0) {
+            Ok(()) => true,
+            Err(e) => e.raw_os_error() != Some(libc::ESRCH),
+        }
+    }
+
     pub(super) fn signal_group(pgid: i32, sig: libc::c_int) -> io::Result<()> {
         // SAFETY: killpg only takes integers; `group_id` excluded 0, 1 and our own group.
         if unsafe { libc::killpg(pgid, sig) } == 0 {
@@ -142,17 +151,20 @@ mod unix {
         killer: &mut (dyn ChildKiller + Send + Sync),
         grace: Duration,
     ) -> Result<(), AgentError> {
-        if exited.load(Ordering::SeqCst) {
-            return Ok(());
-        }
+        let done = exited.load(Ordering::SeqCst);
         let Some(pgid) = group_id(pid) else {
-            killer.kill()?;
+            if !done {
+                killer.kill()?;
+            }
             return Ok(());
         };
+        // ESRCH: the group is empty (nothing to stop, and its id may be reused).
         match signal_group(pgid, libc::SIGTERM) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
-                killer.kill()?;
+                if !done {
+                    killer.kill()?;
+                }
                 return Ok(());
             }
             Err(e) => {
@@ -162,12 +174,13 @@ mod unix {
                     .map_err(|k| AgentError::Pty(format!("killpg: {e}; kill: {k}")));
             }
         }
-        let flag = Arc::clone(exited);
         let spawned = std::thread::Builder::new()
             .name(format!("pty-reaper-{pgid}"))
             .spawn(move || {
                 std::thread::sleep(grace);
-                if !flag.load(Ordering::SeqCst) {
+                // Gated on members, not on `exited`: survivors of a leader that exited still
+                // hold the group id, so it cannot have been reused.
+                if group_has_members(pgid) {
                     match signal_group(pgid, libc::SIGKILL) {
                         Ok(()) => log::info!("agent process group {pgid}: SIGKILL after grace"),
                         Err(e) => log::debug!("killpg({pgid}, SIGKILL): {e}"),
@@ -183,18 +196,20 @@ mod unix {
     pub(super) fn finish_all(children: &[(u32, Arc<AtomicBool>)], budget: Duration) {
         let deadline = Instant::now() + budget;
         loop {
-            let pending: Vec<(i32, &Arc<AtomicBool>)> = children
+            // Gated on members, not on the exit flags (see the module doc).
+            let pending: Vec<i32> = children
                 .iter()
-                .filter(|(pid, flag)| !flag.load(Ordering::SeqCst) && group_alive(*pid))
-                .filter_map(|(pid, flag)| group_id(Some(*pid)).map(|g| (g, flag)))
+                .filter(|(pid, _)| group_alive(*pid))
+                .filter_map(|(pid, _)| group_id(Some(*pid)))
                 .collect();
             if pending.is_empty() {
                 return;
             }
             let now = Instant::now();
             if now >= deadline {
-                for (pgid, flag) in pending {
-                    if !flag.load(Ordering::SeqCst) {
+                for pgid in pending {
+                    // Re-checked right before the signal (the group may have emptied).
+                    if group_has_members(pgid) {
                         match signal_group(pgid, libc::SIGKILL) {
                             Ok(()) => log::info!("quit: SIGKILL to agent process group {pgid}"),
                             Err(e) => log::debug!("quit: killpg({pgid}, SIGKILL): {e}"),

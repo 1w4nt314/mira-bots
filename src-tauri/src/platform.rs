@@ -7,7 +7,10 @@ pub fn name() -> &'static str {
 
 /// macOS: `ActivationPolicy::Accessory` (no Dock icon, no menu bar, not in Cmd+Tab; windows
 /// still become key). Other platforms: nothing. Tauri's default menu stays on (Cmd+C/V may
-/// depend on it).
+/// depend on it). Called from `lib.rs::run` between `Builder::build` and `App::run`: there
+/// `App` still owns the runtime, so tauri 2.12's `App::set_activation_policy` sets it on the
+/// event loop before launch (in `setup` the runtime is already taken and the app would start
+/// as Regular first).
 // TODO(macos-verify): Accessory: no Dock icon, workplace still gets keyboard focus, Cmd+Q/W/C/V
 // (plan7 M.2, M.6)
 pub fn apply_activation_policy(app: &mut tauri::App) {

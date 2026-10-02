@@ -1,5 +1,5 @@
 //! Accept loop: Windows named pipe (one instance per connection) or a Unix domain socket
-//! (Linux til test, macOS i produktion). Each connection is handled by [`handle_connection`] on
+//! (Linux for tests, macOS in production). Each connection is handled by [`handle_connection`] on
 //! its own task.
 
 use std::future::Future;
@@ -58,14 +58,21 @@ where
 }
 
 /// Starts the accept loop on Tauri's async runtime. `ready` is set once the pipe exists and
-/// cleared if the server stops; on failure the app keeps running without hooks (error is logged)
-/// and `spawn_agent` refuses to start agents.
-pub fn start(name: String, ctx: HandlerCtx, ready: Arc<AtomicBool>) {
+/// cleared if the server stops; on failure the app keeps running without hooks (the error is
+/// logged and stored in `error` for Diagnostik's Pipe-note) and `spawn_agent` refuses to start
+/// agents.
+pub fn start(
+    name: String,
+    ctx: HandlerCtx,
+    ready: Arc<AtomicBool>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+) {
     tauri::async_runtime::spawn(async move {
         let result = run(name.clone(), ctx, Arc::clone(&ready)).await;
         ready.store(false, Ordering::Release);
         if let Err(e) = result {
             log::error!("pipe server on {name} stopped: {e}; hook events are disabled");
+            *error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
         }
     });
 }
@@ -116,7 +123,7 @@ pub async fn run(name: String, ctx: HandlerCtx, ready: Arc<AtomicBool>) -> io::R
     }
 }
 
-/// Serves a Unix domain socket at `name` (a path; Linux til test, macOS i produktion) in a
+/// Serves a Unix domain socket at `name` (a path; Linux for tests, macOS in production) in a
 /// private directory (plan7 C7.2). A too long path or a directory that is not private fails at
 /// once (no retries); binding is retried. The socket file is removed when this task ends or is
 /// aborted ([`unix_socket::SocketGuard`]) and on app exit/panic (`cleanup_registered`).
@@ -252,11 +259,33 @@ mod tests {
         }
     }
 
-    /// `<tmp>/mira-bots-test-<uuid>/<file>`; the dir does not exist yet (run creates it 0700).
+    /// `<tmp>/mira-bots-t<pid>-<8 hex>/<file>` (short: a macOS runner's `$TMPDIR` is already 49
+    /// characters), or the same under the production fallback base when that is too long; the
+    /// dir does not exist yet (run creates it 0700). The prefix lets `cleanup` remove the dir.
     fn test_socket(file: &str) -> PathBuf {
-        std::env::temp_dir()
-            .join(format!("mira-bots-test-{}", uuid::Uuid::new_v4()))
-            .join(file)
+        use crate::pipe::unix_socket;
+        let dir = format!(
+            "{}t{}-{}",
+            crate::config::SOCKET_DIR_PREFIX,
+            std::process::id(),
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        unix_socket::first_that_fits(
+            std::env::temp_dir().join(&dir).join(file),
+            Path::new(unix_socket::FALLBACK_BASE).join(&dir).join(file),
+        )
+    }
+
+    #[test]
+    fn test_sockets_always_fit() {
+        for file in ["e2e.sock", "x.sock", "g.sock"] {
+            let p = test_socket(file);
+            assert!(
+                crate::pipe::unix_socket::check_length(&p).is_ok(),
+                "{}",
+                p.display()
+            );
+        }
     }
 
     async fn wait_ready(ready: &AtomicBool) {
@@ -382,9 +411,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn too_long_path_is_reported_at_once() {
-        let long = std::env::temp_dir()
-            .join(format!("mira-bots-test-{}", "l".repeat(100)))
-            .join("x.sock");
+        // Injected bases (no real long $TMPDIR): primary and fallback are both too long.
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let tmp = Path::new("/tmp").join(format!("mb-long-{id}-{}", "l".repeat(80)));
+        let base = Path::new("/tmp").join(format!("mb-fb-{id}-{}", "f".repeat(80)));
+        let long = crate::pipe::unix_socket::choose_path_in(&tmp, &base, 501, 4242);
         let ready = Arc::new(AtomicBool::new(false));
         let t0 = tokio::time::Instant::now();
         let err = run(
@@ -400,7 +431,38 @@ mod tests {
             "{err}"
         );
         assert!(!long.parent().unwrap().exists(), "nothing created");
+        assert!(!tmp.exists() && !base.exists(), "nothing created");
         assert!(!ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn start_stores_the_error_for_diagnostics() {
+        let path = test_socket("x.sock");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::write(&dir, b"file").unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+        start(
+            path.to_string_lossy().into_owned(),
+            ctx(),
+            Arc::clone(&ready),
+            Arc::clone(&error),
+        );
+        let mut stored = None;
+        for _ in 0..200 {
+            stored = error.lock().unwrap().clone();
+            if stored.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let stored = stored.expect("the error is stored");
+        assert!(
+            stored.starts_with("Kunne ikke oprette socket-mappen"),
+            "{stored}"
+        );
+        assert!(!ready.load(Ordering::Acquire));
+        std::fs::remove_file(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -257,7 +257,7 @@ Din egen `~/.claude/settings.json` røres aldrig. Dine eksisterende globale hook
 
 ## Diagnostik og log
 
-Fanen Diagnostik i Workplace viser blandt andet Claude Code-sti og -version, om hooks med `args` understøttes, `settings.json`, `mcp.json` og systemprompt-filens stier, om `mira-mcp.exe` er fundet, profilmappens sti og antal indlæste profiler (med en advarsel, hvis en profilfil var ødelagt), projektroden, workspace-filens sti og om den findes (med "Workspace-advarsel", hvis den ikke kunne læses), antal projekter og "Profiler kopieret ved start", pipen, platform (`windows`/`macos`/`linux`), pipen (på macOS socket-stien, med "Pipe-note", hvis den var for lang), antal modtagne hook-events og det sidste event samt antal værktøjskald, antal værktøjskald med fejl og det sidste værktøjskald (kun værktøjets navn, agenten og om det lykkedes, aldrig indholdet). Diagnostik advarer, når `mira-mcp.exe` eller `settings.json` mangler. Under "Projekter" står projektlisten med antal kørende arbejdsagenter og tickets pr. projekt, "⚠ n agenter, ingen koordinator" hvor det gælder, og knapperne "Åbn mappe" (pr. projekt), "Nyt projekt…", "Åbn projektroden" og "Vælg projektrod…" (se Projektroden). Knappen Kopiér lægger det hele på udklipsholderen som tekst til en fejlrapport, og Åbn logmappe åbner mappen med loggen i Stifinder (Windows), Finder (macOS) eller filhåndteringen.
+Fanen Diagnostik i Workplace viser blandt andet Claude Code-sti og -version, om hooks med `args` understøttes, `settings.json`, `mcp.json` og systemprompt-filens stier, om `mira-mcp.exe` er fundet, profilmappens sti og antal indlæste profiler (med en advarsel, hvis en profilfil var ødelagt), projektroden, workspace-filens sti og om den findes (med "Workspace-advarsel", hvis den ikke kunne læses), antal projekter og "Profiler kopieret ved start", platform (`windows`/`macos`/`linux`), pipen (på macOS socket-stien, med "Pipe-note", hvis socket-mappen ikke kunne bruges, stien var for lang, eller reservestien under `/tmp` bruges), antal modtagne hook-events og det sidste event samt antal værktøjskald, antal værktøjskald med fejl og det sidste værktøjskald (kun værktøjets navn, agenten og om det lykkedes, aldrig indholdet). Diagnostik advarer, når `mira-mcp.exe` eller `settings.json` mangler. Under "Projekter" står projektlisten med antal kørende arbejdsagenter og tickets pr. projekt, "⚠ n agenter, ingen koordinator" hvor det gælder, og knapperne "Åbn mappe" (pr. projekt), "Nyt projekt…", "Åbn projektroden" og "Vælg projektrod…" (se Projektroden). Knappen Kopiér lægger det hele på udklipsholderen som tekst til en fejlrapport, og Åbn logmappe åbner mappen med loggen i Stifinder (Windows), Finder (macOS) eller filhåndteringen.
 
 Loggen ligger i `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log` (macOS: `~/Library/Logs/dk.mira.bots/mira-bots.log`). Den roteres ved hver start, og de seneste tre gamle filer gemmes. Sæt `MIRA_LOG=debug` (eller `trace`, `info`, `warn`, `error`) for mere detaljeret log; standard er `info`, og debug giver bl.a. én linje pr. hook-event.
 
@@ -302,17 +302,17 @@ Resten af denne README skriver stierne på Windows-form; brug tabellen.
 | `%LOCALAPPDATA%\dk.mira.bots\logs\mira-bots.log` | `~/Library/Logs/dk.mira.bots/mira-bots.log` |
 | `%USERPROFILE%\mira-bots\projects\` | `~/mira-bots/projects/` |
 | `%LOCALAPPDATA%\dk.mira.bots` (WebView2's localStorage) | WKWebView's lager under `~/Library/` (origin `tauri://localhost`; den præcise sti er UVERIFICERET; nøglerne er pr. platform, og der migreres intet) |
-| `\\.\pipe\mira-bots-<pid>` | `$TMPDIR/mira-bots-<uid>/mira-bots-<pid>.sock` (mappen 0700, filen 0600, slettes ved afslutning; `/tmp/mira-bots-<uid>/…` bruges, hvis `$TMPDIR` er lang) |
+| `\\.\pipe\mira-bots-<pid>` | `$TMPDIR/mira-bots-<uid>/mira-bots-<pid>.sock` (mappen 0700, filen 0600, slettes ved afslutning; `/tmp/mira-bots-<uid>/<pid>.sock` bruges, hvis stien under `$TMPDIR` ville blive over 100 tegn) |
 | `resources\mira-hook.exe` | `mira-bots.app/Contents/Resources/resources/mira-hook` |
 | `%TEMP%` | `$TMPDIR` |
 
-Er stien til socketen stadig for lang (over 100 tegn), starter hook-forbindelsen ikke: Diagnostik viser "Pipe lytter: nej" og forklaringen i "Pipe-note", og der kan ikke startes agenter, før `TMPDIR` er sat til en kortere mappe.
+Når reservestien under `/tmp` bruges, siger "Pipe-note" det. Er også den for lang (over 100 tegn), eller kan socket-mappen ikke bruges (ejet af en anden bruger, ikke privat), starter hook-forbindelsen ikke: Diagnostik viser "Pipe lytter: nej" og forklaringen i "Pipe-note", og der kan ikke startes agenter, før `TMPDIR` er sat til en kortere mappe.
 
 ### Sådan findes `claude`
 
 Appen leder i denne rækkefølge: `MIRA_CLAUDE_PATH` (hvis den peger på en fil); så `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`, `~/.npm-global/bin/claude`, `~/.volta/bin/claude`, fnm (`~/Library/Application Support/fnm/aliases/default/bin/claude` og `~/.local/share/fnm/aliases/default/bin/claude`) og nvm (`~/.nvm/versions/node/<version>/bin/claude`, nyeste først); til sidst første `claude` i `PATH`.
 
-Fordi en app, der startes fra Finder, Dock eller Launchpad, ikke arver terminalens `PATH`, læser appen login-shellens `PATH` én gang ved start (`$SHELL -ilc`, højst 5 sekunder, flettet med appens egen `PATH`) og bruger den både til opslaget og til agentens miljø. Fejler eller overskrider shellen tiden, bruges appens egen `PATH`, og loggen siger det. Native installer (`curl … install.sh`), Homebrew cask `claude-code` og npm bliver alle fundet; ellers sæt `MIRA_CLAUDE_PATH`. Appen kalder aldrig `npm prefix -g`.
+Fordi en app, der startes fra Finder, Dock eller Launchpad, ikke arver terminalens `PATH`, læser appen login-shellens `PATH` én gang ved start (`$SHELL -ilc` med `printenv PATH`, så også fish virker; uden `$SHELL` bruges `/bin/zsh`; højst 5 sekunder, flettet med appens egen `PATH`) og bruger den både til opslaget og til agentens miljø. Fejler eller overskrider shellen tiden, bruges appens egen `PATH`, og loggen siger det. Native installer (`curl … install.sh`), Homebrew cask `claude-code` og npm bliver alle fundet; ellers sæt `MIRA_CLAUDE_PATH`. Appen kalder aldrig `npm prefix -g`.
 
 ### Kendte forskelle
 
@@ -322,7 +322,7 @@ Fordi en app, der startes fra Finder, Dock eller Launchpad, ikke arver terminale
 - Det første klik på øen rammer knappen (`acceptFirstMouse`).
 - Option er ikke Meta i terminalen (dansk tastatur skriver `{ } [ ] |` med Option).
 - Scrollbars er overlay-scrollbars (systemets).
-- Stop af en agent sender SIGTERM til hele procesgruppen (claude, Bash-værktøjets shells og MCP-servere) og SIGKILL efter 2 sekunder; ved afslut venter appen op til 1,5 sekund. Børn der selv løsriver sig fra gruppen (`setsid`) overlever og overtages af launchd; dem rydder appen ikke op efter.
+- Stop af en agent sender SIGTERM til hele procesgruppen (claude, Bash-værktøjets shells og MCP-servere) og SIGKILL efter 2 sekunder til de processer i gruppen, der stadig lever, også når `claude` selv allerede er afsluttet; ved afslut venter appen op til 1,5 sekund. Børn der selv løsriver sig fra gruppen (`setsid`) overlever og overtages af launchd; dem rydder appen ikke op efter.
 - Appen startes fra Finder uden `TERM`, så den sætter `TERM=xterm-256color` og `COLORTERM=truecolor` for agenten, hvis de mangler.
 - `mira-hook` og `mira-mcp` er ad-hoc-signerede (`codesign -s -`); `MIRA_SKIP_CODESIGN=1` springer signeringen over ved lokale bygninger.
 - Appens CSS bruger `@property`, `oklch()`, `@layer` og `color-mix()` (WebKit fra Safari 16.4). Derfor: macOS 13.3+ anbefales, helst 14+.
@@ -492,7 +492,7 @@ Intet af dette er kørt på en Mac; hvert punkt står som `TODO(macos-verify)` i
 12. Afslut (ø-knappen eller Cmd+Q): alle agenter væk inden for ca. 2 s; ingen efterladte processer; ingen zombier.
 13. Stier: profiler i `~/mira-bots/projects/.mira-bots/profiles/`, app-data i `~/Library/Application Support/dk.mira.bots/` (settings.json, mcp.json, tickets.json, profiles/), log i `~/Library/Logs/dk.mira.bots/mira-bots.log`; "Åbn logmappe"/"Åbn mappe" åbner Finder.
 14. WKWebView: kontoret, figurerne og SVG-gradienterne tegnes; dark/light følger systemet live; ingen layoutfejl; overlay-scrollbars; ingen tekst kan markeres i øen (`-webkit-user-select`).
-15. Lang `$TMPDIR` (eksporter en 110 tegn lang sti og start appen fra terminalen): Diagnostik viser "Pipe lytter: nej" med Pipe-noten, eller `/tmp/mira-bots-<uid>/…` bruges, når den er kortere.
+15. Lang `$TMPDIR` (eksporter en 110 tegn lang sti og start appen fra terminalen): Diagnostik viser `/tmp/mira-bots-<uid>/<pid>.sock`, "Pipe lytter: ja" og en Pipe-note om reservestien; hooks virker.
 16. Mappevælgeren ("Vælg projektrod…") åbner foran Workplace og giver en sti; projektroden med mellemrum i navnet virker (hooks exec-form, statusLine med citationstegn).
 17. "Flyt til projekt…" og "Skift model" (genstart med `--resume`) virker: den gamle procesgruppe dør, den nye starter, samtalen er bevaret; trust-dialogen vises i et git-projekt.
 

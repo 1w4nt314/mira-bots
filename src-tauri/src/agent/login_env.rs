@@ -36,6 +36,14 @@ struct LoginEnv {
 
 static LOGIN_ENV: OnceLock<LoginEnv> = OnceLock::new();
 
+/// The shell used when `$SHELL` is unset or empty: zsh on macOS (the default login shell since
+/// 10.15; `/bin/sh -il` would not read `.zprofile`/`.zshrc`, where Homebrew's PATH lives), else sh.
+#[cfg(target_os = "macos")]
+pub const FALLBACK_SHELL: &str = "/bin/zsh";
+/// The shell used when `$SHELL` is unset or empty: zsh on macOS, else sh.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const FALLBACK_SHELL: &str = "/bin/sh";
+
 /// Pure: text between the first two `delimiter`s, ANSI escapes removed, trimmed. `None` when
 /// fewer than two delimiters are present.
 pub fn parse_delimited(output: &str, delimiter: &str) -> Option<String> {
@@ -104,9 +112,14 @@ pub fn merge_paths(login: Option<&str>, current: Option<&OsStr>) -> OsString {
 }
 
 #[cfg(unix)]
-/// `shell -ilc 'printf "%s" "<D>"; printf "%s" "$PATH"; printf "%s" "<D>"'` with stdin null,
-/// stderr null, stdout piped, cwd = $HOME (if set), env DISABLE_AUTO_UPDATE=1; polls
-/// try_wait every 50 ms, kills on `timeout`. Returns the parsed PATH or None (warn-logged).
+/// `shell -ilc 'printf "%s" "<D>"; /usr/bin/printenv PATH || printenv PATH; printf "%s" "<D>"'`
+/// with stdin null, stderr null, stdout piped, cwd = $HOME (if set), env
+/// DISABLE_AUTO_UPDATE=true (Oh My Zsh compares with `true`); polls try_wait every 50 ms, kills
+/// on `timeout`. Returns the parsed PATH or None (warn-logged).
+///
+/// `printenv` prints the exported, colon-separated PATH whatever the shell's own syntax is: in
+/// fish, `"$PATH"` is a list joined with spaces, which would give one bogus entry. The command
+/// string only uses `printf`, `;` and `||`, which sh, bash, zsh and fish (3.0+) all understand.
 ///
 /// The shell is started in its own session (`setsid`): an interactive shell then has no
 /// controlling terminal to wait for, and on timeout `killpg` also ends anything its profile
@@ -116,8 +129,8 @@ pub fn read_login_path(shell: &Path, timeout: Duration) -> Option<String> {
     unix::read_login_path(shell, timeout, LOGIN_PATH_DELIMITER)
 }
 
-/// Once per process. Unix: shell = $SHELL (else "/bin/sh"); merge with the process PATH.
-/// Windows: process PATH. Safe to call twice (second call is a no-op).
+/// Once per process. Unix: shell = $SHELL (else [`FALLBACK_SHELL`]); merge with the process
+/// PATH. Windows: process PATH. Safe to call twice (second call is a no-op).
 pub fn init() {
     LOGIN_ENV.get_or_init(compute);
 }
@@ -128,7 +141,7 @@ fn compute() -> LoginEnv {
     {
         let shell = std::env::var_os("SHELL")
             .filter(|s| !s.is_empty())
-            .map_or_else(|| PathBuf::from("/bin/sh"), PathBuf::from);
+            .map_or_else(|| PathBuf::from(FALLBACK_SHELL), PathBuf::from);
         let started = std::time::Instant::now();
         let login = read_login_path(&shell, LOGIN_SHELL_TIMEOUT);
         let source = if login.is_some() {
@@ -197,16 +210,14 @@ mod unix {
         timeout: Duration,
         delimiter: &str,
     ) -> Option<String> {
-        let script = format!(
-            "printf \"%s\" \"{delimiter}\"; printf \"%s\" \"$PATH\"; printf \"%s\" \"{delimiter}\""
-        );
+        let script = command_string(delimiter);
         let mut cmd = Command::new(shell);
         cmd.arg("-ilc")
             .arg(script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .env("DISABLE_AUTO_UPDATE", "1");
+            .env("DISABLE_AUTO_UPDATE", "true");
         if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
             if Path::new(&home).is_dir() {
                 cmd.current_dir(home);
@@ -293,6 +304,14 @@ mod unix {
                 return answer(shell, &out, delimiter);
             }
         }
+    }
+
+    /// The `-ilc` command string: the exported PATH (via `printenv`, never `"$PATH"`) between
+    /// two delimiters.
+    pub(super) fn command_string(delimiter: &str) -> String {
+        format!(
+            "printf \"%s\" \"{delimiter}\"; /usr/bin/printenv PATH || printenv PATH; printf \"%s\" \"{delimiter}\""
+        )
     }
 
     fn answer(shell: &Path, out: &[u8], delimiter: &str) -> Option<String> {
@@ -498,10 +517,50 @@ mod tests {
         }
 
         #[test]
-        fn shell_runs_with_disable_auto_update() {
+        fn shell_runs_with_disable_auto_update_true() {
+            // Oh My Zsh's check_for_upgrade.sh tests `[[ "$DISABLE_AUTO_UPDATE" = true ]]`.
             let (dir, shell) = script(&format!("printf '%s' \"{D}${{DISABLE_AUTO_UPDATE}}{D}\""));
-            assert_eq!(read(&shell, Duration::from_secs(5)), Some("1".to_string()));
+            assert_eq!(
+                read(&shell, Duration::from_secs(5)),
+                Some("true".to_string())
+            );
             let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn the_command_string_never_expands_path_in_the_shell() {
+            let cmd = unix::command_string(D);
+            assert!(!cmd.contains("$PATH"), "{cmd}");
+            assert!(
+                cmd.contains("/usr/bin/printenv PATH || printenv PATH"),
+                "{cmd}"
+            );
+        }
+
+        #[test]
+        fn a_fish_like_shell_still_gives_a_colon_separated_path() {
+            // Simulates fish: its profile prepends to PATH, and a `"$PATH"` in the command string
+            // would expand to the list joined with spaces. The command string is then run by sh
+            // with that substitution applied, so only `printenv` can produce the real PATH.
+            let (dir, shell) = script(
+                "[ \"$1\" = \"-ilc\" ] || exit 3\n\
+                 PATH=/fish/a:/fish/b:$PATH; export PATH\n\
+                 spaced=$(printf '%s' \"$PATH\" | tr ':' ' ')\n\
+                 cmd=$(printf '%s' \"$2\" | sed \"s|\\\"\\$PATH\\\"|\\\"$spaced\\\"|g\")\n\
+                 exec /bin/sh -c \"$cmd\"",
+            );
+            let path = read(&shell, Duration::from_secs(5)).expect("a PATH");
+            assert!(path.starts_with("/fish/a:/fish/b:"), "{path}");
+            assert!(!path.contains("/fish/a /fish/b"), "{path}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn the_fallback_shell_fits_the_platform() {
+            #[cfg(target_os = "macos")]
+            assert_eq!(super::super::FALLBACK_SHELL, "/bin/zsh");
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(super::super::FALLBACK_SHELL, "/bin/sh");
         }
 
         #[test]

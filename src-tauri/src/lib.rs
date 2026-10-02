@@ -327,7 +327,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         log::max_level()
     );
-    platform::apply_activation_policy(app);
     let handle = app.handle().clone();
 
     let data_dir = app.path().app_data_dir().unwrap_or_else(|e| {
@@ -534,6 +533,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let pipe_ready = Arc::new(AtomicBool::new(false));
+    let pipe_error = Arc::new(Mutex::new(None));
     let hook_stats = Arc::new(HookStats::default());
     pipe::server::start(
         pipe_name.clone(),
@@ -546,6 +546,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             tools: Some(tool_handler),
         },
         Arc::clone(&pipe_ready),
+        Arc::clone(&pipe_error),
     );
 
     let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
@@ -570,6 +571,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         },
         island: IslandState::default(),
         pipe_ready,
+        pipe_error,
         sink,
         hook_stats,
         claude_version,
@@ -678,7 +680,7 @@ pub fn run() {
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
     // inside build(). The Builder is consumed on failure and cannot be retried without the log
     // plugin, so report to the emergency file and exit with a non-zero code: never silently.
-    let app = match built {
+    let mut app = match built {
         Ok(app) => app,
         Err(e) => {
             let message = format!("error while building mira-bots: {e}");
@@ -688,6 +690,10 @@ pub fn run() {
         }
     };
 
+    // After build (the windows exist but the event loop has not started) and before run: the
+    // runtime is still owned by `App`, so the policy is set on the event loop before launch and
+    // the app never starts as a Regular app (no Dock flash, no focus steal; plan7 A.5).
+    platform::apply_activation_policy(&mut app);
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(state) = app_handle.try_state::<AppState>() {

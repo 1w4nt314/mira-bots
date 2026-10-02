@@ -2639,7 +2639,15 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             assert_eq!(exits(), 2);
-            // A second call (RunEvent::Exit after ExitRequested) returns at once.
+            // Once the groups are empty (the SIGKILLed `sleep`s were orphans; a container's
+            // PID 1 may reap them with a delay), a second call (RunEvent::Exit after
+            // ExitRequested) sends nothing and returns at once.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for pid in [a.pid.unwrap(), b.pid.unwrap()] {
+                while process::group_alive(pid) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             let t = Instant::now();
             m.kill_all();
             assert!(t.elapsed() < Duration::from_millis(200));
