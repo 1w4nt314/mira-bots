@@ -281,7 +281,7 @@ Kendt risiko: installeren er ikke kodesigneret. Windows SmartScreen og Defender 
 
 ## macOS
 
-> **UVERIFICERET på en rigtig Mac.** Udviklerne har ingen Mac. Koden er typetjekket mod `aarch64-apple-darwin`, og tests og `.dmg` bygges af GitHub Actions på macOS, men intet er kørt som app på en Mac endnu. Alt i listen "Skal testes på macOS" nederst er åbent. Kun Apple Silicon (arm64) bygges; Intel-Macs og universal-builds er ikke med i trin 7.
+> **UVERIFICERET på en rigtig Mac.** Udviklerne har ingen Mac. Koden er typetjekket mod `aarch64-apple-darwin`, og tests og `.dmg` bygges af GitHub Actions på macOS, men bortset fra røgtesten i CI (se "Røgtest i CI") er intet kørt som app på en Mac endnu. Alt i listen "Skal testes på macOS" nederst er åbent. Kun Apple Silicon (arm64) bygges; Intel-Macs og universal-builds er ikke med i trin 7.
 
 ### Installation
 
@@ -338,6 +338,27 @@ npm run clippy:mac
 ```
 
 Wrapperen `scripts/mac-cc.sh` fjerner de Apple-flag (`-arch`, `-mmacosx-version-min`), som Linux-clang ikke kender. Linking og tests mod macOS kræver CI (jobbet `check-macos`).
+
+### Røgtest i CI
+
+macOS-buildet er eksperimentelt, indtil en bruger med en Mac har gennemgået listen "Skal testes på macOS". Indtil da er røgtesten det eneste sted, hvor den rigtige app startes. Jobbet `check-macos` bygger `.app`'en (`npm run tauri -- build --target aarch64-apple-darwin --bundles app`, ingen `.dmg`) og kører `scripts/mac-smoke.sh`, der starter binæren i bundlen direkte med `MIRA_LOG=debug`. `build-installer-macos` kører samme test på den bundle, der bliver leveret. Testen kræver ingen brugerhandling og ingen `claude`; appen starter også uden `claude` og logger blot "claude not found". Det er netop sådan testen kører på runneren.
+
+Testen fejler jobbet, hvis et af disse krav ikke er opfyldt:
+
+- Opstart: processen kører stadig efter opstart (der ventes højst 20 sekunder).
+- Logfil: `~/Library/Logs/dk.mira.bots/mira-bots.log` findes og indeholder `pipe server listening on <sti>` for processens pid.
+- Socket: filen ligger under `$TMPDIR/mira-bots-<uid>/` eller under reservestien `/tmp/mira-bots-<uid>/`, har rettighederne 0600 i en mappe med 0700 og ejes af brugeren.
+- Ingen panic: `$TMPDIR/mira-bots-panic.log` får intet nyt indhold, og loggen har ingen `panic:`-linje, heller ikke under nedlukningen.
+- Nedlukning: appen afslutter med exit 0 inden for 10 sekunder, når den får quit-Apple-Eventet (det samme, som Cmd+Q og log ud sender).
+- Oprydning: socket-filen er væk efter afslutningen.
+
+Testen sender ikke SIGTERM til appen, fordi hverken appen, Tauri eller tao håndterer SIGTERM. Processen dør så uden `RunEvent::Exit`, og socket-filen bliver liggende. SIGTERM bruges kun som nødudvej, hvis Apple-Eventet ikke virker, og så fejler testen.
+
+Disse punkter bliver kun rapporteret og får ikke jobbet til at fejle: processens vinduer (antal, placering og om de er på skærmen, fra CGWindowList), et screenshot af skærmen og af hvert synligt vindue, om `mira-hook` og `mira-mcp` blev fundet, ERROR-linjer i loggen og om socket-mappen er fjernet. Screenshots kræver rettigheden Skærmoptagelse og kan være sorte eller kun vise skrivebordsbaggrunden.
+
+Resultatet ligger i artifact `macos-smoke`, og `macos-smoke-release` på main og tags. Det indeholder `summary.txt` med OK, FEJL, ADVARSEL eller INFO for hvert punkt, loggen, appens output, vindueslisten og screenshots.
+
+Testen dækker ikke trust-dialogen i `claude`, fokus og tastatur (øen, Workplace, Cmd-genveje og Option-tegn), Gatekeeper og karantæne (CI-bundlen er bygget lokalt og har ingen quarantine-attribut), hooks fra en rigtig agent, Dock og menulinje, flere skærme og fuldskærm. Alt det står stadig i "Skal testes på macOS".
 
 ## Udvikling
 

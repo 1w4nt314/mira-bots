@@ -74,10 +74,13 @@ jobs:
 
   # macos-latest = macOS 26 arm64 (research7 section 6). UNVERIFIED on a real runner until the
   # first push. Runs the same checks as check-windows, including the unix-only tests (process
-  # groups, unix socket, login shell PATH) on a real Mac.
+  # groups, unix socket, login shell PATH) on a real Mac, then builds the .app and starts it
+  # (scripts/mac-smoke.sh): nobody on the team has a Mac, so this is the only runtime test.
   check-macos:
     needs: check-linux
     runs-on: macos-latest
+    # The release build (lto, codegen-units 1) dominates; a cold cache needs the most.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -87,6 +90,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
       - run: npm run build
@@ -94,6 +98,20 @@ jobs:
       - run: cargo check --workspace
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Only the .app (no .dmg here; build-installer-macos makes that on main/tags).
+      # beforeBuildCommand builds, copies and ad-hoc signs mira-hook/mira-mcp and the frontend.
+      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles app
+      # Runtime smoke test without user interaction and without claude: start, log file, socket
+      # (0600/0700), quit via Apple Event, socket removed; screenshots are best effort.
+      - name: Smoke test the .app
+        run: bash scripts/mac-smoke.sh
+      - name: Upload the smoke test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-smoke
+          path: smoke/
+          if-no-files-found: warn
 
   build-installer:
     # Installers are built for main and version tags only; nothing is published or signed.
@@ -169,4 +187,15 @@ jobs:
         with:
           name: mira-bots-macos-app
           path: target/aarch64-apple-darwin/release/bundle/macos/*.app.zip
+          if-no-files-found: warn
+      # The same smoke test on the bundle that is shipped (after the uploads, so a failing smoke
+      # test still leaves the .dmg to look at, but turns the job red).
+      - name: Smoke test the .app
+        run: bash scripts/mac-smoke.sh
+      - name: Upload the smoke test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-smoke-release
+          path: smoke/
           if-no-files-found: warn
