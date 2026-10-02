@@ -2093,6 +2093,11 @@ impl TicketService {
         if t.state == TicketState::InProgress {
             return self.give_back(&t.id, Some(by_agent), now);
         }
+        // A waiting parent is its agent's work in progress (step 6a): like a ticket in progress,
+        // only its own agent may put it back; another coordinator must not drop it.
+        if t.state == TicketState::Waiting && t.assignee_agent_id.as_deref() != Some(by_agent) {
+            return Err(TicketError::NotYours);
+        }
         self.commit(|doc| {
             apply(
                 doc,
@@ -4323,6 +4328,25 @@ mod tests {
         // Not for a parent with an assignee.
         s.assign(&p.id, "a", 22).unwrap();
         assert_eq!(s.note_children_done(&p.id, 23), Ok(None));
+    }
+
+    #[test]
+    fn unassign_by_agent_of_a_waiting_parent_needs_ownership() {
+        let (mut s, m) = svc();
+        let (p, _c1, _c2) = parent_with_children(&mut s, false);
+        s.submit_by_agent("k", None, "fordelt", 20).unwrap();
+        let saves = m.saves();
+        // Another agent (a second coordinator) may not drop it; nothing is saved.
+        assert_eq!(
+            s.unassign_by_agent(&p.short_id(), "k2", 30),
+            Err(TicketError::NotYours)
+        );
+        assert_eq!(m.saves(), saves);
+        assert_eq!(s.get(&p.id).unwrap().state, S::Waiting);
+        // Its own agent may put it back.
+        let b = s.unassign_by_agent(&p.short_id(), "k", 31).unwrap();
+        assert_eq!((b.state, b.assignee_agent_id), (S::Backlog, None));
+        assert_invariants(&s);
     }
 
     #[test]
