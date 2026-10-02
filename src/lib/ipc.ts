@@ -133,8 +133,11 @@ export const resizeIsland = (width: number, height: number) =>
 export const quitApp = () => invoke<void>(COMMANDS.quitApp);
 export const getDiagnostics = () => invoke<Diagnostics>(COMMANDS.getDiagnostics);
 /** Opens or focuses the workplace window and selects `agentId` and/or the sidebar `tab` there. */
-export const openWorkplace = (agentId: string | null, tab: WorkplaceTab | null = null) =>
-  invoke<void>(COMMANDS.openWorkplace, { agentId, tab });
+export const openWorkplace = (
+  agentId: string | null,
+  tab: WorkplaceTab | null = null,
+  spawn: SeatKind | null = null,
+) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn });
 /** Takes the selection stored by `openWorkplace` for a newly created window (once). */
 export const takeWorkplaceSelection = () =>
   invoke<WorkplaceSelection | null>(COMMANDS.takeWorkplaceSelection);

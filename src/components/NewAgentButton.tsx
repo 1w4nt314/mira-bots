@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { errorMessage, getAppInfo, spawnAgent } from "../lib/ipc";
+import { errorMessage, getAppInfo, openWorkplace } from "../lib/ipc";
 import { isExited } from "../lib/status";
 import { useStore } from "../state/store";
 
@@ -42,12 +42,11 @@ export default function NewAgentButton() {
       ? "Fandt ikke claude endnu — installer Claude Code eller sæt MIRA_CLAUDE_PATH"
       : null;
 
-  // One click: default profile (coder), default folder, work seat (profile/folder are chosen in
-  // Workplace).
+  // Opens Workplace with the spawn dialog for a work seat (profile and project are chosen there).
   const start = async () => {
     setBusy(true);
     try {
-      await spawnAgent(null, null, null, null, "work");
+      await openWorkplace(null, null, "work");
     } catch (e) {
       dispatch({ type: "error/set", error: errorMessage(e) });
     } finally {
@@ -69,7 +68,7 @@ export default function NewAgentButton() {
         title={
           disabledReason ??
           claudeHint ??
-          "Start en ny agent i standardmappen (vælg rolle/mappe i Workplace)"
+          "Åbn Workplace og start en agent på en arbejdsplads (vælg profil og projekt)"
         }
         className="shrink-0 rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"
       >

@@ -175,12 +175,24 @@ export default function Workplace() {
     setTermMode((m) => (m === "min" ? "normal" : m));
   }, []);
 
+  // Latest spawn blocks, read by `apply` below (its effect must not re-run when they change).
+  const spawnBlockedRef = useRef<{ work: string | null; staff: string | null }>({
+    work: null,
+    staff: null,
+  });
+
   // Selection handed over by the island: stored for a new window, pushed to an existing one.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     const apply = (sel: WorkplaceSelection) => {
       if (sel.agentId !== null) selectAgent(sel.agentId);
+      // The island's "+ Ny agent": open the spawn dialog, unless spawning is blocked right now.
+      if (sel.spawn === "work" || sel.spawn === "staff") {
+        const blocked = spawnBlockedRef.current[sel.spawn];
+        if (blocked !== null) dispatch({ type: "error/set", error: blocked });
+        else setSpawnFor({ seatKind: sel.spawn, ticket: null });
+      }
       const tab = parseWorkplaceTab(sel.tab);
       if (tab !== null) setRequestedTab((prev) => ({ tab, nonce: (prev?.nonce ?? 0) + 1 }));
     };
@@ -227,6 +239,8 @@ export default function Workplace() {
   const limitReached = "Loftet for denne række er nået";
   const spawnBlockedWork = spawnDisabled ?? (liveWork >= maxWork ? limitReached : null);
   const spawnBlockedStaff = spawnDisabled ?? (liveStaff >= maxStaff ? limitReached : null);
+
+  spawnBlockedRef.current = { work: spawnBlockedWork, staff: spawnBlockedStaff };
 
   const reportError = useCallback(
     (err: unknown) => dispatch({ type: "error/set", error: errorMessage(err) }),

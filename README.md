@@ -57,7 +57,7 @@ En arbejdsagent starter i et projekt: arbejdsmappen er `<projektrod>\<projekt>`,
 
 I Workplace vælger du profil, plads og (på en arbejdsplads) projekt i dialogen "Ny agent": et eksisterende projekt eller "Nyt projekt…", som opretter mappen under roden. På en stabsplads viser dialogen kun projektroden ("Mappe: … (projektroden; staben læser alle projekter)"). Du kan overskrive profilens model og effort for netop denne agent. Starter du en agent med en ticket (slip noten på en tom plads, eller "Ny agent …" i "Tildel…"), bruges ticketens projekt: dialogen viser "Fra ticketen: «p»" eller "Nyt projekt «p» oprettes", og har ticketen intet projekt, vælger du et. Mappevælgeren er flyttet til Diagnostik, hvor den vælger selve projektroden (se Projektroden).
 
-Kendt mangel i trin 4b: knappen "+ Ny agent" i islanden sender intet projekt og får derfor afvisningen "En arbejdsplads kræver et projekt — vælg et projekt til agenten". Start arbejdsagenter fra Workplace.
+Knappen "+ Ny agent" i islanden starter ikke selv en agent, for en arbejdsplads kræver et projekt: den åbner Workplace med dialogen "Ny agent på en arbejdsplads", hvor du vælger profil og projekt. Er hook-forbindelsen ikke klar, eller er loftet for arbejdspladser nået, viser Workplace i stedet en fejl.
 
 ## Tickets
 
@@ -402,6 +402,7 @@ Intet af dette kan afprøves i udviklingsmiljøet; hvert punkt står som `TODO(w
 85. MCP: `/mcp` viser 17 værktøjer for en specialist med alle roller og 11 for en koder (inkl. `mira_list_projects`); `mira_create_ticket` uden `project` arver koderens projekt, med `{"new": "x"}` afvises den med `agentsMayCreateProjects`-teksten (og virker med `true` i filen); `mira_spawn_agent` med `project` starter i den mappe; `mira_get_workspace_rules` viser roden, projektlisten og noter.
 86. "Vælg projektrod…" åbner mappevælgeren foran Workplace, gemmer stien i `%APPDATA%\dk.mira.bots\app-settings.json` (med backslashes), og først efter genstart ligger profiler, workspace-fil og nye agenter under den nye rod; den gamle rod røres ikke.
 87. Lange stier: et projekt med 64 tegn under en rod på ca. 60 tegn giver `<rod>\<projekt>\.mira-bots\tickets\<id>.md` under 260 tegn, og Claude Code starter; to projekter `a_b` og `a-b` kan begge bruges (deres transskripter deler mappe i `~\.claude\projects\`; kun `claude --continue` i en almindelig terminal blander dem).
+88. Øens knap "+ Ny agent": et klik åbner Workplace (eller sætter det åbne vindue i front) med dialogen "Ny agent på en arbejdsplads" åben; profil og projekt vælges dér, og knappen starter ingen agent selv. Ved loftet (fx "Loft på 2 arbejdspladser nået") er knappen deaktiveret; tooltippet er "Åbn Workplace og start en agent på en arbejdsplads (vælg profil og projekt)". Virker også, når Workplace allerede er åbent.
 
 ## Licens og inspiration
 

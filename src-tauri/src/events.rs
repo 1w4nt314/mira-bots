@@ -32,12 +32,15 @@ pub const PROFILES_CHANGED: &str = "profiles-changed";
 
 /// Payload of `workplace-select` and the result of `take_workplace_selection`: which agent and/or
 /// sidebar tab the workplace window should show (`tab`: "permissions" | "diagnostics" |
-/// "tickets").
+/// "tickets"), and optionally a seat kind whose spawn dialog it should open (`spawn`: "work" |
+/// "staff").
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkplaceSelection {
     pub agent_id: Option<String>,
     pub tab: Option<String>,
+    #[serde(default)]
+    pub spawn: Option<String>,
 }
 
 /// In-process notification (not a Tauri event) from the pipe handler after a hook frame was
@@ -103,17 +106,30 @@ mod tests {
         let sel = WorkplaceSelection {
             agent_id: Some("a".into()),
             tab: Some("tickets".into()),
+            spawn: Some("work".into()),
         };
         let v = serde_json::to_value(&sel).unwrap();
-        assert_eq!(v, json!({"agentId":"a","tab":"tickets"}));
+        assert_eq!(v, json!({"agentId":"a","tab":"tickets","spawn":"work"}));
         assert_eq!(
             serde_json::from_value::<WorkplaceSelection>(v).unwrap(),
             sel
         );
         assert_eq!(
             serde_json::to_value(WorkplaceSelection::default()).unwrap(),
-            json!({"agentId":null,"tab":null})
+            json!({"agentId":null,"tab":null,"spawn":null})
         );
+    }
+
+    #[test]
+    fn workplace_selection_spawn_is_optional_when_reading() {
+        // Old payloads (before `spawn` existed) still parse, with `spawn` = None.
+        let old = json!({"agentId":"a","tab":"tickets"});
+        let sel = serde_json::from_value::<WorkplaceSelection>(old).unwrap();
+        assert_eq!(sel.spawn, None);
+        assert_eq!(sel.agent_id.as_deref(), Some("a"));
+        let new = json!({"agentId":null,"tab":null,"spawn":"staff"});
+        let sel = serde_json::from_value::<WorkplaceSelection>(new).unwrap();
+        assert_eq!(sel.spawn.as_deref(), Some("staff"));
     }
 
     #[test]

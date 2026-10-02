@@ -320,6 +320,17 @@ pub fn check_tab(tab: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Seat kinds `open_workplace` may open the spawn dialog for.
+pub const WORKPLACE_SPAWN_KINDS: [&str; 2] = ["work", "staff"];
+
+/// `None` (no spawn dialog) or one of [`WORKPLACE_SPAWN_KINDS`].
+pub fn check_spawn(spawn: Option<&str>) -> Result<(), String> {
+    match spawn {
+        Some(s) if !WORKPLACE_SPAWN_KINDS.contains(&s) => Err(format!("Ukendt pladstype: {s}")),
+        _ => Ok(()),
+    }
+}
+
 /// Refuses to start agents while the pipe server is not listening.
 pub fn check_pipe_ready(ready: &AtomicBool) -> Result<(), AgentError> {
     if ready.load(Ordering::Acquire) {
@@ -1568,7 +1579,8 @@ pub fn resize_island(
 }
 
 /// Opens (or focuses) the workplace window and selects `agent_id` and/or the sidebar `tab`
-/// ("permissions" | "diagnostics" | "tickets") in it. Async on purpose: creating a window from a
+/// ("permissions" | "diagnostics" | "tickets") in it; `spawn` ("work" | "staff") makes it open the
+/// "Ny agent" dialog for that seat kind (the island's "+ Ny agent"). Async on purpose: creating a window from a
 /// synchronous command deadlocks on Windows (research2 §5).
 // TODO(windows-verify): the "n i review" chip in the non-focusable island opens the workplace on
 // the Tickets tab, both when the window is created and when it is already open (plan D.36).
@@ -1578,19 +1590,28 @@ pub async fn open_workplace(
     state: State<'_, AppState>,
     agent_id: Option<String>,
     tab: Option<String>,
+    spawn: Option<String>,
 ) -> Result<(), String> {
     check_tab(tab.as_deref())?;
-    let selection = WorkplaceSelection { agent_id, tab };
+    check_spawn(spawn.as_deref())?;
+    let selection = WorkplaceSelection {
+        agent_id,
+        tab,
+        spawn,
+    };
     *lock(&state.workplace_select) = Some(selection.clone());
     let created =
         workplace::open_or_focus(&app).map_err(|e| format!("Kunne ikke åbne Workplace: {e}"))?;
     log::info!(
-        "workplace {} (select {:?}, tab {:?})",
+        "workplace {} (select {:?}, tab {:?}, spawn {:?})",
         if created { "created" } else { "focused" },
         selection.agent_id,
-        selection.tab
+        selection.tab,
+        selection.spawn
     );
-    if !created && (selection.agent_id.is_some() || selection.tab.is_some()) {
+    if !created
+        && (selection.agent_id.is_some() || selection.tab.is_some() || selection.spawn.is_some())
+    {
         // A new window fetches the selection itself via take_workplace_selection. The slot is
         // kept here too, in case the existing window is still loading and misses the event.
         if let Err(e) = app.emit_to(workplace::LABEL, WORKPLACE_SELECT, &selection) {
@@ -2098,10 +2119,23 @@ mod tests {
         let sel = WorkplaceSelection {
             agent_id: Some("a1".into()),
             tab: Some("tickets".into()),
+            spawn: Some("work".into()),
         };
         let slot = Mutex::new(Some(sel.clone()));
         assert_eq!(take_selection(&slot), Some(sel));
         assert_eq!(take_selection(&slot), None);
+    }
+
+    #[test]
+    fn workplace_spawn_accepts_only_seat_kinds() {
+        assert_eq!(check_spawn(None), Ok(()));
+        assert_eq!(check_spawn(Some("work")), Ok(()));
+        assert_eq!(check_spawn(Some("staff")), Ok(()));
+        assert_eq!(
+            check_spawn(Some("x")),
+            Err("Ukendt pladstype: x".to_string())
+        );
+        assert!(check_spawn(Some("")).is_err());
     }
 
     #[test]

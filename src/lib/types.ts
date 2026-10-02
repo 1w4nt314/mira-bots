@@ -368,4 +368,6 @@ export type WorkplaceTab = "permissions" | "diagnostics" | "tickets" | "agents";
 export interface WorkplaceSelection {
   agentId: string | null;
   tab: string | null;
+  /** "work" | "staff": open the "Ny agent" dialog for that seat kind. */
+  spawn: string | null;
 }
