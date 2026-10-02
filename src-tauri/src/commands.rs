@@ -197,11 +197,13 @@ impl AppState {
             auto_review_on_stop: ws.rules.auto_review_on_stop,
             pipe_name: self.paths.pipe_name.clone(),
             pipe_ready: self.pipe_ready.load(Ordering::Acquire),
+            pipe_note: pipe_note(&self.paths.pipe_name),
             frames_received: self.hook_stats.received(),
             frames_unknown_session: self.hook_stats.unknown(),
             last_hook_event: self.hook_stats.last_event(),
             log_path: path_string(&self.paths.log_file),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: crate::platform::name().into(),
             projects_root: self.paths.projects_root.to_string_lossy().into_owned(),
             running_agents: lock(&self.manager).running_count(),
             tickets_path: self.paths.tickets_file.to_string_lossy().into_owned(),
@@ -329,6 +331,20 @@ pub fn check_spawn(spawn: Option<&str>) -> Result<(), String> {
     match spawn {
         Some(s) if !WORKPLACE_SPAWN_KINDS.contains(&s) => Err(format!("Ukendt pladstype: {s}")),
         _ => Ok(()),
+    }
+}
+
+/// Diagnostik's `pipeNote`: unix: the too-long-socket-path text (the server did not start);
+/// Windows: `None`.
+fn pipe_note(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        crate::pipe::unix_socket::check_length(std::path::Path::new(name)).err()
+    }
+    #[cfg(windows)]
+    {
+        let _ = name;
+        None
     }
 }
 
@@ -2082,6 +2098,8 @@ mod tests {
         );
         assert!(!d.auto_review_on_stop);
         assert!(d.pipe_ready);
+        assert_eq!(d.platform, std::env::consts::OS);
+        assert_eq!(d.pipe_note, pipe_note(&d.pipe_name));
         assert_eq!((d.frames_received, d.frames_unknown_session), (1, 1));
         assert_eq!(d.last_hook_event.unwrap().name, "Stop");
         assert!(d.log_path.unwrap().ends_with("mira-bots.log"));

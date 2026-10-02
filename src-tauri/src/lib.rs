@@ -9,6 +9,7 @@ pub mod island;
 pub mod mcp;
 pub mod permissions;
 pub mod pipe;
+pub mod platform;
 pub mod profiles;
 pub mod projects;
 pub mod tickets;
@@ -258,6 +259,9 @@ fn install_panic_hook() {
         log::error!("panic: {info}");
         log::logger().flush();
         emergency_log(&format!("panic: {info}"));
+        // Release builds abort right after this hook, so the socket would stay behind.
+        #[cfg(unix)]
+        pipe::unix_socket::cleanup_registered();
     }));
 }
 
@@ -681,6 +685,11 @@ pub fn run() {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 lock(&state.manager).kill_all();
             }
+        }
+        // The process exits without dropping the pipe server task (and its SocketGuard).
+        #[cfg(unix)]
+        if matches!(event, RunEvent::Exit) {
+            pipe::unix_socket::cleanup_registered();
         }
     });
 }

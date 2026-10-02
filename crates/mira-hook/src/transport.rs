@@ -1,5 +1,5 @@
 //! Client side of the pipe: Windows named pipe via `std::fs::OpenOptions`, Unix domain socket
-//! elsewhere (the Unix path only exists so the whole chain can be tested on Linux).
+//! elsewhere (Unix domain socket: Linux til test, macOS i produktion).
 
 use std::io::{self, Read, Write};
 use std::time::Instant;
@@ -45,7 +45,8 @@ pub fn connect(name: &str, deadline: Instant) -> io::Result<Box<dyn ReadWrite>> 
     }
 }
 
-/// Connects to the app's Unix socket (the "pipe name" is a socket path). `deadline` is unused:
+/// Connects to the app's Unix socket (the "pipe name" is a socket path in the app's private
+/// `mira-bots-<uid>` directory; Linux til test, macOS i produktion). `deadline` is unused:
 /// a Unix connect either succeeds or fails immediately.
 #[cfg(unix)]
 pub fn connect(name: &str, _deadline: Instant) -> io::Result<Box<dyn ReadWrite>> {

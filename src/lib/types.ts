@@ -191,11 +191,15 @@ export interface Diagnostics {
   autoReviewOnStop: boolean;
   pipeName: string;
   pipeReady: boolean;
+  /** Unix: why the socket path cannot work (too long); null otherwise and on Windows. */
+  pipeNote: string | null;
   framesReceived: number;
   framesUnknownSession: number;
   lastHookEvent: LastHookEvent | null;
   logPath: string | null;
   appVersion: string;
+  /** "windows" | "macos" | "linux" (Rust `std::env::consts::OS`). */
+  platform: string;
   /** The projects root in use (a changed setting applies after a restart). */
   projectsRoot: string;
   runningAgents: number;

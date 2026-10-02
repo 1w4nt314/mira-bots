@@ -9,13 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use super::process;
 use super::pty::{self, PtyHandle, SpawnSpec};
 use super::ring_buffer::RingBuffer;
 use super::roles::{self, Role};
 use super::{now_ms, AgentError};
 use crate::config::{
     AGENT_ID_ENV, DEFAULT_TOOL_WHITELIST, MAX_STAFF_AGENTS, OUTPUT_RING_CAPACITY, PIPE_ENV,
-    PTY_COLS, PTY_ROWS, RESTARTING_TEXT, ROLES_ENV, STARTING_HINT_AFTER, STARTING_HINT_TEXT,
+    PTY_COLS, PTY_ROWS, QUIT_KILL_BUDGET, RESTARTING_TEXT, ROLES_ENV, STARTING_HINT_AFTER,
+    STARTING_HINT_TEXT,
 };
 use crate::hooks::status::AgentStatus;
 use crate::profiles::model::ProfileSnapshot;
@@ -839,14 +841,22 @@ impl AgentManager {
     }
 
     /// Kills every child (app exit / `quit_app`). Idempotent; errors are only logged.
+    /// Blocks at most [`QUIT_KILL_BUDGET`] on unix (waits for the process groups, then SIGKILL);
+    /// returns at once on Windows. Safe under the manager lock: the waiter threads set the exit
+    /// flags before they report (and need this lock).
     pub fn kill_all(&mut self) {
+        let mut children = Vec::new();
         for (id, agent) in &mut self.agents {
             if let Some(pty) = agent.pty.as_mut() {
                 if let Err(e) = pty.kill() {
                     log::debug!("kill_all: agent {id}: {e}");
                 }
+                if let Some(pid) = pty.pid() {
+                    children.push((pid, pty.exit_flag()));
+                }
             }
         }
+        process::finish_all(&children, QUIT_KILL_BUDGET);
     }
 
     /// Removes an exited agent. Returns its PTY handle if it still had one (stopped, waiter not
@@ -2587,6 +2597,50 @@ mod tests {
             let code = wait_for_gen_exit(&events, 1);
             let (exited, _pty) = m.mark_exited(&other.id, 1, code).unwrap();
             assert_eq!(exited.detail, None);
+        }
+
+        #[test]
+        fn kill_all_ends_every_group_within_the_quit_budget() {
+            let mut m = AgentManager::new(5);
+            let (sink, events) = collecting_sink();
+            // SIGTERM is ignored by the shell and (inherited) by its child: only SIGKILL helps.
+            let script = r#"trap "" TERM; sleep 30"#;
+            let a = m
+                .spawn_spec(sh(script, vec![]), meta("q-a"), sink.clone())
+                .unwrap();
+            let b = m.spawn_spec(sh(script, vec![]), meta("q-b"), sink).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let t = Instant::now();
+            m.kill_all();
+            let took = t.elapsed();
+            assert!(
+                took >= QUIT_KILL_BUDGET - Duration::from_millis(100)
+                    && took < QUIT_KILL_BUDGET + Duration::from_secs(1),
+                "{took:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            for pid in [a.pid.unwrap(), b.pid.unwrap()] {
+                while !process::pid_is_dead(pid) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(process::pid_is_dead(pid), "agent pid {pid} survived quit");
+            }
+            let exits = || {
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| matches!(e, SinkEvent::Exited { .. }))
+                    .count()
+            };
+            while exits() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(exits(), 2);
+            // A second call (RunEvent::Exit after ExitRequested) returns at once.
+            let t = Instant::now();
+            m.kill_all();
+            assert!(t.elapsed() < Duration::from_millis(200));
         }
     }
 }

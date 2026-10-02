@@ -165,11 +165,12 @@ pub fn pipe_name(pid: u32) -> String {
     format!(r"\\.\pipe\mira-bots-{pid}")
 }
 
-/// Unix `<tmpdir>/mira-bots-<pid>.sock`.
-#[cfg(not(windows))]
+/// Unix `<tmpdir>/mira-bots-<uid>/mira-bots-<pid>.sock` (fallback `/tmp/…` when `$TMPDIR` is too
+/// long; see [`super::unix_socket::choose_path`]).
+#[cfg(unix)]
 pub fn pipe_name(pid: u32) -> String {
-    std::env::temp_dir()
-        .join(format!("mira-bots-{pid}.sock"))
+    use super::unix_socket;
+    unix_socket::choose_path(&std::env::temp_dir(), unix_socket::uid(), pid)
         .to_string_lossy()
         .into_owned()
 }
@@ -387,7 +388,16 @@ mod tests {
         assert!(n.contains("mira-bots-4242"));
         #[cfg(windows)]
         assert!(n.starts_with(r"\\.\pipe\"));
-        #[cfg(not(windows))]
-        assert!(n.ends_with(".sock"));
+        #[cfg(unix)]
+        {
+            assert!(n.ends_with(".sock"));
+            let dir = std::path::Path::new(&n).parent().unwrap();
+            let dir_name = dir.file_name().unwrap().to_str().unwrap();
+            assert!(dir_name.starts_with(crate::config::SOCKET_DIR_PREFIX));
+            assert_eq!(
+                dir_name,
+                format!("mira-bots-{}", super::super::unix_socket::uid())
+            );
+        }
     }
 }

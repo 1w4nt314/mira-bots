@@ -3,5 +3,7 @@
 pub mod handler;
 pub mod protocol;
 pub mod server;
+#[cfg(unix)]
+pub mod unix_socket;
 
 pub use handler::{handle_connection, EmitFn, HandlerCtx, ToolHandler};

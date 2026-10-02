@@ -28,6 +28,11 @@ thiserror = "2"
 # Workspace crate (serde_json only): the role matrix `mira_mcp::tools::ROLE_TOOLS` lives there once.
 mira-mcp = { path = "../crates/mira-mcp" }
 
+# Unix only (plan7 A.10): killpg/getuid for agent process groups and the private socket dir.
+# Already in Cargo.lock via portable-pty, so no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 mira-hook = { path = "../crates/mira-hook" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "test-util"] }

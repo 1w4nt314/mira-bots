@@ -2,6 +2,7 @@
 
 pub mod claude_path;
 pub mod manager;
+pub mod process;
 pub mod pty;
 pub mod ring_buffer;
 pub mod roles;
