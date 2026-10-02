@@ -186,6 +186,11 @@ pub const REVIEW_DELIVERY_MAX_ATTEMPTS: u32 = 3;
 pub const REVIEW_NOTE_MAX_CHARS: usize = 2_000;
 /// Agent detail while it restarts with `--resume` (model/effort change).
 pub const RESTARTING_TEXT: &str = "Genstarter med nye indstillinger";
+
+/// Agent detail while it restarts in another project ("Flyt til projekt…", plan4b A.3).
+pub fn moving_text(project: &str) -> String {
+    format!("Flytter til «{project}»…")
+}
 /// Whether the per-profile settings get a `statusLine` pointing at the hook exe (live
 /// model/effort). `false` leaves only PostModelSwitch and the requested values.
 pub const STATUSLINE_ENABLED: bool = true;
@@ -319,6 +324,7 @@ mod tests {
         assert_eq!(REVIEW_DELIVERY_MAX_ATTEMPTS, 3);
         assert_eq!(REVIEW_NOTE_MAX_CHARS, 2_000);
         assert_eq!(RESTARTING_TEXT, "Genstarter med nye indstillinger");
+        assert_eq!(moving_text("shop"), "Flytter til «shop»…");
         const { assert!(STATUSLINE_ENABLED) };
         assert_eq!(STATUSLINE_EVENT, "StatusLine");
     }

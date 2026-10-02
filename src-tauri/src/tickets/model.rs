@@ -389,7 +389,7 @@ pub enum TicketError {
         agent_project: String,
         ticket_project: String,
     },
-    #[error("Projektet kan kun ændres, mens ticketen ligger i Backlog")]
+    #[error("Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent")]
     ProjectChangeNotAllowed,
 }
 
@@ -728,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             TicketError::ProjectChangeNotAllowed.to_string(),
-            "Projektet kan kun ændres, mens ticketen ligger i Backlog"
+            "Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent"
         );
     }
 

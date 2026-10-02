@@ -181,6 +181,26 @@ export default function Workplace() {
     staff: null,
   });
 
+  // N7: a spawn request that arrived before this window loaded the app info (a new window):
+  // applied once the info is there, so the limits are known.
+  const appInfoLoadedRef = useRef(false);
+  appInfoLoadedRef.current = appInfo !== null;
+  const pendingSpawnRef = useRef<"work" | "staff" | null>(null);
+  const openSpawn = useCallback(
+    (seat: "work" | "staff") => {
+      const blocked = spawnBlockedRef.current[seat];
+      if (blocked !== null) dispatch({ type: "error/set", error: blocked });
+      else setSpawnFor({ seatKind: seat, ticket: null });
+    },
+    [dispatch],
+  );
+  useEffect(() => {
+    if (appInfo === null || pendingSpawnRef.current === null) return;
+    const seat = pendingSpawnRef.current;
+    pendingSpawnRef.current = null;
+    openSpawn(seat);
+  }, [appInfo, openSpawn]);
+
   // Selection handed over by the island: stored for a new window, pushed to an existing one.
   useEffect(() => {
     let cancelled = false;
@@ -189,9 +209,8 @@ export default function Workplace() {
       if (sel.agentId !== null) selectAgent(sel.agentId);
       // The island's "+ Ny agent": open the spawn dialog, unless spawning is blocked right now.
       if (sel.spawn === "work" || sel.spawn === "staff") {
-        const blocked = spawnBlockedRef.current[sel.spawn];
-        if (blocked !== null) dispatch({ type: "error/set", error: blocked });
-        else setSpawnFor({ seatKind: sel.spawn, ticket: null });
+        if (appInfoLoadedRef.current) openSpawn(sel.spawn);
+        else pendingSpawnRef.current = sel.spawn;
       }
       const tab = parseWorkplaceTab(sel.tab);
       if (tab !== null) setRequestedTab((prev) => ({ tab, nonce: (prev?.nonce ?? 0) + 1 }));
@@ -220,7 +239,7 @@ export default function Workplace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [dispatch, selectAgent]);
+  }, [dispatch, selectAgent, openSpawn]);
 
   // A selected agent that disappears (removed) simply shows no panel; ids are never reused.
   const selected = agents.find((a) => a.id === selectedId) ?? null;

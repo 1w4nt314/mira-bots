@@ -43,6 +43,7 @@ use model::{
 };
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
+pub use service::RejectReturn;
 use service::{ReviewCounts, TicketLinks, TicketService, REVIEWER_REMOVED_NOTE};
 use store::JsonFileStore;
 
@@ -233,6 +234,36 @@ impl TicketsCtx {
             m.list()
         };
         emit_json(&self.emit, AGENTS_CHANGED, &list);
+    }
+
+    /// Where the rejected ticket `id` goes (W1): first in the sender's queue only while the
+    /// sender is live and may still take the ticket — it may have moved to another project
+    /// ("Flyt til projekt…") after submitting. Read before the rejection.
+    pub fn reject_return(&self, id: &str) -> RejectReturn {
+        let Some(tk) = self.read(|s| s.get_by_any_id(id)) else {
+            return RejectReturn::Backlog;
+        };
+        let Some(sender) = tk.assignee_agent_id.as_deref() else {
+            return RejectReturn::Backlog;
+        };
+        let m = lock(&self.manager);
+        match m.get(sender) {
+            Some(a) if !matches!(a.status, AgentStatus::Exited { .. }) => {
+                let ok = crate::projects::assignment_target(
+                    tk.project.as_ref(),
+                    a.seat_kind,
+                    a.project.as_deref(),
+                    &a.name,
+                )
+                .is_ok();
+                if ok {
+                    RejectReturn::Sender
+                } else {
+                    RejectReturn::Moved
+                }
+            }
+            _ => RejectReturn::Backlog,
+        }
     }
 
     /// Clears the agent's detail when it is the "turn ended without submitting" or "turn failed"
@@ -1225,7 +1256,7 @@ mod tests {
             assert_eq!(t.ctx.route_reviews(), 1, "round {round}");
             let rev = reviewer_of(&t, &id).unwrap();
             t.ctx
-                .mutate(|s| s.reject_by_agent(&rev, "r", &id, "mere", true, 10))
+                .mutate(|s| s.reject_by_agent(&rev, "r", &id, "mere", RejectReturn::Sender, 10))
                 .unwrap();
             t.ctx.mutate(|s| s.mark_dispatched(&id, "a1", 11)).unwrap();
             t.ctx

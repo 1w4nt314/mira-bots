@@ -1,7 +1,20 @@
 import { useEffect, useState } from "react";
 import { errorMessage, getAppInfo, openWorkplace } from "../lib/ipc";
 import { isExited } from "../lib/status";
+import type { AppInfo } from "../lib/types";
 import { useStore } from "../state/store";
+
+/**
+ * Why the island cannot start a work agent now (`running` = live work agents), or null. A missing
+ * claude does not block: the backend looks it up again on spawn and its (Danish) error is shown
+ * if it is still missing.
+ */
+function blockedReason(info: AppInfo, running: number): string | null {
+  if (info.hookExe === null) return "Fandt ikke mira-hook — sæt MIRA_HOOK_EXE";
+  if (!info.pipeReady) return "Hook-forbindelsen er ikke klar — genstart mira-bots";
+  if (running >= info.maxAgents) return `Loft på ${info.maxAgents} arbejdspladser nået`;
+  return null;
+}
 
 export default function NewAgentButton() {
   const { state, dispatch } = useStore();
@@ -26,16 +39,7 @@ export default function NewAgentButton() {
   const info = state.appInfo;
   // The island always spawns into a work seat, so only live work agents count against the limit.
   const running = state.agents.filter((a) => a.seatKind === "work" && !isExited(a)).length;
-  // A missing claude does not disable the button: the backend looks it up again on spawn and
-  // its (Danish) error is shown if it is still missing.
-  let disabledReason: string | null = null;
-  if (info !== null && info.hookExe === null) {
-    disabledReason = "Fandt ikke mira-hook — sæt MIRA_HOOK_EXE";
-  } else if (info !== null && !info.pipeReady) {
-    disabledReason = "Hook-forbindelsen er ikke klar — genstart mira-bots";
-  } else if (info !== null && running >= info.maxAgents) {
-    disabledReason = `Loft på ${info.maxAgents} arbejdspladser nået`;
-  }
+  const disabledReason = info === null ? null : blockedReason(info, running);
   const pipeDown = info !== null && info.hookExe !== null && !info.pipeReady;
   const claudeHint =
     info !== null && info.claudePath === null
@@ -46,6 +50,16 @@ export default function NewAgentButton() {
   const start = async () => {
     setBusy(true);
     try {
+      // N7: clicked before the app info arrived: fetch it first, so the limits apply here too.
+      if (info === null) {
+        const fresh = await getAppInfo();
+        dispatch({ type: "appInfo/set", appInfo: fresh });
+        const blocked = blockedReason(fresh, running);
+        if (blocked !== null) {
+          dispatch({ type: "error/set", error: blocked });
+          return;
+        }
+      }
       await openWorkplace(null, null, "work");
     } catch (e) {
       dispatch({ type: "error/set", error: errorMessage(e) });

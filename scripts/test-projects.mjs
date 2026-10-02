@@ -55,7 +55,9 @@ check(p.projectLabel("a"), "a", "projectLabel(a)");
 check(p.projectLabel({ new: "b" }), "+b", "projectLabel({new})");
 check(p.projectLabel(null), "uden projekt", "projectLabel(null)");
 check(p.sameProjectId("A", "a"), true, "sameProjectId(A, a)");
-check(p.sameProjectId("Æ", "æ"), false, "sameProjectId is ASCII-only, like Rust");
+check(p.sameProjectId("Æ", "æ"), true, "sameProjectId folds non-ASCII, like Rust's to_lowercase");
+check(p.sameProjectId("Økonomi", "økonomi"), true, "sameProjectId(Økonomi, økonomi)");
+check(p.sameProjectId("Økonomi", "Okonomi"), false, "Ø is not O");
 check(p.sameProjectId(null, null), false, "null equals nothing");
 check(p.sameProjectId("a", null), false, "a vs null");
 

@@ -20,8 +20,9 @@ use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
 use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
 use crate::config::{
-    MAX_REVIEW_ROUNDS, REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS,
-    TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS,
+    MAX_REVIEW_ROUNDS, MOVED_NOTE, REPORTS_PER_TICKET_MAX, RESTART_NOTE,
+    REVIEW_DELIVERY_MAX_ATTEMPTS, TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS,
+    TICKET_TITLE_MAX_CHARS,
 };
 use crate::projects::{validate_project_id, ProjectId, ProjectRef};
 
@@ -38,6 +39,29 @@ pub const REVIEWER_REMOVED_NOTE: &str = "reviewer fjernet";
 /// `"eskaleret efter 3 runder"`.
 pub fn escalated_note() -> String {
     format!("eskaleret efter {MAX_REVIEW_ROUNDS} runder")
+}
+
+/// Where a rejected ticket goes (plan5 C.9, W1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectReturn {
+    /// First in the sender's queue: the sender is live and may still take the ticket.
+    Sender,
+    /// The backlog (the sender is gone): a fresh start, review round 0.
+    Backlog,
+    /// The backlog with [`MOVED_NOTE`]: the sender is live but now stands in another project.
+    /// The rejection note and the review round stay.
+    Moved,
+}
+
+impl From<bool> for RejectReturn {
+    /// `sender_live` without a project check.
+    fn from(sender_live: bool) -> Self {
+        if sender_live {
+            Self::Sender
+        } else {
+            Self::Backlog
+        }
+    }
 }
 
 /// Per reviewer agent: its open review assignments (agents without any are absent).
@@ -719,7 +743,8 @@ impl TicketService {
         let note = note.filter(|n| !n.trim().is_empty());
         let ev = match (target, t.state) {
             (S::Rejected, S::Review) => {
-                return self.reject(id, note.as_deref().unwrap_or_default(), agent_live, now)
+                let to = RejectReturn::from(agent_live);
+                return self.reject(id, note.as_deref().unwrap_or_default(), to, now);
             }
             (S::Rejected, from) if from != S::Rejected => return Err(TicketError::UseReject),
             (S::Assigned, from) if from != S::Assigned => return Err(TicketError::UseAssign),
@@ -760,15 +785,16 @@ impl TicketService {
         self.fetch(id)
     }
 
-    /// review → rejected → first in the same agent's queue (agent alive) or backlog. One save.
+    /// review → rejected → first in the same agent's queue or the backlog (see [`RejectReturn`]).
+    /// One save.
     pub fn reject(
         &mut self,
         id: &str,
         note: &str,
-        agent_live: bool,
+        to: RejectReturn,
         now: u64,
     ) -> Result<Ticket, TicketError> {
-        self.reject_as(id, note, agent_live, TicketActor::User, None, now)
+        self.reject_as(id, note, to, TicketActor::User, None, now)
     }
 
     /// [`Self::reject`] by `by`, with `prefix` before the note in the history.
@@ -776,7 +802,7 @@ impl TicketService {
         &mut self,
         id: &str,
         note: &str,
-        agent_live: bool,
+        to: RejectReturn,
         by: TicketActor,
         prefix: Option<String>,
         now: u64,
@@ -786,8 +812,24 @@ impl TicketService {
         };
         self.commit(|doc| {
             let t = apply(doc, id, &ev, by, prefix, now)?;
-            match (agent_live, t.assignee_agent_id) {
-                (true, Some(agent)) => {
+            match (to, t.assignee_agent_id) {
+                (RejectReturn::Moved, Some(_)) => {
+                    // W1: the sender moved to another project; the ticket must not follow it
+                    // there. It keeps its rejection note and review round for the next agent.
+                    let round = t.review_round;
+                    apply(
+                        doc,
+                        id,
+                        &TicketEvent::ToBacklog {
+                            note: Some(MOVED_NOTE.to_string()),
+                        },
+                        TicketActor::System,
+                        None,
+                        now,
+                    )?;
+                    find_mut(doc, id)?.review_round = round;
+                }
+                (RejectReturn::Sender, Some(agent)) => {
                     // Make room at the front of the queue.
                     for q in doc.tickets.iter_mut().filter(|q| {
                         q.state == TicketState::Assigned
@@ -1448,7 +1490,7 @@ impl TicketService {
         agent_name: &str,
         ticket_id: &str,
         note: &str,
-        sender_live: bool,
+        to: RejectReturn,
         now: u64,
     ) -> Result<Ticket, TicketError> {
         let t = self.review_ticket_for(agent_id, ticket_id)?;
@@ -1458,7 +1500,7 @@ impl TicketService {
         self.reject_as(
             &t.id,
             note.trim(),
-            sender_live,
+            to,
             TicketActor::Agent,
             Some(format!("afvist af {agent_name}")),
             now,
@@ -1529,8 +1571,9 @@ impl TicketService {
     // ---- step 5c: handing a ticket in progress on ----
 
     /// The ticket in progress (full or short id) that `by_agent` may hand on: `None` = the user
-    /// (any ticket in progress); `Some(agent)` = only the agent's own ticket in progress.
-    fn handoff_source(
+    /// (any ticket in progress); `Some(agent)` = only the agent's own ticket in progress. Also
+    /// read before a handoff creates a project folder (N3).
+    pub fn handoff_source(
         &self,
         ticket_id: &str,
         by_agent: Option<&str>,
@@ -1871,9 +1914,14 @@ mod tests {
         s.mark_dispatched(&a.id, "demo", 5).unwrap();
         s.complete_turn("a1", 6).unwrap();
         assert_eq!(s.get(&a.id).unwrap().state, S::Review);
-        assert_eq!(s.reject(&a.id, "  ", true, 7), Err(TicketError::NeedsNote));
+        assert_eq!(
+            s.reject(&a.id, "  ", RejectReturn::Sender, 7),
+            Err(TicketError::NeedsNote)
+        );
         let saves = m.saves();
-        let r = s.reject(&a.id, "mangler test", true, 7).unwrap();
+        let r = s
+            .reject(&a.id, "mangler test", RejectReturn::Sender, 7)
+            .unwrap();
         assert_eq!(m.saves(), saves + 1);
         assert_eq!((r.state, r.queue_position), (S::Assigned, Some(0)));
         assert_eq!(r.rejection_note.as_deref(), Some("mangler test"));
@@ -1891,8 +1939,25 @@ mod tests {
         // Agent gone: rejected → backlog.
         s.mark_dispatched(&a.id, "demo", 8).unwrap();
         s.complete_turn("a1", 9).unwrap();
-        let r = s.reject(&a.id, "nej", false, 10).unwrap();
+        let r = s.reject(&a.id, "nej", RejectReturn::Backlog, 10).unwrap();
         assert_eq!((r.state, r.assignee_agent_id.clone()), (S::Backlog, None));
+        assert_invariants(&s);
+
+        // Sender moved to another project (W1): backlog with the note; the rejection note and
+        // the review round stay, the queue is untouched.
+        s.assign(&a.id, "a1", 11).unwrap();
+        s.mark_dispatched(&a.id, "demo", 12).unwrap();
+        s.complete_turn("a1", 13).unwrap();
+        let round = s.get(&a.id).unwrap().review_round;
+        let r = s.reject(&a.id, "igen", RejectReturn::Moved, 14).unwrap();
+        assert_eq!((r.state, r.assignee_agent_id.clone()), (S::Backlog, None));
+        assert_eq!(r.rejection_note.as_deref(), Some("igen"));
+        assert_eq!(r.review_round, round + 1);
+        assert_eq!(r.history.last().unwrap().note.as_deref(), Some(MOVED_NOTE));
+        assert_eq!(
+            positions(&s, "a1"),
+            vec![("b".into(), Some(0)), ("c".into(), Some(1))]
+        );
         assert_invariants(&s);
     }
 
@@ -2574,11 +2639,18 @@ mod tests {
         s.assign(&first.id, "a1", 5).unwrap();
         s.route_review(&t.id, "rev", "r", 5).unwrap();
         assert_eq!(
-            s.reject_by_agent("rev", "r", &t.id, "  ", true, 6),
+            s.reject_by_agent("rev", "r", &t.id, "  ", RejectReturn::Sender, 6),
             Err(TicketError::NeedsNote)
         );
         let r = s
-            .reject_by_agent("rev", "bot-rev", &t.id, "mangler test", true, 7)
+            .reject_by_agent(
+                "rev",
+                "bot-rev",
+                &t.id,
+                "mangler test",
+                RejectReturn::Sender,
+                7,
+            )
             .unwrap();
         assert_eq!(
             (r.state, r.queue_position, r.review_round),
@@ -2599,7 +2671,7 @@ mod tests {
         assert_eq!(s.get(&t.id).unwrap().review_round, 1);
         s.route_review(&t.id, "rev", "r", 10).unwrap();
         let b = s
-            .reject_by_agent("rev", "r", &t.id, "nej", false, 11)
+            .reject_by_agent("rev", "r", &t.id, "nej", RejectReturn::Backlog, 11)
             .unwrap();
         assert_eq!((b.state, b.review_round), (S::Backlog, 0));
         assert_invariants(&s);

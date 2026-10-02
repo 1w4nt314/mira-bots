@@ -62,14 +62,17 @@ export function projectLabel(ref: ProjectRef | null): string {
   return typeof ref === "string" ? ref : `+${ref.new}`;
 }
 
-/** Folds A–Z only, like Rust's `eq_ignore_ascii_case` (NTFS compares project folders so). */
-function asciiLower(s: string): string {
-  return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+/**
+ * Unicode lower-casing without locale, like Rust's `str::to_lowercase` in `projects::same_id`
+ * (NTFS folds "Økonomi" and "økonomi" too).
+ */
+function foldCase(s: string): string {
+  return s.toLowerCase();
 }
 
-/** Project ids compare ASCII-case-insensitively; null never equals anything. */
+/** Project ids compare case-insensitively (Unicode); null never equals anything. */
 export function sameProjectId(a: string | null, b: string | null): boolean {
-  return a !== null && b !== null && asciiLower(a) === asciiLower(b);
+  return a !== null && b !== null && foldCase(a) === foldCase(b);
 }
 
 export type AssignmentIssue =
@@ -122,7 +125,7 @@ export function coordinatorHint(agents: readonly AgentInfo[], projectId: string)
 
 /**
  * Running work agents and tickets (any state, existing project only) per project; the key is
- * the ASCII-lowercased id.
+ * the lower-cased id (see `foldCase`).
  */
 export function countsByProject(
   agents: readonly AgentInfo[],
@@ -130,7 +133,7 @@ export function countsByProject(
 ): Map<string, { agents: number; tickets: number }> {
   const out = new Map<string, { agents: number; tickets: number }>();
   const entry = (id: string) => {
-    const key = asciiLower(id);
+    const key = foldCase(id);
     let e = out.get(key);
     if (e === undefined) {
       e = { agents: 0, tickets: 0 };
@@ -153,7 +156,7 @@ export function countsFor(
   counts: Map<string, { agents: number; tickets: number }>,
   id: string,
 ): { agents: number; tickets: number } {
-  return counts.get(asciiLower(id)) ?? { agents: 0, tickets: 0 };
+  return counts.get(foldCase(id)) ?? { agents: 0, tickets: 0 };
 }
 
 // A project may be called "all" or "none": those ids are stored with a prefix that no project

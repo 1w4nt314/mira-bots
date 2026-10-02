@@ -23,7 +23,8 @@ use crate::agent::{
 };
 use crate::app_settings::{self, AppSettings};
 use crate::config::{
-    DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER, SYSTEM_PROMPT_FILE,
+    moving_text, DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER,
+    SYSTEM_PROMPT_FILE,
 };
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
@@ -521,6 +522,10 @@ pub fn ticket_set_state(
     note: Option<String>,
 ) -> Result<TicketSummary, String> {
     let before = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
+    if before.state == TicketState::Review && target == TicketState::Rejected {
+        // Dragging to "Afvist" is a rejection: same rules as the reject button (W1).
+        return ticket_reject(t, id, note.as_deref().unwrap_or_default());
+    }
     let old = before.assignee_agent_id;
     let live = old.as_deref().is_some_and(|a| agent_live(&t.manager, a));
     let now = now_ms();
@@ -545,15 +550,17 @@ pub fn ticket_approve(t: &TicketsCtx, id: &str) -> Result<TicketSummary, String>
         .map(|tk| TicketSummary::from(&tk))
 }
 
-/// review → rejected → first in the same agent's queue (agent live) or the backlog.
+/// review → rejected → first in the same agent's queue (agent live and still in the ticket's
+/// project) or the backlog.
 pub fn ticket_reject(t: &TicketsCtx, id: &str, note: &str) -> Result<TicketSummary, String> {
     if note.trim().is_empty() {
         return Err(TicketError::NeedsNote.into());
     }
     let old = assignee_of(t, id)?;
-    let live = old.as_deref().is_some_and(|a| agent_live(&t.manager, a));
+    // W1: back to the sender only while it is live and still in the ticket's project.
+    let to = t.reject_return(id);
     let now = now_ms();
-    let tk = t.mutate(|s| s.reject(id, note.trim(), live, now))?;
+    let tk = t.mutate(|s| s.reject(id, note.trim(), to, now))?;
     t.notify(old);
     t.route_reviews();
     Ok(TicketSummary::from(&tk))
@@ -906,6 +913,14 @@ pub fn spawn_project(
     }
 }
 
+/// Whether a spawn with `ticket` may create its project folder (W3). The ticket's own
+/// `{"new": …}` was authorised when the ticket got it (by the user, or by an agent the
+/// workspace allowed to), so it is always realised; `may_create` (`agentsMayCreateProjects` for
+/// `mira_spawn_agent`) only governs a `project` the caller passes for a ticket without one.
+pub fn spawn_may_create(ticket: &Ticket, may_create: bool) -> bool {
+    may_create || matches!(ticket.project, Some(ProjectRef::New { .. }))
+}
+
 /// The ticket of a spawn on a work seat gets the (realised) project of the placement before its
 /// file is written, so the file shows it (plan4b punkt 9). Unchanged on a staff seat.
 pub fn ticket_in_placement(
@@ -975,6 +990,7 @@ pub fn spawn_with_ticket_core(
     validate_overrides(overrides.clone().unwrap_or_default())?;
     let seat = seat_kind.unwrap_or(profile.default_seat);
     profile.check_seat(seat)?;
+    let may_create = spawn_may_create(&ticket, may_create);
     let project = spawn_project(&ticket, seat, project)?;
     let (ctx, placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
     ticket = ticket_in_placement(&state.tickets, ticket, &placement)?;
@@ -1171,6 +1187,10 @@ fn restart_with(
             effort.map(|e| e.as_str().to_string()),
             Arc::clone(&state.sink),
         );
+        if let (Ok(_), Some((_, project))) = (&result, &moved) {
+            // W2: say where it goes instead of "nye indstillinger".
+            m.set_start_text(agent_id, moving_text(project));
+        }
         (result, old_pty, resumed)
     };
     // Close the old pseudo terminal only after the manager lock is released (it may block).
@@ -1195,6 +1215,12 @@ fn restart_with(
                 }
                 None => info,
             };
+            // W2: a move into a git project shows the trust dialog; the hint points at it.
+            schedule_starting_hint(
+                app.clone(),
+                Arc::clone(&state.manager),
+                agent_id.to_string(),
+            );
             state.emit_agents(app);
             Ok(info)
         }
@@ -1345,6 +1371,9 @@ pub fn open_project_folder(
         .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
 }
 
+/// [`store_projects_root`] with a relative path.
+pub const PROJECTS_ROOT_NOT_ABSOLUTE: &str = "Projektroden skal være en absolut sti";
+
 /// Stores a new projects root in `app-settings.json` (created if missing). It applies after a
 /// restart of mira-bots (plan4b A.1); returns the stored path.
 pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<String, String> {
@@ -1353,6 +1382,10 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
         return Err("Vælg en mappe til projektroden".into());
     }
     let dir = PathBuf::from(path);
+    // N5: a relative path would resolve against whatever the working directory is next start.
+    if !dir.is_absolute() {
+        return Err(PROJECTS_ROOT_NOT_ABSOLUTE.into());
+    }
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir).map_err(|e| format!("Mappen kunne ikke oprettes: {e}"))?;
     }
@@ -2689,6 +2722,56 @@ mod tests {
     }
 
     #[test]
+    fn reject_after_the_sender_moved_goes_to_the_backlog() {
+        // W1: submitted in "p", moved to "q", then rejected (button and drag to "Afvist").
+        let (mut t, live, _) = tickets_setup();
+        let mk = |t: &TestCtx| {
+            let tk = ticket_create(&t.ctx, "x", "", false, p()).unwrap();
+            t.ctx
+                .mutate(|s| {
+                    s.assign(&tk.id, &live, 1)?;
+                    s.mark_dispatched(&tk.id, "bot", 2)?;
+                    s.complete_turn(&live, 3)
+                })
+                .unwrap();
+            tk.id
+        };
+        let a = mk(&t);
+        let b = mk(&t);
+        lock(&t.ctx.manager).set_project(&live, Some("q".into()));
+        t.sent();
+        for (id, s) in [
+            (&a, ticket_reject(&t.ctx, &a, "Mangler test").unwrap()),
+            (
+                &b,
+                ticket_set_state(
+                    &t.ctx,
+                    &b,
+                    TicketState::Rejected,
+                    Some("Mangler test".into()),
+                )
+                .unwrap(),
+            ),
+        ] {
+            assert_eq!((s.state, s.assignee_agent_id), (TicketState::Backlog, None));
+            let tk = t.ctx.read(|s| s.get(id)).unwrap();
+            assert_eq!(tk.rejection_note.as_deref(), Some("Mangler test"));
+            assert_eq!(tk.review_round, 1);
+            assert_eq!(tk.history.last().unwrap().note.as_deref(), Some(MOVED_NOTE));
+        }
+        // Nothing was queued for the moved agent, so nothing can be delivered in "q".
+        assert_eq!(t.ctx.read(|s| s.queue(&live)).len(), 0);
+        // Moved back: the next rejection goes first in its queue again.
+        lock(&t.ctx.manager).set_project(&live, Some("P".into()));
+        let c = mk(&t);
+        let s = ticket_reject(&t.ctx, &c, "igen").unwrap();
+        assert_eq!(
+            (s.state, s.queue_position),
+            (TicketState::Assigned, Some(0))
+        );
+    }
+
+    #[test]
     fn reject_requeues_for_a_live_agent_and_approve_finishes() {
         let (mut t, live, dead) = tickets_setup();
         let mk = |t: &TestCtx, agent: &str| {
@@ -3005,7 +3088,8 @@ mod tests {
         assert!(std::fs::read_to_string(file)
             .unwrap()
             .contains("- projekt: App\n"));
-        // An agent may not create one: refused before anything exists.
+        // W3: `mira_spawn_agent` with default rules (agentsMayCreateProjects false) still
+        // realises the ticket's own "Nyt projekt" — the user decided it.
         let tk2 = ticket_create(
             &state.tickets,
             "andet",
@@ -3017,14 +3101,36 @@ mod tests {
         )
         .unwrap();
         let t2 = ticket_for_spawn(&state.tickets, &tk2.id).unwrap();
+        let may_create = spawn_may_create(&t2, false);
+        assert!(may_create);
         let p2 = spawn_project(&t2, SeatKind::Work, None).unwrap();
+        let placed =
+            resolve_placement(&state, &coder, SeatKind::Work, p2.as_ref(), may_create).unwrap();
+        assert_eq!(placed.project.as_deref(), Some("Andet"));
+        assert!(state.paths.projects_root.join("Andet").is_dir());
+        // A project the agent passes for a ticket without one stays under the rule: refused
+        // before anything exists.
+        let tk3 = ticket_create(&state.tickets, "uden", "", false, None).unwrap();
+        let t3 = ticket_for_spawn(&state.tickets, &tk3.id).unwrap();
+        let may_create = spawn_may_create(&t3, false);
+        assert!(!may_create);
+        let param = Some(ProjectRef::New {
+            new: "Tredje".into(),
+        });
+        let p3 = spawn_project(&t3, SeatKind::Work, param).unwrap();
         let err =
-            resolve_placement(&state, &coder, SeatKind::Work, p2.as_ref(), false).unwrap_err();
+            resolve_placement(&state, &coder, SeatKind::Work, p3.as_ref(), may_create).unwrap_err();
         assert!(
             err.starts_with("Agenter må ikke oprette projekter"),
             "{err}"
         );
-        assert!(!state.paths.projects_root.join("Andet").exists());
+        assert!(!state.paths.projects_root.join("Tredje").exists());
+        // An existing project on the ticket needs no permission either way.
+        let t4 = Ticket {
+            project: Some(ProjectRef::Existing("App".into())),
+            ..t3
+        };
+        assert!(!spawn_may_create(&t4, false));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3248,6 +3354,14 @@ mod tests {
             store_projects_root(&dir, "  ").unwrap_err(),
             "Vælg en mappe til projektroden"
         );
+        // N5: relative paths are refused; nothing is created or stored.
+        for rel in ["x", "andet/rod", "./x"] {
+            assert_eq!(
+                store_projects_root(&dir, rel).unwrap_err(),
+                PROJECTS_ROOT_NOT_ABSOLUTE
+            );
+        }
+        assert_eq!(app_settings::load(&dir).projects_root(), None);
         let other = dir.join("andet").join("rod");
         let stored = store_projects_root(&dir, &format!(" {} ", other.display())).unwrap();
         assert_eq!(stored, other.to_string_lossy());

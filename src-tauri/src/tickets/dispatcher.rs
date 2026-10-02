@@ -1269,6 +1269,7 @@ mod tests {
     use crate::hooks::fixtures as fx;
     use crate::hooks::status::apply;
     use crate::tickets::model::{TicketActor, TicketDoc};
+    use crate::tickets::service::RejectReturn;
     use crate::tickets::store::MemoryStore;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1355,7 +1356,7 @@ mod tests {
                         && !matches!(a.status, AgentStatus::Exited { .. })
                         && a.project
                             .as_deref()
-                            .is_some_and(|x| x.eq_ignore_ascii_case(&p))
+                            .is_some_and(|x| crate::projects::same_id(x, &p))
                 })
                 .map(|(_, a)| a.name.clone())
                 .collect();
@@ -1919,7 +1920,9 @@ mod tests {
             failed: false,
         });
         assert_eq!(h.ticket(&a.id).state, S::Review);
-        h.svc().reject(&a.id, "Mangler test", true, 10).unwrap();
+        h.svc()
+            .reject(&a.id, "Mangler test", RejectReturn::Sender, 10)
+            .unwrap();
         assert_eq!(h.ticket(&a.id).queue_position, Some(0));
         assert_eq!(h.ticket(&b.id).queue_position, Some(1));
         h.set_status("a1", AgentStatus::Idle);

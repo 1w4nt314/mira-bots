@@ -137,9 +137,10 @@ pub fn validate_project_id(raw: &str) -> Result<ProjectId, ProjectError> {
     Ok(raw.to_string())
 }
 
-/// Project ids compare ASCII-case-insensitively (NTFS).
+/// Project ids compare case-insensitively with Unicode lower-casing (NTFS folds `Økonomi` and
+/// `økonomi` too; N1). `src/lib/projects.ts` `sameProjectId` folds the same way.
 pub fn same_id(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+    a == b || a.to_lowercase() == b.to_lowercase()
 }
 
 /// `<root>/<id>`.
@@ -178,7 +179,7 @@ pub fn list_projects(root: &Path) -> Vec<Project> {
             })
         })
         .collect();
-    out.sort_by_key(|p| p.id.to_ascii_lowercase());
+    out.sort_by_key(|p| p.id.to_lowercase());
     out
 }
 
@@ -415,8 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn same_id_and_matches_ignore_ascii_case() {
+    fn same_id_and_matches_ignore_case() {
         assert!(same_id("Mira", "mIRA"));
+        // N1: not only ASCII.
+        assert!(same_id("Økonomi", "økonomi"));
+        assert!(same_id("ÆBLE-Å", "æble-å"));
+        assert!(!same_id("Økonomi", "Okonomi"));
         assert!(!same_id("a", "b"));
         let a = ProjectRef::Existing("A".into());
         assert!(matches(Some(&a), "a"));

@@ -277,10 +277,6 @@ impl ToolsCtx {
             .ok_or_else(|| TicketError::AgentNotLive.into())
     }
 
-    fn is_live(&self, agent_id: &str) -> bool {
-        self.target_agent(agent_id).is_ok()
-    }
-
     /// See [`TicketsCtx::set_agent_detail`].
     fn set_detail(
         &self,
@@ -326,8 +322,8 @@ impl ToolsCtx {
 
     /// The assignment rule for a ticket with `project` going to `target` (plan4b A.2): a work
     /// agent only takes its own project; `Some(id)` when the ticket's project must become `id`
-    /// (a `{"new": …}` matching the agent's project, realised under the same rule as
-    /// [`Self::agent_project`]).
+    /// (a `{"new": …}` matching the agent's project; realised whatever agentsMayCreateProjects
+    /// says, since it is the ticket's own field, W3).
     fn target_project(
         &self,
         project: Option<&ProjectRef>,
@@ -341,10 +337,11 @@ impl ToolsCtx {
         )? {
             AssignmentProject::Unchanged => Ok(None),
             AssignmentProject::Set(p) => {
-                let may_create = self.tickets.workspace.rules().agents_may_create_projects;
+                // W3: this is the ticket's own `{"new": …}` (authorised when the ticket got it),
+                // not a project the agent names, so agentsMayCreateProjects does not apply.
                 let root = self.tickets.workspace.root();
                 Ok(Some(
-                    projects::realize(root, &ProjectRef::New { new: p }, may_create)?.id,
+                    projects::realize(root, &ProjectRef::New { new: p }, true)?.id,
                 ))
             }
         }
@@ -687,10 +684,11 @@ impl ToolsCtx {
             .tickets
             .read(|s| s.get_by_any_id(id))
             .and_then(|t| t.assignee_agent_id);
-        let sender_live = sender.as_deref().is_some_and(|a| self.is_live(a));
+        // W1: back to the sender only while it is live and still in the ticket's project.
+        let to = self.tickets.reject_return(id);
         let t = self
             .tickets
-            .mutate(|s| s.reject_by_agent(&agent.id, &agent.name, id, &note, sender_live, now))?;
+            .mutate(|s| s.reject_by_agent(&agent.id, &agent.name, id, &note, to, now))?;
         self.tickets.notify(sender.iter().map(String::as_str));
         self.tickets.route_reviews();
         log::info!(
@@ -823,13 +821,16 @@ impl ToolsCtx {
     ) -> Result<Value, String> {
         let t = match target {
             Some(to) => {
-                // Step 4b: the project rule for the new agent (only the agent's own ticket in
-                // progress can be handed on; the service checks that below).
-                let project = self
+                // Step 4b: the project rule for the new agent. Only the agent's own ticket in
+                // progress can be handed on, and not to itself: checked before a `{"new": …}`
+                // project folder is created (N3); the service checks again under its lock.
+                let source = self
                     .tickets
-                    .read(|s| s.get_by_any_id(ticket_id))
-                    .and_then(|t| t.project);
-                let set = self.assignment_project(project.as_ref(), given, to)?;
+                    .read(|s| s.handoff_source(ticket_id, Some(&agent.id)))?;
+                if to.id == agent.id {
+                    return Err(TicketError::HandoffToSelf.into());
+                }
+                let set = self.assignment_project(source.project.as_ref(), given, to)?;
                 self.tickets.mutate(|s| {
                     s.handoff_in(
                         ticket_id,
@@ -1791,6 +1792,36 @@ mod tests {
             .as_deref()
             .unwrap()
             .ends_with(": Tests ok"));
+    }
+
+    #[test]
+    fn reject_via_tool_after_the_sender_moved_goes_to_the_backlog() {
+        // W1: the sender moved to another project while its ticket was in review.
+        let mut t = setup();
+        let tk = t.review_for_r(&t.a, "Ret login");
+        lock(&t.tc.ctx.manager).set_project(&t.a, Some("andet".into()));
+        t.tc.sent();
+        let r = t
+            .call(
+                Some(&t.r),
+                "mira_reject_ticket",
+                json!({"id": tk.id, "note": "Mangler test"}),
+                8,
+            )
+            .unwrap();
+        assert_eq!(r["state"], json!("backlog"));
+        assert_eq!(r["reviewRound"], json!(1));
+        let now = t.ticket(&tk.id);
+        assert_eq!(
+            (now.state, now.assignee_agent_id),
+            (TicketState::Backlog, None)
+        );
+        assert_eq!(now.rejection_note.as_deref(), Some("Mangler test"));
+        assert_eq!(
+            now.history.last().unwrap().note.as_deref(),
+            Some(crate::config::MOVED_NOTE)
+        );
+        assert!(t.tc.ctx.read(|s| s.queue(&t.a)).is_empty());
     }
 
     #[test]
@@ -2802,6 +2833,62 @@ mod tests {
     }
 
     #[test]
+    fn assign_tool_realises_the_users_new_project_with_default_rules() {
+        // W3: the user gave the ticket "Nyt projekt: neu"; agentsMayCreateProjects is false
+        // (default), yet the coordinator may hand it to the agent standing in "neu".
+        let t = setup();
+        let neu = t.tc.ctx.manager.lock().unwrap().insert_fake_in(
+            "s-neu",
+            "/w/neu",
+            &[Role::Coder],
+            SeatKind::Work,
+            Some("neu"),
+        );
+        let root = t.tc.ctx.workspace.root().to_path_buf();
+        assert!(!root.join("neu").exists());
+        let tk =
+            t.tc.ctx
+                .mutate(|s| {
+                    s.create_in(
+                        "byg",
+                        "",
+                        false,
+                        Some(ProjectRef::New { new: "Neu".into() }),
+                        1,
+                    )
+                })
+                .unwrap();
+        let r = t
+            .call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": tk.id, "agentId": neu}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(r["state"], "assigned");
+        assert!(root.join("neu").is_dir());
+        assert_eq!(
+            t.ticket(&tk.id).project,
+            Some(ProjectRef::Existing("neu".into()))
+        );
+        // A project the coordinator names itself stays under the rule.
+        let x = t
+            .call(Some(&t.k), "mira_create_ticket", json!({"title": "x"}), 3)
+            .unwrap();
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_assign_ticket",
+                json!({"id": x["id"], "agentId": t.r, "project": {"new": "andet"}}),
+                4
+            ),
+            Err(ProjectError::AgentsMayNotCreate("andet".into()).to_string())
+        );
+        assert!(!root.join("andet").exists());
+    }
+
+    #[test]
     fn assign_tool_creates_a_named_new_project_when_allowed() {
         let t = setup();
         workspace_file(&t, r#"{"agentsMayCreateProjects": true}"#);
@@ -2890,6 +2977,69 @@ mod tests {
             Err("Ticketen har allerede projekt «p»".into())
         );
         assert_eq!(t.ticket(&mine.id).assignee_agent_id, Some(t.a.clone()));
+    }
+
+    #[test]
+    fn handoff_tool_checks_ownership_before_creating_a_project() {
+        // N3: a refused handoff never leaves an empty project folder behind.
+        let t = setup();
+        workspace_file(&t, r#"{"agentsMayCreateProjects": true}"#);
+        let c = &t.tc.ctx;
+        let root = c.workspace.root().to_path_buf();
+        let start = |agent: &str, title: &str| {
+            let tk = c
+                .mutate(|s| s.create_in(title, "", false, None, 1))
+                .unwrap();
+            c.mutate(|s| s.assign(&tk.id, agent, 2)).unwrap();
+            c.mutate(|s| s.mark_dispatched(&tk.id, agent, 3)).unwrap();
+            tk
+        };
+        // Someone else's ticket.
+        let theirs = start(&t.a, "a's");
+        assert_eq!(
+            t.call(
+                Some(&t.b),
+                "mira_handoff_ticket",
+                json!({"ticketId": theirs.id, "agentId": t.r, "project": {"new": "fremmed"}}),
+                4
+            ),
+            Err(TicketError::NotYours.to_string())
+        );
+        assert!(!root.join("fremmed").exists());
+        // To itself.
+        let own = start(&t.k, "k's");
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_handoff_ticket",
+                json!({"ticketId": own.id, "agentId": t.k, "project": {"new": "selv"}}),
+                5
+            ),
+            Err(TicketError::HandoffToSelf.to_string())
+        );
+        assert!(!root.join("selv").exists());
+        // A ticket not in progress.
+        let queued = c.mutate(|s| s.create_in("kø", "", false, None, 6)).unwrap();
+        c.mutate(|s| s.assign(&queued.id, &t.k, 7)).unwrap();
+        assert_eq!(
+            t.call(
+                Some(&t.k),
+                "mira_handoff_ticket",
+                json!({"ticketId": queued.id, "agentId": t.r, "project": {"new": "kø"}}),
+                8
+            ),
+            Err(TicketError::NotInProgress.to_string())
+        );
+        assert!(!root.join("kø").exists());
+        // The own ticket in progress to another agent: created and set.
+        t.call(
+            Some(&t.k),
+            "mira_handoff_ticket",
+            json!({"ticketId": own.id, "agentId": t.r, "project": {"new": "nyt"}}),
+            9,
+        )
+        .unwrap();
+        assert!(root.join("nyt").is_dir());
     }
 
     #[test]

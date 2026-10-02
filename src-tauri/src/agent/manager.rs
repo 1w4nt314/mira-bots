@@ -189,6 +189,12 @@ pub struct Agent {
     /// Set by a `--resume` restart (ms since epoch); a non-zero exit shortly after it, before the
     /// session started, means the conversation could not be resumed ([`RESTART_FAILED_TEXT`]).
     resume_started_at: Option<u64>,
+    /// When the current child was started (spawn or restart, ms since epoch): the Starting hint
+    /// counts from here ([`AgentManager::apply_starting_hint`]).
+    started_at: u64,
+    /// The detail a restart showed while `Starting` ([`RESTARTING_TEXT`] or the move text); the
+    /// Starting hint may replace it. `None` after a plain spawn.
+    start_text: Option<String>,
 }
 
 pub struct AgentManager {
@@ -489,7 +495,7 @@ impl AgentManager {
                     && a.seat_kind == SeatKind::Work
                     && a.project
                         .as_deref()
-                        .is_some_and(|p| p.eq_ignore_ascii_case(project))
+                        .is_some_and(|p| crate::projects::same_id(p, project))
             })
             .collect()
     }
@@ -622,6 +628,8 @@ impl AgentManager {
                 agent.info.status = AgentStatus::Starting;
                 agent.info.detail = Some(RESTARTING_TEXT.to_string());
                 agent.info.last_event_at = now;
+                agent.started_at = now;
+                agent.start_text = Some(RESTARTING_TEXT.to_string());
                 agent.info.model = model;
                 agent.info.effort = effort;
                 agent.info.model_observed = false;
@@ -740,6 +748,7 @@ impl AgentManager {
     ) {
         self.by_session
             .insert(session_key(&info.session_id), info.id.clone());
+        let started_at = info.created_at;
         self.agents.insert(
             info.id.clone(),
             Agent {
@@ -754,6 +763,8 @@ impl AgentManager {
                 last_user_input_at: None,
                 has_conversation: false,
                 resume_started_at: None,
+                started_at,
+                start_text: None,
             },
         );
     }
@@ -803,12 +814,15 @@ impl AgentManager {
         let now = now_ms();
         // A `--resume` restart that died with an error before its SessionStart (still Starting
         // with the restart text): the conversation could not be resumed (review5 N1).
-        let resume_failed = code != Some(0)
-            && agent.info.status == AgentStatus::Starting
-            && agent.info.detail.as_deref() == Some(RESTARTING_TEXT)
-            && agent
-                .resume_started_at
-                .is_some_and(|t| now.saturating_sub(t) <= RESUME_FAIL_WINDOW_MS);
+        let resume_failed =
+            code != Some(0)
+                && agent.info.status == AgentStatus::Starting
+                && agent.info.detail.as_deref().is_some_and(|d| {
+                    agent.start_text.as_deref() == Some(d) || d == STARTING_HINT_TEXT
+                })
+                && agent
+                    .resume_started_at
+                    .is_some_and(|t| now.saturating_sub(t) <= RESUME_FAIL_WINDOW_MS);
         // Keep a known code if stop() raced ahead with None; otherwise take the reported one.
         let keep =
             matches!(agent.info.status, AgentStatus::Exited { code: Some(_) }) && code.is_none();
@@ -988,18 +1002,41 @@ impl AgentManager {
             })
     }
 
-    /// Sets [`STARTING_HINT_TEXT`] as detail when the agent is still `Starting` without a detail
-    /// [`STARTING_HINT_AFTER`] after it was created (no hook event yet, usually the trust dialog).
-    /// `last_event_at` is left alone. Returns the updated info if the hint was set.
+    /// Sets [`STARTING_HINT_TEXT`] as detail when the agent is still `Starting`
+    /// [`STARTING_HINT_AFTER`] after its child was started (spawn or restart; no hook event yet,
+    /// usually the trust dialog). The detail must be empty or the restart's own text
+    /// ([`RESTARTING_TEXT`], the move text): a move into a git project shows the trust dialog
+    /// too (W2). `last_event_at` is left alone. Returns the updated info if the hint was set.
     pub fn apply_starting_hint(&mut self, id: &str, now_ms: u64) -> Option<AgentInfo> {
         let agent = self.agents.get_mut(id)?;
-        let due =
-            now_ms.saturating_sub(agent.info.created_at) >= STARTING_HINT_AFTER.as_millis() as u64;
-        if agent.info.status != AgentStatus::Starting || agent.info.detail.is_some() || !due {
+        let due = now_ms.saturating_sub(agent.started_at) >= STARTING_HINT_AFTER.as_millis() as u64;
+        let replaceable = match agent.info.detail.as_deref() {
+            None => true,
+            Some(d) => agent.start_text.as_deref() == Some(d),
+        };
+        if agent.info.status != AgentStatus::Starting || !replaceable || !due {
             return None;
         }
         agent.info.detail = Some(STARTING_HINT_TEXT.to_string());
         Some(agent.info.clone())
+    }
+
+    /// Replaces the restart text of a restarted agent that is still `Starting` with `text` (the
+    /// move text, plan4b A.3); the Starting hint may later replace it in turn. Returns whether it
+    /// was set.
+    pub fn set_start_text(&mut self, id: &str, text: String) -> bool {
+        match self.agents.get_mut(id) {
+            Some(a)
+                if a.info.status == AgentStatus::Starting
+                    && a.start_text.is_some()
+                    && a.info.detail == a.start_text =>
+            {
+                a.info.detail = Some(text.clone());
+                a.start_text = Some(text);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Removes the Starting hint (first hook event for the agent, even one that leaves the status
@@ -1116,6 +1153,7 @@ impl AgentManager {
     pub fn backdate(&mut self, id: &str, ms: u64) {
         if let Some(a) = self.agents.get_mut(id) {
             a.info.created_at = a.info.created_at.saturating_sub(ms);
+            a.started_at = a.started_at.saturating_sub(ms);
         }
     }
 }
@@ -2120,6 +2158,7 @@ mod tests {
     #[cfg(unix)]
     mod unix_pty {
         use super::*;
+        use crate::config::moving_text;
         use std::time::{Duration, Instant};
 
         fn collecting_sink() -> (EventSink, Arc<Mutex<Vec<SinkEvent>>>) {
@@ -2314,6 +2353,64 @@ mod tests {
                 let _ = m.stop(&info.id);
             }
             let _ = events;
+        }
+
+        /// W2: a move shows the move text instead of the restart text, and 15 s after the
+        /// restart (not the spawn) without a hook event the Starting hint replaces it.
+        #[test]
+        fn move_restart_shows_the_move_text_then_the_starting_hint() {
+            let mut m = AgentManager::new(5);
+            let (sink, _events) = collecting_sink();
+            let info = m
+                .spawn_spec(sh("sleep 30", vec![]), meta("sess-mv"), sink.clone())
+                .unwrap();
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            m.backdate(&info.id, 60_000);
+            // Only a restarted agent has a start text to replace.
+            assert!(!m.set_start_text(&info.id, moving_text("shop")));
+            let before = now_ms();
+            let (res, old) = m.restart(
+                &info.id,
+                sh("sleep 30", vec![]),
+                &RestartSession::Resume("sess-mv".into()),
+                None,
+                None,
+                sink,
+            );
+            res.unwrap();
+            drop(old);
+            assert!(m.set_start_text(&info.id, moving_text("shop")));
+            let now = m.get(&info.id).unwrap();
+            assert_eq!(now.detail.as_deref(), Some("Flytter til «shop»…"));
+            // Counted from the restart, not from the (backdated) spawn.
+            assert!(m.apply_starting_hint(&info.id, before + 14_000).is_none());
+            let hinted = m.apply_starting_hint(&info.id, now_ms() + 15_000).unwrap();
+            assert_eq!(hinted.detail.as_deref(), Some(STARTING_HINT_TEXT));
+            assert_eq!(hinted.status, AgentStatus::Starting);
+            // The first hook event clears it like after a spawn.
+            assert!(m.clear_starting_hint(&info.id));
+            // A plain restart (model change): the restart text is replaced as well.
+            let (sink2, _e2) = collecting_sink();
+            let (res, old) = m.restart(
+                &info.id,
+                sh("sleep 30", vec![]),
+                &RestartSession::Resume("sess-mv".into()),
+                None,
+                None,
+                sink2,
+            );
+            res.unwrap();
+            drop(old);
+            assert_eq!(
+                m.get(&info.id).unwrap().detail.as_deref(),
+                Some(RESTARTING_TEXT)
+            );
+            assert!(m.apply_starting_hint(&info.id, now_ms() + 15_000).is_some());
+            // Another detail (e.g. set by a hook) is never replaced.
+            m.set_status(&info.id, AgentStatus::Starting, Some("x".into()))
+                .unwrap();
+            assert!(m.apply_starting_hint(&info.id, now_ms() + 60_000).is_none());
+            m.stop(&info.id).unwrap();
         }
 
         /// A restart keeps id, session, cwd, creation time and the ring buffer; the old child's
