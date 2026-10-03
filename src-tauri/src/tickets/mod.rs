@@ -29,7 +29,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::roles::Role;
-use crate::agent::{now_ms, AgentManager};
+use crate::agent::{now_ms, AgentInfo, AgentManager};
 use crate::checks::{self, CheckRunner, ChecksReport, ProcessChecks, ProjectFileReader};
 use crate::config::{
     worktree_created_note, CHANGES_REPORT_TITLE, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS,
@@ -39,6 +39,7 @@ use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::git::{self, GitRunner};
 use crate::hooks::status::AgentStatus;
 use crate::inbox::{InboxError, InboxService};
+use crate::notices::{derive_ticket_notices, notice_for_exit, NoticesCtx};
 use crate::workspace::WorkspaceReader;
 use dispatcher::{
     AgentPort, AgentSnapshot, DispatchMsg, RestartForTicket, RestartPort, TicketsHost,
@@ -217,6 +218,9 @@ pub struct TicketsCtx {
     /// (≥ 1 s apart, research §5.4). Its own lock: no other lock is held under it, and `gh` runs
     /// under it on purpose.
     pub(crate) write_back_lock: Mutex<Option<std::time::Instant>>,
+    /// Beskedkøen (trin 6d, plan A.8; `AppState.notices` er samme `Arc`). Fodres af
+    /// [`Self::mutate_if`] og [`Self::notice_exit`]; dens lås tages aldrig sammen med en anden.
+    pub notices: Arc<NoticesCtx>,
 }
 
 impl TicketsCtx {
@@ -240,6 +244,7 @@ impl TicketsCtx {
             service: Mutex::new(service),
             manager,
             dispatch_tx,
+            notices: Arc::new(NoticesCtx::new(Arc::clone(&emit))),
             emit,
             reports: ReportStore::new(reports_root),
             report_lock: Mutex::new(()),
@@ -447,19 +452,26 @@ impl TicketsCtx {
     /// whom to wake ([`Self::after_relations`]). So every way a child becomes Done (reviewer,
     /// user, manual move, skipReview) or a ticket is deleted reaches the same path without
     /// changing the callers.
+    ///
+    /// Trin 6d-krog (plan A.8): en [`crate::notices::NoticeSnap`]-liste tages også før og efter
+    /// `f`; efter `tickets-changed`-emittet (ingen lås holdt) giver [`derive_ticket_notices`]
+    /// beskederne (eskaleret, forløbsforælder i review, tilbagemelding fejlet), og køen fjerner
+    /// dubletter.
     fn mutate_if<T>(
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
         changed: impl FnOnce(&T) -> bool,
     ) -> Result<T, String> {
-        let (result, list, links, reviews, before, after) = {
+        let (result, list, links, reviews, before, after, notes_before, notes_after) = {
             let mut svc = lock(&self.service);
             let before = svc.relations_snapshot();
+            let notes_before = svc.notice_snapshot();
             let result = f(&mut svc).map_err(String::from)?;
             if !changed(&result) {
                 return Ok(result);
             }
             let after = svc.relations_snapshot();
+            let notes_after = svc.notice_snapshot();
             (
                 result,
                 svc.list(),
@@ -467,12 +479,19 @@ impl TicketsCtx {
                 svc.open_review_counts(),
                 before,
                 after,
+                notes_before,
+                notes_after,
             )
         };
         let agents_changed = self.apply_links(&links, &reviews);
         emit_json(&self.emit, TICKETS_CHANGED, &list);
         if agents_changed {
             self.emit_agents();
+        }
+        let now = now_ms();
+        let notices = derive_ticket_notices(&notes_before, &notes_after, now);
+        if !notices.is_empty() {
+            self.notices.push_all(notices, now);
         }
         let fx = relation_effects(&before, &after);
         if !fx.is_empty() {
@@ -728,6 +747,18 @@ impl TicketsCtx {
             );
         }
         Ok(released.len())
+    }
+
+    /// Beskeden "agent afsluttede med ticket i gang" (trin 6d, plan A.8 b) efter at
+    /// [`Self::release_agent`] gav `released` tickets tilbage (intet ved 0). `agent` er den
+    /// afsluttede agents info (dens `last_event_at` er afslutningen). Svarer hvor mange beskeder
+    /// der kom ind.
+    pub fn notice_exit(&self, agent: &AgentInfo, released: usize) -> usize {
+        let now = now_ms();
+        match notice_for_exit(agent, released, now) {
+            Some(n) => self.notices.push_all(vec![n], now),
+            None => 0,
+        }
     }
 
     /// "Flyt til projekt…" with `force` (plan4b A.3): the agent's queued tickets go to the
@@ -3683,5 +3714,285 @@ mod tests {
         let tk2 = ticket_in(&c.t, Some("proj"));
         assert_eq!(c.t.ctx.prepare_ticket_git(&tk2).unwrap().base, "develop");
         cleanup(&c.t);
+    }
+}
+
+/// Trin 6d (plan punkt 14): beskederne som `mutate_if` og afslutningsvejen giver.
+#[cfg(test)]
+mod notice_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::agent::SeatKind;
+    use crate::events::NOTICES_CHANGED;
+    use crate::notices::{Notice, NoticeKind};
+    use crate::tickets::model::{TicketSource, WriteBack, WriteBackState};
+    use crate::tickets::service::ChildSpec;
+
+    fn notices(t: &TestCtx) -> Vec<Notice> {
+        t.ctx.notices.payload().items
+    }
+
+    fn of_kind(t: &TestCtx, kind: NoticeKind) -> Vec<Notice> {
+        notices(t).into_iter().filter(|n| n.kind == kind).collect()
+    }
+
+    /// A reviewer setup with `maxReviewRounds: 1` in the workspace file.
+    fn one_round() -> (TestCtx, String, String) {
+        let mut m = AgentManager::new(5);
+        let a1 = m.insert_fake_with("s-a1", "/w/a1", &[Role::Coder], SeatKind::Work);
+        let r1 = m.insert_fake_with("s-r1", "/w/r1", &[Role::Reviewer], SeatKind::Staff);
+        let t = test_ctx(Arc::new(Mutex::new(m)));
+        let path = t.ctx.workspace.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"maxReviewRounds": 1}"#).unwrap();
+        (t, a1, r1)
+    }
+
+    fn cleanup(t: &TestCtx) {
+        let path = t.ctx.workspace.path().to_path_buf();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Rejected by its reviewer, delivered again and submitted again by `agent`.
+    fn reject_and_resubmit(t: &TestCtx, id: &str, agent: &str) {
+        let rev = t
+            .ctx
+            .read(|s| s.get(id))
+            .unwrap()
+            .reviewer_agent_id
+            .unwrap();
+        t.ctx
+            .mutate(|s| s.reject_by_agent(&rev, "r", id, "mere", RejectReturn::Sender, 10))
+            .unwrap();
+        t.ctx.mutate(|s| s.mark_dispatched(id, agent, 11)).unwrap();
+        t.ctx
+            .mutate(|s| s.submit_by_agent(agent, None, "igen", 12))
+            .unwrap();
+    }
+
+    #[test]
+    fn escalation_emits_notices_changed_once() {
+        let (t, a1, r1) = one_round();
+        let c = &t.ctx;
+        let tk = c
+            .mutate(|s| s.create("Fejl i login", "hemmelig body", false, 1))
+            .unwrap();
+        c.mutate(|s| s.assign(&tk.id, &a1, 2)).unwrap();
+        c.mutate(|s| s.mark_dispatched(&tk.id, &a1, 3)).unwrap();
+        c.mutate(|s| s.submit_by_agent(&a1, None, "klar", 4))
+            .unwrap();
+        assert_eq!(c.route_reviews(), 1);
+        reject_and_resubmit(&t, &tk.id, &a1);
+        assert!(notices(&t).is_empty());
+        t.clear();
+        assert_eq!(c.route_reviews(), 0, "escalated, not routed");
+        let esc = of_kind(&t, NoticeKind::Escalated);
+        assert_eq!(esc.len(), 1);
+        assert_eq!(
+            esc[0].text,
+            format!("{}: «Fejl i login» efter 1 runder", tk.short_id())
+        );
+        assert!(!esc[0].text.contains("hemmelig"), "never the body");
+        assert_eq!(esc[0].ticket_id.as_deref(), Some(tk.id.as_str()));
+        let emitted = t.emitted(NOTICES_CHANGED);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0]["unread"], 1);
+        assert_eq!(emitted[0]["items"][0]["kind"], "escalated");
+        // Ten mutations that leave the escalation alone: no new notice, no emit.
+        t.clear();
+        for i in 0..10 {
+            c.mutate(|s| s.create(&format!("andet {i}"), "", false, 20 + i))
+                .unwrap();
+        }
+        c.mutate(|s| s.note_by_system(&tk.id, "en note", 40))
+            .unwrap();
+        assert_eq!(c.route_reviews(), 0);
+        assert!(t.emitted(NOTICES_CHANGED).is_empty());
+        assert_eq!(notices(&t).len(), 1);
+        // "Fjern reviewer" escalates again in the same round: the same key, nothing new.
+        c.assign_reviewer(&tk.id, Some(&r1)).unwrap();
+        c.assign_reviewer(&tk.id, None).unwrap();
+        assert!(c.read(|s| s.get(&tk.id)).unwrap().escalated);
+        assert_eq!(of_kind(&t, NoticeKind::Escalated).len(), 1);
+        // A new round (the user's reviewer rejects, the agent submits again): one new notice.
+        c.assign_reviewer(&tk.id, Some(&r1)).unwrap();
+        reject_and_resubmit(&t, &tk.id, &a1);
+        assert_eq!(c.route_reviews(), 0);
+        let tk2 = c.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!((tk2.escalated, tk2.review_round), (true, 2));
+        let esc = of_kind(&t, NoticeKind::Escalated);
+        assert_eq!(esc.len(), 2);
+        assert!(esc[0].text.ends_with("efter 2 runder"), "{}", esc[0].text);
+        cleanup(&t);
+    }
+
+    #[test]
+    fn flow_parent_review_emits_notice() {
+        let mut mgr = AgentManager::new(5);
+        let a = mgr.insert_fake("s-a", "/w/a");
+        let t = test_ctx(Arc::new(Mutex::new(mgr)));
+        let c = Arc::clone(&t.ctx);
+        let p = Some(crate::projects::ProjectRef::Existing("web".into()));
+        let parent = c
+            .mutate(|s| s.create_in("Login", "", false, p, Some("feature".into()), 1))
+            .unwrap();
+        let spec = ChildSpec {
+            title: "trin".into(),
+            body: String::new(),
+            blocked_by_previous: false,
+            skip_review: false,
+        };
+        let kids = c
+            .mutate(|s| {
+                s.create_playbook_children(
+                    &parent.id,
+                    &[spec],
+                    (TicketSource::User, TicketActor::User),
+                    2,
+                )
+            })
+            .unwrap();
+        // The child in review (assigned): no flow notice.
+        c.mutate(|s| {
+            s.assign(&kids[0].id, &a, 3)?;
+            s.mark_dispatched(&kids[0].id, &a, 3)?;
+            s.submit_by_agent(&a, Some(&kids[0].id), "klar", 3)
+        })
+        .unwrap();
+        assert!(of_kind(&t, NoticeKind::FlowReview).is_empty());
+        t.clear();
+        c.mutate(|s| s.approve(&kids[0].id, 4)).unwrap();
+        let tk = c.read(|s| s.get(&parent.id)).unwrap();
+        assert_eq!(
+            (tk.state, tk.assignee_agent_id),
+            (TicketState::Review, None)
+        );
+        let flow = of_kind(&t, NoticeKind::FlowReview);
+        assert_eq!(flow.len(), 1);
+        assert_eq!(flow[0].text, format!("{}: «Login»", parent.short_id()));
+        assert_eq!(
+            (flow[0].ticket_id.as_deref(), flow[0].project.as_deref()),
+            (Some(parent.id.as_str()), Some("web"))
+        );
+        assert_eq!(t.emitted(NOTICES_CHANGED).len(), 1);
+        // Further mutations while it waits for the user: nothing new.
+        c.mutate(|s| s.note_by_system(&parent.id, "note", 5))
+            .unwrap();
+        assert_eq!(of_kind(&t, NoticeKind::FlowReview).len(), 1);
+    }
+
+    fn external(t: &TestCtx) -> Ticket {
+        let e = crate::tickets::model::test_support::github_ref(7);
+        t.ctx
+            .mutate(|s| s.create_external("Crash", "ekstern body", false, None, None, e, 1))
+            .unwrap()
+    }
+
+    fn failed(attempts: u32, err: &str) -> WriteBack {
+        WriteBack {
+            comment: WriteBackState::Failed,
+            attempts,
+            last_error: Some(err.into()),
+            last_body: Some("ekstern tekst".into()),
+            ..WriteBack::default()
+        }
+    }
+
+    #[test]
+    fn write_back_failed_emits_notice() {
+        let t = test_ctx(Arc::new(Mutex::new(AgentManager::new(5))));
+        let tk = external(&t);
+        t.clear();
+        t.ctx
+            .mutate(|s| s.set_write_back(&tk.id, failed(1, "ingen forbindelse til GitHub"), 2))
+            .unwrap();
+        let wb = of_kind(&t, NoticeKind::WriteBackFailed);
+        assert_eq!(wb.len(), 1);
+        assert_eq!(
+            wb[0].text,
+            format!("{}: ingen forbindelse til GitHub", tk.short_id())
+        );
+        assert!(
+            !wb[0].text.contains("ekstern"),
+            "never the body or the external text"
+        );
+        assert_eq!(t.emitted(NOTICES_CHANGED).len(), 1);
+        // "Prøv igen": in flight (attempt 2), failed again → a second notice.
+        let inflight = WriteBack {
+            comment: WriteBackState::Inflight,
+            attempts: 2,
+            ..WriteBack::default()
+        };
+        t.ctx
+            .mutate(|s| s.set_write_back(&tk.id, inflight, 3))
+            .unwrap();
+        t.ctx
+            .mutate(|s| s.set_write_back(&tk.id, failed(2, "GitHub: rate limit"), 4))
+            .unwrap();
+        assert_eq!(of_kind(&t, NoticeKind::WriteBackFailed).len(), 2);
+        assert_eq!(t.emitted(NOTICES_CHANGED).len(), 2);
+    }
+
+    #[test]
+    fn write_back_without_external_change_emits_nothing() {
+        let t = test_ctx(Arc::new(Mutex::new(AgentManager::new(5))));
+        let tk = external(&t);
+        let wb = failed(1, "ingen forbindelse til GitHub");
+        t.ctx
+            .mutate(|s| s.set_write_back(&tk.id, wb.clone(), 2))
+            .unwrap();
+        t.clear();
+        // The same state saved again, and an unrelated mutation: no new notice, no emit.
+        t.ctx.mutate(|s| s.set_write_back(&tk.id, wb, 3)).unwrap();
+        t.ctx.mutate(|s| s.create("andet", "", false, 4)).unwrap();
+        assert!(t.emitted(NOTICES_CHANGED).is_empty());
+        assert_eq!(notices(&t).len(), 1);
+    }
+
+    #[test]
+    fn no_notice_when_kind_is_off() {
+        let t = test_ctx(Arc::new(Mutex::new(AgentManager::new(5))));
+        t.ctx.notices.set_off(&["writeBackFailed".into()]);
+        let tk = external(&t);
+        t.clear();
+        t.ctx
+            .mutate(|s| s.set_write_back(&tk.id, failed(1, "fejl"), 2))
+            .unwrap();
+        assert!(notices(&t).is_empty());
+        assert!(t.emitted(NOTICES_CHANGED).is_empty());
+        // Turned on again: the next attempt gives a notice (the off one was never remembered).
+        t.ctx.notices.set_off(&[]);
+        t.ctx
+            .mutate(|s| s.set_write_back(&tk.id, failed(2, "fejl"), 3))
+            .unwrap();
+        assert_eq!(of_kind(&t, NoticeKind::WriteBackFailed).len(), 1);
+    }
+
+    #[test]
+    fn exit_notice_with_and_without_released_tickets() {
+        let mut mgr = AgentManager::new(5);
+        let a = mgr.insert_fake("s-a", "/w/a");
+        let m = Arc::new(Mutex::new(mgr));
+        let t = test_ctx(Arc::clone(&m));
+        // Nothing to release: no notice.
+        let released = t.ctx.release_agent(&a, AGENT_EXITED_NOTE).unwrap();
+        let info = lock(&m).get(&a).unwrap();
+        assert_eq!(t.ctx.notice_exit(&info, released), 0);
+        assert!(t.emitted(NOTICES_CHANGED).is_empty());
+        // One ticket in progress: one notice, once.
+        let tk = t.ctx.mutate(|s| s.create("Arbejde", "", false, 1)).unwrap();
+        t.ctx.mutate(|s| s.assign(&tk.id, &a, 2)).unwrap();
+        t.ctx.mutate(|s| s.mark_dispatched(&tk.id, &a, 3)).unwrap();
+        let released = t.ctx.release_agent(&a, AGENT_EXITED_NOTE).unwrap();
+        assert_eq!(released, 1);
+        assert_eq!(t.ctx.notice_exit(&info, released), 1);
+        assert_eq!(t.ctx.notice_exit(&info, released), 0, "same exit");
+        let n = of_kind(&t, NoticeKind::AgentExited);
+        assert_eq!(n.len(), 1);
+        assert_eq!(
+            n[0].text,
+            format!("{}: 1 ticket(s) tilbage i backlog", info.name)
+        );
+        assert_eq!(n[0].agent_id.as_deref(), Some(a.as_str()));
     }
 }

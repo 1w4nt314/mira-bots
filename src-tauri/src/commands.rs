@@ -34,6 +34,7 @@ use crate::hooks::status::AgentStatus;
 use crate::inbox::{InboxItem, InboxItemSummary, InboxPayload, RefreshReason, StartRequest};
 use crate::island::{self, IslandState};
 use crate::mcp;
+use crate::notices::{NoticeKind, NoticesCtx, NoticesPayload};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 use crate::profiles::model::{
     model_is_valid, new_custom_id, validate_overrides, AgentProfile, Effort, ProfileError,
@@ -133,6 +134,8 @@ pub struct AppState {
     /// `app-settings.json` as loaded at start (step 6d A.7). Changed only through
     /// [`AppState::update_settings`] (read-modify-write + save), never by a struct literal.
     pub settings: Mutex<AppSettings>,
+    /// Beskedkøen (trin 6d, plan A.8): samme `Arc` som `tickets.notices`.
+    pub notices: Arc<NoticesCtx>,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -175,6 +178,21 @@ impl AppState {
     /// live settings (a failed write changes nothing in memory). Returns the new settings.
     pub fn update_settings(&self, f: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
         update_settings_in(&self.paths.data_dir, &self.settings, f)
+    }
+
+    /// "Giv besked ved: …" (trin 6d, plan punkt 15): `notifyOff` læses, ændres og skrives
+    /// (typen ud, og ind igen når `on` er falsk), derefter får køen den nye liste. En fejlet
+    /// gemning ændrer intet.
+    pub fn set_notify_pref(&self, kind: NoticeKind, on: bool) -> Result<NoticesPayload, String> {
+        let name = kind.as_str();
+        let next = self.update_settings(|s| {
+            s.notify_off.retain(|k| k != name);
+            if !on {
+                s.notify_off.push(name.to_string());
+            }
+        })?;
+        log::info!("notices: {name} {}", if on { "on" } else { "off" });
+        Ok(self.notices.set_off(&next.notify_off))
     }
 
     /// Recomputes the `claude` lookup on every call.
@@ -1401,8 +1419,15 @@ fn restart_with(
         }
         Err(e) => {
             log::warn!("restart of agent {agent_id} failed: {e}");
-            if let Err(e) = state.tickets.release_agent(agent_id, AGENT_EXITED_NOTE) {
-                log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+            match state.tickets.release_agent(agent_id, AGENT_EXITED_NOTE) {
+                Ok(released) => {
+                    // Trin 6d (plan A.8 b): den mislykkede genstart afsluttede agenten.
+                    let info = lock(&state.manager).get(agent_id);
+                    if let Some(info) = info {
+                        state.tickets.notice_exit(&info, released);
+                    }
+                }
+                Err(e) => log::warn!("releasing the tickets of agent {agent_id} failed: {e}"),
             }
             state.emit_agents(app);
             Err(e.into())
@@ -2079,6 +2104,30 @@ pub async fn check_gh_auth(state: State<'_, AppState>) -> Result<GhAuthResult, S
         .map_err(|e| format!("gh-login kunne ikke tjekkes: {e}"))
 }
 
+// ---- beskeder (trin 6d, plan punkt 15) ----
+
+/// Beskedkøen (nyeste først) og antallet af ulæste.
+#[tauri::command]
+pub fn list_notices(state: State<'_, AppState>) -> NoticesPayload {
+    state.notices.payload()
+}
+
+/// Markerer beskederne med disse id'er som læst (`null`: dem alle).
+#[tauri::command]
+pub fn mark_notices_seen(state: State<'_, AppState>, ids: Option<Vec<String>>) -> NoticesPayload {
+    state.notices.mark_seen(ids.as_deref())
+}
+
+/// Slår en beskedtype til eller fra (`notifyOff` i `app-settings.json`).
+#[tauri::command]
+pub fn set_notify_pref(
+    state: State<'_, AppState>,
+    kind: NoticeKind,
+    on: bool,
+) -> Result<NoticesPayload, String> {
+    state.set_notify_pref(kind, on)
+}
+
 // ---- ticket commands (C3.2) ----
 
 #[tauri::command]
@@ -2420,6 +2469,7 @@ mod tests {
         let t = test_ctx(Arc::clone(&manager));
         t.ctx.mutate(|s| s.create("a", "", false, 1)).unwrap();
         t.ctx.mutate(|s| s.create("b", "", false, 1)).unwrap();
+        let notices = Arc::clone(&t.ctx.notices);
         AppState {
             manager,
             pending: Arc::new(Mutex::new(PendingPermissions::new())),
@@ -2460,6 +2510,7 @@ mod tests {
             )),
             profiles_migrated: 0,
             settings: Mutex::new(app_settings::load(dir)),
+            notices,
         }
     }
 
@@ -4032,6 +4083,59 @@ mod tests {
             }
         );
         assert_eq!(*lock(&state.settings), on_disk);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Trin 6d (plan punkt 15): `set_notify_pref` læser, ændrer og skriver `notifyOff` (de øvrige
+    /// indstillinger bliver), køen dropper typen, og "til" igen fjerner den fra listen.
+    #[test]
+    fn set_notify_pref_updates_settings_and_queue() {
+        use crate::notices::{Notice, NoticeKey};
+        let (state, dir) = temp_state();
+        state.update_settings(|s| s.watch_paused = true).unwrap();
+        let n = |kind: NoticeKind, g: u64| {
+            (
+                NoticeKey::new(kind, "x", g),
+                Notice::new(kind, format!("n{g}"), g),
+            )
+        };
+        state.notices.push_all(
+            vec![n(NoticeKind::Escalated, 1), n(NoticeKind::BudgetReached, 2)],
+            3,
+        );
+        let p = state
+            .set_notify_pref(NoticeKind::BudgetReached, false)
+            .unwrap();
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].kind, NoticeKind::Escalated);
+        let p = state
+            .set_notify_pref(NoticeKind::BudgetReached, false)
+            .unwrap();
+        assert_eq!(p.unread, 1, "twice off is still one entry");
+        let saved = app_settings::load(&dir);
+        assert_eq!(saved.notify_off, vec!["budgetReached".to_string()]);
+        assert!(saved.watch_paused, "the other settings stay");
+        assert_eq!(
+            state
+                .notices
+                .push_all(vec![n(NoticeKind::BudgetReached, 4)], 5),
+            0,
+            "off: not created"
+        );
+        state
+            .set_notify_pref(NoticeKind::BudgetReached, true)
+            .unwrap();
+        assert!(app_settings::load(&dir).notify_off.is_empty());
+        assert_eq!(
+            state
+                .notices
+                .push_all(vec![n(NoticeKind::BudgetReached, 6)], 7),
+            1
+        );
+        // Læst: én ad gangen via id, derefter alle.
+        let id = state.notices.payload().items[0].id.clone();
+        assert_eq!(state.notices.mark_seen(Some(&[id])).unread, 1);
+        assert_eq!(state.notices.mark_seen(None).unread, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

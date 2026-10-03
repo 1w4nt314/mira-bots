@@ -36,6 +36,7 @@ use crate::config::{
     TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
     WRITE_BACK_INTERRUPTED_NOTE,
 };
+use crate::notices::{clip_line, NoticeSnap, NOTICE_PART_MAX_CHARS, NOTICE_TITLE_MAX_CHARS};
 use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
 
 /// History note when a turn ended normally (Stop hook).
@@ -963,6 +964,43 @@ impl TicketService {
                 parent_id: t.parent_id.clone(),
                 blocked_by: t.blocked_by.clone(),
                 assignee: t.assignee_agent_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Den del af hver ticket som beskederne bruger (trin 6d, plan A.8: tages i `mutate_if` ved
+    /// siden af [`Self::relations_snapshot`]). Titlen er på én linje og klippet; brødteksten og
+    /// de eksterne noter er aldrig med.
+    pub fn notice_snapshot(&self) -> Vec<NoticeSnap> {
+        self.doc
+            .tickets
+            .iter()
+            .map(|t| {
+                let own = t.external.as_ref().filter(|e| !e.inherited);
+                let failed = own.filter(|e| {
+                    e.write_back.comment == WriteBackState::Failed
+                        || e.write_back.close == WriteBackState::Failed
+                });
+                NoticeSnap {
+                    id: t.id.clone(),
+                    short: t.short_id(),
+                    title: clip_line(&t.title, NOTICE_TITLE_MAX_CHARS),
+                    state: t.state,
+                    escalated: t.escalated,
+                    review_round: t.review_round,
+                    assignee: t.assignee_agent_id.clone(),
+                    playbook_started_at: t.playbook_started_at,
+                    updated_at: t.updated_at,
+                    project: t.project.as_ref().map(|p| p.name().to_string()),
+                    wb_failed: failed.map(|e| e.write_back.attempts),
+                    wb_error: failed.and_then(|e| {
+                        e.write_back
+                            .last_error
+                            .as_deref()
+                            .map(|err| clip_line(err, NOTICE_PART_MAX_CHARS))
+                    }),
+                    external_number: own.and_then(|e| e.number),
+                }
             })
             .collect()
     }

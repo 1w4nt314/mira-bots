@@ -32,6 +32,9 @@ pub const PROFILES_CHANGED: &str = "profiles-changed";
 /// The inbox (`InboxPayload`: items without bodies + status per source) after any inbox change
 /// and at the start and end of a refresh (step 6c).
 pub const INBOX_CHANGED: &str = "inbox-changed";
+/// Beskedkøen (`NoticesPayload`: `{unread, items}`, nyeste først) efter at en besked kom ind,
+/// blev markeret læst eller forsvandt fordi dens type blev fravalgt (trin 6d, plan A.8).
+pub const NOTICES_CHANGED: &str = "notices-changed";
 
 /// Payload of `workplace-select` and the result of `take_workplace_selection`: which agent and/or
 /// sidebar tab the workplace window should show (`tab`: "permissions" | "diagnostics" |
@@ -107,6 +110,7 @@ mod tests {
         assert_eq!(TICKETS_CHANGED, "tickets-changed");
         assert_eq!(PROFILES_CHANGED, "profiles-changed");
         assert_eq!(INBOX_CHANGED, "inbox-changed");
+        assert_eq!(NOTICES_CHANGED, "notices-changed");
     }
 
     #[test]

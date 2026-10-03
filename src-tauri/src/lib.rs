@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod inbox;
 pub mod island;
 pub mod mcp;
+pub mod notices;
 pub mod permissions;
 pub mod pipe;
 pub mod platform;
@@ -171,6 +172,8 @@ pub fn tauri_sink(
                 (m.mark_exited(&agent_id, gen, code), replaced)
             };
             let known = exited.is_some();
+            // Trin 6d (plan A.8 b): den afsluttede agents info til beskeden nedenfor.
+            let info = exited.as_ref().map(|(info, _)| info.clone());
             // Drop the PTY (ConPTY ClosePseudoConsole may block) only after the lock is released.
             drop(exited);
             if replaced {
@@ -181,8 +184,15 @@ pub fn tauri_sink(
             lock(&pending).remove_for_agent(&agent_id);
             if known {
                 log::info!("agent {agent_id} exited (code {code:?})");
-                if let Err(e) = tickets.release_agent(&agent_id, AGENT_EXITED_NOTE) {
-                    log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+                match tickets.release_agent(&agent_id, AGENT_EXITED_NOTE) {
+                    Ok(released) => {
+                        if let Some(info) = &info {
+                            tickets.notice_exit(info, released);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("releasing the tickets of agent {agent_id} failed: {e}")
+                    }
                 }
                 let list = lock(&manager).list();
                 if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
@@ -515,6 +525,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         inbox_service,
     )
     .shared();
+    // Trin 6d (plan A.8): beskedtyper som brugeren har fravalgt, oprettes aldrig.
+    tickets.notices.set_off(&settings.notify_off);
+    let notices = Arc::clone(&tickets.notices);
     let sink = tauri_sink(
         handle.clone(),
         Arc::clone(&manager),
@@ -608,6 +621,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         workspace,
         profiles_migrated,
         settings: Mutex::new(settings),
+        notices,
     });
 
     // After `manage`: the exit handler's `kill_all` needs `AppState` (review7 W5).
@@ -716,6 +730,9 @@ pub fn run() {
             commands::retry_write_back,
             commands::open_inbox_url,
             commands::check_gh_auth,
+            commands::list_notices,
+            commands::mark_notices_seen,
+            commands::set_notify_pref,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -810,10 +827,10 @@ mod tests {
     }
 
     /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50; plan6b punkt 6:
-    /// → 51; plan6c punkt 11: → 57; plan6c punkt 15: → 60). Counted from the source so a command added without a
-    /// handler (or the other way round) is noticed.
+    /// → 51; plan6c punkt 11: → 57; plan6c punkt 15: → 60; plan6d punkt 15: → 63). Counted
+    /// from the source so a command added without a handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_60_commands() {
+    fn generate_handler_lists_63_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -822,8 +839,11 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 60, "{names:?}");
+        assert_eq!(names.len(), 63, "{names:?}");
         for n in [
+            "list_notices",
+            "mark_notices_seen",
+            "set_notify_pref",
             "get_inbox",
             "get_inbox_item",
             "refresh_inbox",
