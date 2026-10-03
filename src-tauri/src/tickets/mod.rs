@@ -39,7 +39,9 @@ use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::git::{self, GitRunner};
 use crate::hooks::status::AgentStatus;
 use crate::workspace::WorkspaceReader;
-use dispatcher::{AgentPort, AgentSnapshot, DispatchMsg, TicketsHost};
+use dispatcher::{
+    AgentPort, AgentSnapshot, DispatchMsg, RestartForTicket, RestartPort, TicketsHost,
+};
 use model::{
     ChecksState, GitMode, ReportAuthor, Ticket, TicketActor, TicketChecks, TicketError, TicketGit,
     TicketReport, TicketState, TicketSummary, WorkspaceRules,
@@ -1170,15 +1172,29 @@ impl TicketsHost for Arc<TicketsCtx> {
 
 /// The dispatcher's [`AgentPort`] over the real manager. Each call takes the manager lock
 /// briefly; a detail change is announced with `agents-changed` (after the lock is released).
+/// `restart` is the app's restart path for a fresh session per ticket (step 6b, plan A.7;
+/// `commands::restart_port`, set in `lib.rs`); without it `restart_fresh` is refused and the
+/// ticket is typed into the current session.
 #[derive(Clone)]
 pub struct ManagerPort {
     pub manager: Arc<Mutex<AgentManager>>,
     pub emit: EmitFn,
+    pub restart: Option<RestartPort>,
 }
 
 impl ManagerPort {
     pub fn new(manager: Arc<Mutex<AgentManager>>, emit: EmitFn) -> Self {
-        ManagerPort { manager, emit }
+        ManagerPort {
+            manager,
+            emit,
+            restart: None,
+        }
+    }
+
+    /// Installs the restart path (step 6b).
+    pub fn with_restart(mut self, restart: RestartPort) -> Self {
+        self.restart = Some(restart);
+        self
     }
 }
 
@@ -1188,9 +1204,9 @@ impl AgentPort for ManagerPort {
     }
 
     fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
-        let (a, last_user_input_at) = {
+        let (a, last_user_input_at, has_conversation) = {
             let m = lock(&self.manager);
-            (m.get(id)?, m.last_user_input_at(id))
+            (m.get(id)?, m.last_user_input_at(id), m.has_conversation(id))
         };
         Some(AgentSnapshot {
             name: a.name,
@@ -1201,7 +1217,16 @@ impl AgentPort for ManagerPort {
             seat_kind: a.seat_kind,
             roles: a.roles,
             project: a.project,
+            has_conversation,
         })
+    }
+
+    fn restart_fresh(&self, req: RestartForTicket) -> Result<(), String> {
+        match &self.restart {
+            // No manager lock is held here: the restart takes it itself.
+            Some(restart) => restart(req),
+            None => Err("genstart er ikke tilgængelig".into()),
+        }
     }
 
     fn write_input(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -1350,6 +1375,37 @@ mod tests {
             .iter()
             .find(|a| a["id"] == id)
             .unwrap()
+    }
+
+    /// Step 6b: the port tells whether the session had a turn and passes a restart to the
+    /// installed path (refused without one); it holds no manager lock while calling it.
+    #[test]
+    fn manager_port_has_conversation_and_restart_fresh() {
+        let m = Arc::new(Mutex::new(AgentManager::new(5)));
+        let id =
+            lock(&m).insert_fake_with("s-1", "/w/a", &[Role::Coder], crate::agent::SeatKind::Work);
+        let emit: EmitFn = Arc::new(|_, _| {});
+        let port = ManagerPort::new(Arc::clone(&m), emit);
+        assert!(!port.snapshot(&id).unwrap().has_conversation);
+        lock(&m).mark_conversation(&id);
+        assert!(port.snapshot(&id).unwrap().has_conversation);
+        let req = RestartForTicket {
+            agent_id: id.clone(),
+            cwd: Some(PathBuf::from("/w/a/.mira-bots/wt/ab12cd34")),
+            force_fresh: true,
+            ticket_short: "ab12cd34".into(),
+        };
+        assert!(port.restart_fresh(req.clone()).is_err());
+        let seen: Arc<Mutex<Vec<RestartForTicket>>> = Arc::default();
+        let (seen2, m2) = (Arc::clone(&seen), Arc::clone(&m));
+        let port = port.with_restart(Arc::new(move |r: RestartForTicket| {
+            // The manager lock is free during the call.
+            assert!(m2.try_lock().is_ok());
+            seen2.lock().unwrap().push(r);
+            Ok(())
+        }));
+        assert_eq!(port.restart_fresh(req.clone()), Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec![req]);
     }
 
     #[test]

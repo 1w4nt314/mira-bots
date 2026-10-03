@@ -193,6 +193,12 @@ pub const RESTARTING_TEXT: &str = "Genstarter med nye indstillinger";
 pub fn moving_text(project: &str) -> String {
     format!("Flytter til «{project}»…")
 }
+
+/// Agent detail while it restarts with a fresh session (or in the ticket's worktree) before
+/// a ticket delivery (step 6b, plan A.7).
+pub fn fresh_text(short: &str) -> String {
+    format!("Ny session til ticket {short}…")
+}
 /// Whether the per-profile settings get a `statusLine` pointing at the hook exe (live
 /// model/effort). `false` leaves only PostModelSwitch and the requested values.
 pub const STATUSLINE_ENABLED: bool = true;
@@ -417,6 +423,7 @@ mod tests {
         assert_eq!(REVIEW_NOTE_MAX_CHARS, 2_000);
         assert_eq!(RESTARTING_TEXT, "Genstarter med nye indstillinger");
         assert_eq!(moving_text("shop"), "Flytter til «shop»…");
+        assert_eq!(fresh_text("ab12cd34"), "Ny session til ticket ab12cd34…");
         const { assert!(STATUSLINE_ENABLED) };
         assert_eq!(STATUSLINE_EVENT, "StatusLine");
     }

@@ -619,7 +619,8 @@ impl AgentManager {
         let gen = agent.pty_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let mut old = agent.pty.take();
         if let Some(pty) = old.as_mut() {
-            if let Err(e) = pty.kill() {
+            // Windows: the whole tree (node, mira-mcp), not only claude.exe (step 6b, plan A.7).
+            if let Err(e) = pty.kill_tree() {
                 log::debug!("restart: kill agent {id}: {e}");
             }
         }
@@ -667,11 +668,12 @@ impl AgentManager {
     }
 
     /// How a restart of agent `id` continues its session (review5 N1): `--resume` only when the
-    /// session has had a turn, otherwise a fresh session with a new uuid. `None` for unknown
-    /// agents.
-    pub fn restart_session(&self, id: &str) -> Option<RestartSession> {
+    /// session has had a turn, otherwise a fresh session with a new uuid. `force_fresh` (a fresh
+    /// session per ticket, step 6b plan A.7) always gives a fresh session, never `--resume`.
+    /// `None` for unknown agents.
+    pub fn restart_session(&self, id: &str, force_fresh: bool) -> Option<RestartSession> {
         let a = self.agents.get(id)?;
-        Some(if a.has_conversation {
+        Some(if a.has_conversation && !force_fresh {
             RestartSession::Resume(a.info.session_id.clone())
         } else {
             RestartSession::Fresh(uuid::Uuid::new_v4().to_string())
@@ -2111,28 +2113,47 @@ mod tests {
         assert_eq!(m.get(&id).unwrap().detail, None);
     }
 
+    /// Step 6b (plan A.7): a fresh session per ticket never resumes, even after a turn.
+    #[test]
+    fn restart_session_forced_fresh_even_with_conversation() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("sess-1", "/w/a");
+        m.mark_conversation(&id);
+        assert!(m.restart_session("nope", true).is_none());
+        let Some(RestartSession::Fresh(new_id)) = m.restart_session(&id, true) else {
+            panic!("forced: fresh session");
+        };
+        assert_ne!(new_id, "sess-1");
+        assert!(uuid::Uuid::parse_str(&new_id).is_ok());
+        // Without force the same agent resumes.
+        assert_eq!(
+            m.restart_session(&id, false),
+            Some(RestartSession::Resume("sess-1".into()))
+        );
+    }
+
     /// review5 N1: `--resume` only after a turn (UserPromptSubmit/Stop) of the current session;
     /// a new session id (`/clear`) starts over.
     #[test]
     fn restart_session_resumes_only_after_a_turn() {
         let mut m = AgentManager::new(5);
         let id = m.insert_fake("sess-1", "/w/a");
-        assert!(m.restart_session("nope").is_none());
-        let RestartSession::Fresh(new_id) = m.restart_session(&id).unwrap() else {
+        assert!(m.restart_session("nope", false).is_none());
+        let RestartSession::Fresh(new_id) = m.restart_session(&id, false).unwrap() else {
             panic!("no turn yet: fresh session");
         };
         assert_ne!(new_id, "sess-1");
         assert!(uuid::Uuid::parse_str(&new_id).is_ok());
         m.mark_conversation(&id);
         assert_eq!(
-            m.restart_session(&id),
+            m.restart_session(&id, false),
             Some(RestartSession::Resume("sess-1".into()))
         );
         // `/clear`: the frame rebinds the agent to a new session without a transcript.
         m.match_frame(Some(&id), "sess-2").unwrap();
         assert!(!m.has_conversation(&id));
         assert!(matches!(
-            m.restart_session(&id),
+            m.restart_session(&id, false),
             Some(RestartSession::Fresh(_))
         ));
         // A frame of the same session does not reset it.
@@ -2514,6 +2535,54 @@ mod tests {
             let _ = std::fs::remove_dir_all(&moved);
         }
 
+        /// Step 6b (plan A.7): a forced fresh restart in the ticket's worktree gets a new
+        /// session id (session map follows), the new cwd and no conversation; id and ring
+        /// buffer stay.
+        #[test]
+        fn forced_fresh_restart_changes_session_and_cwd() {
+            let mut m = AgentManager::new(5);
+            let (sink, events) = collecting_sink();
+            let info = m
+                .spawn_spec(
+                    sh("echo before; sleep 30", vec![]),
+                    meta("sess-f"),
+                    sink.clone(),
+                )
+                .unwrap();
+            assert!(wait_for_output(&events, "before").contains("before"));
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            m.mark_conversation(&info.id);
+            let session = m.restart_session(&info.id, true).unwrap();
+            let RestartSession::Fresh(new_id) = session.clone() else {
+                panic!("forced: fresh session");
+            };
+            let wt = std::env::temp_dir().join(format!("mira-fresh-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut spec = sh("echo after; sleep 30", vec![]);
+            spec.cwd = wt.clone();
+            let (res, old) = m.restart(&info.id, spec, &session, None, None, sink.clone());
+            drop(old);
+            let after = res.unwrap();
+            assert_eq!(after.id, info.id);
+            assert_eq!(after.session_id, new_id);
+            assert_ne!(after.session_id, "sess-f");
+            assert_eq!(after.cwd, wt.to_string_lossy());
+            assert!(!m.has_conversation(&info.id));
+            assert_eq!(m.agent_id_for_session(&new_id), Some(info.id.clone()));
+            assert_eq!(m.agent_id_for_session("sess-f"), None);
+            // The next restart of the new session (no turn yet) is fresh again, never --resume.
+            assert!(matches!(
+                m.restart_session(&info.id, false),
+                Some(RestartSession::Fresh(_))
+            ));
+            wait_for_output(&events, "after");
+            let (_, bytes) = m.output_snapshot(&info.id).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("before") && text.contains("after"), "{text}");
+            m.stop(&info.id).unwrap();
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+
         /// The exit code of generation `gen` (waits up to 10 s).
         fn wait_for_gen_exit(events: &Arc<Mutex<Vec<SinkEvent>>>, want: u64) -> Option<i32> {
             let t = Instant::now();
@@ -2562,7 +2631,7 @@ mod tests {
             // The session had a turn → --resume; the resumed child exits 1 right away.
             m.mark_conversation(&info.id);
             m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
-            let resume = m.restart_session(&info.id).unwrap();
+            let resume = m.restart_session(&info.id, false).unwrap();
             assert_eq!(resume, RestartSession::Resume("sess-new".into()));
             let (res, old) = m.restart(
                 &info.id,

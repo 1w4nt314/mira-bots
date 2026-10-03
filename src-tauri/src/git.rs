@@ -240,6 +240,23 @@ pub fn worktree_dir(project: &Path, short: &str) -> PathBuf {
         .join(short)
 }
 
+/// The project folder of an app worktree: `P` for `P/.mira-bots/wt/<short>` (the inverse of
+/// [`worktree_dir`], `<short>` a valid [`branch_name`] id); `None` for any other folder. Step 6b:
+/// an agent that sits in a ticket's worktree goes back to its project folder for a ticket
+/// without one.
+pub fn worktree_project(dir: &Path) -> Option<PathBuf> {
+    let short = dir.file_name()?.to_str()?;
+    branch_name(short)?;
+    let mut project = dir.parent()?;
+    for part in WORKTREE_DIR.rsplit('/') {
+        if project.file_name()?.to_str()? != part {
+            return None;
+        }
+        project = project.parent()?;
+    }
+    Some(project.to_path_buf())
+}
+
 /// A ref name the app may pass to git as an argument: 1–200 chars, no whitespace or control
 /// characters, not starting with `-` (it would be an option).
 pub fn valid_ref(s: &str) -> bool {
@@ -638,6 +655,23 @@ mod tests {
                 .join("wt")
                 .join("ab12cd34")
         );
+    }
+
+    #[test]
+    fn worktree_project_inverts_worktree_dir() {
+        let proj = Path::new("/r/proj");
+        let wt = worktree_dir(proj, "ab12cd34");
+        assert_eq!(worktree_project(&wt), Some(proj.to_path_buf()));
+        for other in [
+            proj.to_path_buf(),
+            proj.join(".mira-bots").join("wt"),
+            proj.join(".mira-bots").join("wt").join("not-hex!"),
+            proj.join(".mira-bots").join("xx").join("ab12cd34"),
+            proj.join("other").join("wt").join("ab12cd34"),
+            PathBuf::from("ab12cd34"),
+        ] {
+            assert_eq!(worktree_project(&other), None, "{}", other.display());
+        }
     }
 
     #[test]

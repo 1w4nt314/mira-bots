@@ -24,11 +24,13 @@ use super::model::{
 };
 use super::prompt::{self, ReviewSender, TicketDelivery, WakeInfo};
 use super::service::{DueWake, TicketService};
+use crate::agent::roles::has_work_role;
 use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
     CHILDREN_DONE_NOTE, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
-    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS,
-    TURN_FAILED_TEXT, WAKE_MAX_ATTEMPTS, WAKE_UNCONFIRMED_TEXT, WOKEN_NOTE,
+    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RESTART_TIMEOUT_MS, RETRY_TIMEOUT_MS,
+    SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT, WAKE_MAX_ATTEMPTS, WAKE_UNCONFIRMED_TEXT,
+    WOKEN_NOTE,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -43,6 +45,17 @@ pub const TERMINAL_GONE_NOTE: &str = "Terminalen er væk";
 pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
 /// History note after the "Bed om aflevering" line was typed (the ticket is otherwise unchanged).
 pub const SUBMISSION_REQUESTED_NOTE: &str = "bedt om aflevering";
+/// History note (by the app) when the restart before a delivery did not bring the agent back
+/// within [`RESTART_TIMEOUT_MS`] (step 6b, plan A.7): the ticket goes to the agent's session as
+/// it is once it is idle.
+pub const RESTART_TIMEOUT_NOTE: &str =
+    "ny session startede ikke inden for 60 s; ticketen leveres i agentens nuværende session";
+
+/// History note (by the app) when the restart before a delivery was refused (step 6b): the
+/// ticket is typed into the agent's current session.
+pub fn restart_failed_note(err: &str) -> String {
+    format!("ny session kunne ikke startes ({err}); ticketen leveres i agentens nuværende session")
+}
 
 /// No ticket is typed into a terminal the user typed into less than this long ago (their
 /// half-written prompt would be merged with the ticket line); the dispatch waits instead. The
@@ -67,6 +80,75 @@ pub struct AgentSnapshot {
     pub roles: Vec<Role>,
     /// The agent's project (plan4b A.1); `None` on a staff seat.
     pub project: Option<String>,
+    /// The current session has had a turn (`AgentManager::has_conversation`): a fresh session
+    /// per ticket restarts only such a session (step 6b, plan A.7); a new session has none.
+    pub has_conversation: bool,
+}
+
+/// The restart the dispatcher asks for before a work delivery (step 6b, plan A.7): `cwd` is the
+/// ticket's worktree when the agent must move there, or its project folder when it sits in
+/// another ticket's worktree and this ticket has none (`None` keeps the cwd); `force_fresh`
+/// starts a new session (never `--resume`); otherwise the session continues in the new cwd
+/// (`--resume`, like "Flyt til projekt"). The agent keeps its project, model and effort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartForTicket {
+    pub agent_id: String,
+    pub cwd: Option<PathBuf>,
+    pub force_fresh: bool,
+    pub ticket_short: String,
+}
+
+/// The app's restart path for [`AgentPort::restart_fresh`] (`commands::restart_for_ticket`,
+/// installed in `lib.rs` like the tools' `SpawnPort`).
+pub type RestartPort = Arc<dyn Fn(RestartForTicket) -> Result<(), String> + Send + Sync>;
+
+/// What [`fresh_decision`] says about a work delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FreshDecision {
+    /// Type the ticket into the agent's current session.
+    None,
+    /// Restart first ([`RestartForTicket`]), then deliver at the next Idle.
+    Restart {
+        cwd: Option<PathBuf>,
+        force_fresh: bool,
+    },
+}
+
+/// Step 6b (plan A.7): whether a work delivery of `ticket` to the agent `snap` restarts it first.
+/// Never for a staff seat or an agent without a work role (a coordination task). Otherwise:
+/// - `needs_cwd`: the ticket's worktree (`git.worktree`, an existing folder) is not the agent's
+///   cwd ([`crate::git::same_path`]) → restart in it; without one, an agent that sits in an app
+///   worktree (`<project>/.mira-bots/wt/<short>`, [`crate::git::worktree_project`]) goes back
+///   to the project folder (it must not work on another ticket's branch);
+/// - `needs_fresh`: rule `freshSessionPerTicket`, the session has had a turn
+///   (`has_conversation`; the first ticket after a spawn never restarts) and the ticket is not a
+///   rejected one coming back (`review_round > 0` or a rejection note: the context is kept).
+///
+/// `Restart { cwd, force_fresh: needs_fresh }` when either holds; a rejected ticket that must
+/// change folders continues its session there (`--resume`).
+pub fn fresh_decision(
+    rules: &WorkspaceRules,
+    snap: &AgentSnapshot,
+    ticket: &Ticket,
+    git: Option<&TicketGit>,
+) -> FreshDecision {
+    if snap.seat_kind != SeatKind::Work || !has_work_role(&snap.roles) {
+        return FreshDecision::None;
+    }
+    let cwd = git
+        .and_then(|g| g.worktree.as_deref())
+        .map(PathBuf::from)
+        .filter(|wt| wt.is_dir())
+        .or_else(|| crate::git::worktree_project(&snap.cwd).filter(|p| p.is_dir()))
+        .filter(|want| {
+            !crate::git::same_path(&want.to_string_lossy(), &snap.cwd.to_string_lossy())
+        });
+    let rejected_back = ticket.review_round > 0 || ticket.rejection_note.is_some();
+    let force_fresh = rules.fresh_session_per_ticket && snap.has_conversation && !rejected_back;
+    if cwd.is_none() && !force_fresh {
+        return FreshDecision::None;
+    }
+    FreshDecision::Restart { cwd, force_fresh }
 }
 
 /// Access to the agents (implemented by `ManagerPort` over `Arc<Mutex<AgentManager>>`; each call
@@ -86,6 +168,13 @@ pub trait AgentPort: Send {
     /// default (test ports).
     fn has_live_coordinator(&self) -> bool {
         false
+    }
+    /// Step 6b (plan A.7): restarts the idle agent before a work delivery (a fresh session and/or
+    /// the ticket's worktree as cwd). Synchronous; the dispatcher holds no lock while calling
+    /// it. On `Ok` the app sends [`DispatchMsg::AgentRestarting`] and, after the new session's
+    /// SessionStart, [`DispatchMsg::AgentIdle`]. Refused by default (test ports, no app).
+    fn restart_fresh(&self, _req: RestartForTicket) -> Result<(), String> {
+        Err("ingen genstart i denne port".into())
     }
 }
 
@@ -143,6 +232,9 @@ pub enum TimerKind {
     NudgeDelay,
     /// "Bed om aflevering": line typed, Enter pending.
     NudgeEnter,
+    /// Step 6b: the restart before a delivery did not bring the agent back in time
+    /// ([`RESTART_TIMEOUT_MS`]).
+    RestartTimeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,7 +257,8 @@ pub enum DispatchMsg {
     /// The agent stopped/exited/was removed (its tickets are already released).
     AgentGone { agent_id: String },
     /// The agent is restarted with `--resume` (model/effort change, plan5 A.5): any delivery
-    /// state is dropped like for `AgentGone`; its queue continues at the next Idle.
+    /// state is dropped like for `AgentGone`; its queue continues at the next Idle. A
+    /// [`Delivery::AwaitingRestart`] (the dispatcher's own restart, step 6b) is kept.
     AgentRestarting { agent_id: String },
     /// `spawn_agent_with_ticket`: the line went in as the positional prompt.
     SpawnedWithTicket { agent_id: String, ticket_id: String },
@@ -284,6 +377,13 @@ enum Delivery {
         ticket_id: String,
         token: u64,
     },
+    /// Step 6b (plan A.7): the agent was restarted before `ticket_id` is delivered (a fresh
+    /// session and/or the ticket's worktree); survives `AgentRestarting`, the next Idle (or
+    /// `RestartTimeout`) frees the agent and the queue is considered again.
+    AwaitingRestart {
+        ticket_id: String,
+        token: u64,
+    },
     /// Typing a "Du …" line for `ticket_id`: "Bed om aflevering" (C4.7, the ticket in progress),
     /// "stop, it was handed on" (review 5c W4) or the wake line of a waiting parent (step 6a):
     /// waiting for the grace period (`NudgeDelay`), then for the Enter (`NudgeEnter`). Nothing is
@@ -352,6 +452,10 @@ pub struct Dispatcher<H, P, T> {
     stop_notices: HashMap<String, StopNotice>,
     /// Per agent: unconfirmed wake attempts (review 6a W1).
     wake_misses: HashMap<String, WakeMiss>,
+    /// Per agent: the ticket it was last restarted for (step 6b). That ticket is never restarted
+    /// for again by the same agent (no loop when the new cwd does not match, a timeout delivers
+    /// as it is); cleared when a ticket is typed or the agent is gone.
+    restarted_for: HashMap<String, String>,
     next_token: u64,
     /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
     auto_review_on_stop: Option<bool>,
@@ -366,6 +470,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             deliveries: HashMap::new(),
             stop_notices: HashMap::new(),
             wake_misses: HashMap::new(),
+            restarted_for: HashMap::new(),
             next_token: 0,
             auto_review_on_stop: None,
         }
@@ -429,9 +534,13 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.deliveries.remove(&agent_id);
                 self.stop_notices.remove(&agent_id);
                 self.wake_misses.remove(&agent_id);
+                self.restarted_for.remove(&agent_id);
             }
             DispatchMsg::AgentRestarting { agent_id } => {
-                self.deliveries.remove(&agent_id);
+                // Our own restart before a delivery announces itself too: keep waiting for it.
+                if !matches!(self.state(&agent_id), Delivery::AwaitingRestart { .. }) {
+                    self.deliveries.remove(&agent_id);
+                }
                 self.wake_misses.remove(&agent_id);
             }
             DispatchMsg::SpawnedWithTicket {
@@ -621,6 +730,16 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             Delivery::Free => {
                 // An idle agent may be a reviewer that came up after reviews were waiting.
                 self.host.reroute_reviews();
+                self.consider(agent_id);
+            }
+            Delivery::AwaitingRestart { ticket_id, .. } => {
+                // The new session is up (step 6b): deliver as usual; it has no conversation and
+                // `restarted_for` holds the ticket, so it is not restarted again.
+                log::info!(
+                    "dispatch {agent_id}: restarted for ticket {}; delivering",
+                    super::model::short_id(&ticket_id)
+                );
+                self.set(agent_id, Delivery::Free);
                 self.consider(agent_id);
             }
             Delivery::AwaitingSession { ticket_id, token } => {
@@ -1169,7 +1288,9 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                         self.set(agent_id, Delivery::Delaying { token });
                     } else {
                         match item {
-                            Item::Work(ticket) => self.type_ticket(agent_id, &snap, &ticket, token),
+                            Item::Work(ticket) => {
+                                self.deliver_work(agent_id, &snap, &ticket, token)
+                            }
                             Item::Review(ticket) => {
                                 self.type_review(agent_id, &snap, &ticket, token)
                             }
@@ -1263,6 +1384,30 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 },
                 TimerKind::NudgeEnter,
             ) if t == token => self.nudge_enter(agent_id, &ticket_id, nudge),
+            (
+                Delivery::AwaitingRestart {
+                    ticket_id,
+                    token: t,
+                },
+                TimerKind::RestartTimeout,
+            ) if t == token => {
+                // Fallback: the ticket goes into whatever session the agent has once it is idle
+                // (`restarted_for` prevents a second restart).
+                log::warn!(
+                    "dispatch {agent_id}: no session {} s after the restart for ticket {}; delivering without it",
+                    RESTART_TIMEOUT_MS / 1000,
+                    super::model::short_id(&ticket_id)
+                );
+                let now = now_ms();
+                if let Err(e) = self
+                    .host
+                    .mutate(|s| s.note_by_system(&ticket_id, RESTART_TIMEOUT_NOTE, now))
+                {
+                    log::warn!("dispatch {agent_id}: noting the restart timeout failed: {e}");
+                }
+                self.set(agent_id, Delivery::Free);
+                self.consider(agent_id);
+            }
             _ => log::debug!("dispatch {agent_id}: ignoring stale {kind:?} timer"),
         }
     }
@@ -1310,13 +1455,93 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             .is_some_and(|a| a.roles.contains(&Role::Coordinator))
     }
 
+    /// The queue head's delivery after the dispatch delay (step 6b, plan A.7): the ticket's git
+    /// branch first (a real work delivery), then [`fresh_decision`]. A restart that is accepted
+    /// leaves the agent in [`Delivery::AwaitingRestart`] (timer [`TimerKind::RestartTimeout`]);
+    /// the ticket file is written after it, in the new cwd. A refused restart types the ticket
+    /// into the current session with a note, if the agent is still idle with it next.
+    fn deliver_work(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
+        let delivery = self.delivery_for(agent_id, snap, ticket);
+        let git = if delivery.is_work() {
+            self.host.prepare_git(ticket, &snap.cwd)
+        } else {
+            None
+        };
+        let decision = if self.restarted_for.get(agent_id) == Some(&ticket.id) {
+            FreshDecision::None
+        } else {
+            fresh_decision(&self.host.rules(), snap, ticket, git.as_ref())
+        };
+        let FreshDecision::Restart { cwd, force_fresh } = decision else {
+            self.type_prepared(agent_id, snap, ticket, token, delivery.with_git(git));
+            return;
+        };
+        let short = ticket.short_id();
+        log::info!(
+            "dispatch {agent_id}: fresh session for ticket {short} (cwd {}, {})",
+            if cwd.is_some() { "changed" } else { "same" },
+            if force_fresh {
+                "new session"
+            } else {
+                "session kept"
+            }
+        );
+        self.restarted_for
+            .insert(agent_id.to_string(), ticket.id.clone());
+        let req = RestartForTicket {
+            agent_id: agent_id.to_string(),
+            cwd,
+            force_fresh,
+            ticket_short: short.clone(),
+        };
+        match self.port.restart_fresh(req) {
+            Ok(()) => {
+                self.schedule(
+                    agent_id,
+                    token,
+                    TimerKind::RestartTimeout,
+                    RESTART_TIMEOUT_MS,
+                );
+                self.set(
+                    agent_id,
+                    Delivery::AwaitingRestart {
+                        ticket_id: ticket.id.clone(),
+                        token,
+                    },
+                );
+            }
+            Err(e) => {
+                log::warn!("dispatch {agent_id}: restart for ticket {short} failed: {e}");
+                // The agent may have exited (its tickets released) or started working: only a
+                // still idle agent with the same queue head gets it now.
+                match self.ready_item(agent_id) {
+                    Some((snap, Item::Work(t))) if t.id == ticket.id => {
+                        let now = now_ms();
+                        let note = restart_failed_note(&e);
+                        if let Err(e) = self.host.mutate(|s| s.note_by_system(&t.id, &note, now)) {
+                            log::warn!(
+                                "dispatch {agent_id}: noting the restart failure failed: {e}"
+                            );
+                        }
+                        let t = self.host.read(|s| s.get(&t.id)).unwrap_or(t);
+                        let delivery = self.delivery_for(agent_id, &snap, &t).with_git(git);
+                        self.type_prepared(agent_id, &snap, &t, token, delivery);
+                    }
+                    _ => {
+                        self.set(agent_id, Delivery::Free);
+                        self.consider(agent_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
     /// Enter follows after `ENTER_DELAY_MS`. Step 6b: a real work delivery asks the host for the
-    /// ticket's git branch first (`## Git` in the file). The file is written in the agent's cwd
-    /// as before; with a worktree the section names the worktree folder (an agent spawned with
-    /// the ticket already runs there; moving a running agent there is the fresh-session step).
+    /// ticket's git branch first (`## Git` in the file). The file is written in the agent's cwd:
+    /// the ticket's worktree after the restart of [`Self::deliver_work`] or for an agent
+    /// spawned with the ticket; otherwise the section names the worktree folder.
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
-        let now = now_ms();
         let delivery = self.delivery_for(agent_id, snap, ticket);
         let delivery = if delivery.is_work() {
             let git = self.host.prepare_git(ticket, &snap.cwd);
@@ -1324,6 +1549,20 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         } else {
             delivery
         };
+        self.type_prepared(agent_id, snap, ticket, token, delivery);
+    }
+
+    /// [`Self::type_ticket`] with the delivery (and its git branch) already decided.
+    fn type_prepared(
+        &mut self,
+        agent_id: &str,
+        snap: &AgentSnapshot,
+        ticket: &Ticket,
+        token: u64,
+        delivery: TicketDelivery,
+    ) {
+        let now = now_ms();
+        self.restarted_for.remove(agent_id);
         if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, &delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
@@ -1746,6 +1985,11 @@ mod tests {
         fail_writes: bool,
         /// `has_live_coordinator` (step 6a).
         coordinator_live: bool,
+        /// Step 6b: every `restart_fresh` request; `Some(err)` refuses them.
+        restarts: Vec<RestartForTicket>,
+        fail_restart: Option<String>,
+        /// The failed restart leaves the agent exited (the new child could not start).
+        exit_on_failed_restart: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1754,6 +1998,31 @@ mod tests {
     impl AgentPort for FakePort {
         fn has_live_coordinator(&self) -> bool {
             lock(&self.0).coordinator_live
+        }
+
+        /// Like the app: the agent starts again (no conversation, the new cwd); the test sends
+        /// `AgentRestarting` and the Idle of the new session itself.
+        fn restart_fresh(&self, req: RestartForTicket) -> Result<(), String> {
+            let mut s = lock(&self.0);
+            s.restarts.push(req.clone());
+            if let Some(e) = s.fail_restart.clone() {
+                if s.exit_on_failed_restart {
+                    if let Some(snap) = s.snapshots.get_mut(&req.agent_id) {
+                        snap.status = AgentStatus::Exited { code: None };
+                    }
+                }
+                return Err(e);
+            }
+            let snap = s
+                .snapshots
+                .get_mut(&req.agent_id)
+                .ok_or("Agenten kører ikke")?;
+            snap.status = AgentStatus::Starting;
+            snap.has_conversation = false;
+            if let Some(cwd) = req.cwd {
+                snap.cwd = cwd;
+            }
+            Ok(())
         }
 
         fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
@@ -1868,6 +2137,7 @@ mod tests {
                     seat_kind,
                     roles: roles.to_vec(),
                     project: None,
+                    has_conversation: false,
                 },
             );
         }
@@ -2733,6 +3003,7 @@ mod tests {
             seat_kind: SeatKind::Work,
             roles: vec![],
             project: None,
+            has_conversation: false,
         };
         assert_eq!(h.d.user_grace_left(&snap), Some(USER_INPUT_GRACE_MS));
         let mut host = h.d.host.clone();
@@ -3210,6 +3481,383 @@ mod tests {
         assert_eq!(h.git_calls.load(Ordering::SeqCst), 0);
         assert!(!h.ticket_file("p1", &t).contains("## Git"));
         assert_eq!(h.ticket(&t.id).git, None);
+    }
+
+    // ---- step 6b: fresh session per ticket (plan A.7, punkt 19) ----
+
+    impl Harness {
+        /// Whether `id`'s current session has had a turn.
+        fn conversation(&self, id: &str, had: bool) {
+            lock(&self.port.0)
+                .snapshots
+                .get_mut(id)
+                .unwrap()
+                .has_conversation = had;
+        }
+
+        fn restarts(&self) -> Vec<RestartForTicket> {
+            lock(&self.port.0).restarts.clone()
+        }
+
+        /// A worktree folder for `t` under the harness root (exists) and its git info.
+        fn worktree_for(&self, t: &Ticket) -> (PathBuf, TicketGit) {
+            let wt = self.root.join("proj/.mira-bots/wt").join(t.short_id());
+            fs::create_dir_all(&wt).unwrap();
+            let git = TicketGit {
+                worktree: Some(wt.to_string_lossy().into_owned()),
+                repo: self.root.join("proj").to_string_lossy().into_owned(),
+                ..worktree_git(&t.short_id())
+            };
+            (wt, git)
+        }
+
+        /// The new session of a restarted agent comes up (SessionStart → Idle).
+        fn session_started(&mut self, agent: &str) {
+            self.set_status(agent, AgentStatus::Idle);
+            self.idle(agent);
+        }
+    }
+
+    fn snap_for(seat_kind: SeatKind, roles: &[Role], cwd: &Path, conv: bool) -> AgentSnapshot {
+        AgentSnapshot {
+            name: "a".into(),
+            cwd: cwd.to_path_buf(),
+            status: AgentStatus::Idle,
+            detail: None,
+            last_user_input_at: None,
+            seat_kind,
+            roles: roles.to_vec(),
+            project: Some("proj".into()),
+            has_conversation: conv,
+        }
+    }
+
+    /// One row of [`fresh_decision_table`]: name, rules, agent, ticket, git, expected.
+    type Row<'a> = (
+        &'a str,
+        &'a WorkspaceRules,
+        AgentSnapshot,
+        &'a Ticket,
+        Option<&'a TicketGit>,
+        FreshDecision,
+    );
+
+    #[test]
+    fn fresh_decision_table() {
+        let h = Harness::new();
+        let t = h.queued("a1", "A");
+        let (wt, git) = h.worktree_for(&t);
+        let cwd = h.root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let on = WorkspaceRules::defaults();
+        assert!(on.fresh_session_per_ticket);
+        let off = WorkspaceRules {
+            fresh_session_per_ticket: false,
+            ..on
+        };
+        let coder = &[Role::Coder][..];
+        let work = |conv| snap_for(SeatKind::Work, coder, &cwd, conv);
+        let in_wt = |conv| snap_for(SeatKind::Work, coder, &wt, conv);
+        let other_wt = cwd.join(".mira-bots/wt/ffffffff");
+        fs::create_dir_all(&other_wt).unwrap();
+        let in_other = |conv| snap_for(SeatKind::Work, coder, &other_wt, conv);
+        let rejected = Ticket {
+            review_round: 1,
+            ..t.clone()
+        };
+        let noted = Ticket {
+            rejection_note: Some("Mangler test".into()),
+            ..t.clone()
+        };
+        let restart = |cwd: Option<&Path>, force_fresh| FreshDecision::Restart {
+            cwd: cwd.map(Path::to_path_buf),
+            force_fresh,
+        };
+        let missing = TicketGit {
+            worktree: Some(h.root.join("gone").to_string_lossy().into_owned()),
+            ..git.clone()
+        };
+        let trailing = TicketGit {
+            worktree: Some(format!("{}/", wt.to_string_lossy())),
+            ..git.clone()
+        };
+        #[rustfmt::skip]
+        let rows: Vec<Row> = vec![
+            ("normal: new ticket after a turn", &on, work(true), &t, None, restart(None, true)),
+            ("rule off", &off, work(true), &t, None, FreshDecision::None),
+            ("staff seat", &on, snap_for(SeatKind::Staff, &[Role::Planner], &cwd, true), &t, Some(&git), FreshDecision::None),
+            ("staff seat with a work role", &on, snap_for(SeatKind::Staff, &[Role::Researcher], &cwd, true), &t, Some(&git), FreshDecision::None),
+            ("work seat without a work role", &on, snap_for(SeatKind::Work, &[Role::Reviewer], &cwd, true), &t, Some(&git), FreshDecision::None),
+            ("first ticket (no turn yet)", &on, work(false), &t, None, FreshDecision::None),
+            ("first ticket, spawned in its worktree", &on, in_wt(false), &t, Some(&git), FreshDecision::None),
+            ("first ticket, worktree elsewhere", &on, work(false), &t, Some(&git), restart(Some(&wt), false)),
+            ("rejected back (round)", &on, work(true), &rejected, None, FreshDecision::None),
+            ("rejected back (note)", &on, work(true), &noted, None, FreshDecision::None),
+            ("rejected back, already in its worktree", &on, in_wt(true), &rejected, Some(&git), FreshDecision::None),
+            ("rejected back, worktree elsewhere", &on, work(true), &rejected, Some(&git), restart(Some(&wt), false)),
+            ("rule off, worktree elsewhere", &off, work(true), &t, Some(&git), restart(Some(&wt), false)),
+            ("normal, worktree elsewhere", &on, work(true), &t, Some(&git), restart(Some(&wt), true)),
+            ("normal, already in the worktree", &on, in_wt(true), &t, Some(&git), restart(None, true)),
+            ("same folder written differently", &on, in_wt(false), &t, Some(&trailing), FreshDecision::None),
+            ("worktree folder missing", &on, work(false), &t, Some(&missing), FreshDecision::None),
+            ("worktree folder missing after a turn", &on, work(true), &t, Some(&missing), restart(None, true)),
+            ("no git, in another ticket's worktree", &on, in_other(false), &t, None, restart(Some(&cwd), false)),
+            ("no git, in another ticket's worktree after a turn", &on, in_other(true), &t, None, restart(Some(&cwd), true)),
+            ("rejected back without git, in another worktree", &on, in_other(true), &rejected, None, restart(Some(&cwd), false)),
+            ("worktree missing, in another ticket's worktree", &off, in_other(true), &t, Some(&missing), restart(Some(&cwd), false)),
+            ("own worktree, from another ticket's worktree", &on, in_other(false), &t, Some(&git), restart(Some(&wt), false)),
+        ];
+        for (name, rules, snap, ticket, git, want) in rows {
+            assert_eq!(fresh_decision(rules, &snap, ticket, git), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn work_ticket_restarts_agent_before_delivery_and_delivers_after_idle() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.conversation("a1", true);
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        // Restarted (fresh, same cwd), nothing typed yet.
+        assert_eq!(
+            h.restarts(),
+            vec![RestartForTicket {
+                agent_id: "a1".into(),
+                cwd: None,
+                force_fresh: true,
+                ticket_short: t.short_id(),
+            }]
+        );
+        assert!(h.writes().is_empty());
+        assert!(matches!(
+            h.d.state("a1"),
+            Delivery::AwaitingRestart { ticket_id, .. } if *ticket_id == t.id
+        ));
+        // The restart announces itself; the dispatcher keeps waiting for it.
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        assert!(matches!(h.d.state("a1"), Delivery::AwaitingRestart { .. }));
+        // An Idle of the old session (queued before the restart) types nothing: still Starting.
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes().is_empty());
+        // The new session is up: exactly one delivery, no second restart.
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t)), enter("a1")]);
+        assert_eq!(h.restarts().len(), 1);
+        h.submitted("a1", &line(&t));
+        assert_eq!(h.ticket(&t.id).state, S::InProgress);
+        // The stale restart timeout does nothing.
+        h.advance(RESTART_TIMEOUT_MS);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.restarts().len(), 1);
+        assert!(h.d.restarted_for.is_empty());
+    }
+
+    #[test]
+    fn restart_moves_agent_into_the_worktree_and_writes_the_file_there() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.conversation("a1", true);
+        let t = h.queued("a1", "Ret login");
+        let (wt, git) = h.worktree_for(&t);
+        *lock(&h.git) = Some(git.clone());
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            (r[0].cwd.as_deref(), r[0].force_fresh),
+            (Some(wt.as_path()), true)
+        );
+        // git was prepared once, before the restart, and saved on the ticket.
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(h.ticket(&t.id).git, Some(git.clone()));
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        assert_eq!(h.restarts().len(), 1);
+        // The file lands in the worktree (the agent's new cwd), not in the old folder.
+        let file = prompt::ticket_dir(&wt).join(format!("{}.md", t.short_id()));
+        let f = fs::read_to_string(&file).unwrap();
+        assert!(
+            f.contains(&format!("- mappe: {}", wt.to_string_lossy())),
+            "{f}"
+        );
+        assert!(!prompt::ticket_dir(&h.root.join("a1"))
+            .join(format!("{}.md", t.short_id()))
+            .exists());
+    }
+
+    #[test]
+    fn restart_failure_falls_back_to_typing() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.conversation("a1", true);
+        lock(&h.port.0).fail_restart = Some("Agenten arbejder".into());
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.restarts().len(), 1);
+        // Typed into the current session right away, with a note by the app.
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        let now = h.ticket(&t.id);
+        let last = now.history.last().unwrap();
+        assert_eq!(
+            last.note.as_deref(),
+            Some(restart_failed_note("Agenten arbejder").as_str())
+        );
+        assert_eq!(last.by, TicketActor::System);
+        assert!(matches!(h.d.state("a1"), Delivery::Typed { .. }));
+    }
+
+    #[test]
+    fn restart_failure_with_the_agent_gone_types_nothing() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.conversation("a1", true);
+        {
+            let mut p = lock(&h.port.0);
+            p.fail_restart = Some("kunne ikke starte".into());
+            p.exit_on_failed_restart = true;
+        }
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        // The new child could not start: the agent exited (the app releases its tickets).
+        assert_eq!(h.restarts().len(), 1);
+        assert!(h.writes().is_empty());
+        assert_eq!(h.ticket(&t.id).state, S::Assigned);
+        assert!(h.d.deliveries.is_empty());
+    }
+
+    #[test]
+    fn restart_timeout_frees_and_delivers() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.conversation("a1", true);
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        // No SessionStart within the timeout (e.g. a dialog in the terminal).
+        h.advance(RESTART_TIMEOUT_MS);
+        assert!(h.writes().is_empty());
+        assert!(h.d.deliveries.is_empty());
+        assert_eq!(
+            h.ticket(&t.id).history.last().unwrap().note.as_deref(),
+            Some(RESTART_TIMEOUT_NOTE)
+        );
+        // Once idle the ticket is typed as it is: no second restart.
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        assert_eq!(h.restarts().len(), 1);
+
+        // Already idle at the timeout (the Idle got lost): delivered right after it.
+        h.agent("a2", AgentStatus::Idle);
+        h.conversation("a2", true);
+        let t2 = h.queued("a2", "B");
+        h.idle("a2");
+        h.advance(DISPATCH_DELAY_MS);
+        h.set_status("a2", AgentStatus::Idle);
+        h.advance(RESTART_TIMEOUT_MS + DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().last(), Some(&("a2".into(), line(&t2))));
+        assert_eq!(h.restarts().len(), 2);
+    }
+
+    #[test]
+    fn rejected_ticket_back_to_same_agent_does_not_restart() {
+        let mut h = Harness::new();
+        h.d.auto_review_on_stop = Some(true);
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        // First ticket after the spawn: no turn yet, no restart.
+        deliver_until_enter(&mut h, "a1");
+        assert!(h.restarts().is_empty());
+        h.submitted("a1", &line(&a));
+        h.conversation("a1", true);
+        h.set_status("a1", AgentStatus::Thinking);
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: "a1".into(),
+            failed: false,
+        });
+        assert_eq!(h.ticket(&a.id).state, S::Review);
+        h.svc()
+            .reject(&a.id, "Mangler test", RejectReturn::Sender, 10)
+            .unwrap();
+        h.set_status("a1", AgentStatus::Idle);
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        // Back to the same agent: the session (and its context) continues.
+        assert!(h.restarts().is_empty());
+        let a_now = h.ticket(&a.id);
+        assert_eq!(h.writes().last(), Some(&("a1".into(), line(&a_now))));
+    }
+
+    #[test]
+    fn first_ticket_after_spawn_in_its_worktree_does_not_restart() {
+        // B3: an agent spawned with the ticket starts in the ticket's worktree; when the
+        // positional prompt is not confirmed, the PTY fallback must not restart it.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Starting);
+        let t = h.queued("a1", "A");
+        let (wt, git) = h.worktree_for(&t);
+        h.svc().set_git(&t.id, Some(git), 3).unwrap();
+        lock(&h.port.0).snapshots.get_mut("a1").unwrap().cwd = wt.clone();
+        h.send(DispatchMsg::SpawnedWithTicket {
+            agent_id: "a1".into(),
+            ticket_id: t.id.clone(),
+        });
+        h.session_started("a1");
+        h.advance(SPAWN_CONFIRM_TIMEOUT_MS + DISPATCH_DELAY_MS);
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        assert!(prompt::ticket_dir(&wt)
+            .join(format!("{}.md", t.short_id()))
+            .exists());
+    }
+
+    #[test]
+    fn staff_agent_is_never_restarted() {
+        let mut h = Harness::new();
+        h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+        h.conversation("p1", true);
+        let t = h.queued("p1", "Plan noget");
+        deliver_until_enter(&mut h, "p1");
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.writes().len(), 2);
+        let _ = t;
+    }
+
+    #[test]
+    fn agent_gone_while_awaiting_restart_clears_everything() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.conversation("a1", true);
+        h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(matches!(h.d.state("a1"), Delivery::AwaitingRestart { .. }));
+        h.remove_agent("a1");
+        h.send(DispatchMsg::AgentGone {
+            agent_id: "a1".into(),
+        });
+        assert!(h.d.deliveries.is_empty());
+        assert!(h.d.restarted_for.is_empty());
+        h.advance(RESTART_TIMEOUT_MS);
+        assert!(h.writes().is_empty());
     }
 
     // ---- review deliveries (plan5 punkt 12) ----

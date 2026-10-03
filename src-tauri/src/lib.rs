@@ -522,7 +522,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         dispatch_rx,
         Dispatcher::new(
             Arc::clone(&tickets),
-            ManagerPort::new(Arc::clone(&manager), Arc::clone(&emit)),
+            // Step 6b: a fresh session per ticket restarts through the UI's restart path; the
+            // closure looks the state up per call (like the tools' SpawnPort below).
+            ManagerPort::new(Arc::clone(&manager), Arc::clone(&emit))
+                .with_restart(commands::restart_port(handle.clone())),
             RealTimers::new(dispatch_tx),
         ),
     ));

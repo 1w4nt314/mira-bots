@@ -23,7 +23,7 @@ use crate::agent::{
 };
 use crate::app_settings::{self, AppSettings};
 use crate::config::{
-    moving_text, DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER,
+    fresh_text, moving_text, DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER,
     SYSTEM_PROMPT_FILE,
 };
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
@@ -40,7 +40,7 @@ use crate::profiles::model::{
 use crate::profiles::prompt::{profile_files_dir, write_profile_prompt};
 use crate::profiles::ProfilesCtx;
 use crate::projects::{self, AssignmentProject, Project, ProjectError, ProjectId, ProjectRef};
-use crate::tickets::dispatcher::DispatchMsg;
+use crate::tickets::dispatcher::{DispatchMsg, RestartForTicket, RestartPort};
 use crate::tickets::model::{
     ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
     TicketSummary, WorkspaceRules,
@@ -1254,32 +1254,41 @@ fn restart_agent(
     model: Option<Option<String>>,
     effort: Option<Effort>,
 ) -> Result<AgentInfo, String> {
-    restart_with(app, state, agent_id, model, effort, None)
+    restart_with(app, state, agent_id, model, effort, None, false, None)
 }
 
-/// [`restart_agent`], optionally in another folder and project (`moved`; plan4b A.3).
+/// [`restart_agent`], optionally in another folder (`moved`: the cwd and, for "Flyt til
+/// projekt", the new project; `None` keeps the agent's project; plan4b A.3). `force_fresh`
+/// starts a new session even after a turn (never `--resume`; a fresh session per ticket, step
+/// 6b plan A.7). `start_text` replaces the restart text while the agent starts (default: the
+/// move text for a new project, else [`crate::config::RESTARTING_TEXT`]).
+#[allow(clippy::too_many_arguments)]
 fn restart_with(
     app: &AppHandle,
     state: &AppState,
     agent_id: &str,
     model: Option<Option<String>>,
     effort: Option<Effort>,
-    moved: Option<(PathBuf, String)>,
+    moved: Option<(PathBuf, Option<String>)>,
+    force_fresh: bool,
+    start_text: Option<String>,
 ) -> Result<AgentInfo, String> {
     let info = check_restartable(lock(&state.manager).get(agent_id).as_ref())?;
     let (model, effort) = restart_values(&info, model, effort);
     let profile = state.profiles.get(&info.profile_id);
     let ctx = spawn_context(state, &info.profile_id, profile.as_ref())?;
+    let new_project = moved.as_ref().and_then(|(_, p)| p.clone());
     let req = match &moved {
         Some((cwd, project)) => restart_request_in(
             &info,
             model.clone(),
             effort,
             cwd.clone(),
-            Some(project.clone()),
+            project.clone().or_else(|| info.project.clone()),
         ),
         None => restart_request(&info, model.clone(), effort),
     };
+    let start_text = start_text.or_else(|| new_project.as_deref().map(moving_text));
     lock(&state.pending).remove_for_agent(agent_id);
     let (result, old_pty, resumed) = {
         let mut m = lock(&state.manager);
@@ -1288,7 +1297,9 @@ fn restart_with(
             return Err(e.into());
         }
         // Decided under the same lock as the restart (a turn may have ended meanwhile).
-        let session = m.restart_session(agent_id).ok_or(AgentError::NotRunning)?;
+        let session = m
+            .restart_session(agent_id, force_fresh)
+            .ok_or(AgentError::NotRunning)?;
         let resumed = matches!(session, RestartSession::Resume(_));
         let spec = build_restart_spec(&req, &ctx, &session, agent_id);
         let (result, old_pty) = m.restart(
@@ -1299,9 +1310,9 @@ fn restart_with(
             effort.map(|e| e.as_str().to_string()),
             Arc::clone(&state.sink),
         );
-        if let (Ok(_), Some((_, project))) = (&result, &moved) {
-            // W2: say where it goes instead of "nye indstillinger".
-            m.set_start_text(agent_id, moving_text(project));
+        if let (Ok(_), Some(text)) = (&result, start_text) {
+            // W2: say where it goes (or which ticket it starts) instead of "nye indstillinger".
+            m.set_start_text(agent_id, text);
         }
         (result, old_pty, resumed)
     };
@@ -1318,8 +1329,8 @@ fn restart_with(
                 model.as_deref().unwrap_or("default"),
                 effort.map_or("-", Effort::as_str)
             );
-            let info = match &moved {
-                Some((_, project)) => {
+            let info = match &new_project {
+                Some(project) => {
                     let mut m = lock(&state.manager);
                     m.set_project(agent_id, Some(project.clone()));
                     log::info!("agent {agent_id} moved to project {project}");
@@ -1327,7 +1338,8 @@ fn restart_with(
                 }
                 None => info,
             };
-            // W2: a move into a git project shows the trust dialog; the hint points at it.
+            // W2: a move into a git project shows the trust dialog; the hint points at it (also
+            // after a restart into a ticket's worktree, step 6b; research6b §1.7).
             schedule_starting_hint(
                 app.clone(),
                 Arc::clone(&state.manager),
@@ -1379,6 +1391,50 @@ pub fn set_agent_effort(
     let effort = Effort::parse(effort.trim()).ok_or(ProfileError::UnknownEffort)?;
     restart_agent(&app, &state, &agent_id, None, Some(effort))
 }
+
+// ---- fresh session per ticket (step 6b, plan A.7) ----
+
+/// The dispatcher's restart before a ticket delivery ([`RestartPort`], plan A.7): the agent's
+/// model/effort and project stay; `req.cwd` (the ticket's worktree) becomes the cwd when given;
+/// `force_fresh` starts a new session (never `--resume`), otherwise the session continues
+/// (`--resume` when it had a turn). The gate (Idle, no ticket in progress) is the same as for a
+/// model change and is checked again under the manager lock; the restart sends
+/// `AgentRestarting`, which keeps the dispatcher's `AwaitingRestart`. The agent shows
+/// [`fresh_text`] while it starts (the 15 s hint follows if no hook event comes). A restart is
+/// not user input (the grace period is untouched).
+// TODO(windows-verify): two tickets in a row give a new session id (Diagnostik/statuslinje), the
+// terminal is not mixed up, and no node/mira-mcp of the old session is left (plan6b D.101).
+pub fn restart_for_ticket(
+    app: &AppHandle,
+    state: &AppState,
+    req: RestartForTicket,
+) -> Result<(), String> {
+    restart_with(
+        app,
+        state,
+        &req.agent_id,
+        None,
+        None,
+        req.cwd.map(|cwd| (cwd, None)),
+        req.force_fresh,
+        Some(fresh_text(&req.ticket_short)),
+    )
+    .map(|_| ())
+}
+
+/// The [`RestartPort`] of the dispatcher's `ManagerPort` (set in `lib.rs` like the tools'
+/// `SpawnPort`): looks the state up per call, so a restart before `manage` is refused.
+pub fn restart_port(app: AppHandle) -> RestartPort {
+    Arc::new(move |req: RestartForTicket| {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| RESTART_UNAVAILABLE.to_string())?;
+        restart_for_ticket(&app, &state, req)
+    })
+}
+
+/// [`restart_port`] before the app state is managed.
+pub const RESTART_UNAVAILABLE: &str = "Appen er ved at starte; genstart er ikke tilgængelig endnu";
 
 // ---- projects (plan4b C4b.4) ----
 
@@ -1452,7 +1508,9 @@ pub fn move_agent_to_project(
         &agent_id,
         None,
         None,
-        Some((PathBuf::from(&p.path), p.id)),
+        Some((PathBuf::from(&p.path), Some(p.id))),
+        false,
+        None,
     )
 }
 
