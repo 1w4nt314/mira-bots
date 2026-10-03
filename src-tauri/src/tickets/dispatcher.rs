@@ -713,7 +713,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             newly_done: w
                 .newly_done
                 .iter()
-                .map(|c| (c.short_id(), c.title.clone()))
+                // Step 6c: an external child's title never goes into the line.
+                .map(|c| (c.short_id(), prompt::line_title(c)))
                 .collect(),
             open_left: w.open_left,
         };

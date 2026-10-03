@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod events;
 pub mod git;
 pub mod hooks;
+pub mod inbox;
 pub mod island;
 pub mod mcp;
 pub mod permissions;
@@ -35,7 +36,7 @@ use agent::{now_ms, AgentManager, EventSink, SinkEvent};
 use app_settings::AppSettings;
 use commands::{AppPaths, AppState};
 use config::{
-    CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
+    CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, INBOX_FILE, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
     LOG_MAX_FILE_SIZE, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR, REPORTS_DIR, SETTINGS_FILE,
     SYSTEM_PROMPT_FILE, TICKETS_FILE, WORKSPACE_FILE,
 };
@@ -499,6 +500,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&workspace),
         // git is looked up (and probed) on first use, not at startup.
         Arc::new(git::SystemGit::new()),
+        // Step 6c: the inbox document (nothing writes it before Start/refresh exist).
+        inbox::load_inbox(data_dir.join(INBOX_FILE)).0,
     )
     .shared();
     let sink = tauri_sink(

@@ -74,7 +74,7 @@ impl JsonFileStore {
 }
 
 /// `path` with `suffix` appended to its file name (`tickets.json` → `tickets.json.tmp`).
-fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
@@ -318,6 +318,12 @@ mod tests {
             path: "reports/01-tjek-fejl-tests.md".into(),
             size: 12,
         });
+        // Step 6c: a done ticket started from a GitHub issue, written back.
+        let mut external = ticket("55555555-0000-4000-8000-000000000000", TicketState::Done);
+        let mut e = crate::tickets::model::test_support::github_ref(7);
+        e.write_back.comment = crate::tickets::model::WriteBackState::Done;
+        e.write_back.attempts = 1;
+        external.external = Some(e);
         TicketDoc {
             schema_version: 1,
             tickets: vec![
@@ -325,6 +331,7 @@ mod tests {
                 ticket("22222222-0000-4000-8000-000000000000", TicketState::Done),
                 child,
                 feature,
+                external,
             ],
             review_assignments: Vec::new(),
         }
@@ -487,6 +494,38 @@ mod tests {
         // The 6b fields survive a save in this build (schema stays 1).
         let doc = sample_doc();
         assert_eq!(migrate(serde_json::to_value(&doc).unwrap()).unwrap(), doc);
+    }
+
+    #[test]
+    fn version_1_file_without_6c_fields_loads() {
+        // A step 1–6b `tickets.json`: no `external` on any ticket (plan6c punkt 2).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        assert_eq!(
+            v["tickets"][4]["external"]["writeBack"]["comment"],
+            json!("done")
+        );
+        for t in v["tickets"].as_array_mut().unwrap() {
+            assert!(t.as_object_mut().unwrap().remove("external").is_some());
+        }
+        let dir = TempDir::new();
+        let path = dir.0.join("tickets.json");
+        fs::write(&path, v.to_string()).unwrap();
+        let r = JsonFileStore::new(path).load().unwrap();
+        assert_eq!(r.warning, None);
+        let mut want = sample_doc();
+        for t in want.tickets.iter_mut() {
+            t.external = None;
+        }
+        assert_eq!(r.doc, want);
+        // The 6c field survives a save in this build (schema stays 1).
+        let doc = sample_doc();
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["schemaVersion"], json!(1));
+        assert_eq!(migrate(v).unwrap(), doc);
+        // An unknown write-back state quarantines the file like an unknown ticket state.
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        v["tickets"][4]["external"]["writeBack"]["comment"] = json!("queued");
+        assert_quarantined(&v.to_string());
     }
 
     #[test]

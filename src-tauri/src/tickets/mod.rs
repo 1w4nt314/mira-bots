@@ -38,13 +38,14 @@ use crate::config::{
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::git::{self, GitRunner};
 use crate::hooks::status::AgentStatus;
+use crate::inbox::{InboxError, InboxService};
 use crate::workspace::WorkspaceReader;
 use dispatcher::{
     AgentPort, AgentSnapshot, DispatchMsg, RestartForTicket, RestartPort, TicketsHost,
 };
 use model::{
     ChecksState, GitMode, ReportAuthor, Ticket, TicketActor, TicketChecks, TicketError, TicketGit,
-    TicketReport, TicketState, TicketSummary, WorkspaceRules,
+    TicketId, TicketReport, TicketState, TicketSummary, WorkspaceRules,
 };
 use prompt::{clean_body, one_line};
 use reports::ReportStore;
@@ -169,9 +170,16 @@ pub struct TicketsCtx {
     /// The checks threads started so far (tests join them).
     #[cfg(test)]
     check_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The inbox document (step 6c, plan A.1). Held only around one [`InboxService`] call
+    /// ([`Self::inbox_read`]/[`Self::inbox_mutate`]), never together with the service lock.
+    inbox: Mutex<InboxService>,
+    /// Serialises Start/refresh/write-back steps that touch both documents (step 6c). Taken
+    /// before, never inside, the service lock; `gh` and file moves never run under it.
+    inbox_lock: Mutex<()>,
 }
 
 impl TicketsCtx {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         service: TicketService,
         manager: Arc<Mutex<AgentManager>>,
@@ -180,6 +188,7 @@ impl TicketsCtx {
         reports_root: PathBuf,
         workspace: Arc<WorkspaceReader>,
         git: Arc<dyn GitRunner>,
+        inbox: InboxService,
     ) -> Self {
         TicketsCtx {
             service: Mutex::new(service),
@@ -197,6 +206,45 @@ impl TicketsCtx {
             me: OnceLock::new(),
             #[cfg(test)]
             check_threads: Mutex::new(Vec::new()),
+            inbox: Mutex::new(inbox),
+            inbox_lock: Mutex::new(()),
+        }
+    }
+
+    /// Takes the inbox serial lock (step 6c): before, never inside, the service lock.
+    pub fn lock_inbox_serial(&self) -> MutexGuard<'_, ()> {
+        lock(&self.inbox_lock)
+    }
+
+    /// Read-only access to the inbox document (its own short lock).
+    pub fn inbox_read<T>(&self, f: impl FnOnce(&InboxService) -> T) -> T {
+        f(&lock(&self.inbox))
+    }
+
+    /// Runs `f` under the inbox document's lock (the service saves). Never called with the
+    /// service lock held.
+    // B2: emits `inbox-changed` (list + last known status) after the lock is released.
+    pub fn inbox_mutate<T>(
+        &self,
+        f: impl FnOnce(&mut InboxService) -> Result<T, InboxError>,
+    ) -> Result<T, String> {
+        f(&mut lock(&self.inbox)).map_err(String::from)
+    }
+
+    /// Tickets that just became Done (step 6c, plan A.2: the write-back hook). Runs after the
+    /// mutation's emits without any lock held. B1 only logs the external ones; the write back
+    /// (folder: B2, GitHub: B3) starts here on its own thread.
+    fn on_done(&self, ids: &[TicketId]) {
+        for id in ids {
+            let external = self.read(|s| s.get(id)).and_then(|t| t.external);
+            if let Some(e) = external {
+                log::info!(
+                    "inbox: ticket {} from {} is done (write back: {:?})",
+                    model::short_id(id),
+                    e.kind.as_str(),
+                    e.write_back.comment
+                );
+            }
         }
     }
 
@@ -285,6 +333,7 @@ impl TicketsCtx {
     /// whose last open child went away gets [`crate::config::CHILDREN_DONE_NOTE`] (a history
     /// entry only: its own effects are empty, so this does not recurse).
     fn after_relations(&self, fx: RelationEffects) {
+        self.on_done(&fx.done);
         for (parent, agent) in &fx.woken {
             log::info!(
                 "forløb: forælder {} vækkes hos {agent}",
@@ -1375,6 +1424,16 @@ pub(crate) mod test_support {
         pub store: MemoryStore,
     }
 
+    /// [`test_ctx`] with a given inbox (step 6c).
+    pub fn test_ctx_with_inbox(manager: Arc<Mutex<AgentManager>>, inbox: InboxService) -> TestCtx {
+        build_test_ctx(
+            manager,
+            Arc::new(crate::git::fake::FakeGit::new()),
+            Arc::new(crate::checks::ProcessChecks::new()),
+            inbox,
+        )
+    }
+
     pub fn test_ctx(manager: Arc<Mutex<AgentManager>>) -> TestCtx {
         test_ctx_with_git(manager, Arc::new(crate::git::fake::FakeGit::new()))
     }
@@ -1394,6 +1453,19 @@ pub(crate) mod test_support {
         git: Arc<dyn crate::git::GitRunner>,
         checks: Arc<dyn crate::checks::CheckRunner>,
     ) -> TestCtx {
+        let inbox = InboxService::new(
+            Box::new(crate::inbox::MemoryInboxStore::new()),
+            crate::inbox::InboxDoc::default(),
+        );
+        build_test_ctx(manager, git, checks, inbox)
+    }
+
+    fn build_test_ctx(
+        manager: Arc<Mutex<AgentManager>>,
+        git: Arc<dyn crate::git::GitRunner>,
+        checks: Arc<dyn crate::checks::CheckRunner>,
+        inbox: InboxService,
+    ) -> TestCtx {
         let store = MemoryStore::new();
         let svc = TicketService::new(Box::new(store.clone()), TicketDoc::default());
         let (tx, rx) = unbounded_channel();
@@ -1411,7 +1483,7 @@ pub(crate) mod test_support {
                 .join(crate::config::WORKSPACE_FILE),
         ));
         TestCtx {
-            ctx: TicketsCtx::new(svc, manager, tx, emit, reports_root, workspace, git)
+            ctx: TicketsCtx::new(svc, manager, tx, emit, reports_root, workspace, git, inbox)
                 .with_check_runner(checks)
                 .shared(),
             rx,
@@ -1578,6 +1650,10 @@ mod tests {
                     .join(crate::config::WORKSPACE_FILE),
             )),
             Arc::new(crate::git::fake::FakeGit::new()),
+            InboxService::new(
+                Box::new(crate::inbox::MemoryInboxStore::new()),
+                crate::inbox::InboxDoc::default(),
+            ),
         )
         .shared();
         assert!(slot.set(Arc::clone(&ctx)).is_ok());

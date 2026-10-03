@@ -300,6 +300,116 @@ pub const CHECKS_REPORT_TITLE: &str = "Tjek";
 /// Title of the app's report with the ticket's git changes.
 pub const CHANGES_REPORT_TITLE: &str = "Ændringer";
 
+// --- inbox: folder and GitHub issues, Start, write back (step 6c, plan6c C6c.1/C6c.5) ---
+
+/// File name of the inbox store in the app data dir.
+pub const INBOX_FILE: &str = "inbox.json";
+/// Current `schemaVersion` of `inbox.json`.
+pub const INBOX_SCHEMA_VERSION: u32 = 1;
+/// Longest external body kept (chars); the rest stays on the source.
+pub const INBOX_BODY_MAX_CHARS: usize = TICKET_BODY_MAX_CHARS;
+/// Most labels kept per inbox item.
+pub const INBOX_LABELS_MAX: usize = 20;
+/// Longest label (chars).
+pub const INBOX_LABEL_MAX_CHARS: usize = 40;
+/// Larger inbox files are skipped (256 KB).
+pub const INBOX_FILE_MAX_BYTES: u64 = 262_144;
+/// Most files read per inbox folder per scan.
+pub const INBOX_FILES_PER_DIR_MAX: usize = 200;
+/// `--limit` of `gh issue list` (one page only).
+pub const INBOX_GITHUB_LIMIT: usize = 100;
+/// Smallest interval between two scans of one folder source (except a manual refresh).
+pub const INBOX_FOLDER_MIN_INTERVAL_MS: u64 = 60_000;
+/// Smallest interval between two fetches of one GitHub source (except a manual refresh).
+pub const INBOX_GITHUB_MIN_INTERVAL_MS: u64 = 120_000;
+/// Back-off after 1, 2, 3, 4+ failed fetches of a source.
+pub const INBOX_BACKOFF_MS: [u64; 4] = [120_000, 240_000, 480_000, 900_000];
+/// A dismissed item whose source no longer lists it is forgotten after this long (30 days).
+pub const INBOX_DISMISSED_KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Timeout of one `gh` call.
+pub const GH_TIMEOUT_MS: u64 = 30_000;
+/// Timeout of `gh auth status`.
+pub const GH_AUTH_TIMEOUT_MS: u64 = 15_000;
+/// Output kept per `gh` call (the tail, chars); a clipped answer is an error.
+pub const GH_OUTPUT_MAX_CHARS: usize = 1_000_000;
+/// Longest write-back text (comment / `.result.md`).
+pub const WRITE_BACK_MAX_CHARS: usize = 8_000;
+/// The ticket summary in the write-back text is clipped to this first.
+pub const WRITE_BACK_SUMMARY_MAX_CHARS: usize = 3_000;
+/// Inbox folder directly in the projects root.
+pub const INBOX_DIR: &str = "inbox";
+/// Inbox folder of a project, relative to the project folder (`/`-separated).
+pub const PROJECT_INBOX_DIR: &str = ".mira-bots/inbox";
+/// Started files are moved here (inside the inbox folder).
+pub const INBOX_STARTED_DIR: &str = "started";
+/// Done files and their `.result.md` go here (inside the inbox folder).
+pub const INBOX_DONE_DIR: &str = "done";
+/// Temporary files (`--body-file`) in the app data dir.
+pub const INBOX_TMP_DIR: &str = "tmp";
+/// History note when the app restarted while a write back was running.
+pub const WRITE_BACK_INTERRUPTED_NOTE: &str = "tilbagemelding afbrudt af genstart";
+/// History note when an inbox file could not be moved to `started/`/`done/`.
+pub const INBOX_MOVE_FAILED_NOTE: &str =
+    "filen kunne ikke flyttes (er den åben i et andet program?)";
+/// Start of an item that is gone, dismissed or unknown.
+pub const INBOX_ITEM_GONE: &str = "Emnet er ikke længere i indbakken";
+/// Start of a closed GitHub issue.
+pub const INBOX_ISSUE_CLOSED: &str = "Issuen er lukket på GitHub; den startes ikke";
+/// Start without a project (neither from the item nor chosen).
+pub const INBOX_PROJECT_REQUIRED: &str = "Vælg et projekt";
+/// History note of a ticket started from the inbox; `source` as in the ticket file.
+pub fn started_from_note(source: &str) -> String {
+    format!("startet fra indbakken: {source}")
+}
+/// History note after the GitHub comment.
+pub fn written_back_note(number: u64) -> String {
+    format!("meldt tilbage til GitHub #{number}")
+}
+/// History note after closing the issue.
+pub fn issue_closed_note(number: u64) -> String {
+    format!("issue #{number} lukket på GitHub")
+}
+/// History note when the write back failed.
+pub fn write_back_failed_note(err: &str) -> String {
+    format!("kunne ikke melde tilbage: {err}")
+}
+/// History note after writing the folder result.
+pub fn result_written_note(name: &str) -> String {
+    format!("resultat skrevet til inbox/done/{name}.result.md")
+}
+/// Sanitising note: invisible chars removed.
+pub fn invisible_removed_note(n: usize) -> String {
+    format!("{n} usynlige tegn fjernet")
+}
+/// Sanitising note: HTML comments removed.
+pub fn html_comments_removed_note(n: usize) -> String {
+    format!("{n} HTML-kommentar(er) fjernet")
+}
+/// Sanitising note: the body was clipped.
+pub fn clipped_note(from: usize, max: usize) -> String {
+    format!("klippet fra {from} til {max} tegn — resten står på kilden")
+}
+/// Frontmatter note: unknown key.
+pub fn unknown_key_note(key: &str) -> String {
+    format!("ukendt nøgle «{key}» ignoreret")
+}
+/// Frontmatter note: unknown kind.
+pub fn unknown_kind_note(kind: &str) -> String {
+    format!("ukendt kind «{kind}» ignoreret")
+}
+/// Frontmatter note: a file in project `folder_project` names another project.
+pub fn foreign_project_note(named: &str, folder_project: &str) -> String {
+    format!("projekt «{named}» ignoreret (filen ligger i projektet «{folder_project}»)")
+}
+/// Folder note: a file over [`INBOX_FILE_MAX_BYTES`].
+pub const INBOX_FILE_TOO_BIG_NOTE: &str = "filen er over 256 KB og springes over";
+/// Folder note: more than [`INBOX_FILES_PER_DIR_MAX`] files.
+pub const INBOX_TOO_MANY_FILES_NOTE: &str = "kun de første 200 filer læses";
+/// Start dialog warning: an open ticket with the same title exists.
+pub fn duplicate_hint_text(short: &str, title: &str) -> String {
+    format!("Ligner ticket {short}: «{title}»")
+}
+
 // --- macOS / unix (step 7) ---
 
 /// Unix: time between SIGTERM and SIGKILL to an agent's process group.
@@ -489,6 +599,88 @@ mod tests {
         assert_eq!(CHECKS_REJECT_PREFIX, "afvist af appen");
         assert_eq!(CHECKS_REPORT_TITLE, "Tjek");
         assert_eq!(CHANGES_REPORT_TITLE, "Ændringer");
+    }
+
+    #[test]
+    fn step6c_constants() {
+        assert_eq!((INBOX_FILE, INBOX_SCHEMA_VERSION), ("inbox.json", 1));
+        assert_eq!(INBOX_BODY_MAX_CHARS, 20_000);
+        assert_eq!((INBOX_LABELS_MAX, INBOX_LABEL_MAX_CHARS), (20, 40));
+        assert_eq!(INBOX_FILE_MAX_BYTES, 262_144);
+        assert_eq!((INBOX_FILES_PER_DIR_MAX, INBOX_GITHUB_LIMIT), (200, 100));
+        assert_eq!(
+            (INBOX_FOLDER_MIN_INTERVAL_MS, INBOX_GITHUB_MIN_INTERVAL_MS),
+            (60_000, 120_000)
+        );
+        assert_eq!(INBOX_BACKOFF_MS, [120_000, 240_000, 480_000, 900_000]);
+        assert_eq!(INBOX_DISMISSED_KEEP_MS, 2_592_000_000);
+        assert_eq!(
+            (GH_TIMEOUT_MS, GH_AUTH_TIMEOUT_MS, GH_OUTPUT_MAX_CHARS),
+            (30_000, 15_000, 1_000_000)
+        );
+        assert_eq!(
+            (WRITE_BACK_MAX_CHARS, WRITE_BACK_SUMMARY_MAX_CHARS),
+            (8_000, 3_000)
+        );
+        assert_eq!(
+            (
+                INBOX_DIR,
+                PROJECT_INBOX_DIR,
+                INBOX_STARTED_DIR,
+                INBOX_DONE_DIR,
+                INBOX_TMP_DIR
+            ),
+            ("inbox", ".mira-bots/inbox", "started", "done", "tmp")
+        );
+        assert_eq!(
+            WRITE_BACK_INTERRUPTED_NOTE,
+            "tilbagemelding afbrudt af genstart"
+        );
+        assert_eq!(
+            INBOX_MOVE_FAILED_NOTE,
+            "filen kunne ikke flyttes (er den åben i et andet program?)"
+        );
+        assert_eq!(INBOX_ITEM_GONE, "Emnet er ikke længere i indbakken");
+        assert_eq!(
+            INBOX_ISSUE_CLOSED,
+            "Issuen er lukket på GitHub; den startes ikke"
+        );
+        assert_eq!(INBOX_PROJECT_REQUIRED, "Vælg et projekt");
+        assert_eq!(
+            started_from_note("GitHub issue #7 i o/r"),
+            "startet fra indbakken: GitHub issue #7 i o/r"
+        );
+        assert_eq!(written_back_note(7), "meldt tilbage til GitHub #7");
+        assert_eq!(issue_closed_note(7), "issue #7 lukket på GitHub");
+        assert_eq!(write_back_failed_note("x"), "kunne ikke melde tilbage: x");
+        assert_eq!(
+            result_written_note("fejl-1"),
+            "resultat skrevet til inbox/done/fejl-1.result.md"
+        );
+        assert_eq!(invisible_removed_note(4), "4 usynlige tegn fjernet");
+        assert_eq!(
+            html_comments_removed_note(2),
+            "2 HTML-kommentar(er) fjernet"
+        );
+        assert_eq!(
+            clipped_note(25_000, 20_000),
+            "klippet fra 25000 til 20000 tegn — resten står på kilden"
+        );
+        assert_eq!(unknown_key_note("foo"), "ukendt nøgle «foo» ignoreret");
+        assert_eq!(unknown_kind_note("docs"), "ukendt kind «docs» ignoreret");
+        assert_eq!(
+            foreign_project_note("b", "a"),
+            "projekt «b» ignoreret (filen ligger i projektet «a»)"
+        );
+        assert_eq!(
+            INBOX_FILE_TOO_BIG_NOTE,
+            "filen er over 256 KB og springes over"
+        );
+        assert_eq!(INBOX_TOO_MANY_FILES_NOTE, "kun de første 200 filer læses");
+        assert_eq!(
+            duplicate_hint_text("ab12cd34", "Fix"),
+            "Ligner ticket ab12cd34: «Fix»"
+        );
     }
 
     #[test]

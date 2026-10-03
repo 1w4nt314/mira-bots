@@ -166,6 +166,115 @@ pub struct TicketGit {
     pub worktree: Option<String>,
 }
 
+/// Where an external ticket came from (step 6c). Wire: `"folder"|"github"`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum ExternalKind {
+    Folder,
+    Github,
+}
+
+impl ExternalKind {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExternalKind::Folder => "folder",
+            ExternalKind::Github => "github",
+        }
+    }
+}
+
+/// State of one write-back step (step 6c, plan A.7). Wire: `"none"|"inflight"|"done"|"failed"`.
+/// `inflight` is saved before the call; at startup it becomes `failed` (the call may or may not
+/// have reached the source, so only a click tries again, with the marker check first).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteBackState {
+    #[default]
+    None,
+    Inflight,
+    Done,
+    Failed,
+}
+
+/// The report back to the source when the ticket is Done (step 6c, C6c.2). Every field has a
+/// default, so an older or partial object still reads.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WriteBack {
+    /// The comment (GitHub) or the `.result.md` (folder).
+    pub comment: WriteBackState,
+    /// Closing the issue (GitHub only, after a `done` comment).
+    pub close: WriteBackState,
+    pub comment_url: Option<String>,
+    /// Unix ms.
+    pub commented_at: Option<u64>,
+    /// Unix ms.
+    pub closed_at: Option<u64>,
+    /// Write attempts so far (> 0: look for the marker before posting again).
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    /// The text of the last attempt (kept, not shown in 6c).
+    pub last_body: Option<String>,
+}
+
+/// The external source of a ticket started from the inbox (step 6c, C6c.2). Set by the app,
+/// never from the external text; `TicketSource` stays `user` (the user clicked Start).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalRef {
+    pub kind: ExternalKind,
+    /// `github:owner/name#123` or `folder:<project|_rod>:<relative path>`.
+    pub external_id: String,
+    /// `owner/name` (GitHub).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Issue number (GitHub).
+    #[serde(default)]
+    pub number: Option<u64>,
+    /// Path relative to the inbox folder (folder).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Issue URL (GitHub).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The cleaned external title (only in the ticket file, never in a typed line).
+    pub title: String,
+    /// Cleaned labels (B1 addition to C6c.2: the ticket file's "labels" line).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Cleaned author login (B1 addition to C6c.2: the ticket file's "oprindelig forfatter").
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Sanitising notes ("2 HTML-kommentar(er) fjernet", …), shown in the ticket file.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// The inbox item this ticket was started from.
+    pub inbox_item_id: String,
+    /// Unix ms.
+    pub imported_at: u64,
+    #[serde(default)]
+    pub write_back: WriteBack,
+}
+
+impl ExternalRef {
+    /// The `{kilde}` of C6c.4/C6c.5: `GitHub issue #{n} i {repo}` or `filen {path} i indbakken`
+    /// (repo and path sanitised like a title: one line, no invisible chars).
+    pub fn source_label(&self) -> String {
+        use super::prompt::sanitize_title;
+        match self.kind {
+            ExternalKind::Github => match (self.number, self.repo.as_deref()) {
+                (Some(n), Some(r)) => format!("GitHub issue #{n} i {}", sanitize_title(r)),
+                _ => "GitHub issue".to_string(),
+            },
+            ExternalKind::Folder => match self.path.as_deref() {
+                Some(p) => format!("filen {} i indbakken", sanitize_title(p)),
+                None => "en fil i indbakken".to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TicketHistoryEntry {
@@ -237,6 +346,9 @@ pub struct Ticket {
     /// The ticket's git branch/worktree (step 6b). Absent before 6b.
     #[serde(default)]
     pub git: Option<TicketGit>,
+    /// The external source (step 6c: started from the inbox). Absent before 6c.
+    #[serde(default)]
+    pub external: Option<ExternalRef>,
 }
 
 impl Ticket {
@@ -281,6 +393,8 @@ pub struct TicketSummary {
     pub playbook_started_at: Option<u64>,
     pub checks: Option<TicketChecks>,
     pub git: Option<TicketGit>,
+    /// Copy of `Ticket.external` (step 6c; badge and write-back state without `get_ticket`).
+    pub external: Option<ExternalRef>,
 }
 
 impl From<&Ticket> for TicketSummary {
@@ -311,6 +425,7 @@ impl From<&Ticket> for TicketSummary {
             playbook_started_at: t.playbook_started_at,
             checks: t.checks.clone(),
             git: t.git.clone(),
+            external: t.external.clone(),
         }
     }
 }
@@ -544,6 +659,10 @@ pub enum TicketError {
     InvalidKind,
     #[error("Playbooken kan ikke udrulles: {0}")]
     PlaybookStepsInvalid(String),
+    // ---- step 6c (inbox) ----
+    /// Start of an inbox item that already has a ticket (short id).
+    #[error("Issue/filen er allerede startet som ticket {0}")]
+    ExternalAlreadyStarted(String),
 }
 
 /// The rules of this workspace (plan5 C5.1): the "Regler" section of every profile's system
@@ -644,6 +763,26 @@ pub(crate) mod test_support {
             playbook_started_at: None,
             checks: None,
             git: None,
+            external: None,
+        }
+    }
+
+    /// A GitHub [`ExternalRef`] for issue `#n` in `o/r` (step 6c tests).
+    pub fn github_ref(n: u64) -> ExternalRef {
+        ExternalRef {
+            kind: ExternalKind::Github,
+            external_id: format!("github:o/r#{n}"),
+            repo: Some("o/r".into()),
+            number: Some(n),
+            path: None,
+            url: Some(format!("https://github.com/o/r/issues/{n}")),
+            title: "Crash ved start".into(),
+            labels: vec!["bug".into()],
+            author: Some("alice".into()),
+            notes: Vec::new(),
+            inbox_item_id: "item-1".into(),
+            imported_at: 5,
+            write_back: WriteBack::default(),
         }
     }
 }
@@ -779,6 +918,7 @@ mod tests {
             "playbookStartedAt",
             "checks",
             "git",
+            "external",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
         }
@@ -881,6 +1021,78 @@ mod tests {
         assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
         let back = serde_json::from_value::<TicketSummary>(s).unwrap();
         assert_eq!((back.kind, back.git), (t.kind.clone(), t.git.clone()));
+
+        // step 6c: external in both (C6c.2).
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(v["external"], json!(null));
+        assert_eq!(s["external"], json!(null));
+        t.external = Some(test_support::github_ref(123));
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        let want = json!({"kind":"github","externalId":"github:o/r#123","repo":"o/r","number":123,
+            "path":null,"url":"https://github.com/o/r/issues/123","title":"Crash ved start",
+            "labels":["bug"],"author":"alice","notes":[],"inboxItemId":"item-1","importedAt":5,
+            "writeBack":{"comment":"none","close":"none","commentUrl":null,"commentedAt":null,
+                "closedAt":null,"attempts":0,"lastError":null,"lastBody":null}});
+        assert_eq!(v["external"], want);
+        assert_eq!(s["external"], want);
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+        assert_eq!(
+            serde_json::from_value::<TicketSummary>(s).unwrap().external,
+            t.external
+        );
+    }
+
+    #[test]
+    fn external_ref_round_trips_and_defaults() {
+        for (st, wire) in [
+            (WriteBackState::None, "none"),
+            (WriteBackState::Inflight, "inflight"),
+            (WriteBackState::Done, "done"),
+            (WriteBackState::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(st).unwrap(), json!(wire));
+        }
+        assert_eq!(
+            serde_json::to_value(ExternalKind::Folder).unwrap(),
+            json!("folder")
+        );
+        assert_eq!(ExternalKind::Github.as_str(), "github");
+        let mut e = test_support::github_ref(7);
+        e.write_back = WriteBack {
+            comment: WriteBackState::Done,
+            close: WriteBackState::Failed,
+            comment_url: Some("https://github.com/o/r/issues/7#issuecomment-1".into()),
+            commented_at: Some(9),
+            closed_at: None,
+            attempts: 2,
+            last_error: Some("x".into()),
+            last_body: Some("y".into()),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(serde_json::from_value::<ExternalRef>(v).unwrap(), e);
+        // Only the required fields: the rest defaults (a folder ref without GitHub data).
+        let min = json!({"kind":"folder","externalId":"folder:web:fejl-1.md","title":"T",
+            "inboxItemId":"i","importedAt":1});
+        let e: ExternalRef = serde_json::from_value(min).unwrap();
+        assert_eq!(e.kind, ExternalKind::Folder);
+        assert_eq!((e.repo, e.number, e.path, e.url), (None, None, None, None));
+        assert!(e.labels.is_empty() && e.notes.is_empty() && e.author.is_none());
+        assert_eq!(e.write_back, WriteBack::default());
+        // A partial write-back object reads with defaults.
+        let wb: WriteBack = serde_json::from_value(json!({"comment":"inflight"})).unwrap();
+        assert_eq!(wb.comment, WriteBackState::Inflight);
+        assert_eq!((wb.close, wb.attempts), (WriteBackState::None, 0));
+    }
+
+    #[test]
+    fn old_ticket_without_external_loads() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Done)).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("external").is_some());
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!(t.external, None);
+        assert_eq!(t, ticket("t1", TicketState::Done));
     }
 
     #[test]
@@ -1077,6 +1289,10 @@ mod tests {
             (
                 TicketError::PlaybookStepsInvalid("trin 1 mangler titel".into()),
                 "Playbooken kan ikke udrulles: trin 1 mangler titel",
+            ),
+            (
+                TicketError::ExternalAlreadyStarted("ab12cd34".into()),
+                "Issue/filen er allerede startet som ticket ab12cd34",
             ),
         ];
         for (e, text) in table {

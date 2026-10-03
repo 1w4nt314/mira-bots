@@ -17,9 +17,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 
 use super::model::{
-    short_id, ChecksState, ReportAuthorKind, ReviewAssignment, Ticket, TicketActor, TicketChecks,
-    TicketDoc, TicketError, TicketGit, TicketHistoryEntry, TicketId, TicketIssue, TicketPatch,
-    TicketReport, TicketSource, TicketState, TicketSummary,
+    short_id, ChecksState, ExternalKind, ExternalRef, ReportAuthorKind, ReviewAssignment, Ticket,
+    TicketActor, TicketChecks, TicketDoc, TicketError, TicketGit, TicketHistoryEntry, TicketId,
+    TicketIssue, TicketPatch, TicketReport, TicketSource, TicketState, TicketSummary, WriteBack,
+    WriteBackState,
 };
 use super::prompt::{one_line, ChildLine, ChildReview};
 use super::state::{transition_noted, TicketEvent, REOPENED_NOTE};
@@ -27,11 +28,13 @@ use super::store::TicketStore;
 use super::NOT_SUBMITTED_NOTE;
 use crate::agent::roles::has_work_role;
 use crate::agent::{AgentInfo, SeatKind};
+use crate::config::started_from_note;
 use crate::config::{
     playbook_created_note, BLOCKED_BY_MAX, CHANGES_REPORT_TITLE, CHECKS_INTERRUPTED_NOTE,
     CHECKS_REJECT_PREFIX, CHILDREN_DONE_NOTE, FLOW_DONE_NOTE, MOVED_NOTE, PARENT_DELETED_NOTE,
     PLAYBOOK_STEPS_MAX, REPORTS_PER_TICKET_MAX, RESTART_NOTE, REVIEW_DELIVERY_MAX_ATTEMPTS,
     TICKET_BODY_MAX_CHARS, TICKET_SUMMARY_MAX_CHARS, TICKET_TITLE_MAX_CHARS, WAITING_NOTE,
+    WRITE_BACK_INTERRUPTED_NOTE,
 };
 use crate::projects::{same_id, validate_project_id, ProjectId, ProjectRef};
 
@@ -200,12 +203,18 @@ pub struct RelationEffects {
     pub woken: Vec<(TicketId, String)>,
     /// `(ticket, assignee)` behind [`Self::unblocked`] (for the log; Batch 2 addition to C6.1).
     pub freed: Vec<(TicketId, String)>,
+    /// Tickets that became Done in this mutation (step 6c, plan A.2: the write-back hook). A
+    /// ticket that was Done before, or is created, deleted, rejected or reopened, is not listed.
+    pub done: Vec<TicketId>,
 }
 
 impl RelationEffects {
     /// Nothing to do.
     pub fn is_empty(&self) -> bool {
-        self.wake.is_empty() && self.unblocked.is_empty() && self.children_done.is_empty()
+        self.wake.is_empty()
+            && self.unblocked.is_empty()
+            && self.children_done.is_empty()
+            && self.done.is_empty()
     }
 }
 
@@ -217,6 +226,8 @@ impl RelationEffects {
 ///   not after (its blocker became Done or was deleted);
 /// - `children_done`: a backlog ticket without an assignee whose open-children count went from
 ///   > 0 to 0.
+///
+/// - `done` (step 6c): a ticket that existed before with another state and is Done after.
 ///
 /// A child that is rejected, put back in the backlog or reopened stays open: no effect.
 pub fn relation_effects(before: &[RelSnap], after: &[RelSnap]) -> RelationEffects {
@@ -239,6 +250,13 @@ pub fn relation_effects(before: &[RelSnap], after: &[RelSnap]) -> RelationEffect
     };
     let mut fx = RelationEffects::default();
     for a in after {
+        if a.state == TicketState::Done
+            && state_b
+                .get(a.id.as_str())
+                .is_some_and(|b| *b != TicketState::Done)
+        {
+            fx.done.push(a.id.clone());
+        }
         match (a.state, a.assignee.as_deref()) {
             (TicketState::Waiting, Some(agent)) => {
                 let lost_child = before.iter().any(|c| {
@@ -556,6 +574,11 @@ fn note_entry(t: &mut Ticket, by: TicketActor, note: String, now: u64) {
     });
 }
 
+/// Whether a write-back step was running (step 6c).
+fn write_back_inflight(wb: &WriteBack) -> bool {
+    wb.comment == WriteBackState::Inflight || wb.close == WriteBackState::Inflight
+}
+
 /// Rewrites queue positions: per agent the `assigned` tickets ordered by
 /// `(queue_position or MAX, updated_at)` get `0..n`; every other ticket gets `None`.
 fn normalize_queues(doc: &mut TicketDoc) {
@@ -637,10 +660,35 @@ impl TicketService {
                 .as_ref()
                 .is_some_and(|c| c.state == ChecksState::Pending)
         });
-        if !stale.is_empty() || stale_reviews || pending_checks {
+        // Step 6c (plan A.7): a write back that was running when the app stopped may or may not
+        // have reached the source; it becomes `failed` (only a click tries again).
+        let inflight_write_back = svc.doc.tickets.iter().any(|t| {
+            t.external
+                .as_ref()
+                .is_some_and(|e| write_back_inflight(&e.write_back))
+        });
+        if !stale.is_empty() || stale_reviews || pending_checks || inflight_write_back {
             let r = svc.commit(|doc| {
                 doc.review_assignments.clear();
                 for t in doc.tickets.iter_mut() {
+                    if let Some(e) = t
+                        .external
+                        .as_mut()
+                        .filter(|e| write_back_inflight(&e.write_back))
+                    {
+                        for st in [&mut e.write_back.comment, &mut e.write_back.close] {
+                            if *st == WriteBackState::Inflight {
+                                *st = WriteBackState::Failed;
+                            }
+                        }
+                        e.write_back.last_error = Some(WRITE_BACK_INTERRUPTED_NOTE.into());
+                        note_entry(
+                            t,
+                            TicketActor::System,
+                            WRITE_BACK_INTERRUPTED_NOTE.into(),
+                            now,
+                        );
+                    }
                     if t.state == TicketState::Review {
                         t.reviewer_agent_id = None;
                     }
@@ -1025,6 +1073,78 @@ impl TicketService {
         self.fetch(&id)
     }
 
+    /// A ticket started from the inbox (step 6c, plan punkt 5): like [`Self::create_in`] by the
+    /// user, with `external` and the history note [`started_from_note`]. `title`/`body` must
+    /// already be cleaned (`inbox::external`); `kind` validated by the caller. Refused with
+    /// [`TicketError::ExternalAlreadyStarted`] when a ticket with the same external id exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_external(
+        &mut self,
+        title: &str,
+        body: &str,
+        skip_review: bool,
+        project: Option<ProjectRef>,
+        kind: Option<String>,
+        external: ExternalRef,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        if let Some(t) = self.find_by_external(external.kind, &external.external_id) {
+            return Err(TicketError::ExternalAlreadyStarted(t.short_id()));
+        }
+        let mut t = self.new_ticket(
+            &mut || uuid::Uuid::new_v4().to_string(),
+            title,
+            body,
+            skip_review,
+            project,
+            (TicketSource::User, TicketActor::User),
+            now,
+        )?;
+        t.kind = kind;
+        note_entry(
+            &mut t,
+            TicketActor::User,
+            started_from_note(&external.source_label()),
+            now,
+        );
+        t.external = Some(external);
+        let id = t.id.clone();
+        self.commit(|doc| {
+            doc.tickets.push(t);
+            Ok(())
+        })?;
+        self.fetch(&id)
+    }
+
+    /// The ticket started from the external item `(kind, external_id)` (step 6c), any state.
+    pub fn find_by_external(&self, kind: ExternalKind, external_id: &str) -> Option<&Ticket> {
+        self.doc.tickets.iter().find(|t| {
+            t.external
+                .as_ref()
+                .is_some_and(|e| e.kind == kind && e.external_id == external_id)
+        })
+    }
+
+    /// Replaces the write-back state of an external ticket (step 6c). No history entry (the
+    /// caller adds the notes).
+    pub fn set_write_back(
+        &mut self,
+        id: &str,
+        wb: WriteBack,
+        now: u64,
+    ) -> Result<Ticket, TicketError> {
+        self.commit(|doc| {
+            let t = find_mut(doc, id)?;
+            let e = t.external.as_mut().ok_or_else(|| {
+                TicketError::Validation("Ticketen har ingen ekstern kilde".into())
+            })?;
+            e.write_back = wb;
+            t.updated_at = now;
+            Ok(())
+        })?;
+        self.fetch(id)
+    }
+
     /// A validated backlog ticket with a fresh id (not yet in the document).
     #[allow(clippy::too_many_arguments)]
     fn new_ticket(
@@ -1079,6 +1199,7 @@ impl TicketService {
             playbook_started_at: None,
             checks: None,
             git: None,
+            external: None,
         };
         Ok(t)
     }
@@ -5030,6 +5151,14 @@ mod tests {
         }
     }
 
+    /// Effects with nothing but `done` (step 6c).
+    fn done_only(ids: &[&str]) -> RelationEffects {
+        RelationEffects {
+            done: ids.iter().map(|s| s.to_string()).collect(),
+            ..RelationEffects::default()
+        }
+    }
+
     #[test]
     fn relation_effects_table() {
         let set = |v: &[&str]| {
@@ -5074,7 +5203,8 @@ mod tests {
         // The parent is not waiting (in progress) → no wake.
         let busy = rs("p", S::InProgress, None, &[], Some("k"));
         let fx = relation_effects(&[busy.clone(), open.clone()], &[busy, done.clone()]);
-        assert!(fx.is_empty());
+        // (Step 6c: the child itself is newly done.)
+        assert_eq!(fx, done_only(&["c1"]));
         // Unchanged → nothing.
         let all = [parent.clone(), open.clone(), other_open.clone()];
         assert!(relation_effects(&all, &all).is_empty());
@@ -5102,11 +5232,11 @@ mod tests {
             &[blocker.clone(), b2.clone(), two.clone()],
             &[blocker_done.clone(), b2, two],
         );
-        assert!(fx.is_empty());
+        assert_eq!(fx, done_only(&["b1"]));
         // A blocked backlog ticket (no agent) → nothing to notify.
         let loose = rs("q", S::Backlog, None, &["b1"], None);
         let fx = relation_effects(&[blocker, loose.clone()], &[blocker_done, loose]);
-        assert!(fx.is_empty());
+        assert_eq!(fx, done_only(&["b1"]));
 
         // A backlog parent without an assignee loses its last open child → children_done.
         let lonely = rs("p", S::Backlog, None, &[], None);
@@ -5520,6 +5650,187 @@ mod tests {
         let o = in_review(&mut s, "a2", "normal");
         let b = s.reject(&o.id, "nej", RejectReturn::Backlog, 8).unwrap();
         assert_eq!((b.state, b.review_round), (S::Backlog, 0));
+    }
+
+    // ---- step 6c ----
+
+    #[test]
+    fn relation_effects_lists_newly_done() {
+        let (mut s, _) = svc();
+        // Review → Done by approval.
+        let a = in_review(&mut s, "a1", "approve");
+        let before = s.relations_snapshot();
+        s.approve(&a.id, 10).unwrap();
+        let fx = relation_effects(&before, &s.relations_snapshot());
+        assert_eq!(fx.done, vec![a.id.clone()]);
+        assert!(!fx.is_empty());
+        // Review → Done by the user's manual move.
+        let b = in_review(&mut s, "a2", "manual");
+        let before = s.relations_snapshot();
+        s.set_state(&b.id, S::Done, None, true, 11).unwrap();
+        assert_eq!(
+            relation_effects(&before, &s.relations_snapshot()).done,
+            vec![b.id.clone()]
+        );
+        // In progress → Done by submit with skipReview.
+        let c = in_progress(&mut s, "a3", "skip", true);
+        let before = s.relations_snapshot();
+        let c2 = s.submit_by_agent("a3", None, "klar", 12).unwrap();
+        assert_eq!(c2.state, S::Done);
+        assert_eq!(
+            relation_effects(&before, &s.relations_snapshot()).done,
+            vec![c.id.clone()]
+        );
+        // Unchanged Done tickets, a reopened one and a deleted one are not listed.
+        let all = s.relations_snapshot();
+        assert!(relation_effects(&all, &all).is_empty());
+        let before = s.relations_snapshot();
+        s.set_state(&a.id, S::Backlog, None, true, 13).unwrap();
+        assert!(relation_effects(&before, &s.relations_snapshot())
+            .done
+            .is_empty());
+        let before = s.relations_snapshot();
+        s.delete(&b.id).unwrap();
+        assert!(relation_effects(&before, &s.relations_snapshot())
+            .done
+            .is_empty());
+        // A ticket that appears as Done (not in `before`) is not "newly done" either.
+        let x = rs("x", S::Done, None, &[], None);
+        assert!(relation_effects(&[], std::slice::from_ref(&x)).is_empty());
+        let fx = relation_effects(&[rs("x", S::Review, None, &[], Some("r"))], &[x]);
+        assert_eq!(fx.done, vec!["x".to_string()]);
+        assert!(fx.wake.is_empty() && fx.unblocked.is_empty() && fx.children_done.is_empty());
+    }
+
+    #[test]
+    fn create_external_find_by_external_and_set_write_back() {
+        let (mut s, m) = svc();
+        let e = crate::tickets::model::test_support::github_ref(7);
+        let t = s
+            .create_external(
+                "Crash ved start",
+                "Trin 1",
+                false,
+                None,
+                Some("bug".into()),
+                e.clone(),
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            (t.state, t.source, t.kind.as_deref()),
+            (S::Backlog, TicketSource::User, Some("bug"))
+        );
+        assert_eq!(t.external.as_ref(), Some(&e));
+        assert_eq!(t.history.len(), 2);
+        assert_eq!(t.history[0].note, None);
+        assert_eq!(
+            t.history[1].note.as_deref(),
+            Some("startet fra indbakken: GitHub issue #7 i o/r")
+        );
+        assert_eq!(t.history[1].by, TicketActor::User);
+        assert_eq!(m.doc().unwrap().tickets.len(), 1);
+        assert_eq!(
+            s.find_by_external(ExternalKind::Github, "github:o/r#7")
+                .map(|x| x.id.clone()),
+            Some(t.id.clone())
+        );
+        assert!(s
+            .find_by_external(ExternalKind::Folder, "github:o/r#7")
+            .is_none());
+        assert_eq!(
+            s.create_external("Igen", "", false, None, None, e.clone(), 6),
+            Err(TicketError::ExternalAlreadyStarted(t.short_id()))
+        );
+        // Validation as create: empty title, bad project.
+        let mut e2 = e.clone();
+        e2.external_id = "github:o/r#8".into();
+        assert!(s
+            .create_external(" ", "", false, None, None, e2.clone(), 6)
+            .is_err());
+        assert!(s
+            .create_external(
+                "x",
+                "",
+                false,
+                Some(ProjectRef::Existing("../x".into())),
+                None,
+                e2,
+                6
+            )
+            .is_err());
+        assert_eq!(s.len(), 1);
+        // Write-back state: no history entry.
+        let wb = WriteBack {
+            comment: WriteBackState::Inflight,
+            attempts: 1,
+            ..WriteBack::default()
+        };
+        let t2 = s.set_write_back(&t.id, wb.clone(), 9).unwrap();
+        assert_eq!(t2.external.unwrap().write_back, wb);
+        assert_eq!((t2.history.len(), t2.updated_at), (2, 9));
+        let plain = mk(&mut s, "plain", 10);
+        assert!(matches!(
+            s.set_write_back(&plain.id, wb, 11),
+            Err(TicketError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn recover_marks_inflight_write_back_failed() {
+        let (mut s, _) = svc();
+        let mut ids = Vec::new();
+        for (n, comment, close) in [
+            (1, WriteBackState::Inflight, WriteBackState::None),
+            (2, WriteBackState::Done, WriteBackState::Inflight),
+            (3, WriteBackState::Done, WriteBackState::Done),
+        ] {
+            let e = crate::tickets::model::test_support::github_ref(n);
+            let t = s.create_external("T", "", true, None, None, e, 1).unwrap();
+            let wb = WriteBack {
+                comment,
+                close,
+                attempts: 1,
+                ..WriteBack::default()
+            };
+            s.set_write_back(&t.id, wb, 2).unwrap();
+            ids.push(t.id);
+        }
+        let doc = s.doc.clone();
+        let m = MemoryStore::with_doc(doc.clone());
+        let (r, warning) = TicketService::load_and_recover(Box::new(m.clone()), 100);
+        assert_eq!(warning, None);
+        assert_eq!(m.saves(), 1);
+        let wb = |i: usize| r.get(&ids[i]).unwrap().external.unwrap().write_back;
+        assert_eq!(
+            (wb(0).comment, wb(0).close),
+            (WriteBackState::Failed, WriteBackState::None)
+        );
+        assert_eq!(
+            wb(0).last_error.as_deref(),
+            Some(WRITE_BACK_INTERRUPTED_NOTE)
+        );
+        assert_eq!(
+            (wb(1).comment, wb(1).close),
+            (WriteBackState::Done, WriteBackState::Failed)
+        );
+        for i in [0, 1] {
+            assert_eq!(
+                r.get(&ids[i])
+                    .unwrap()
+                    .history
+                    .last()
+                    .unwrap()
+                    .note
+                    .as_deref(),
+                Some("tilbagemelding afbrudt af genstart")
+            );
+        }
+        assert_eq!(r.get(&ids[2]).unwrap(), doc.tickets[2]);
+        // Nothing in flight any more → no save.
+        let m2 = MemoryStore::with_doc(m.doc().unwrap());
+        TicketService::load_and_recover(Box::new(m2.clone()), 200);
+        assert_eq!(m2.saves(), 0);
     }
 }
 
