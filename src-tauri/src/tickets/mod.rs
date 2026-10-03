@@ -176,6 +176,11 @@ pub struct TicketsCtx {
     /// Serialises Start/refresh/write-back steps that touch both documents (step 6c). Taken
     /// before, never inside, the service lock; `gh` and file moves never run under it.
     inbox_lock: Mutex<()>,
+    /// Refresh state (single flight, status per source; step 6c).
+    pub inbox_rt: crate::inbox::InboxRuntime,
+    /// The inbox threads started so far (`mira-inbox`, `mira-writeback`; tests join them).
+    #[cfg(test)]
+    inbox_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl TicketsCtx {
@@ -208,6 +213,9 @@ impl TicketsCtx {
             check_threads: Mutex::new(Vec::new()),
             inbox: Mutex::new(inbox),
             inbox_lock: Mutex::new(()),
+            inbox_rt: crate::inbox::InboxRuntime::new(),
+            #[cfg(test)]
+            inbox_threads: Mutex::new(Vec::new()),
         }
     }
 
@@ -221,29 +229,100 @@ impl TicketsCtx {
         f(&lock(&self.inbox))
     }
 
-    /// Runs `f` under the inbox document's lock (the service saves). Never called with the
-    /// service lock held.
-    // B2: emits `inbox-changed` (list + last known status) after the lock is released.
+    /// Runs `f` under the inbox document's lock (the service saves); on success emits
+    /// `inbox-changed` (list + status) after the lock is released. Never called with the service
+    /// lock held (the payload reads the tickets).
     pub fn inbox_mutate<T>(
+        &self,
+        f: impl FnOnce(&mut InboxService) -> Result<T, InboxError>,
+    ) -> Result<T, String> {
+        let r = self.inbox_mutate_quiet(f)?;
+        self.emit_inbox();
+        Ok(r)
+    }
+
+    /// [`Self::inbox_mutate`] without the emit (the refresh emits once at its end).
+    pub fn inbox_mutate_quiet<T>(
         &self,
         f: impl FnOnce(&mut InboxService) -> Result<T, InboxError>,
     ) -> Result<T, String> {
         f(&mut lock(&self.inbox)).map_err(String::from)
     }
 
+    /// Runs `f` with this context's `Arc` on a thread named `name` (step 6c: `mira-inbox`,
+    /// `mira-writeback`). `false` when the context is not [`Self::shared`] or the thread could
+    /// not start (nothing ran). A panic on the thread is caught and logged.
+    pub fn spawn_inbox_thread(
+        &self,
+        name: &str,
+        f: impl FnOnce(&Arc<TicketsCtx>) + Send + 'static,
+    ) -> bool {
+        let Some(me) = self.me.get().and_then(Weak::upgrade) else {
+            log::warn!("inbox: {name} needs the shared context");
+            return false;
+        };
+        let thread_name = name.to_string();
+        let spawned = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&me))).is_err() {
+                    log::error!("inbox: the {thread_name} thread panicked");
+                }
+            });
+        match spawned {
+            Ok(_handle) => {
+                #[cfg(test)]
+                lock(&self.inbox_threads).push(_handle);
+                true
+            }
+            Err(e) => {
+                log::warn!("inbox: could not start {name}: {e}");
+                false
+            }
+        }
+    }
+
+    /// Waits for every inbox thread started so far, also those they start (tests).
+    #[cfg(test)]
+    pub fn join_inbox_threads(&self) {
+        loop {
+            let Some(h) = lock(&self.inbox_threads).pop() else {
+                return;
+            };
+            h.join().expect("inbox thread");
+        }
+    }
+
     /// Tickets that just became Done (step 6c, plan A.2: the write-back hook). Runs after the
-    /// mutation's emits without any lock held. B1 only logs the external ones; the write back
-    /// (folder: B2, GitHub: B3) starts here on its own thread.
+    /// mutation's emits without any lock held — but possibly while the caller holds
+    /// `inbox_lock` (Start), so it never takes that lock itself: a folder ticket that never
+    /// wrote back gets a `mira-writeback` thread ([`crate::inbox::write_back::folder_write_back`]).
+    /// GitHub: B3.
     fn on_done(&self, ids: &[TicketId]) {
+        use crate::inbox::write_back::{folder_write_back, wants_write_back};
         for id in ids {
-            let external = self.read(|s| s.get(id)).and_then(|t| t.external);
-            if let Some(e) = external {
-                log::info!(
-                    "inbox: ticket {} from {} is done (write back: {:?})",
-                    model::short_id(id),
-                    e.kind.as_str(),
-                    e.write_back.comment
-                );
+            let Some(e) = self.read(|s| s.get(id)).and_then(|t| t.external) else {
+                continue;
+            };
+            if !wants_write_back(&e) {
+                continue;
+            }
+            match e.kind {
+                model::ExternalKind::Folder => {
+                    let id = id.clone();
+                    self.spawn_inbox_thread("mira-writeback", move |me| {
+                        if let Err(err) = folder_write_back(me, &id) {
+                            log::info!(
+                                "inbox: no write back for ticket {}: {err}",
+                                model::short_id(&id)
+                            );
+                        }
+                    });
+                }
+                model::ExternalKind::Github => log::info!(
+                    "inbox: ticket {} from github is done (write back: B3)",
+                    model::short_id(id)
+                ),
             }
         }
     }

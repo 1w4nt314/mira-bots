@@ -30,6 +30,7 @@ use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
 use crate::hooks::settings::write_profile_settings;
 use crate::hooks::status::AgentStatus;
+use crate::inbox::{InboxItem, InboxItemSummary, InboxPayload, RefreshReason, StartRequest};
 use crate::island::{self, IslandState};
 use crate::mcp;
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
@@ -116,6 +117,8 @@ pub struct AppState {
     pub tickets: Arc<TicketsCtx>,
     /// Warning from loading `tickets.json` (corrupt file renamed etc.), for Diagnostics.
     pub tickets_warning: Option<String>,
+    /// Warning from loading `inbox.json` (corrupt file renamed etc.), for Diagnostics (step 6c).
+    pub inbox_warning: Option<String>,
     /// Agent profiles (store + `profiles-changed`).
     pub profiles: Arc<ProfilesCtx>,
     /// `<projects_root>/mira-bots.workspace.json`, read on demand (shared with `TicketsCtx`).
@@ -230,6 +233,7 @@ impl AppState {
             workspace_warning: ws.warning,
             projects_total: crate::projects::list_projects(&self.paths.projects_root).len(),
             profiles_migrated: self.profiles_migrated,
+            inbox_warning: self.inbox_warning.clone(),
         }
     }
 
@@ -1899,6 +1903,64 @@ pub fn open_log_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
         .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
 }
 
+// ---- inbox commands (step 6c, plan punkt 11; cores on `TicketsCtx`, `inbox::ipc`) ----
+
+/// The inbox: items without bodies and the status per source (also the `inbox-changed`
+/// payload).
+#[tauri::command]
+pub fn get_inbox(state: State<'_, AppState>) -> Result<InboxPayload, String> {
+    Ok(state.tickets.inbox_payload())
+}
+
+/// One inbox item with its body (the Start dialog).
+#[tauri::command]
+pub fn get_inbox_item(state: State<'_, AppState>, id: String) -> Result<InboxItem, String> {
+    state.tickets.inbox_item(&id)
+}
+
+/// Refreshes the inbox on its own thread; `false` when a refresh is already running. Only
+/// `manual` overrides the per-source minimum interval and back-off.
+#[tauri::command]
+pub async fn refresh_inbox(
+    state: State<'_, AppState>,
+    reason: RefreshReason,
+) -> Result<bool, String> {
+    state.tickets.inbox_refresh(reason)
+}
+
+/// "Start": the item becomes a ticket (blocking work — file moves, B3: `gh` — runs in
+/// `spawn_blocking`).
+// TODO(windows-verify): Start of `.mira-bots\inbox\fejl.md` creates the ticket and moves the
+// file to `started\` (plan D.111).
+#[tauri::command]
+pub async fn start_inbox_item(
+    state: State<'_, AppState>,
+    req: StartRequest,
+) -> Result<TicketSummary, String> {
+    let ctx = Arc::clone(&state.tickets);
+    tauri::async_runtime::spawn_blocking(move || ctx.inbox_start(req))
+        .await
+        .map_err(|e| format!("Start mislykkedes: {e}"))?
+}
+
+/// "Afvis".
+#[tauri::command]
+pub fn dismiss_inbox_item(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<InboxItemSummary, String> {
+    state.tickets.inbox_dismiss(&id)
+}
+
+/// "Fortryd" on a dismissed item.
+#[tauri::command]
+pub fn undismiss_inbox_item(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<InboxItemSummary, String> {
+    state.tickets.inbox_undismiss(&id)
+}
+
 // ---- ticket commands (C3.2) ----
 
 #[tauri::command]
@@ -2267,6 +2329,7 @@ mod tests {
             workplace_select: Mutex::new(None),
             tickets: t.ctx,
             tickets_warning: Some("tickets.json kunne ikke læses".into()),
+            inbox_warning: Some("inbox.json kunne ikke læses".into()),
             profiles: Arc::new(ProfilesCtx::new(
                 ProfileStore::load(profiles_dir(&dir.join("projects")), 1),
                 Arc::new(|_, _| {}),
@@ -2327,6 +2390,10 @@ mod tests {
         assert_eq!(
             d.tickets_warning.as_deref(),
             Some("tickets.json kunne ikke læses")
+        );
+        assert_eq!(
+            d.inbox_warning.as_deref(),
+            Some("inbox.json kunne ikke læses")
         );
         std::fs::write(dir.join("settings.json"), "{}").unwrap();
         std::fs::write(dir.join("mcp.json"), "{}").unwrap();

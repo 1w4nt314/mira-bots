@@ -239,6 +239,21 @@ impl InboxService {
             .collect()
     }
 
+    /// Started folder items whose file could not be moved (`moved == false`; refresh tries
+    /// again).
+    pub fn pending_moves(&self) -> Vec<InboxItem> {
+        self.doc
+            .items
+            .iter()
+            .filter(|i| {
+                i.kind == ExternalKind::Folder
+                    && i.state == InboxState::Started
+                    && i.moved == Some(false)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Items not started, not dismissed and not gone (Diagnostics' "Nye emner").
     pub fn new_count(&self) -> usize {
         self.doc

@@ -11,17 +11,41 @@
 //! system work never run under any of them.
 
 pub mod external;
+pub mod folder;
+pub mod ipc;
+pub mod refresh;
 pub mod service;
 pub mod source;
 pub mod start;
 pub mod store;
+pub mod write_back;
+
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::INBOX_SCHEMA_VERSION;
+use crate::config::{INBOX_SCHEMA_VERSION, INBOX_TMP_DIR};
 pub use crate::tickets::model::ExternalKind;
+pub use ipc::InboxPayload;
+pub use refresh::{InboxRuntime, RefreshReason};
 pub use service::{Applied, InboxError, InboxService};
+pub use source::{InboxStatus, Source, SourceStatus};
+pub use start::StartRequest;
 pub use store::{load_inbox, InboxStore, JsonInboxStore, MemoryInboxStore};
+
+/// Startup: removes `<app_data>/tmp/wb-*` (write-back body files a crash left behind; the
+/// folder itself stays). Returns how many were removed.
+pub fn clean_tmp(data_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(data_dir.join(INBOX_TMP_DIR)) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("wb-"))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
 
 /// Where an inbox item stands. Wire: `"new"|"started"|"dismissed"`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +194,60 @@ impl From<&InboxItem> for InboxItemSummary {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::agent::AgentManager;
+    use crate::tickets::test_support::{test_ctx_with_inbox, TestCtx};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    /// A ticket context whose projects root exists, with project `web` and its inbox folder
+    /// `web/.mira-bots/inbox/` (the root's `inbox/` is not created). Removed on drop.
+    pub struct FolderEnv {
+        pub t: TestCtx,
+        pub root: PathBuf,
+        pub store: MemoryInboxStore,
+    }
+
+    impl FolderEnv {
+        pub fn new(items: Vec<InboxItem>) -> Self {
+            let store = MemoryInboxStore::new();
+            let doc = InboxDoc {
+                items,
+                ..InboxDoc::default()
+            };
+            let inbox = InboxService::new(Box::new(store.clone()), doc);
+            let t = test_ctx_with_inbox(Arc::new(Mutex::new(AgentManager::new(5))), inbox);
+            let root = t.ctx.workspace.root().to_path_buf();
+            std::fs::create_dir_all(folder::project_inbox_dir(&root.join("web"))).unwrap();
+            FolderEnv { t, root, store }
+        }
+
+        /// `web/.mira-bots/inbox/`.
+        pub fn web_inbox(&self) -> PathBuf {
+            folder::project_inbox_dir(&self.root.join("web"))
+        }
+
+        /// Writes `name` into the web inbox.
+        pub fn write(&self, name: &str, text: &str) -> PathBuf {
+            let p = self.web_inbox().join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        }
+
+        /// The item for `folder:web:<name>`.
+        pub fn item(&self, name: &str) -> Option<InboxItem> {
+            let id = self.t.ctx.inbox_read(|i| {
+                i.find_by_external(ExternalKind::Folder, &format!("folder:web:{name}"))
+                    .map(|i| i.id.clone())
+            })?;
+            self.t.ctx.inbox_read(|i| i.get(&id))
+        }
+    }
+
+    impl Drop for FolderEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     /// A new GitHub item for issue `#n` in `o/r` (project `web`).
     pub fn github_item(id: &str, n: u64) -> InboxItem {
@@ -266,5 +344,18 @@ mod tests {
             serde_json::to_value(InboxDoc::default()).unwrap(),
             json!({"schemaVersion":1,"items":[]})
         );
+    }
+
+    #[test]
+    fn clean_tmp_removes_only_write_back_files() {
+        let dir = std::env::temp_dir().join(format!("mira-tmp-{}", uuid::Uuid::new_v4()));
+        assert_eq!(clean_tmp(&dir), 0);
+        let tmp = dir.join(INBOX_TMP_DIR);
+        std::fs::create_dir_all(tmp.join("wb-dir")).unwrap();
+        std::fs::write(tmp.join("wb-ab12cd34-1.md"), "x").unwrap();
+        std::fs::write(tmp.join("andet.md"), "x").unwrap();
+        assert_eq!(clean_tmp(&dir), 1);
+        assert!(tmp.join("andet.md").exists() && tmp.join("wb-dir").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

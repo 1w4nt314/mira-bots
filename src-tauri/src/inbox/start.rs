@@ -7,13 +7,17 @@
 //! first, then `inbox.json`; when the second fails, the next Start/refresh finds the ticket via
 //! `external.external_id` and repairs the item (`reconcile`).
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 
 use super::external::{clean_external_title, sanitize_external_body, Sanitized};
-use super::{InboxItem, InboxState};
+use super::folder::{folder_dir_for, move_with_retry};
+use super::{ExternalKind, InboxItem, InboxState};
 use crate::agent::now_ms;
 use crate::config::{
-    duplicate_hint_text, INBOX_BODY_MAX_CHARS, INBOX_ITEM_GONE, INBOX_PROJECT_REQUIRED,
+    duplicate_hint_text, INBOX_BODY_MAX_CHARS, INBOX_ITEM_GONE, INBOX_MOVE_FAILED_NOTE,
+    INBOX_PROJECT_REQUIRED, INBOX_STARTED_DIR,
 };
 use crate::projects::ProjectRef;
 use crate::tickets::model::{ExternalRef, TicketError, TicketSummary, WriteBack};
@@ -148,6 +152,55 @@ pub fn start_core(
         ticket.short_id()
     );
     Ok(TicketSummary::from(&ticket))
+}
+
+/// Start fails for a GitHub item until B3 fetches its body with `gh issue view`.
+pub const GITHUB_START_PENDING: &str = "Start fra GitHub er ikke klar endnu";
+
+/// Starts an inbox item (C6c.1; blocking — the command runs it in `spawn_blocking`). Folder:
+/// the stored body (cleaned again by [`start_core`]), then the file moves to `started/` without
+/// any lock; a failed move keeps the ticket (note "filen kunne ikke flyttes …", `moved =
+/// false`; the next refresh tries again). GitHub: B3.
+pub fn start_item(ctx: &Arc<TicketsCtx>, req: StartRequest) -> Result<TicketSummary, String> {
+    let item = ctx
+        .inbox_read(|i| i.get(&req.item_id))
+        .filter(|i| !i.gone)
+        .ok_or_else(|| INBOX_ITEM_GONE.to_string())?;
+    match item.kind {
+        ExternalKind::Folder => {
+            let body = sanitize_external_body(
+                item.body.as_deref().unwrap_or_default(),
+                INBOX_BODY_MAX_CHARS,
+            );
+            let summary = start_core(ctx, req, body, external_ref_for(&item))?;
+            move_started_file(ctx, &item, &summary.id);
+            Ok(summary)
+        }
+        ExternalKind::Github => Err(GITHUB_START_PENDING.into()),
+    }
+}
+
+/// Moves a started folder item's file to `started/` (no lock held) and records the result.
+fn move_started_file(ctx: &TicketsCtx, item: &InboxItem, ticket_id: &str) {
+    let dir = folder_dir_for(ctx.workspace.root(), &item.source_id);
+    let (Some(dir), Some(path)) = (dir, item.path.as_deref()) else {
+        return;
+    };
+    let moved = match move_with_retry(&dir.join(path), &dir.join(INBOX_STARTED_DIR)) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("inbox: moving the file of item {} failed: {e}", item.id);
+            let now = now_ms();
+            if let Err(e) = ctx.mutate(|s| s.note_by_system(ticket_id, INBOX_MOVE_FAILED_NOTE, now))
+            {
+                log::warn!("inbox: note failed: {e}");
+            }
+            false
+        }
+    };
+    if let Err(e) = ctx.inbox_mutate(|i| i.set_moved(&item.id, moved)) {
+        log::warn!("inbox: item {} not updated: {e}", item.id);
+    }
 }
 
 #[cfg(test)]
@@ -354,5 +407,69 @@ mod tests {
         assert!(duplicate_hint(&t2.ctx, Some(&web), "Issue 1").is_some());
         assert!(start(&t2, req("i1"), "x").is_ok());
         assert_eq!(t2.ctx.read(|x| x.len()), 2);
+    }
+
+    #[test]
+    fn start_moves_file_to_started_and_keeps_item_on_move_failure() {
+        use super::super::refresh::{refresh, RefreshReason};
+        use super::super::test_support::FolderEnv;
+        let env = FolderEnv::new(Vec::new());
+        env.write("a.md", "# Fejl A\nTrin\u{200B} 1");
+        env.write("b.md", "# Fejl B\nTrin 2");
+        let ctx = &env.t.ctx;
+        refresh(ctx, RefreshReason::Manual).unwrap();
+        ctx.join_inbox_threads();
+        let a = env.item("a.md").unwrap();
+        let s = start_item(ctx, req(&a.id)).unwrap();
+        let started = env.web_inbox().join(INBOX_STARTED_DIR);
+        assert!(started.join("a.md").is_file());
+        assert!(!env.web_inbox().join("a.md").exists());
+        let a = env.item("a.md").unwrap();
+        assert_eq!((a.state, a.moved), (InboxState::Started, Some(true)));
+        let tk = ctx.read(|x| x.get(&s.id)).unwrap();
+        assert_eq!(tk.title, "Fejl A");
+        assert_eq!(tk.body, "Trin 1");
+        let ext = tk.external.unwrap();
+        assert_eq!(ext.kind, ExternalKind::Folder);
+        assert_eq!(ext.path.as_deref(), Some("a.md"));
+        // `started/` cannot be created (a file is in the way): the Start still succeeds.
+        std::fs::remove_dir_all(&started).unwrap();
+        std::fs::write(&started, "blokerer").unwrap();
+        let b = env.item("b.md").unwrap();
+        let s = start_item(ctx, req(&b.id)).unwrap();
+        let tk = ctx.read(|x| x.get(&s.id)).unwrap();
+        assert_eq!(
+            tk.history.last().unwrap().note.as_deref(),
+            Some(INBOX_MOVE_FAILED_NOTE)
+        );
+        let b = env.item("b.md").unwrap();
+        assert_eq!((b.state, b.moved), (InboxState::Started, Some(false)));
+        assert!(env.web_inbox().join("b.md").is_file());
+        // The next refresh lists the file again but makes no duplicate, and moves it.
+        std::fs::remove_file(&started).unwrap();
+        refresh(ctx, RefreshReason::Manual).unwrap();
+        ctx.join_inbox_threads();
+        assert!(started.join("b.md").is_file());
+        assert_eq!(env.item("b.md").unwrap().moved, Some(true));
+        assert_eq!(ctx.inbox_payload().items.len(), 2);
+        assert_eq!(ctx.read(|x| x.len()), 2);
+        // A started item cannot start again.
+        assert!(start_item(ctx, req(&b.id))
+            .unwrap_err()
+            .contains(&tk.short_id()));
+    }
+
+    #[test]
+    fn start_item_of_unknown_or_github_item() {
+        let (t, _) = ctx_with(vec![github_item("g1", 3)]);
+        assert_eq!(
+            start_item(&t.ctx, req("nej")).unwrap_err(),
+            INBOX_ITEM_GONE.to_string()
+        );
+        assert_eq!(
+            start_item(&t.ctx, req("g1")).unwrap_err(),
+            GITHUB_START_PENDING.to_string()
+        );
+        assert_eq!(t.ctx.read(|x| x.len()), 0);
     }
 }

@@ -488,6 +488,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let profiles = Arc::new(ProfilesCtx::new(profile_store, Arc::clone(&emit)));
 
     let tickets_file = data_dir.join(TICKETS_FILE);
+    // Logs the warning itself; Diagnostik shows it (`inbox_warning`).
+    let (inbox_service, inbox_warning) = inbox::load_inbox(data_dir.join(INBOX_FILE));
+    let removed = inbox::clean_tmp(&data_dir);
+    if removed > 0 {
+        log::info!("inbox: {removed} leftover write-back file(s) removed");
+    }
     let (service, tickets_warning) = tickets::load_tickets(tickets_file.clone(), now_ms());
     let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMsg>();
     // `shared`: the project checks run on their own thread with the context (step 6b).
@@ -500,8 +506,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&workspace),
         // git is looked up (and probed) on first use, not at startup.
         Arc::new(git::SystemGit::new()),
-        // Step 6c: the inbox document (nothing writes it before Start/refresh exist).
-        inbox::load_inbox(data_dir.join(INBOX_FILE)).0,
+        // Step 6c: the inbox document (refreshed by the Workplace; B4).
+        inbox_service,
     )
     .shared();
     let sink = tauri_sink(
@@ -591,6 +597,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         workplace_select: Mutex::new(None),
         tickets,
         tickets_warning,
+        inbox_warning,
         profiles,
         workspace,
         profiles_migrated,
@@ -693,6 +700,12 @@ pub fn run() {
             commands::set_projects_root,
             commands::move_agent_to_project,
             commands::ticket_start_playbook,
+            commands::get_inbox,
+            commands::get_inbox_item,
+            commands::refresh_inbox,
+            commands::start_inbox_item,
+            commands::dismiss_inbox_item,
+            commands::undismiss_inbox_item,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -787,10 +800,10 @@ mod tests {
     }
 
     /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50; plan6b punkt 6:
-    /// → 51). Counted from the source so a command added without a handler (or the other way
-    /// round) is noticed.
+    /// → 51; plan6c punkt 11: → 57). Counted from the source so a command added without a
+    /// handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_51_commands() {
+    fn generate_handler_lists_57_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -799,8 +812,14 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 51, "{names:?}");
+        assert_eq!(names.len(), 57, "{names:?}");
         for n in [
+            "get_inbox",
+            "get_inbox_item",
+            "refresh_inbox",
+            "start_inbox_item",
+            "dismiss_inbox_item",
+            "undismiss_inbox_item",
             "ticket_start_playbook",
             "close_workplace",
             "list_projects",

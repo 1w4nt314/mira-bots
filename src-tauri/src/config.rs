@@ -405,6 +405,10 @@ pub fn foreign_project_note(named: &str, folder_project: &str) -> String {
 pub const INBOX_FILE_TOO_BIG_NOTE: &str = "filen er over 256 KB og springes over";
 /// Folder note: more than [`INBOX_FILES_PER_DIR_MAX`] files.
 pub const INBOX_TOO_MANY_FILES_NOTE: &str = "kun de første 200 filer læses";
+/// Source error of a folder source (C6c.5).
+pub fn folder_read_failed_note(err: &str) -> String {
+    format!("mappen kunne ikke læses: {err}")
+}
 /// Start dialog warning: an open ticket with the same title exists.
 pub fn duplicate_hint_text(short: &str, title: &str) -> String {
     format!("Ligner ticket {short}: «{title}»")
@@ -677,6 +681,10 @@ mod tests {
             "filen er over 256 KB og springes over"
         );
         assert_eq!(INBOX_TOO_MANY_FILES_NOTE, "kun de første 200 filer læses");
+        assert_eq!(
+            folder_read_failed_note("nægtet"),
+            "mappen kunne ikke læses: nægtet"
+        );
         assert_eq!(
             duplicate_hint_text("ab12cd34", "Fix"),
             "Ligner ticket ab12cd34: «Fix»"

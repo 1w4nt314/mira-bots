@@ -332,6 +332,10 @@ pub struct Diagnostics {
     pub projects_total: usize,
     /// Profiles copied from the step 1–5 agents root at this start (0 otherwise).
     pub profiles_migrated: usize,
+    // ---- step 6c ----
+    /// Set when `inbox.json` could not be read at startup (renamed to `.broken-<ts>`, or
+    /// unreadable → read-only).
+    pub inbox_warning: Option<String>,
 }
 
 #[cfg(test)]
@@ -550,6 +554,7 @@ mod tests {
             workspace_warning: None,
             projects_total: 3,
             profiles_migrated: 7,
+            inbox_warning: None,
         };
         // Step 7 fields, checked apart (the json! below is at the macro recursion limit),
         // including the serde order: platform after appVersion, pipeNote after pipeReady.
@@ -561,6 +566,9 @@ mod tests {
         let obj = value.as_object_mut().unwrap();
         assert_eq!(obj.remove("platform"), Some(json!("linux")));
         assert_eq!(obj.remove("pipeNote"), Some(Value::Null));
+        // Step 6c fields, checked apart as well (last in the serde order).
+        assert!(at("profilesMigrated") < at("inboxWarning"));
+        assert_eq!(obj.remove("inboxWarning"), Some(Value::Null));
         assert_eq!(
             value,
             json!({

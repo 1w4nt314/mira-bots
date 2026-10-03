@@ -29,6 +29,9 @@ pub const WORKPLACE_SELECT: &str = "workplace-select";
 pub const TICKETS_CHANGED: &str = "tickets-changed";
 /// Full profile list (`AgentProfile[]`) after a profile was saved, deleted or reset.
 pub const PROFILES_CHANGED: &str = "profiles-changed";
+/// The inbox (`InboxPayload`: items without bodies + status per source) after any inbox change
+/// and at the start and end of a refresh (step 6c).
+pub const INBOX_CHANGED: &str = "inbox-changed";
 
 /// Payload of `workplace-select` and the result of `take_workplace_selection`: which agent and/or
 /// sidebar tab the workplace window should show (`tab`: "permissions" | "diagnostics" |
@@ -99,6 +102,7 @@ mod tests {
         assert_eq!(WORKPLACE_SELECT, "workplace-select");
         assert_eq!(TICKETS_CHANGED, "tickets-changed");
         assert_eq!(PROFILES_CHANGED, "profiles-changed");
+        assert_eq!(INBOX_CHANGED, "inbox-changed");
     }
 
     #[test]
