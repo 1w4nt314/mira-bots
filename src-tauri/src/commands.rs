@@ -28,6 +28,7 @@ use crate::config::{
 };
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
+use crate::gh::{GhAuthResult, GhProbe};
 use crate::hooks::settings::write_profile_settings;
 use crate::hooks::status::AgentStatus;
 use crate::inbox::{InboxItem, InboxItemSummary, InboxPayload, RefreshReason, StartRequest};
@@ -42,6 +43,7 @@ use crate::profiles::prompt::{profile_files_dir, write_profile_prompt};
 use crate::profiles::ProfilesCtx;
 use crate::projects::{self, AssignmentProject, Project, ProjectError, ProjectId, ProjectRef};
 use crate::tickets::dispatcher::{DispatchMsg, RestartForTicket, RestartPort};
+use crate::tickets::model::WriteBack;
 use crate::tickets::model::{
     ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
     TicketSummary, WorkspaceRules,
@@ -110,6 +112,9 @@ pub struct AppState {
     pub hook_stats: Arc<HookStats>,
     /// Result of the one-shot background `claude --version` probe.
     pub claude_version: Arc<Mutex<VersionProbe>>,
+    /// Result of the background `gh --version` probe (step 6c; started again by Diagnostik
+    /// while gh is missing and the lookup may run again).
+    pub gh_probe: Arc<Mutex<GhProbe>>,
     /// Agent/tab to select when a newly created workplace window asks
     /// (`take_workplace_selection`).
     pub workplace_select: Mutex<Option<WorkplaceSelection>>,
@@ -189,6 +194,12 @@ impl AppState {
             claude_code_args_supported,
             claude_code_mcp_supported,
         ) = version_fields(&lock(&self.claude_version));
+        // gh missing: look again (on the gh-version thread) once the cached miss expired, so
+        // a gh installed while the app runs shows up here.
+        if *lock(&self.gh_probe) == VersionProbe::NotFound && crate::gh::gh_lookup_due() {
+            crate::gh::start_gh_probe(Arc::clone(&self.gh_probe));
+        }
+        let (gh_version, gh_version_note) = crate::gh::version_fields(&lock(&self.gh_probe));
         let ws = self.workspace.snapshot();
         Diagnostics {
             claude_path: path_string(&find_claude()),
@@ -234,6 +245,17 @@ impl AppState {
             projects_total: crate::projects::list_projects(&self.paths.projects_root).len(),
             profiles_migrated: self.profiles_migrated,
             inbox_warning: self.inbox_warning.clone(),
+            gh_path: path_string(&crate::gh::known_gh()),
+            gh_version,
+            gh_version_note,
+            inbox_path: self
+                .paths
+                .data_dir
+                .join(crate::config::INBOX_FILE)
+                .to_string_lossy()
+                .into_owned(),
+            inbox_new: self.tickets.inbox_read(|i| i.new_count()),
+            inbox_sources: self.tickets.inbox_sources_diag(),
         }
     }
 
@@ -1961,6 +1983,47 @@ pub fn undismiss_inbox_item(
     state.tickets.inbox_undismiss(&id)
 }
 
+/// "Prøv igen" on a Done ticket from the inbox: the write back again (GitHub: a marker check
+/// first, so a comment is never posted twice). Blocking work in `spawn_blocking`.
+// TODO(windows-verify): network off at Done → "ikke meldt tilbage"; on again → "Prøv igen"
+// posts exactly one comment, also after a restart mid-attempt (plan6c D.113).
+#[tauri::command]
+pub async fn retry_write_back(
+    state: State<'_, AppState>,
+    ticket_id: String,
+) -> Result<WriteBack, String> {
+    let ctx = Arc::clone(&state.tickets);
+    tauri::async_runtime::spawn_blocking(move || ctx.inbox_retry_write_back(&ticket_id))
+        .await
+        .map_err(|e| format!("Tilbagemelding mislykkedes: {e}"))?
+}
+
+/// Opens the GitHub address of an inbox item or of a ticket from the inbox (`id`: either) in
+/// the default browser — only an `https://github.com/<repo>/issues/<n>` address looked up in the
+/// stored data, never one from the caller.
+// TODO(macos-verify): the "#n" button opens the default browser (plan6c D.macOS 24).
+#[tauri::command]
+pub fn open_inbox_url(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let url = state.tickets.inbox_url(&id)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("Kunne ikke åbne adressen: {e}"))
+}
+
+/// "Tjek gh-login" (Diagnostik; only on a click): `gh auth status --hostname github.com`
+/// without token lines.
+#[tauri::command]
+pub async fn check_gh_auth(state: State<'_, AppState>) -> Result<GhAuthResult, String> {
+    let ctx = Arc::clone(&state.tickets);
+    tauri::async_runtime::spawn_blocking(move || ctx.inbox_check_gh_auth())
+        .await
+        .map_err(|e| format!("gh-login kunne ikke tjekkes: {e}"))
+}
+
 // ---- ticket commands (C3.2) ----
 
 #[tauri::command]
@@ -2326,6 +2389,9 @@ mod tests {
             sink: Arc::new(|_| {}),
             hook_stats: Arc::new(HookStats::default()),
             claude_version: Arc::new(Mutex::new(VersionProbe::Ok("2.1.286 (Claude Code)".into()))),
+            gh_probe: Arc::new(Mutex::new(VersionProbe::Ok(
+                "gh version 2.39.0 (2026-01-01)".into(),
+            ))),
             workplace_select: Mutex::new(None),
             tickets: t.ctx,
             tickets_warning: Some("tickets.json kunne ikke læses".into()),
@@ -2395,6 +2461,11 @@ mod tests {
             d.inbox_warning.as_deref(),
             Some("inbox.json kunne ikke læses")
         );
+        assert_eq!(d.gh_version.as_deref(), Some("2.39.0"));
+        assert_eq!(d.gh_version_note.as_deref(), Some(crate::gh::GH_OLD_NOTE));
+        assert!(d.inbox_path.ends_with("inbox.json"));
+        assert_eq!(d.inbox_new, 0);
+        assert!(d.inbox_sources.is_empty(), "no projects, no root inbox");
         std::fs::write(dir.join("settings.json"), "{}").unwrap();
         std::fs::write(dir.join("mcp.json"), "{}").unwrap();
         state

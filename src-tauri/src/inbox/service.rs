@@ -112,6 +112,12 @@ fn update_from(it: &mut InboxItem, f: &FetchedItem) -> bool {
     it.candidates = f.candidates.clone();
     it.updated_at = f.updated_at.clone();
     it.fingerprint = f.fingerprint.clone();
+    // Only a known type name survives (the source already validated it against the playbooks).
+    it.ticket_kind = f
+        .ticket_kind
+        .as_deref()
+        .map(str::to_lowercase)
+        .filter(|k| crate::tickets::playbook::is_playbook_name(k));
     *it != before
 }
 
@@ -139,6 +145,7 @@ fn new_item(source: &SourceId, f: &FetchedItem, now: u64) -> InboxItem {
         gone: false,
         moved: None,
         notes: Vec::new(),
+        ticket_kind: None,
     };
     update_from(&mut it, f);
     it
@@ -527,6 +534,33 @@ mod tests {
         assert_eq!(it.body.as_deref(), Some("xy"));
         assert_eq!(it.notes, vec!["1 HTML-kommentar(er) fjernet".to_string()]);
         assert_eq!(it.source_id, "folder:_rod");
+    }
+
+    #[test]
+    fn apply_keeps_only_a_known_ticket_kind() {
+        let (mut s, _) = svc();
+        let src = SourceId::folder(Some("web"));
+        let item = |n: &str, kind: Option<&str>| FetchedItem {
+            external_id: format!("folder:web:{n}"),
+            title: n.into(),
+            body: Some("B".into()),
+            ticket_kind: kind.map(str::to_string),
+            ..FetchedItem::default()
+        };
+        s.apply(
+            &src,
+            fetched(
+                vec![
+                    item("a.md", Some("Bug")),
+                    item("b.md", Some("ikke et navn!")),
+                ],
+                true,
+            ),
+            1,
+        )
+        .unwrap();
+        let kinds: Vec<Option<String>> = s.list().into_iter().map(|i| i.ticket_kind).collect();
+        assert_eq!(kinds, vec![Some("bug".to_string()), None]);
     }
 
     #[test]

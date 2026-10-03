@@ -5,6 +5,7 @@ pub mod commands;
 pub mod config;
 pub mod diagnostics;
 pub mod events;
+pub mod gh;
 pub mod git;
 pub mod hooks;
 pub mod inbox;
@@ -362,6 +363,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
     let claude_version = Arc::new(Mutex::new(VersionProbe::Pending));
     start_version_probe(Arc::clone(&claude_version));
+    // Step 6c: `gh --version` on the `gh-version` thread (lookup included; never blocks setup).
+    let gh_probe = Arc::new(Mutex::new(VersionProbe::Pending));
+    gh::start_gh_probe(Arc::clone(&gh_probe));
 
     let log_file = match app.path().app_log_dir() {
         Ok(d) => Some(d.join(format!("{LOG_FILE_STEM}.log"))),
@@ -594,6 +598,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         sink,
         hook_stats,
         claude_version,
+        gh_probe,
         workplace_select: Mutex::new(None),
         tickets,
         tickets_warning,
@@ -706,6 +711,9 @@ pub fn run() {
             commands::start_inbox_item,
             commands::dismiss_inbox_item,
             commands::undismiss_inbox_item,
+            commands::retry_write_back,
+            commands::open_inbox_url,
+            commands::check_gh_auth,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -800,10 +808,10 @@ mod tests {
     }
 
     /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50; plan6b punkt 6:
-    /// → 51; plan6c punkt 11: → 57). Counted from the source so a command added without a
+    /// → 51; plan6c punkt 11: → 57; plan6c punkt 15: → 60). Counted from the source so a command added without a
     /// handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_57_commands() {
+    fn generate_handler_lists_60_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -812,7 +820,7 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 57, "{names:?}");
+        assert_eq!(names.len(), 60, "{names:?}");
         for n in [
             "get_inbox",
             "get_inbox_item",
@@ -820,6 +828,9 @@ mod tests {
             "start_inbox_item",
             "dismiss_inbox_item",
             "undismiss_inbox_item",
+            "retry_write_back",
+            "open_inbox_url",
+            "check_gh_auth",
             "ticket_start_playbook",
             "close_workplace",
             "list_projects",

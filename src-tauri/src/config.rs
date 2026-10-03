@@ -409,6 +409,22 @@ pub const INBOX_TOO_MANY_FILES_NOTE: &str = "kun de første 200 filer læses";
 pub fn folder_read_failed_note(err: &str) -> String {
     format!("mappen kunne ikke læses: {err}")
 }
+/// Source error of a rate-limited GitHub source with the local clock time of the next try
+/// (C6c.5).
+pub fn rate_limited_note(hhmm: &str) -> String {
+    format!("GitHub: rate limit — prøver igen kl. {hhmm}")
+}
+/// `retry_write_back` on a ticket whose write back is done (C6c.5).
+pub const WRITE_BACK_ALREADY_DONE: &str = "Allerede meldt tilbage";
+/// `retry_write_back` while a write back runs.
+pub const WRITE_BACK_RUNNING: &str = "Tilbagemeldingen er i gang";
+/// `retry_write_back` on a ticket that is not Done or has no external source.
+pub const WRITE_BACK_NOT_POSSIBLE: &str = "Kun færdige tickets fra indbakken kan meldes tilbage";
+/// `retry_write_back` on a GitHub ticket whose project has `writeBack.comment` off.
+pub const WRITE_BACK_OFF: &str =
+    "Tilbagemelding til GitHub er slået fra (project.json: github.writeBack.comment)";
+/// `open_inbox_url` without a valid GitHub address.
+pub const INBOX_NO_URL: &str = "Ingen GitHub-adresse at åbne";
 /// Start dialog warning: an open ticket with the same title exists.
 pub fn duplicate_hint_text(short: &str, title: &str) -> String {
     format!("Ligner ticket {short}: «{title}»")
@@ -650,6 +666,11 @@ mod tests {
             "Issuen er lukket på GitHub; den startes ikke"
         );
         assert_eq!(INBOX_PROJECT_REQUIRED, "Vælg et projekt");
+        assert_eq!(
+            rate_limited_note("14:05"),
+            "GitHub: rate limit — prøver igen kl. 14:05"
+        );
+        assert_eq!(WRITE_BACK_ALREADY_DONE, "Allerede meldt tilbage");
         assert_eq!(
             started_from_note("GitHub issue #7 i o/r"),
             "startet fra indbakken: GitHub issue #7 i o/r"

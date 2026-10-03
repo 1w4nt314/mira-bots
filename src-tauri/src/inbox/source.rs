@@ -57,6 +57,8 @@ pub struct FetchedItem {
     pub project: Option<String>,
     pub candidates: Vec<String>,
     pub notes: Vec<String>,
+    /// Folder files: the frontmatter `kind:` when it names a known type (B3).
+    pub ticket_kind: Option<String>,
 }
 
 /// The result of one fetch.
@@ -251,6 +253,9 @@ impl SourceStatus {
         self.error = Some(e.text.clone());
         self.error_kind = Some(e.kind);
         self.next_retry_at = next_retry(self.fails, now, e.kind);
+        if let (SourceErrorKind::RateLimited, Some(at)) = (e.kind, self.next_retry_at) {
+            self.error = Some(crate::config::rate_limited_note(&crate::gh::local_hhmm(at)));
+        }
     }
 }
 

@@ -219,11 +219,19 @@ fn scan(dir: &Path, project: Option<&str>, kinds: Option<&[String]>) -> io::Resu
         };
         let parsed = parse_frontmatter(&text);
         let mut notes = parsed.notes;
-        if let (Some(k), Some(kinds)) = (parsed.kind.as_deref(), kinds) {
-            if validate_kind(Some(k), kinds).is_err() {
-                notes.push(unknown_kind_note(k));
-            }
-        }
+        // Without the workspace's playbooks only bug/feature are known.
+        let ticket_kind = match parsed.kind.as_deref() {
+            None => None,
+            Some(k) => match validate_kind(Some(k), kinds.unwrap_or_default()) {
+                Ok(kind) => kind,
+                Err(_) => {
+                    if kinds.is_some() {
+                        notes.push(unknown_kind_note(k));
+                    }
+                    None
+                }
+            },
+        };
         let item_project = match (project, parsed.project.as_deref()) {
             (Some(own), Some(named)) => {
                 if !same_id(own, named) {
@@ -250,6 +258,7 @@ fn scan(dir: &Path, project: Option<&str>, kinds: Option<&[String]>) -> io::Resu
             fingerprint: Some(fingerprint(&meta)),
             project: item_project,
             notes,
+            ticket_kind,
             ..FetchedItem::default()
         });
     }
@@ -659,6 +668,9 @@ mod tests {
             ]
         );
         assert!(f.items[1].notes.is_empty());
+        // `kind:` is kept when known (the Start dialog preselects it), never when unknown.
+        assert_eq!(f.items[0].ticket_kind, None);
+        assert_eq!(f.items[1].ticket_kind.as_deref(), Some("bug"));
         // Root files: a valid, existing project is used (its on-disk name); else none.
         let rdir = root.join(INBOX_DIR);
         fs::create_dir_all(&rdir).unwrap();

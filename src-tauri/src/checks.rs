@@ -45,8 +45,101 @@ pub struct ProjectFile {
     pub checks: Vec<Check>,
     /// The base branch for the ticket branches of this project (wins over the workspace's).
     pub git_base: Option<String>,
-    /// What was adjusted or ignored (clamped `timeoutSec`, an invalid `gitBase`); logged.
+    /// What was adjusted or ignored (clamped `timeoutSec`, an invalid `gitBase`, an invalid
+    /// `github`); logged.
     pub notes: Vec<String>,
+    /// The project's GitHub issues source (step 6c, C6c.2); `None`: absent or invalid (a note).
+    pub github: Option<GithubConfig>,
+}
+
+/// `project.json` → `github` (step 6c, plan punkt 13): the repo whose open issues the inbox
+/// lists (`labels`: all of them, AND), and what Done writes back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GithubConfig {
+    /// `owner/name` ([`crate::gh::valid_repo`]).
+    pub repo: String,
+    /// At most [`GITHUB_LABELS_MAX`], one line, 1–[`GITHUB_LABEL_MAX_CHARS`] chars each.
+    pub labels: Vec<String>,
+    /// Always `"open"` in 6c.
+    pub state: String,
+    pub write_back: WriteBackConfig,
+}
+
+/// `github.writeBack` (default: nothing is written; a comment is public in a public repo).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteBackConfig {
+    pub comment: bool,
+    pub close: bool,
+}
+
+/// Most labels of `github.labels`.
+pub const GITHUB_LABELS_MAX: usize = 10;
+/// Longest label of `github.labels`.
+pub const GITHUB_LABEL_MAX_CHARS: usize = 50;
+
+/// Prefix of every note that switches the GitHub source off.
+pub const GITHUB_IGNORED_PREFIX: &str = "project.json: github ignoreres: ";
+
+/// Parses `github` (plan punkt 13). `Err(reason)`: the source is off and the caller adds the
+/// note [`GITHUB_IGNORED_PREFIX`]`reason`; `notes` gets the milder ones (an ignored `state`).
+fn parse_github(v: &Value, notes: &mut Vec<String>) -> Result<GithubConfig, String> {
+    let Value::Object(g) = v else {
+        return Err("skal være et objekt".into());
+    };
+    let repo = match g.get("repo") {
+        Some(Value::String(r)) if crate::gh::valid_repo(r.trim()) => r.trim().to_string(),
+        Some(Value::String(r)) => {
+            return Err(format!(
+                "repo «{}» skal have formen ejer/navn",
+                crate::tickets::prompt::one_line(r)
+            ))
+        }
+        _ => return Err("repo mangler (formen ejer/navn)".into()),
+    };
+    let labels_rule = format!(
+        "labels skal være en liste med højst {GITHUB_LABELS_MAX} tekster på 1–{GITHUB_LABEL_MAX_CHARS} tegn"
+    );
+    let labels = match g.get("labels") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(list)) if list.len() <= GITHUB_LABELS_MAX => list
+            .iter()
+            .map(|l| one_line_text(l, GITHUB_LABEL_MAX_CHARS))
+            .collect::<Option<Vec<String>>>()
+            .ok_or_else(|| labels_rule.clone())?,
+        Some(_) => return Err(labels_rule),
+    };
+    match g.get("state") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s.trim() == "open" => {}
+        Some(other) => notes.push(format!(
+            "project.json: github.state «{}» ignoreres (kun \"open\")",
+            crate::tickets::prompt::one_line(&match other {
+                Value::String(s) => s.clone(),
+                v => v.to_string(),
+            })
+        )),
+    }
+    let write_back = match g.get("writeBack") {
+        None | Some(Value::Null) => WriteBackConfig::default(),
+        Some(Value::Object(w)) => {
+            let flag = |k: &str| match w.get(k) {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(_) => Err(format!("writeBack.{k} skal være true eller false")),
+            };
+            WriteBackConfig {
+                comment: flag("comment")?,
+                close: flag("close")?,
+            }
+        }
+        Some(_) => return Err("writeBack skal være et objekt".into()),
+    };
+    Ok(GithubConfig {
+        repo,
+        labels,
+        state: "open".into(),
+        write_back,
+    })
 }
 
 /// `<project_dir>/.mira-bots/project.json`, joined component by component.
@@ -142,6 +235,13 @@ pub fn parse_project_file(text: &str) -> Result<ProjectFile, String> {
         Some(_) => out
             .notes
             .push("project.json: gitBase skal være en tekst; den ignoreres".into()),
+    }
+    match map.get("github") {
+        None | Some(Value::Null) => {}
+        Some(g) => match parse_github(g, &mut out.notes) {
+            Ok(c) => out.github = Some(c),
+            Err(reason) => out.notes.push(format!("{GITHUB_IGNORED_PREFIX}{reason}")),
+        },
     }
     Ok(out)
 }
@@ -666,6 +766,118 @@ mod tests {
         assert_eq!(
             err(&format!(r#"{{"checks": [{eleven}]}}"#)),
             "project.json: højst 10 tjek (filen har 11)"
+        );
+    }
+
+    #[test]
+    fn github_config_parses() {
+        let f = parse_project_file(
+            r#"{"gitBase": "main", "github": {"repo": " owner/name ", "labels": ["bug", "help wanted"],
+                "state": "open", "writeBack": {"comment": true, "close": false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.github,
+            Some(GithubConfig {
+                repo: "owner/name".into(),
+                labels: vec!["bug".into(), "help wanted".into()],
+                state: "open".into(),
+                write_back: WriteBackConfig {
+                    comment: true,
+                    close: false
+                },
+            })
+        );
+        assert!(f.notes.is_empty(), "{:?}", f.notes);
+        // Defaults: no labels, nothing written back.
+        let f = parse_project_file(r#"{"github": {"repo": "o/r"}}"#).unwrap();
+        let g = f.github.unwrap();
+        assert_eq!(
+            (g.labels.len(), g.write_back),
+            (0, WriteBackConfig::default())
+        );
+        // Another state: a note, the source stays (open).
+        let f = parse_project_file(r#"{"github": {"repo": "o/r", "state": "all"}}"#).unwrap();
+        assert_eq!(f.github.unwrap().state, "open");
+        assert_eq!(
+            f.notes,
+            vec!["project.json: github.state «all» ignoreres (kun \"open\")"]
+        );
+        // Without github: none.
+        assert_eq!(
+            parse_project_file(r#"{"checks": []}"#).unwrap().github,
+            None
+        );
+    }
+
+    #[test]
+    fn github_invalid_repo_is_note_not_error() {
+        let cases = [
+            (r#"{"github": "o/r"}"#, "skal være et objekt"),
+            (r#"{"github": {}}"#, "repo mangler (formen ejer/navn)"),
+            (
+                r#"{"github": {"repo": "not a repo"}}"#,
+                "repo «not a repo» skal have formen ejer/navn",
+            ),
+            (
+                r#"{"github": {"repo": "host/o/r"}}"#,
+                "repo «host/o/r» skal have formen ejer/navn",
+            ),
+            (
+                r#"{"github": {"repo": "o/r", "labels": "bug"}}"#,
+                "labels skal være en liste med højst 10 tekster på 1–50 tegn",
+            ),
+            (
+                r#"{"github": {"repo": "o/r", "labels": ["a\nb"]}}"#,
+                "labels skal være en liste med højst 10 tekster på 1–50 tegn",
+            ),
+            (
+                r#"{"github": {"repo": "o/r", "writeBack": true}}"#,
+                "writeBack skal være et objekt",
+            ),
+        ];
+        for (text, reason) in cases {
+            let f = parse_project_file(&format!(
+                r#"{{"checks": [{{"name": "t", "run": "x"}}], {}"#,
+                &text[1..]
+            ))
+            .unwrap_or_else(|e| panic!("{text}: the file is kept ({e})"));
+            assert_eq!(f.github, None, "{text}");
+            assert_eq!(f.checks.len(), 1, "{text}: the checks stay");
+            assert_eq!(f.notes, vec![format!("{GITHUB_IGNORED_PREFIX}{reason}")]);
+        }
+        let eleven: Vec<String> = (0..11).map(|i| format!("\"l{i}\"")).collect();
+        let f = parse_project_file(&format!(
+            r#"{{"github": {{"repo": "o/r", "labels": [{}]}}}}"#,
+            eleven.join(",")
+        ))
+        .unwrap();
+        assert_eq!(f.github, None);
+    }
+
+    #[test]
+    fn github_close_requires_bool() {
+        for wb in [r#"{"close": "yes"}"#, r#"{"comment": 1}"#] {
+            let f = parse_project_file(&format!(
+                r#"{{"github": {{"repo": "o/r", "writeBack": {wb}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(f.github, None, "{wb}");
+            assert!(
+                f.notes[0].starts_with(GITHUB_IGNORED_PREFIX),
+                "{:?}",
+                f.notes
+            );
+            assert!(f.notes[0].ends_with("skal være true eller false"));
+        }
+        let f = parse_project_file(r#"{"github": {"repo": "o/r", "writeBack": {"close": true}}}"#)
+            .unwrap();
+        assert_eq!(
+            f.github.unwrap().write_back,
+            WriteBackConfig {
+                comment: false,
+                close: true
+            }
         );
     }
 

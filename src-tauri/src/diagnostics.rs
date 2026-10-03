@@ -336,6 +336,33 @@ pub struct Diagnostics {
     /// Set when `inbox.json` could not be read at startup (renamed to `.broken-<ts>`, or
     /// unreadable → read-only).
     pub inbox_warning: Option<String>,
+    /// The gh executable found so far (`None`: not found, or not looked up yet).
+    pub gh_path: Option<String>,
+    /// `"2.102.0"` from `gh --version`.
+    pub gh_version: Option<String>,
+    /// "ikke fundet" | "kører stadig" | "ældre end 2.40.0 — ikke afprøvet" | the probe's error.
+    pub gh_version_note: Option<String>,
+    /// `<app_data_dir>/inbox.json`.
+    pub inbox_path: String,
+    /// Items in state `new` that a source still lists.
+    pub inbox_new: usize,
+    /// One row per inbox source and project (folder and GitHub), with the last fetch.
+    pub inbox_sources: Vec<InboxSourceDiag>,
+}
+
+/// One inbox source of one project in Diagnostik (C6c.2 `inboxSources`).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxSourceDiag {
+    /// `None`: the projects root's `inbox/`.
+    pub project: Option<String>,
+    pub kind: crate::tickets::model::ExternalKind,
+    pub label: String,
+    /// Unix ms of the last successful fetch.
+    pub last_fetch_at: Option<u64>,
+    /// The last fetch's error, or why `project.json`'s `github` is ignored.
+    pub error: Option<String>,
+    pub items: usize,
 }
 
 #[cfg(test)]
@@ -555,6 +582,19 @@ mod tests {
             projects_total: 3,
             profiles_migrated: 7,
             inbox_warning: None,
+            gh_path: Some("/opt/homebrew/bin/gh".into()),
+            gh_version: Some("2.102.0".into()),
+            gh_version_note: None,
+            inbox_path: "/d/inbox.json".into(),
+            inbox_new: 2,
+            inbox_sources: vec![InboxSourceDiag {
+                project: Some("web".into()),
+                kind: crate::tickets::model::ExternalKind::Github,
+                label: "owner/name".into(),
+                last_fetch_at: None,
+                error: None,
+                items: 0,
+            }],
         };
         // Step 7 fields, checked apart (the json! below is at the macro recursion limit),
         // including the serde order: platform after appVersion, pipeNote after pipeReady.
@@ -569,6 +609,33 @@ mod tests {
         // Step 6c fields, checked apart as well (last in the serde order).
         assert!(at("profilesMigrated") < at("inboxWarning"));
         assert_eq!(obj.remove("inboxWarning"), Some(Value::Null));
+        // Step 6c B3: gh and the inbox sources, in this order after inboxWarning.
+        let keys = [
+            "inboxWarning",
+            "ghPath",
+            "ghVersion",
+            "ghVersionNote",
+            "inboxPath",
+            "inboxNew",
+            "inboxSources",
+        ];
+        assert!(keys.windows(2).all(|w| at(w[0]) < at(w[1])));
+        let b3: serde_json::Map<String, Value> = keys[1..]
+            .iter()
+            .map(|k| (k.to_string(), obj.remove(*k).unwrap()))
+            .collect();
+        assert_eq!(
+            Value::Object(b3),
+            json!({
+                "ghPath": "/opt/homebrew/bin/gh",
+                "ghVersion": "2.102.0",
+                "ghVersionNote": null,
+                "inboxPath": "/d/inbox.json",
+                "inboxNew": 2,
+                "inboxSources": [{"project": "web", "kind": "github", "label": "owner/name",
+                    "lastFetchAt": null, "error": null, "items": 0}]
+            })
+        );
         assert_eq!(
             value,
             json!({

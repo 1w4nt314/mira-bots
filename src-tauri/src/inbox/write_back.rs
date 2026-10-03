@@ -4,23 +4,34 @@
 //! The text ([`render_write_back`]) has no paths and no secrets: only the app's branch name and
 //! the base, the scrubbed summary ([`scrub_summary`]), the checks state and report titles. The
 //! folder source moves the file to `done/` and writes `<name>.result.md` with the same text
-//! without the marker ([`folder_write_back`], on the `mira-writeback` thread). GitHub (comment,
-//! close) comes in B3.
+//! without the marker ([`folder_write_back`], on the `mira-writeback` thread). GitHub
+//! ([`github_write_back`], B3): only when the project's `github.writeBack.comment` is true, a
+//! comment (`gh issue comment … --body-file`) with the hidden marker, then — only with `close:
+//! true` and a posted comment — `gh issue close … --reason completed`; two calls with their own
+//! states. A retry (`attempts > 0`) first looks for the marker among the issue's comments, so a
+//! comment is never posted twice.
 //!
-//! Locks: the write back is claimed under `inbox_lock` (state `none` → `inflight`, saved), the
-//! file work runs without any lock, the result is saved afterwards. Done stays Done whatever
-//! happens here.
+//! Locks: the write back is claimed under `inbox_lock` (state → `inflight`, saved before any
+//! call), the file and `gh` work runs without any of the app's document locks (GitHub: under the
+//! write-back lock only, which serialises the process's write calls ≥ 1 s apart), the result is
+//! saved afterwards. Done stays Done whatever happens here.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::external::{is_hidden_char, strip_html_comments};
 use super::folder::{folder_dir_for, move_with_retry, source_key_of, stem_of, write_result};
+use super::github::find_marker_comment;
 use crate::agent::now_ms;
+use crate::checks::WriteBackConfig;
 use crate::config::{
-    result_written_note, write_back_failed_note, INBOX_DONE_DIR, INBOX_MOVE_FAILED_NOTE,
-    INBOX_STARTED_DIR, WRITE_BACK_MAX_CHARS, WRITE_BACK_SUMMARY_MAX_CHARS,
+    issue_closed_note, result_written_note, write_back_failed_note, written_back_note,
+    INBOX_DONE_DIR, INBOX_MOVE_FAILED_NOTE, INBOX_STARTED_DIR, INBOX_TMP_DIR,
+    WRITE_BACK_ALREADY_DONE, WRITE_BACK_MAX_CHARS, WRITE_BACK_NOT_POSSIBLE, WRITE_BACK_OFF,
+    WRITE_BACK_RUNNING, WRITE_BACK_SUMMARY_MAX_CHARS,
 };
+use crate::gh::{error_text, valid_repo, GhCall};
 use crate::tickets::model::{
     ChecksState, ExternalKind, ExternalRef, GitMode, Ticket, TicketState, WriteBack, WriteBackState,
 };
@@ -301,6 +312,15 @@ pub fn locate_folder_file(dir: &Path, path: &str) -> Option<PathBuf> {
 /// is written anyway (next to where the file would be). Notes: "resultat skrevet til …" or
 /// "kunne ikke melde tilbage: …". `Ok` with the stored state; `Err` when there was nothing to do.
 pub fn folder_write_back(ctx: &Arc<TicketsCtx>, id: &str) -> Result<WriteBack, String> {
+    folder_write_back_with(ctx, id, false)
+}
+
+/// [`folder_write_back`]; `manual` ("Prøv igen") also retries after earlier attempts.
+fn folder_write_back_with(
+    ctx: &Arc<TicketsCtx>,
+    id: &str,
+    manual: bool,
+) -> Result<WriteBack, String> {
     let (t, ext, wb) = {
         let _serial = ctx.lock_inbox_serial();
         let t = ctx
@@ -311,7 +331,14 @@ pub fn folder_write_back(ctx: &Arc<TicketsCtx>, id: &str) -> Result<WriteBack, S
             .clone()
             .filter(|e| e.kind == ExternalKind::Folder)
             .ok_or_else(|| "ingen mappe-kilde".to_string())?;
-        if t.state != TicketState::Done || !wants_write_back(&ext) {
+        if manual {
+            match ext.write_back.comment {
+                _ if t.state != TicketState::Done => return Err(WRITE_BACK_NOT_POSSIBLE.into()),
+                WriteBackState::Done => return Err(WRITE_BACK_ALREADY_DONE.into()),
+                WriteBackState::Inflight => return Err(WRITE_BACK_RUNNING.into()),
+                WriteBackState::None | WriteBackState::Failed => {}
+            }
+        } else if t.state != TicketState::Done || !wants_write_back(&ext) {
             return Err("intet at melde tilbage".into());
         }
         let mut wb = ext.write_back.clone();
@@ -396,6 +423,252 @@ pub fn folder_write_back(ctx: &Arc<TicketsCtx>, id: &str) -> Result<WriteBack, S
         }
     }
     Ok(wb)
+}
+
+/// The project's `github.writeBack` of ticket `t` (`project.json`; absent: nothing).
+fn write_back_config(ctx: &TicketsCtx, t: &Ticket) -> WriteBackConfig {
+    t.project
+        .as_ref()
+        .and_then(|p| p.id())
+        .and_then(|p| crate::projects::find_project(ctx.workspace.root(), p))
+        .and_then(|dir| ctx.project_files.read(Path::new(&dir.path)).ok().flatten())
+        .and_then(|f| f.github)
+        .map(|g| g.write_back)
+        .unwrap_or_default()
+}
+
+/// Pause between two write calls of the process (research §5.4: GitHub's secondary limits).
+const WRITE_GAP: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
+
+/// How long to wait before the next write call when the last one was at `last`.
+fn wait_needed(last: Option<Instant>, now: Instant, gap: Duration) -> Duration {
+    last.map_or(Duration::ZERO, |l| {
+        gap.saturating_sub(now.saturating_duration_since(l))
+    })
+}
+
+/// Waits for [`WRITE_GAP`] after the last write call and records this one.
+fn pace(last: &mut Option<Instant>) {
+    let wait = wait_needed(*last, Instant::now(), WRITE_GAP);
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+    *last = Some(Instant::now());
+}
+
+/// What a GitHub write back does after the claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Comment (first look for the marker when an earlier attempt may have posted), then close.
+    Comment { check_marker: bool },
+    /// The comment is there; only the close is missing ("Prøv igen" after a failed close).
+    CloseOnly,
+}
+
+/// Saves `wb` on ticket `id` (logged when it fails: the ticket may be gone).
+fn save(ctx: &TicketsCtx, id: &str, wb: &WriteBack) {
+    let now = now_ms();
+    if let Err(e) = ctx.mutate(|s| s.set_write_back(id, wb.clone(), now)) {
+        log::warn!("inbox: write back of {} not saved: {e}", short(id));
+    }
+}
+
+/// `<data_dir>/tmp/wb-<short>-<ms>.md` with `text` (UTF-8 without BOM).
+fn body_file(ctx: &TicketsCtx, id: &str, text: &str) -> Result<PathBuf, String> {
+    let dir = ctx.data_dir.join(INBOX_TMP_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("tmp-mappen kunne ikke oprettes: {e}"))?;
+    let path = dir.join(format!("wb-{}-{}.md", short(id), now_ms()));
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|e| format!("den midlertidige fil kunne ikke skrives: {e}"))?;
+    Ok(path)
+}
+
+/// The GitHub write back of Done ticket `id` (plan A.7, punkt 15; on the `mira-writeback` thread
+/// from the Done hook, or `retry_write_back` with `manual`). Without `writeBack.comment: true`
+/// nothing happens (`Ok` with the unchanged state; a manual retry is refused). Claimed under
+/// `inbox_lock`: `comment` → `inflight`, `attempts + 1`, saved before any call. Then, under the
+/// write-back lock only: with earlier attempts the issue's comments are searched for the marker
+/// (found → `done` without posting; a failed search counts as "not found"); else `gh issue
+/// comment <n> --repo <repo> --body-file <tmp>` (the file is removed afterwards, also on
+/// failure). With `close: true` and the comment `done`: `gh issue close <n> --repo <repo>
+/// --reason completed` with its own state. History notes "meldt tilbage til GitHub #n", "issue
+/// #n lukket på GitHub" or "kunne ikke melde tilbage: …".
+pub fn github_write_back(
+    ctx: &Arc<TicketsCtx>,
+    id: &str,
+    manual: bool,
+) -> Result<WriteBack, String> {
+    let (t, ext, cfg, mut wb, step) = {
+        let _serial = ctx.lock_inbox_serial();
+        let t = ctx
+            .read(|s| s.get(id))
+            .ok_or_else(|| format!("ticket {} findes ikke", short(id)))?;
+        let ext = t
+            .external
+            .clone()
+            .filter(|e| e.kind == ExternalKind::Github && t.state == TicketState::Done)
+            .ok_or_else(|| WRITE_BACK_NOT_POSSIBLE.to_string())?;
+        let cfg = write_back_config(ctx, &t);
+        if !cfg.comment {
+            return if manual {
+                Err(WRITE_BACK_OFF.into())
+            } else {
+                Ok(ext.write_back)
+            };
+        }
+        let wb = ext.write_back.clone();
+        if wb.comment == WriteBackState::Inflight || wb.close == WriteBackState::Inflight {
+            return Err(WRITE_BACK_RUNNING.into());
+        }
+        let step = match wb.comment {
+            WriteBackState::Done if manual && cfg.close && wb.close != WriteBackState::Done => {
+                Step::CloseOnly
+            }
+            WriteBackState::Done => return Err(WRITE_BACK_ALREADY_DONE.into()),
+            _ if !manual && !wants_write_back(&ext) => return Err("intet at melde tilbage".into()),
+            _ => Step::Comment {
+                check_marker: wb.attempts > 0,
+            },
+        };
+        let mut wb = wb;
+        match step {
+            Step::Comment { .. } => {
+                wb.comment = WriteBackState::Inflight;
+                wb.attempts += 1;
+            }
+            Step::CloseOnly => wb.close = WriteBackState::Inflight,
+        }
+        let now = now_ms();
+        ctx.mutate(|s| s.set_write_back(id, wb.clone(), now))?;
+        (t, ext, cfg, wb, step)
+    };
+    let repo = ext.repo.clone().unwrap_or_default();
+    let number = ext.number.unwrap_or(0);
+    if !valid_repo(&repo) || number == 0 {
+        let e = "ugyldigt issue (repo eller nummer)".to_string();
+        match step {
+            Step::Comment { .. } => wb.comment = WriteBackState::Failed,
+            Step::CloseOnly => wb.close = WriteBackState::Failed,
+        }
+        wb.last_error = Some(e.clone());
+        save(ctx, id, &wb);
+        note(ctx, id, &write_back_failed_note(&e));
+        return Ok(wb);
+    }
+    let n = number.to_string();
+    let mut last = ctx
+        .write_back_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Step::Comment { check_marker } = step {
+        let found = if check_marker {
+            match find_marker_comment(&*ctx.gh, &repo, number, &marker(id)) {
+                Ok(found) => found,
+                Err(e) => {
+                    log::info!(
+                        "inbox: marker check of {} failed ({e:?}); posting",
+                        short(id)
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let result: Result<Option<String>, String> = match found {
+            Some(url) => {
+                log::info!("inbox: the comment of {} is already on GitHub", short(id));
+                Ok(Some(url).filter(|u| !u.is_empty()))
+            }
+            None => {
+                let text =
+                    render_write_back_with(&t, &known_roots(ctx, &t), &check_names(ctx, &t), true);
+                wb.last_body = Some(text.clone());
+                match body_file(ctx, id, &text) {
+                    Err(e) => Err(e),
+                    Ok(file) => {
+                        let mut call = GhCall::new(["issue", "comment", n.as_str(), "--repo"]);
+                        call.args.push(repo.clone());
+                        call.body_file = Some(file.clone());
+                        pace(&mut last);
+                        let r = ctx.gh.run(&call);
+                        if let Err(e) = std::fs::remove_file(&file) {
+                            log::warn!("inbox: {} not removed: {e}", file.display());
+                        }
+                        r.map(|out| {
+                            out.stdout
+                                .lines()
+                                .map(str::trim)
+                                .find(|l| l.starts_with("https://github.com/"))
+                                .map(str::to_string)
+                        })
+                        .map_err(|e| error_text(&e, &repo))
+                    }
+                }
+            }
+        };
+        let now = now_ms();
+        match result {
+            Ok(url) => {
+                wb.comment = WriteBackState::Done;
+                wb.comment_url = url;
+                wb.commented_at = Some(now);
+                wb.last_error = None;
+                save(ctx, id, &wb);
+                note(ctx, id, &written_back_note(number));
+            }
+            Err(e) => {
+                log::info!("inbox: write back of {} failed: {e}", short(id));
+                wb.comment = WriteBackState::Failed;
+                wb.last_error = Some(e.clone());
+                save(ctx, id, &wb);
+                note(ctx, id, &write_back_failed_note(&e));
+            }
+        }
+    }
+    if cfg.close && wb.comment == WriteBackState::Done && wb.close != WriteBackState::Done {
+        if wb.close != WriteBackState::Inflight {
+            wb.close = WriteBackState::Inflight;
+            save(ctx, id, &wb);
+        }
+        let mut call = GhCall::new(["issue", "close", n.as_str(), "--repo"]);
+        call.args
+            .extend([repo.clone(), "--reason".into(), "completed".into()]);
+        pace(&mut last);
+        match ctx.gh.run(&call) {
+            Ok(_) => {
+                wb.close = WriteBackState::Done;
+                wb.closed_at = Some(now_ms());
+                save(ctx, id, &wb);
+                note(ctx, id, &issue_closed_note(number));
+            }
+            Err(e) => {
+                let e = error_text(&e, &repo);
+                wb.close = WriteBackState::Failed;
+                wb.last_error = Some(e.clone());
+                save(ctx, id, &wb);
+                note(ctx, id, &write_back_failed_note(&e));
+            }
+        }
+    }
+    Ok(wb)
+}
+
+/// `retry_write_back` ("Prøv igen", C6c.1 `write_back`): the folder or GitHub write back of a
+/// Done external ticket, also after earlier attempts. "Allerede meldt tilbage" when it is done.
+pub fn write_back(ctx: &Arc<TicketsCtx>, id: &str) -> Result<WriteBack, String> {
+    let kind = ctx
+        .read(|s| s.get(id))
+        .and_then(|t| t.external.map(|e| e.kind))
+        .ok_or_else(|| WRITE_BACK_NOT_POSSIBLE.to_string())?;
+    match kind {
+        ExternalKind::Folder => folder_write_back_with(ctx, id, true),
+        ExternalKind::Github => github_write_back(ctx, id, true),
+    }
 }
 
 #[cfg(test)]
@@ -679,5 +952,300 @@ mod tests {
         assert_eq!(wb.comment, WriteBackState::None);
         assert_eq!(ctx.read(|x| x.get(&p.id)).unwrap().state, TicketState::Done);
         assert!(!env.web_inbox().join(INBOX_DONE_DIR).exists());
+    }
+
+    // ---- GitHub (B3) ----
+
+    use crate::gh::fake::{FakeGh, OFFLINE};
+    use crate::projects::ProjectRef;
+
+    const COMMENT_URL: &str = "https://github.com/o/r/issues/7#issuecomment-1\n";
+
+    /// A context with project `web` whose `project.json` has `github` with `write_back`.
+    fn gh_env(write_back: &str) -> (super::super::test_support::FolderEnv, Arc<FakeGh>) {
+        let gh = Arc::new(FakeGh::new());
+        let env = super::super::test_support::FolderEnv::with_gh(Vec::new(), gh.clone());
+        env.project_json(&format!(
+            r#"{{"github": {{"repo": "o/r", "writeBack": {write_back}}}}}"#
+        ));
+        (env, gh)
+    }
+
+    /// A GitHub ticket for issue #7 in project web, brought to Done (the hook runs; joined).
+    fn github_done(env: &super::super::test_support::FolderEnv) -> String {
+        let ctx = &env.t.ctx;
+        let ext = crate::tickets::model::test_support::github_ref(7);
+        let t = ctx
+            .mutate(|x| {
+                x.create_external(
+                    "Crash",
+                    "Trin",
+                    false,
+                    Some(ProjectRef::Existing("web".into())),
+                    None,
+                    ext,
+                    1,
+                )
+            })
+            .unwrap();
+        finish(ctx, &t.id);
+        ctx.join_inbox_threads();
+        t.id
+    }
+
+    fn wb_of(ctx: &TicketsCtx, id: &str) -> WriteBack {
+        ctx.read(|x| x.get(id))
+            .unwrap()
+            .external
+            .unwrap()
+            .write_back
+    }
+
+    fn notes_of(ctx: &TicketsCtx, id: &str) -> Vec<String> {
+        ctx.read(|x| x.get(id))
+            .unwrap()
+            .history
+            .iter()
+            .filter_map(|h| h.note.clone())
+            .collect()
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn write_back_posts_comment_then_closes_when_enabled() {
+        let (env, gh) = gh_env(r#"{"comment": true, "close": true}"#);
+        gh.reply(&["issue", "comment"], 0, COMMENT_URL, "");
+        gh.reply(&["issue", "close"], 0, "", "✓ Closed issue o/r#7 (Crash)");
+        let id = github_done(&env);
+        let ctx = &env.t.ctx;
+        let calls = gh.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        let body_file = gh.raw_calls()[0].body_file.clone().unwrap();
+        assert_eq!(
+            calls[0],
+            strs(&[
+                "issue",
+                "comment",
+                "7",
+                "--repo",
+                "o/r",
+                "--body-file",
+                &body_file.to_string_lossy()
+            ])
+        );
+        assert!(body_file.starts_with(ctx.data_dir.join(INBOX_TMP_DIR)));
+        let name = body_file
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with(&format!("wb-{}-", short(&id))) && name.ends_with(".md"));
+        assert!(!body_file.exists(), "the body file is removed");
+        assert_eq!(
+            calls[1],
+            strs(&[
+                "issue",
+                "close",
+                "7",
+                "--repo",
+                "o/r",
+                "--reason",
+                "completed"
+            ])
+        );
+        let body = &gh.bodies()[0];
+        assert!(body.starts_with(WRITE_BACK_HEADING));
+        assert!(body.contains("Rettet; token [fjernet] fjernet"));
+        assert!(body.contains(&marker(&id)));
+        assert!(!body.starts_with('\u{feff}'), "no BOM");
+        let wb = wb_of(ctx, &id);
+        assert_eq!(
+            (wb.comment, wb.close, wb.attempts),
+            (WriteBackState::Done, WriteBackState::Done, 1)
+        );
+        assert_eq!(
+            wb.comment_url.as_deref(),
+            Some("https://github.com/o/r/issues/7#issuecomment-1")
+        );
+        assert!(wb.commented_at.is_some() && wb.closed_at.is_some() && wb.last_error.is_none());
+        assert_eq!(wb.last_body.as_deref(), Some(body.as_str()));
+        let notes = notes_of(ctx, &id);
+        assert!(notes.contains(&written_back_note(7)));
+        assert!(notes.contains(&issue_closed_note(7)));
+        // Done: "Prøv igen" never posts again.
+        assert_eq!(
+            write_back(ctx, &id).unwrap_err(),
+            WRITE_BACK_ALREADY_DONE.to_string()
+        );
+        assert_eq!(gh.calls().len(), 2);
+        assert!(gh
+            .calls()
+            .iter()
+            .flatten()
+            .all(|a| a.trim_start_matches('-') != "body"));
+    }
+
+    #[test]
+    fn write_back_comment_only_when_close_is_off() {
+        let (env, gh) = gh_env(r#"{"comment": true}"#);
+        gh.reply(&["issue", "comment"], 0, COMMENT_URL, "");
+        let id = github_done(&env);
+        assert_eq!(gh.calls().len(), 1);
+        assert_eq!(gh.calls()[0][1], "comment");
+        let wb = wb_of(&env.t.ctx, &id);
+        assert_eq!(
+            (wb.comment, wb.close),
+            (WriteBackState::Done, WriteBackState::None)
+        );
+    }
+
+    #[test]
+    fn write_back_without_config_is_silent() {
+        for cfg in [r#"{"comment": false, "close": true}"#, "null"] {
+            let (env, gh) = gh_env(cfg);
+            let id = github_done(&env);
+            let ctx = &env.t.ctx;
+            assert!(gh.calls().is_empty(), "{cfg}: no gh call");
+            assert_eq!(wb_of(ctx, &id), WriteBack::default());
+            assert!(!notes_of(ctx, &id).iter().any(|n| n.contains("melde")));
+            assert_eq!(
+                write_back(ctx, &id).unwrap_err(),
+                WRITE_BACK_OFF.to_string()
+            );
+            assert!(gh.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn write_back_failure_sets_failed_and_note() {
+        let (env, gh) = gh_env(r#"{"comment": true, "close": true}"#);
+        gh.reply(&["issue", "comment"], 1, "", OFFLINE);
+        let id = github_done(&env);
+        let ctx = &env.t.ctx;
+        assert_eq!(gh.calls().len(), 1, "no close after a failed comment");
+        let wb = wb_of(ctx, &id);
+        assert_eq!(
+            (wb.comment, wb.close, wb.attempts),
+            (WriteBackState::Failed, WriteBackState::None, 1)
+        );
+        assert_eq!(
+            wb.last_error.as_deref(),
+            Some("ingen forbindelse til GitHub")
+        );
+        assert!(
+            notes_of(ctx, &id).contains(&write_back_failed_note("ingen forbindelse til GitHub"))
+        );
+        assert_eq!(ctx.read(|x| x.get(&id)).unwrap().state, TicketState::Done);
+        assert!(
+            std::fs::read_dir(ctx.data_dir.join(INBOX_TMP_DIR))
+                .unwrap()
+                .next()
+                .is_none(),
+            "the body file is removed on failure too"
+        );
+        // A close that fails after a posted comment keeps the comment done.
+        let (env, gh) = gh_env(r#"{"comment": true, "close": true}"#);
+        gh.reply(&["issue", "comment"], 0, COMMENT_URL, "");
+        gh.reply(
+            &["issue", "close"],
+            1,
+            "",
+            "HTTP 403: Resource not accessible",
+        );
+        gh.reply(&["issue", "close"], 0, "", "");
+        let id = github_done(&env);
+        let wb = wb_of(&env.t.ctx, &id);
+        assert_eq!(
+            (wb.comment, wb.close),
+            (WriteBackState::Done, WriteBackState::Failed)
+        );
+        // "Prøv igen" then only closes.
+        let wb = write_back(&env.t.ctx, &id).unwrap();
+        assert_eq!(
+            (wb.comment, wb.close),
+            (WriteBackState::Done, WriteBackState::Done)
+        );
+        let kinds: Vec<String> = gh.calls().iter().map(|c| c[1].clone()).collect();
+        assert_eq!(kinds, ["comment", "close", "close"]);
+    }
+
+    #[test]
+    fn retry_finds_marker_and_does_not_repost() {
+        let (env, gh) = gh_env(r#"{"comment": true}"#);
+        gh.captured(
+            &["issue", "comment"],
+            crate::proc::Captured {
+                timed_out: true,
+                ..crate::proc::Captured::default()
+            },
+        );
+        let id = github_done(&env);
+        let ctx = &env.t.ctx;
+        let wb = wb_of(ctx, &id);
+        assert_eq!((wb.comment, wb.attempts), (WriteBackState::Failed, 1));
+        assert_eq!(
+            wb.last_error.as_deref(),
+            Some("gh svarede ikke inden for 30 s")
+        );
+        // The comment did reach GitHub: the retry finds the marker and posts nothing.
+        let comments = serde_json::json!({"comments": [
+            {"body": "andet", "url": "https://github.com/o/r/issues/7#issuecomment-1"},
+            {"body": format!("x\n{}", marker(&id)), "url": "https://github.com/o/r/issues/7#issuecomment-2"}
+        ]})
+        .to_string();
+        gh.reply(
+            &["issue", "view", "7", "--repo", "o/r", "--json", "comments"],
+            0,
+            &comments,
+            "",
+        );
+        let wb = write_back(ctx, &id).unwrap();
+        assert_eq!((wb.comment, wb.attempts), (WriteBackState::Done, 2));
+        assert_eq!(
+            wb.comment_url.as_deref(),
+            Some("https://github.com/o/r/issues/7#issuecomment-2")
+        );
+        let kinds: Vec<String> = gh.calls().iter().map(|c| c[1].clone()).collect();
+        assert_eq!(kinds, ["comment", "view"], "no second comment");
+        assert_eq!(gh.bodies().len(), 1);
+        assert!(notes_of(ctx, &id).contains(&written_back_note(7)));
+    }
+
+    #[test]
+    fn retry_without_marker_posts_once_and_restart_marks_inflight_failed() {
+        let (env, gh) = gh_env(r#"{"comment": true}"#);
+        gh.reply(&["issue", "comment"], 1, "", OFFLINE);
+        gh.reply(&["issue", "comment"], 0, COMMENT_URL, "");
+        let id = github_done(&env);
+        let ctx = &env.t.ctx;
+        gh.reply(&["issue", "view"], 0, r#"{"comments": []}"#, "");
+        let wb = write_back(ctx, &id).unwrap();
+        assert_eq!((wb.comment, wb.attempts), (WriteBackState::Done, 2));
+        let kinds: Vec<String> = gh.calls().iter().map(|c| c[1].clone()).collect();
+        assert_eq!(kinds, ["comment", "view", "comment"]);
+        // A ticket that is not Done, or a plain one, cannot be retried.
+        let p = ctx.mutate(|x| x.create("P", "", false, 1)).unwrap();
+        assert_eq!(
+            write_back(ctx, &p.id).unwrap_err(),
+            WRITE_BACK_NOT_POSSIBLE.to_string()
+        );
+    }
+
+    #[test]
+    fn write_calls_are_paced() {
+        let now = Instant::now();
+        let gap = Duration::from_secs(1);
+        assert_eq!(wait_needed(None, now, gap), Duration::ZERO);
+        assert_eq!(
+            wait_needed(Some(now), now + Duration::from_millis(300), gap),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            wait_needed(Some(now), now + Duration::from_secs(2), gap),
+            Duration::ZERO
+        );
     }
 }

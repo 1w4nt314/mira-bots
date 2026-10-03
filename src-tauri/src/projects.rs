@@ -87,6 +87,7 @@ const EDGE_SPACE: &str = "må ikke begynde eller slutte med mellemrum";
 const TRAILING_DOT: &str = "må ikke slutte med punktum";
 const RESERVED: &str = "er et reserveret navn i Windows";
 const ONLY_DOTS: &str = "må ikke kun bestå af punktummer";
+const RESERVED_INBOX: &str = "er reserveret til indbakken";
 
 /// Device names Windows reserves in every folder, also with an extension (`NUL.txt`).
 pub const RESERVED_STEMS: [&str; 28] = [
@@ -136,6 +137,10 @@ pub fn validate_project_id(raw: &str) -> Result<ProjectId, ProjectError> {
     if RESERVED_STEMS.contains(&stem.as_str()) {
         return bad(RESERVED);
     }
+    // `<root>/inbox/` is the root inbox folder (step 6c), never a project.
+    if raw.to_lowercase() == crate::config::INBOX_DIR {
+        return bad(RESERVED_INBOX);
+    }
     Ok(raw.to_string())
 }
 
@@ -159,8 +164,8 @@ pub fn project_file(root: &Path, id: &str) -> PathBuf {
 }
 
 /// The project folders directly under `root`, sorted case-insensitively. Hidden folders (`.`
-/// prefix, e.g. `.mira-bots`), files and folders whose names are not valid project ids are
-/// skipped. A missing root gives an empty list.
+/// prefix, e.g. `.mira-bots`), the root inbox folder `inbox` (step 6c), files and folders whose
+/// names are not valid project ids are skipped. A missing root gives an empty list.
 pub fn list_projects(root: &Path) -> Vec<Project> {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -363,6 +368,10 @@ mod tests {
         for (name, want) in table {
             assert_eq!(reason(name), want, "{name:?}");
         }
+        for name in ["inbox", "INBOX", "Inbox"] {
+            assert_eq!(reason(name), RESERVED_INBOX, "{name:?}");
+        }
+        assert!(validate_project_id("inbox-2").is_ok());
         for name in [
             "con",
             "prn",
@@ -457,8 +466,14 @@ mod tests {
         std::fs::write(root.join("f.txt"), "x").unwrap();
         std::fs::create_dir(root.join("CON")).unwrap();
         std::fs::create_dir(root.join("Beta")).unwrap();
+        std::fs::create_dir(root.join("inbox")).unwrap();
         let ids: Vec<_> = list_projects(&root).into_iter().map(|p| p.id).collect();
-        assert_eq!(ids, ["a", "Beta"]);
+        assert_eq!(ids, ["a", "Beta"], "the root inbox folder is no project");
+        assert_eq!(find_project(&root, "inbox"), None);
+        assert!(matches!(
+            create_project(&root, "Inbox"),
+            Err(ProjectError::InvalidName(_, RESERVED_INBOX))
+        ));
 
         assert_eq!(
             create_project(&root, "A"),

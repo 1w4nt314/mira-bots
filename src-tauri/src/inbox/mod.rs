@@ -12,6 +12,7 @@
 
 pub mod external;
 pub mod folder;
+pub mod github;
 pub mod ipc;
 pub mod refresh;
 pub mod service;
@@ -110,6 +111,11 @@ pub struct InboxItem {
     /// Sanitising/parsing notes.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// The ticket type a folder file asks for (frontmatter `kind:`, validated: `bug`, `feature`
+    /// or a playbook; `None` = task or none). Only preselects the Start dialog (never starts
+    /// anything). `kind` is the source kind, hence the name (wire `ticketKind`).
+    #[serde(default)]
+    pub ticket_kind: Option<String>,
 }
 
 /// `inbox.json`: `{"schemaVersion":1,"items":[…]}`.
@@ -160,6 +166,8 @@ pub struct InboxItemSummary {
     pub state: InboxState,
     pub ticket_id: Option<String>,
     pub notes: Vec<String>,
+    /// Frontmatter `kind:` of a folder file (validated), to preselect the Start dialog.
+    pub ticket_kind: Option<String>,
     /// Filled by the caller that knows the tickets (B2); `None` from [`InboxService::list`].
     pub duplicate_of: Option<DuplicateRef>,
 }
@@ -186,6 +194,7 @@ impl From<&InboxItem> for InboxItemSummary {
             state: i.state,
             ticket_id: i.ticket_id.clone(),
             notes: i.notes.clone(),
+            ticket_kind: i.ticket_kind.clone(),
             duplicate_of: None,
         }
     }
@@ -195,7 +204,7 @@ impl From<&InboxItem> for InboxItemSummary {
 pub(crate) mod test_support {
     use super::*;
     use crate::agent::AgentManager;
-    use crate::tickets::test_support::{test_ctx_with_inbox, TestCtx};
+    use crate::tickets::test_support::{test_ctx_with_gh, TestCtx};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -209,16 +218,28 @@ pub(crate) mod test_support {
 
     impl FolderEnv {
         pub fn new(items: Vec<InboxItem>) -> Self {
+            Self::with_gh(items, Arc::new(crate::gh::fake::FakeGh::new()))
+        }
+
+        /// [`Self::new`] with a scripted `gh` (B3).
+        pub fn with_gh(items: Vec<InboxItem>, gh: Arc<dyn crate::gh::GhRunner>) -> Self {
             let store = MemoryInboxStore::new();
             let doc = InboxDoc {
                 items,
                 ..InboxDoc::default()
             };
             let inbox = InboxService::new(Box::new(store.clone()), doc);
-            let t = test_ctx_with_inbox(Arc::new(Mutex::new(AgentManager::new(5))), inbox);
+            let t = test_ctx_with_gh(Arc::new(Mutex::new(AgentManager::new(5))), gh, inbox);
             let root = t.ctx.workspace.root().to_path_buf();
             std::fs::create_dir_all(folder::project_inbox_dir(&root.join("web"))).unwrap();
             FolderEnv { t, root, store }
+        }
+
+        /// Writes `web/.mira-bots/project.json`.
+        pub fn project_json(&self, text: &str) {
+            let p = crate::checks::project_file_path(&self.root.join("web"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
         }
 
         /// `web/.mira-bots/inbox/`.
@@ -274,6 +295,7 @@ pub(crate) mod test_support {
             gone: false,
             moved: None,
             notes: Vec::new(),
+            ticket_kind: None,
         }
     }
 
@@ -302,6 +324,7 @@ pub(crate) mod test_support {
             gone: false,
             moved: None,
             notes: Vec::new(),
+            ticket_kind: None,
         }
     }
 }
@@ -323,7 +346,8 @@ mod tests {
                 "url":"https://github.com/o/r/issues/123","number":123,"repo":"o/r","path":null,
                 "author":"alice","project":"web","candidates":[],
                 "updatedAt":"2026-10-01T10:00:00Z","fingerprint":"2026-10-01T10:00:00Z",
-                "seenAt":1000,"state":"new","ticketId":null,"gone":false,"moved":null,"notes":[]})
+                "seenAt":1000,"state":"new","ticketId":null,"gone":false,"moved":null,"notes":[],
+                "ticketKind":null})
         );
         assert_eq!(serde_json::from_value::<InboxItem>(v).unwrap(), item);
         for (st, wire) in [

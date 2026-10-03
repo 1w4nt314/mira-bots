@@ -3,17 +3,27 @@
 //! Start dialog's duplicate warning (`duplicateOf`).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::external::clean_external_title;
+use super::folder::inbox_dirs;
+use super::github::build_github_sources;
 use super::refresh::{refresh, RefreshReason};
 use super::source::InboxStatus;
 use super::start::{start_item, StartRequest};
+use super::write_back::write_back;
+use super::Source;
 use super::{DuplicateRef, InboxItem, InboxItemSummary, InboxState};
+use crate::checks::GITHUB_IGNORED_PREFIX;
+use crate::config::INBOX_NO_URL;
+use crate::diagnostics::InboxSourceDiag;
 use crate::events::INBOX_CHANGED;
+use crate::gh::{check_auth, issue_url_ok, GhAuthResult};
 use crate::tickets::model::{short_id, TicketState, TicketSummary};
+use crate::tickets::model::{ExternalKind, WriteBack};
 use crate::tickets::prompt::one_line;
 use crate::tickets::service::norm_title;
 use crate::tickets::TicketsCtx;
@@ -112,9 +122,93 @@ impl TicketsCtx {
         refresh(self, reason)
     }
 
-    /// `start_inbox_item` (blocking: file moves; the command runs it in `spawn_blocking`).
+    /// `start_inbox_item` (blocking: file moves, `gh issue view`; the command runs it in
+    /// `spawn_blocking`).
     pub fn inbox_start(self: &Arc<Self>, req: StartRequest) -> Result<TicketSummary, String> {
         start_item(self, req)
+    }
+
+    /// `retry_write_back` ("Prøv igen"; blocking: `gh`/file work).
+    pub fn inbox_retry_write_back(self: &Arc<Self>, ticket_id: &str) -> Result<WriteBack, String> {
+        write_back(self, ticket_id)
+    }
+
+    /// `open_inbox_url`: the GitHub address stored on inbox item `id`, else on ticket `id`'s
+    /// `external` — only when it is exactly the issue's `https://github.com/<repo>/issues/<n>`.
+    /// Never a URL from the caller.
+    pub fn inbox_url(&self, id: &str) -> Result<String, String> {
+        let from_item = self
+            .inbox_read(|i| i.get(id))
+            .and_then(|it| Some((it.url?, it.repo?, it.number?)));
+        let found = from_item.or_else(|| {
+            self.read(|s| s.get(id))
+                .and_then(|t| t.external)
+                .and_then(|e| Some((e.url?, e.repo?, e.number?)))
+        });
+        match found {
+            Some((url, repo, n)) if issue_url_ok(&url, &repo, n) => Ok(url),
+            _ => Err(INBOX_NO_URL.into()),
+        }
+    }
+
+    /// `check_gh_auth` (blocking, 15 s; only on a click).
+    pub fn inbox_check_gh_auth(&self) -> GhAuthResult {
+        check_auth(&*self.gh)
+    }
+
+    /// Diagnostik's `inboxSources`: every folder source and every GitHub source of the
+    /// projects (one row per project), with the last fetch's status; a project whose
+    /// `project.json` `github` is ignored gets a row with that note as its error. Reads folders
+    /// and (cached) project files; never runs `gh`.
+    pub fn inbox_sources_diag(&self) -> Vec<InboxSourceDiag> {
+        let status = self.inbox_rt.status();
+        let row = |id: &str, kind, label: String, project: Option<String>| {
+            let st = status.sources.iter().find(|s| s.id == id);
+            InboxSourceDiag {
+                project,
+                kind,
+                label,
+                last_fetch_at: st.and_then(|s| s.last_fetch_at),
+                error: st.and_then(|s| s.error.clone()),
+                items: st.map_or(0, |s| s.items),
+            }
+        };
+        let root = self.workspace.root();
+        let projects = crate::projects::list_projects(root);
+        let kinds = self.workspace.config().playbook_kinds();
+        let mut out: Vec<InboxSourceDiag> = inbox_dirs(root, &projects, &kinds)
+            .iter()
+            .map(|f| row(&f.id().key, ExternalKind::Folder, f.label(), f.project()))
+            .collect();
+        let mut github = Vec::new();
+        for p in &projects {
+            if let Ok(Some(f)) = self.project_files.read(Path::new(&p.path)) {
+                for n in f
+                    .notes
+                    .iter()
+                    .filter(|n| n.starts_with(GITHUB_IGNORED_PREFIX))
+                {
+                    out.push(InboxSourceDiag {
+                        project: Some(p.id.clone()),
+                        kind: ExternalKind::Github,
+                        label: "project.json".into(),
+                        last_fetch_at: None,
+                        error: Some(n.clone()),
+                        items: 0,
+                    });
+                }
+                if let Some(g) = f.github {
+                    github.push((p.id.clone(), g));
+                }
+            }
+        }
+        for s in build_github_sources(&self.gh, &github) {
+            let id = s.id().key;
+            for p in &s.projects {
+                out.push(row(&id, ExternalKind::Github, s.label(), Some(p.clone())));
+            }
+        }
+        out
     }
 }
 
@@ -215,5 +309,82 @@ mod tests {
         assert_eq!(req.project, Some(ProjectRef::Existing("web".into())));
         let r: RefreshReason = serde_json::from_value(json!("manual")).unwrap();
         assert_eq!(r, RefreshReason::Manual);
+    }
+
+    #[test]
+    fn open_inbox_url_rejects_foreign_host() {
+        let mut evil = github_item("g2", 8);
+        evil.url = Some("https://evil.example/o/r/issues/8".into());
+        let mut other = github_item("g3", 9);
+        other.url = Some("https://github.com/o/r/issues/10".into());
+        let env = FolderEnv::new(vec![
+            github_item("g1", 7),
+            evil,
+            other,
+            folder_item("f1", "a.md"),
+        ]);
+        let ctx = &env.t.ctx;
+        assert_eq!(
+            ctx.inbox_url("g1").unwrap(),
+            "https://github.com/o/r/issues/7"
+        );
+        for id in ["g2", "g3", "f1", "findes-ikke"] {
+            assert_eq!(ctx.inbox_url(id).unwrap_err(), INBOX_NO_URL, "{id}");
+        }
+        // A ticket from GitHub: its stored address; a forged one is refused.
+        let t = ctx
+            .mutate(|s| {
+                s.create_external(
+                    "G",
+                    "",
+                    true,
+                    None,
+                    None,
+                    crate::tickets::model::test_support::github_ref(4),
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            ctx.inbox_url(&t.id).unwrap(),
+            "https://github.com/o/r/issues/4"
+        );
+        let mut forged = crate::tickets::model::test_support::github_ref(5);
+        forged.external_id = "github:o/r#5".into();
+        forged.url = Some("javascript:alert(1)".into());
+        let t = ctx
+            .mutate(|s| s.create_external("H", "", true, None, None, forged, 1))
+            .unwrap();
+        assert_eq!(ctx.inbox_url(&t.id).unwrap_err(), INBOX_NO_URL);
+    }
+
+    #[test]
+    fn diag_lists_sources_per_project_with_ignored_github() {
+        let env = FolderEnv::new(Vec::new());
+        env.project_json(r#"{"github": {"repo": "o/r"}}"#);
+        let api = env.root.join("api");
+        let pj = crate::checks::project_file_path(&api);
+        std::fs::create_dir_all(pj.parent().unwrap()).unwrap();
+        std::fs::write(&pj, r#"{"github": {"repo": "ikke gyldig"}}"#).unwrap();
+        let rows = env.t.ctx.inbox_sources_diag();
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            v,
+            json!([
+                {"project": "web", "kind": "folder", "label": rows[0].label, "lastFetchAt": null,
+                 "error": null, "items": 0},
+                {"project": "api", "kind": "github", "label": "project.json", "lastFetchAt": null,
+                 "error": "project.json: github ignoreres: repo «ikke gyldig» skal have formen ejer/navn",
+                 "items": 0},
+                {"project": "web", "kind": "github", "label": "o/r", "lastFetchAt": null,
+                 "error": null, "items": 0}
+            ])
+        );
+        assert!(env
+            .t
+            .ctx
+            .inbox_check_gh_auth()
+            .text
+            .starts_with("gh: FakeGh"));
     }
 }

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use super::folder::{folder_dir_for, inbox_dirs, move_with_retry};
+use super::github::build_github_sources;
 use super::source::{InboxStatus, Source, SourceError, SourceErrorKind, SourceStatus};
 use super::write_back::locate_folder_file;
 use super::InboxItem;
@@ -79,15 +80,28 @@ impl InboxRuntime {
     }
 }
 
-/// The sources of this refresh: the folder sources that exist (root and projects). B3 adds the
-/// GitHub sources of the projects' `project.json` here.
+/// The sources of this refresh: the folder sources that exist (root and projects), then one
+/// GitHub source per `(repo, labels)` of the projects' `project.json` (`github`; an invalid one
+/// is only a note there). Reads folders and project files, never runs `gh`.
 pub fn build_sources(ctx: &TicketsCtx) -> Vec<Box<dyn Source>> {
     let root = ctx.workspace.root();
     let projects = crate::projects::list_projects(root);
     let kinds = ctx.workspace.config().playbook_kinds();
+    let github: Vec<(String, crate::checks::GithubConfig)> = projects
+        .iter()
+        .filter_map(|p| {
+            let f = ctx.project_files.read(Path::new(&p.path)).ok().flatten()?;
+            Some((p.id.clone(), f.github?))
+        })
+        .collect();
     inbox_dirs(root, &projects, &kinds)
         .into_iter()
         .map(|s| Box::new(s) as Box<dyn Source>)
+        .chain(
+            build_github_sources(&ctx.gh, &github)
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn Source>),
+        )
         .collect()
 }
 
@@ -369,6 +383,71 @@ mod tests {
             .into_iter()
             .find(|s| s.id == key)
             .unwrap()
+    }
+
+    #[test]
+    fn refresh_lists_github_issues_with_dedup_and_min_interval() {
+        use crate::gh::fake::{FakeGh, RATE_LIMIT};
+        let gh = Arc::new(FakeGh::new());
+        gh.reply(
+            &["issue", "list"],
+            0,
+            r#"[{"author":{"login":"alice"},"labels":[{"name":"bug"}],"number":7,"state":"OPEN",
+                "title":"Crash","updatedAt":"2026-10-01T10:00:00Z","url":"https://github.com/o/r/issues/7"}]"#,
+            "",
+        );
+        let env = FolderEnv::with_gh(Vec::new(), gh.clone());
+        env.project_json(r#"{"github": {"repo": "o/r", "labels": ["bug"]}}"#);
+        // A second project with the same repo and labels shares the call.
+        let api = env.root.join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        let pj = crate::checks::project_file_path(&api);
+        std::fs::create_dir_all(pj.parent().unwrap()).unwrap();
+        std::fs::write(&pj, r#"{"github": {"repo": "O/R", "labels": ["bug"]}}"#).unwrap();
+        let ctx = &env.t.ctx;
+        let t0 = 1_000_000;
+        run_refresh(ctx, RefreshReason::Startup, build_sources(ctx), t0);
+        assert_eq!(gh.calls().len(), 1, "one gh call for two projects");
+        let p = ctx.inbox_payload();
+        let it = p
+            .items
+            .iter()
+            .find(|i| i.external_id == "github:o/r#7")
+            .unwrap();
+        assert_eq!(
+            (it.project.as_deref(), it.candidates.clone()),
+            (None, vec!["api".to_string(), "web".to_string()])
+        );
+        assert_eq!(it.number, Some(7));
+        let st = source_status(&env, "github:o/r[bug]");
+        assert!(st.ok && st.items == 1 && st.project.is_none());
+        // Timer within 120 s: no call; manual: a call.
+        run_refresh(ctx, RefreshReason::Timer, build_sources(ctx), t0 + 119_000);
+        assert_eq!(gh.calls().len(), 1);
+        run_refresh(ctx, RefreshReason::Timer, build_sources(ctx), t0 + 120_000);
+        assert_eq!(gh.calls().len(), 2);
+        run_refresh(ctx, RefreshReason::Manual, build_sources(ctx), t0 + 121_000);
+        assert_eq!(gh.calls().len(), 3);
+        // Rate limit: the status shows the clock time of the next try (900 s).
+        gh.reply(&["issue", "list", "--repo"], 1, "", RATE_LIMIT);
+        run_refresh(ctx, RefreshReason::Manual, build_sources(ctx), t0 + 200_000);
+        let st = source_status(&env, "github:o/r[bug]");
+        assert_eq!(st.error_kind, Some(SourceErrorKind::RateLimited));
+        assert_eq!(st.next_retry_at, Some(t0 + 200_000 + 900_000));
+        assert_eq!(
+            st.error.as_deref(),
+            Some(crate::config::rate_limited_note(&crate::gh::local_hhmm(t0 + 1_100_000)).as_str())
+        );
+        // The item stays (an error never marks anything gone).
+        assert_eq!(ctx.inbox_payload().items.len(), 1);
+    }
+
+    #[test]
+    fn refresh_skips_projects_with_an_invalid_github() {
+        let env = FolderEnv::new(Vec::new());
+        env.project_json(r#"{"github": {"repo": "ikke et repo"}}"#);
+        let sources = build_sources(&env.t.ctx);
+        assert!(sources.iter().all(|s| s.id().kind == ExternalKind::Folder));
     }
 
     #[test]

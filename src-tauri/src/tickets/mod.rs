@@ -181,6 +181,15 @@ pub struct TicketsCtx {
     /// The inbox threads started so far (`mira-inbox`, `mira-writeback`; tests join them).
     #[cfg(test)]
     inbox_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The GitHub CLI (step 6c B3; `SystemGh` in the app, `FakeGh` in tests). Never run under
+    /// any lock of this context.
+    pub gh: Arc<dyn crate::gh::GhRunner>,
+    /// The app data folder: `tmp/` holds the `--body-file`s of the GitHub write back.
+    pub data_dir: PathBuf,
+    /// Serialises the GitHub write backs of this process and remembers the last write call
+    /// (≥ 1 s apart, research §5.4). Its own lock: no other lock is held under it, and `gh` runs
+    /// under it on purpose.
+    pub(crate) write_back_lock: Mutex<Option<std::time::Instant>>,
 }
 
 impl TicketsCtx {
@@ -195,6 +204,11 @@ impl TicketsCtx {
         git: Arc<dyn GitRunner>,
         inbox: InboxService,
     ) -> Self {
+        // The reports live in `<app_data>/tickets`: their parent is the app data folder.
+        let data_dir = reports_root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| reports_root.clone());
         TicketsCtx {
             service: Mutex::new(service),
             manager,
@@ -216,7 +230,24 @@ impl TicketsCtx {
             inbox_rt: crate::inbox::InboxRuntime::new(),
             #[cfg(test)]
             inbox_threads: Mutex::new(Vec::new()),
+            gh: Arc::new(crate::gh::SystemGh::new(data_dir.clone())),
+            data_dir,
+            write_back_lock: Mutex::new(None),
         }
+    }
+
+    /// Replaces the GitHub CLI runner (tests).
+    #[cfg(test)]
+    pub fn with_gh(mut self, gh: Arc<dyn crate::gh::GhRunner>) -> Self {
+        self.gh = gh;
+        self
+    }
+
+    /// Replaces the app data folder (tests).
+    #[cfg(test)]
+    pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
+        self.data_dir = dir;
+        self
     }
 
     /// Takes the inbox serial lock (step 6c): before, never inside, the service lock.
@@ -296,10 +327,11 @@ impl TicketsCtx {
     /// Tickets that just became Done (step 6c, plan A.2: the write-back hook). Runs after the
     /// mutation's emits without any lock held — but possibly while the caller holds
     /// `inbox_lock` (Start), so it never takes that lock itself: a folder ticket that never
-    /// wrote back gets a `mira-writeback` thread ([`crate::inbox::write_back::folder_write_back`]).
-    /// GitHub: B3.
+    /// wrote back gets a `mira-writeback` thread ([`crate::inbox::write_back::folder_write_back`];
+    /// GitHub: [`crate::inbox::write_back::github_write_back`], which does nothing unless the
+    /// project's `github.writeBack.comment` is true).
     fn on_done(&self, ids: &[TicketId]) {
-        use crate::inbox::write_back::{folder_write_back, wants_write_back};
+        use crate::inbox::write_back::{folder_write_back, github_write_back, wants_write_back};
         for id in ids {
             let Some(e) = self.read(|s| s.get(id)).and_then(|t| t.external) else {
                 continue;
@@ -319,10 +351,22 @@ impl TicketsCtx {
                         }
                     });
                 }
-                model::ExternalKind::Github => log::info!(
-                    "inbox: ticket {} from github is done (write back: B3)",
-                    model::short_id(id)
-                ),
+                model::ExternalKind::Github => {
+                    let id = id.clone();
+                    self.spawn_inbox_thread("mira-writeback", move |me| {
+                        match github_write_back(me, &id, false) {
+                            Ok(wb) => log::debug!(
+                                "inbox: write back of {}: {:?}",
+                                model::short_id(&id),
+                                wb.comment
+                            ),
+                            Err(err) => log::info!(
+                                "inbox: no write back for ticket {}: {err}",
+                                model::short_id(&id)
+                            ),
+                        }
+                    });
+                }
             }
         }
     }
@@ -1539,11 +1583,38 @@ pub(crate) mod test_support {
         build_test_ctx(manager, git, checks, inbox)
     }
 
+    /// [`test_ctx_with_inbox`] with a scripted `gh` (step 6c B3).
+    pub fn test_ctx_with_gh(
+        manager: Arc<Mutex<AgentManager>>,
+        gh: Arc<dyn crate::gh::GhRunner>,
+        inbox: InboxService,
+    ) -> TestCtx {
+        build_test_ctx_gh(
+            manager,
+            Arc::new(crate::git::fake::FakeGit::new()),
+            Arc::new(crate::checks::ProcessChecks::new()),
+            inbox,
+            gh,
+        )
+    }
+
     fn build_test_ctx(
         manager: Arc<Mutex<AgentManager>>,
         git: Arc<dyn crate::git::GitRunner>,
         checks: Arc<dyn crate::checks::CheckRunner>,
         inbox: InboxService,
+    ) -> TestCtx {
+        // A gh without answers: no test ever runs the real one.
+        let gh = Arc::new(crate::gh::fake::FakeGh::new());
+        build_test_ctx_gh(manager, git, checks, inbox, gh)
+    }
+
+    fn build_test_ctx_gh(
+        manager: Arc<Mutex<AgentManager>>,
+        git: Arc<dyn crate::git::GitRunner>,
+        checks: Arc<dyn crate::checks::CheckRunner>,
+        inbox: InboxService,
+        gh: Arc<dyn crate::gh::GhRunner>,
     ) -> TestCtx {
         let store = MemoryStore::new();
         let svc = TicketService::new(Box::new(store.clone()), TicketDoc::default());
@@ -1553,8 +1624,8 @@ pub(crate) mod test_support {
         let emit: EmitFn = Arc::new(move |n: &str, v: Value| {
             sink.lock().unwrap().push((n.to_string(), v));
         });
-        let reports_root =
-            std::env::temp_dir().join(format!("mira-tickets-{}", uuid::Uuid::new_v4()));
+        let data_dir = std::env::temp_dir().join(format!("mira-data-{}", uuid::Uuid::new_v4()));
+        let reports_root = data_dir.join(crate::config::REPORTS_DIR);
         // A workspace file that does not exist: the defaults.
         let workspace = Arc::new(WorkspaceReader::new(
             std::env::temp_dir()
@@ -1564,6 +1635,8 @@ pub(crate) mod test_support {
         TestCtx {
             ctx: TicketsCtx::new(svc, manager, tx, emit, reports_root, workspace, git, inbox)
                 .with_check_runner(checks)
+                .with_gh(gh)
+                .with_data_dir(data_dir)
                 .shared(),
             rx,
             events,
