@@ -348,6 +348,15 @@ pub struct Diagnostics {
     pub inbox_new: usize,
     /// One row per inbox source and project (folder and GitHub), with the last fetch.
     pub inbox_sources: Vec<InboxSourceDiag>,
+    // ---- trin 6d ----
+    /// "Stop vagten" (`watchPaused` i `app-settings.json`).
+    pub watch_paused: bool,
+    /// Aktive vagt-projekter ved seneste tick/visning.
+    pub watch_active: usize,
+    /// `<app_data_dir>/watch-state.json`.
+    pub watch_state_path: String,
+    /// Sat når `watch-state.json` ikke kunne læses ved start (omdøbt; konservativ start).
+    pub watch_warning: Option<String>,
 }
 
 /// One inbox source of one project in Diagnostik (C6c.2 `inboxSources`).
@@ -595,6 +604,10 @@ mod tests {
                 error: None,
                 items: 0,
             }],
+            watch_paused: true,
+            watch_active: 1,
+            watch_state_path: "/d/watch-state.json".into(),
+            watch_warning: None,
         };
         // Step 7 fields, checked apart (the json! below is at the macro recursion limit),
         // including the serde order: platform after appVersion, pipeNote after pipeReady.
@@ -624,6 +637,28 @@ mod tests {
             .iter()
             .map(|k| (k.to_string(), obj.remove(*k).unwrap()))
             .collect();
+        // Trin 6d: vagt-felterne sidst, i denne rækkefølge.
+        let watch_keys = [
+            "inboxSources",
+            "watchPaused",
+            "watchActive",
+            "watchStatePath",
+            "watchWarning",
+        ];
+        assert!(watch_keys.windows(2).all(|w| at(w[0]) < at(w[1])));
+        let w6d: serde_json::Map<String, Value> = watch_keys[1..]
+            .iter()
+            .map(|k| (k.to_string(), obj.remove(*k).unwrap()))
+            .collect();
+        assert_eq!(
+            Value::Object(w6d),
+            json!({
+                "watchPaused": true,
+                "watchActive": 1,
+                "watchStatePath": "/d/watch-state.json",
+                "watchWarning": null
+            })
+        );
         assert_eq!(
             Value::Object(b3),
             json!({

@@ -462,6 +462,16 @@ impl AgentManager {
         self.check_limit(seat)
     }
 
+    /// Frie pladser af den slags (loftet minus levende agenter; trin 6d A.5: vagtens
+    /// forhåndstjek tæller én pr. manglende rolle).
+    pub fn free_seats(&self, seat: SeatKind) -> usize {
+        let max = match seat {
+            SeatKind::Work => self.max_work,
+            SeatKind::Staff => self.max_staff,
+        };
+        max.saturating_sub(self.running_in(seat))
+    }
+
     /// Changes the seat limits (from the workspace rules, plan4b A.4); running agents are never
     /// stopped, a lower limit only blocks new spawns.
     pub fn set_limits(&mut self, work: usize, staff: usize) {
@@ -1881,6 +1891,25 @@ mod tests {
         let mut c = m.cwds();
         c.sort();
         assert_eq!(c, [PathBuf::from("/w/bot-01"), PathBuf::from("/w/bot-02")]);
+    }
+
+    #[test]
+    fn free_seats_count_live_agents_of_the_seat_kind() {
+        let mut m = AgentManager::with_limits(3, 2);
+        assert_eq!(m.free_seats(SeatKind::Work), 3);
+        m.insert_fake("s1", "/w/a");
+        let gone = m.insert_fake("s2", "/w/b");
+        assert_eq!(m.free_seats(SeatKind::Work), 1);
+        m.stop(&gone).unwrap();
+        assert_eq!(
+            m.free_seats(SeatKind::Work),
+            2,
+            "an exited agent frees its seat"
+        );
+        assert_eq!(m.free_seats(SeatKind::Staff), 2);
+        m.set_limits(1, 2);
+        m.insert_fake("s3", "/w/c");
+        assert_eq!(m.free_seats(SeatKind::Work), 0, "never below zero");
     }
 
     #[test]

@@ -586,6 +586,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&pipe_error),
     );
 
+    // Trin 6d: vagtens budget/fejl-fil. Er den ulæselig, omdøbes den og vagten starter
+    // konservativt (advarslen logges af `load` og vises i Diagnostik).
+    let (watch_state, watch_warning) = watch::WatchStateFile::load(&data_dir);
     let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
     let app_settings_path = app_settings::settings_path(&data_dir);
     app.manage(AppState {
@@ -622,7 +625,15 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         profiles_migrated,
         settings: Mutex::new(settings),
         notices,
+        watch: watch::WatchRuntime::new(watch_state, watch_warning),
     });
+
+    // Trin 6d: vagtens timer (efter `manage`: tick'et slår `AppState` op; første tick efter 60 s).
+    if let Some(state) = app.try_state::<AppState>() {
+        state
+            .watch
+            .set_handle(watch::runtime::start(app.handle().clone()));
+    }
 
     // After `manage`: the exit handler's `kill_all` needs `AppState` (review7 W5).
     #[cfg(unix)]
@@ -733,6 +744,9 @@ pub fn run() {
             commands::list_notices,
             commands::mark_notices_seen,
             commands::set_notify_pref,
+            commands::get_watch,
+            commands::set_watch,
+            commands::restart_watch,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -755,6 +769,8 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(state) = app_handle.try_state::<AppState>() {
+                // Trin 6d (A.11): vagten stoppes først (ingen nye starter/spawns), så agenterne.
+                state.watch.shutdown();
                 lock(&state.manager).kill_all();
             }
             // Step 6b: git and project-check children still running (with their trees).
@@ -827,10 +843,11 @@ mod tests {
     }
 
     /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50; plan6b punkt 6:
-    /// → 51; plan6c punkt 11: → 57; plan6c punkt 15: → 60; plan6d punkt 15: → 63). Counted
+    /// → 51; plan6c punkt 11: → 57; plan6c punkt 15: → 60; plan6d punkt 15: → 63; plan6d punkt
+    /// 18: → 66). Counted
     /// from the source so a command added without a handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_63_commands() {
+    fn generate_handler_lists_66_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -839,8 +856,11 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 63, "{names:?}");
+        assert_eq!(names.len(), 66, "{names:?}");
         for n in [
+            "get_watch",
+            "set_watch",
+            "restart_watch",
             "list_notices",
             "mark_notices_seen",
             "set_notify_pref",

@@ -53,6 +53,7 @@ use crate::tickets::playbook::{self, PlaybookStarted, StartedBy};
 use crate::tickets::service::validate_kind;
 use crate::tickets::tools::{ticket_has_project, SpawnByProfile, SpawnPort, SPAWN_UNAVAILABLE};
 use crate::tickets::{prompt, ReportContent, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
+use crate::watch::{WatchRuntime, WatchView};
 use crate::workplace;
 use crate::workspace::WorkspaceReader;
 
@@ -136,6 +137,8 @@ pub struct AppState {
     pub settings: Mutex<AppSettings>,
     /// Beskedkøen (trin 6d, plan A.8): samme `Arc` som `tickets.notices`.
     pub notices: Arc<NoticesCtx>,
+    /// Vagten (trin 6d, plan punkt 17): `watch-state.json`, timer-tasken, hukommelse og view.
+    pub watch: WatchRuntime,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -193,6 +196,50 @@ impl AppState {
         })?;
         log::info!("notices: {name} {}", if on { "on" } else { "off" });
         Ok(self.notices.set_off(&next.notify_off))
+    }
+
+    /// "Stop vagten"/"Start vagten igen" (`project: None` → `watchPaused`) og "Hold vagt" pr.
+    /// projekt (`watchOff`); læs-ændr-skriv af `app-settings.json`, aldrig `project.json`.
+    pub fn set_watch(&self, project: Option<&str>, on: bool) -> Result<(), String> {
+        let word = if on { "resumed" } else { "paused" };
+        match project.map(str::trim) {
+            None => {
+                self.update_settings(|s| s.watch_paused = !on)?;
+                log::info!("watch: master {word}");
+            }
+            Some("") => return Err("Vælg et projekt".into()),
+            Some(p) => {
+                if !on
+                    && !projects::list_projects(&self.paths.projects_root)
+                        .iter()
+                        .any(|x| projects::same_id(&x.id, p))
+                {
+                    return Err(ProjectError::NotFound(p.to_string()).to_string());
+                }
+                self.update_settings(|s| {
+                    s.watch_off.retain(|x| !projects::same_id(x, p));
+                    if !on {
+                        s.watch_off.push(p.to_string());
+                    }
+                })?;
+                log::info!("watch: {p} {word}");
+            }
+        }
+        Ok(())
+    }
+
+    /// "Genstart vagt": nulstiller fejl og stop for projektet i `watch-state.json`.
+    pub fn restart_watch(&self, project: &str) -> Result<(), String> {
+        let project = project.trim();
+        if project.is_empty() {
+            return Err("Vælg et projekt".into());
+        }
+        let was = self.watch.reset_trip(project);
+        log::info!(
+            "watch: {project} genstartet{}",
+            if was { "" } else { " (var ikke stoppet)" }
+        );
+        Ok(())
     }
 
     /// Recomputes the `claude` lookup on every call.
@@ -284,6 +331,10 @@ impl AppState {
                 .into_owned(),
             inbox_new: self.tickets.inbox_read(|i| i.new_count()),
             inbox_sources: self.tickets.inbox_sources_diag(),
+            watch_paused: lock(&self.settings).watch_paused,
+            watch_active: self.watch.active(),
+            watch_state_path: self.watch.state_path().to_string_lossy().into_owned(),
+            watch_warning: self.watch.warning().map(str::to_string),
         }
     }
 
@@ -2128,6 +2179,52 @@ pub fn set_notify_pref(
     state.set_notify_pref(kind, on)
 }
 
+// ---- vagt (trin 6d, plan punkt 18) ----
+
+/// Vagtens status: det senest publicerede view, eller (før første tick) et beregnet uden sweep.
+#[tauri::command]
+pub async fn get_watch(app: AppHandle) -> Result<WatchView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cached = app.try_state::<AppState>().and_then(|s| s.watch.view());
+        cached.unwrap_or_else(|| crate::watch::runtime::refresh_view(&app))
+    })
+    .await
+    .map_err(|e| format!("Vagten kunne ikke læses: {e}"))
+}
+
+/// "Stop vagten"/"Start vagten igen" (`project: null`) eller "Hold vagt" for ét projekt; svarer
+/// med det nye view (og sender `watch-changed`).
+#[tauri::command]
+pub async fn set_watch(
+    app: AppHandle,
+    project: Option<String>,
+    on: bool,
+) -> Result<WatchView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "Appen er ikke klar".to_string())?;
+        state.set_watch(project.as_deref(), on)?;
+        Ok(crate::watch::runtime::refresh_view(&app))
+    })
+    .await
+    .map_err(|e| format!("Vagten kunne ikke ændres: {e}"))?
+}
+
+/// "Genstart vagt" for et projekt der stoppede efter tre fejl i træk.
+#[tauri::command]
+pub async fn restart_watch(app: AppHandle, project: String) -> Result<WatchView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "Appen er ikke klar".to_string())?;
+        state.restart_watch(&project)?;
+        Ok(crate::watch::runtime::refresh_view(&app))
+    })
+    .await
+    .map_err(|e| format!("Vagten kunne ikke genstartes: {e}"))?
+}
+
 // ---- ticket commands (C3.2) ----
 
 #[tauri::command]
@@ -2323,6 +2420,8 @@ pub fn list_review_assignments(
 
 #[tauri::command]
 pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Trin 6d (A.11): vagten før agenterne, som i exit-handleren.
+    state.watch.shutdown();
     lock(&state.manager).kill_all();
     app.exit(0);
     Ok(())
@@ -2511,7 +2610,80 @@ mod tests {
             profiles_migrated: 0,
             settings: Mutex::new(app_settings::load(dir)),
             notices,
+            watch: WatchRuntime::new(crate::watch::WatchStateFile::load(dir).0, None),
         }
+    }
+
+    #[test]
+    fn watch_settings_view_and_restart() {
+        let dir = std::env::temp_dir().join(format!("mira-watch-cmd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = app_state(&dir);
+        let web = dir.join("projects").join("web");
+        let pj = crate::checks::project_file_path(&web);
+        std::fs::create_dir_all(pj.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pj,
+            r#"{"watch": {"enabled": true, "playbook": "bug", "maxPerHour": 90}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("projects").join("api")).unwrap();
+        let view = crate::watch::runtime::compute_view(&state);
+        assert_eq!(view.projects.len(), 1, "only projects with watch are shown");
+        let p = &view.projects[0];
+        assert_eq!((p.id.as_str(), p.enabled, p.active), ("web", true, false));
+        // Ingen hook-exe i testen: agenter kan ikke startes.
+        assert_eq!(
+            p.reason.as_deref(),
+            Some(crate::config::WATCH_REASON_CANNOT_SPAWN)
+        );
+        assert_eq!((p.cap_hour, p.playbook.as_deref()), (6, Some("bug")));
+        assert_eq!(
+            p.notes,
+            ["project.json: watch.maxPerHour 90 er sat ned til 60 (1–60)"]
+        );
+        // "Hold vagt" fra for web: kun app-settings.json ændres.
+        let before = std::fs::read_to_string(&pj).unwrap();
+        state.set_watch(Some("web"), false).unwrap();
+        assert_eq!(lock(&state.settings).watch_off, ["web"]);
+        let p = crate::watch::runtime::compute_view(&state).projects[0].clone();
+        assert!(p.paused);
+        assert_eq!(
+            p.reason.as_deref(),
+            Some(crate::config::WATCH_REASON_PROJECT_PAUSED)
+        );
+        state.set_watch(Some("WEB"), true).unwrap();
+        assert!(lock(&state.settings).watch_off.is_empty());
+        assert_eq!(
+            state.set_watch(Some("nope"), false).unwrap_err(),
+            "Projektet «nope» findes ikke"
+        );
+        // "Stop vagten".
+        state.set_watch(None, false).unwrap();
+        let v = crate::watch::runtime::compute_view(&state);
+        assert!(v.paused && state.diagnostics().watch_paused);
+        assert_eq!(
+            v.projects[0].reason.as_deref(),
+            Some(crate::config::WATCH_REASON_PAUSED)
+        );
+        state.set_watch(None, true).unwrap();
+        assert!(!app_settings::load(&dir).watch_paused);
+        assert_eq!(std::fs::read_to_string(&pj).unwrap(), before);
+        // Stoppet efter tre fejl → "Genstart vagt".
+        state.watch.state.with(|s| {
+            for _ in 0..3 {
+                s.record_failure("web", "fejl", 5);
+            }
+        });
+        assert!(crate::watch::runtime::compute_view(&state).projects[0].tripped);
+        state.restart_watch("web").unwrap();
+        let p = crate::watch::runtime::compute_view(&state).projects[0].clone();
+        assert!(!p.tripped && p.tripped_at.is_none());
+        assert!(state.restart_watch(" ").is_err());
+        let d = state.diagnostics();
+        assert!(d.watch_state_path.ends_with("watch-state.json"));
+        assert_eq!((d.watch_active, d.watch_warning), (0, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

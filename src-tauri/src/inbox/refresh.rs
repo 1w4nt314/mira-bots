@@ -5,7 +5,9 @@
 //! The frontend drives it (timer, focus, "Opdatér"; B4); the backend enforces per source the
 //! minimum interval (folder 60 s, GitHub 120 s) and the back-off after failures (120 → 240 →
 //! 480 → 900 s; some GitHub errors wait for a manual refresh). A manual refresh overrides both.
-//! There is no backend timer.
+//! The one backend timer is the watch's (step 6d, `watch::runtime`): only while a project
+//! keeps watch, at most every 120 s, always with `RefreshReason::Timer` (so the minimum interval
+//! and back-off above apply) and never through `run_refresh` directly.
 //!
 //! Locks: `fetch` and file moves run without any lock; each merge takes `inbox_lock` (then the
 //! inbox document's own lock, then — reading the tickets — the service lock), as Start does.

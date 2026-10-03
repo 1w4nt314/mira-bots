@@ -35,6 +35,9 @@ pub const INBOX_CHANGED: &str = "inbox-changed";
 /// Beskedkøen (`NoticesPayload`: `{unread, items}`, nyeste først) efter at en besked kom ind,
 /// blev markeret læst eller forsvandt fordi dens type blev fravalgt (trin 6d, plan A.8).
 pub const NOTICES_CHANGED: &str = "notices-changed";
+/// Vagtens status (`WatchView`) efter hvert tick og efter "Hold vagt"/"Stop vagten"/"Genstart
+/// vagt" (trin 6d, plan punkt 18).
+pub const WATCH_CHANGED: &str = "watch-changed";
 
 /// Payload of `workplace-select` and the result of `take_workplace_selection`: which agent and/or
 /// sidebar tab the workplace window should show (`tab`: "permissions" | "diagnostics" |
@@ -111,6 +114,7 @@ mod tests {
         assert_eq!(PROFILES_CHANGED, "profiles-changed");
         assert_eq!(INBOX_CHANGED, "inbox-changed");
         assert_eq!(NOTICES_CHANGED, "notices-changed");
+        assert_eq!(WATCH_CHANGED, "watch-changed");
     }
 
     #[test]
