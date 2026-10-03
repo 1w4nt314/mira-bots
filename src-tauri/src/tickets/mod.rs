@@ -457,7 +457,7 @@ impl TicketsCtx {
     /// `f`; efter `tickets-changed`-emittet (ingen lås holdt) giver [`derive_ticket_notices`]
     /// beskederne (eskaleret, forløbsforælder i review, tilbagemelding fejlet), og køen fjerner
     /// dubletter.
-    fn mutate_if<T>(
+    pub(crate) fn mutate_if<T>(
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
         changed: impl FnOnce(&T) -> bool,
@@ -1480,6 +1480,14 @@ impl TicketsHost for Arc<TicketsCtx> {
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
     ) -> Result<T, String> {
         TicketsCtx::mutate(self, f)
+    }
+
+    fn mutate_if<T>(
+        &self,
+        f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T, String> {
+        TicketsCtx::mutate_if(self, f, changed)
     }
 
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T {

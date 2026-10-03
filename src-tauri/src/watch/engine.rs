@@ -21,15 +21,17 @@ use crate::agent::{AgentInfo, Role};
 use crate::app_settings::AppSettings;
 use crate::config::{
     watch_start_failed_text, watch_tripped_reason, watch_unknown_playbook_text,
-    watch_wait_budget_text, WATCH_REASON_CANNOT_SPAWN, WATCH_REASON_NOT_ENABLED,
-    WATCH_REASON_PAUSED, WATCH_REASON_PROJECT_PAUSED, WATCH_REASON_WS_OFF, WATCH_TRIP_AFTER,
+    watch_wait_budget_text, HOUR_MS, WATCH_ERROR_MAX_CHARS, WATCH_GH_ERROR_TEXT,
+    WATCH_REASON_CANNOT_SPAWN, WATCH_REASON_NOT_ENABLED, WATCH_REASON_PAUSED,
+    WATCH_REASON_PROJECT_PAUSED, WATCH_REASON_WS_OFF, WATCH_TRIP_AFTER, WATCH_WAIT_CAP_ZERO,
     WATCH_WAIT_DUPLICATE, WATCH_WAIT_NO_PLAYBOOK, WATCH_WAIT_PLANNER, WATCH_WAIT_SEAT,
 };
-use crate::notices::{budget_notice, tripped_notice, Notice, NoticeKey};
+use crate::notices::{budget_notice, clip_line, tripped_notice, Notice, NoticeKey};
 use crate::projects::same_id;
 use crate::tickets::model::short_id;
 use crate::tickets::playbook::pick_agent;
-use crate::watch::budget::{local_minute, Caps, Ring, Verdict};
+use crate::tickets::prompt::is_invisible;
+use crate::watch::budget::{local_minute, Caps, Ring, Verdict, WaitWhy};
 use crate::watch::config::{
     in_quiet, pick_playbook, quiet_text, PlaybookRule, WatchConfig, WorkspaceWatch,
 };
@@ -360,11 +362,54 @@ pub fn hhmm(ms: u64, off: i64) -> String {
     format!("{:02}:{:02}", m / 60, m % 60)
 }
 
+/// Ligner ordet en sti eller en URL (`/…`, `~…`, `C:…`, `\\`, eller mindst to `/`)?
+fn looks_like_path(word: &str) -> bool {
+    let w = word.trim_start_matches(['«', '"', '\'', '(', '[', '<']);
+    let b = w.as_bytes();
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    w.starts_with('/')
+        || w.starts_with('~')
+        || w.contains('\\')
+        || drive
+        || w.matches('/').count() >= 2
+}
+
+/// En startfejl som én kort linje til log, badge og `trippedReason` (review6d N2): usynlige
+/// tegn og linjeskift væk, `gh`'s egen stderr (`gh: …`) erstattet af en fast tekst, ord der
+/// ligner stier/URL'er erstattet af `…`, højst [`WATCH_ERROR_MAX_CHARS`] tegn. Ren.
+pub fn short_error(e: &str) -> String {
+    let visible: String = e
+        .chars()
+        .filter(|c| matches!(c, '\t' | '\r' | '\n') || !is_invisible(*c))
+        .collect();
+    let line = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.starts_with("gh:") {
+        return WATCH_GH_ERROR_TEXT.to_string();
+    }
+    let words: Vec<&str> = line
+        .split(' ')
+        .map(|w| if looks_like_path(w) { "…" } else { w })
+        .collect();
+    let text = clip_line(&words.join(" "), WATCH_ERROR_MAX_CHARS);
+    if text.is_empty() {
+        "ukendt fejl".to_string()
+    } else {
+        text
+    }
+}
+
+/// [`playbook_text`] for en tom regel: kun emner med `kind:` startes.
+pub const PLAYBOOK_ONLY_KIND_TEXT: &str = "kun emner med kind:";
+
 /// Reglen som kort tekst til Diagnostik.
 pub fn playbook_text(rule: &PlaybookRule) -> Option<String> {
     match rule {
         PlaybookRule::None => None,
         PlaybookRule::Fixed(n) => Some(n.clone()),
+        // Review6d W2: en tom regel (`{"default": "task"}`) starter kun emner med `kind:`.
+        PlaybookRule::ByLabel { by_label, default } if by_label.is_empty() && default.is_none() => {
+            Some(PLAYBOOK_ONLY_KIND_TEXT.to_string())
+        }
         PlaybookRule::ByLabel { by_label, default } => Some(format!(
             "byLabel ({}) → {}",
             by_label.len(),
@@ -550,6 +595,19 @@ impl<P: WatchPort> WatchEngine<P> {
         build_view(plan, &state, mem, now, off)
     }
 
+    /// [`Self::tick`], men en panik giver `None` (logget som én linje `watch: tick fejlede`),
+    /// og `mem` beholder det motoren nåede før panikken — fx agent-id'er fra et start lige før
+    /// (review6d N8).
+    pub fn tick_guarded(&self, mem: &mut WatchMemory, plan: &TickPlan) -> Option<WatchView> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick(mem, plan))) {
+            Ok(view) => Some(view),
+            Err(_) => {
+                log::error!("watch: tick fejlede");
+                None
+            }
+        }
+    }
+
     /// Dublet → playbook → bemanding (intet budget). `Ok(playbook)` eller hvorfor emnet venter.
     fn precheck<'a>(
         &self,
@@ -594,6 +652,13 @@ impl<P: WatchPort> WatchEngine<P> {
             if self.port.stopping() {
                 return false;
             }
+            // Review6d W1: et emne hvis start fejlede, prøves først igen efter en time; det
+            // blokerer ikke projektets øvrige emner imens.
+            if mem.waiting.get(&c.item_id).is_some_and(|w| {
+                w.reason == WaitReason::Failed && w.next_at.is_some_and(|t| t > now)
+            }) {
+                continue;
+            }
             let pb = match self.precheck(p, c, watch_free) {
                 Ok(pb) => pb,
                 Err(w) => {
@@ -613,9 +678,15 @@ impl<P: WatchPort> WatchEngine<P> {
                 if let Some((key, n)) = budget_notice(&p.id, why, &at, now) {
                     self.port.notify(key, n);
                 }
+                // Review6d N5: et loft på 0 betyder "vagten starter intet".
+                let text = if why == WaitWhy::Off {
+                    WATCH_WAIT_CAP_ZERO.to_string()
+                } else {
+                    watch_wait_budget_text(&at)
+                };
                 let w = Waiting {
                     reason: WaitReason::Budget,
-                    text: watch_wait_budget_text(&at),
+                    text,
                     next_at: next_ms,
                     project: p.id.clone(),
                 };
@@ -659,18 +730,20 @@ impl<P: WatchPort> WatchEngine<P> {
                     );
                 }
                 Err(StartFailure::Real(e)) => {
+                    let e = short_error(&e);
                     let tripped = self.port.with_state(&mut |s| {
                         s.cancel(&p.id, now);
                         s.record_failure(&p.id, &e, now)
                     });
                     log::warn!("watch: {}: start af emne {item} fejlede: {e}", p.id);
+                    let retry = now + HOUR_MS;
                     park(
                         mem,
                         &c.item_id,
                         Waiting {
                             reason: WaitReason::Failed,
-                            text: watch_start_failed_text(&e),
-                            next_at: None,
+                            text: watch_start_failed_text(&e, &hhmm(retry, off)),
+                            next_at: Some(retry),
                             project: p.id.clone(),
                         },
                     );
@@ -678,6 +751,7 @@ impl<P: WatchPort> WatchEngine<P> {
                     return true;
                 }
                 Err(StartFailure::AfterTicket { ticket_id, error }) => {
+                    let error = short_error(&error);
                     let tripped = self
                         .port
                         .with_state(&mut |s| s.record_failure(&p.id, &error, now));
@@ -758,6 +832,9 @@ mod tests {
         /// Sæt `stopping` efter så mange starter.
         stop_after: Option<usize>,
         next_ticket: u32,
+        /// `with_state`-kald indtil nu, og ved hvilket kald porten går i panik (N8).
+        state_calls: usize,
+        panic_at_state_call: Option<usize>,
     }
 
     #[derive(Clone, Default)]
@@ -889,6 +966,13 @@ mod tests {
     }
     impl StatePort for Fake {
         fn with_state<T>(&self, f: &mut dyn FnMut(&mut WatchState) -> T) -> T {
+            let boom = {
+                let mut s = self.s();
+                s.state_calls += 1;
+                s.panic_at_state_call == Some(s.state_calls)
+            };
+            // Uden låsen holdt, så Fake'en ikke forgiftes.
+            assert!(!boom, "test: motoren går i panik");
             f(&mut self.s().state)
         }
     }
@@ -1107,6 +1191,45 @@ mod tests {
         assert_eq!(f.s().starts[0].playbook, "bug");
     }
 
+    #[test]
+    fn ticket_kind_without_a_rule_parks_without_budget() {
+        // Review6d W2 (handoff6d 5): `"watch": {"enabled": true}` alene eller `"playbook":
+        // "task"` — også et emne med `kind: bug` parkeres; en tom regel lader `kind:` vinde.
+        let f = Fake::new();
+        f.add("web", "a", &[], Some("bug"));
+        f.add("api", "b", &[], Some("bug"));
+        f.add("api", "c", &["bug"], None);
+        let only_kind = PlaybookRule::ByLabel {
+            by_label: vec![],
+            default: None,
+        };
+        let plan = plan_of(&[("web", cfg(PlaybookRule::None)), ("api", cfg(only_kind))]);
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let v = e.tick(&mut mem, &plan);
+        assert_eq!(v.waiting["a"].reason, WaitReason::Playbook);
+        assert_eq!(v.waiting["a"].text, "ingen playbook valgt for vagten");
+        assert_eq!(f.started_items(), ["b"]);
+        assert_eq!(f.s().starts[0].playbook, "bug");
+        assert!(f
+            .s()
+            .state
+            .projects
+            .get("web")
+            .is_none_or(|p| p.ring.starts.is_empty()));
+        assert_eq!(v.projects[0].playbook, None);
+        assert_eq!(
+            v.projects[1].playbook.as_deref(),
+            Some("kun emner med kind:")
+        );
+        // c (ingen kind, ingen label-regel) parkeres i api ved næste tick; intet budget.
+        f.advance(MIN);
+        let v = e.tick(&mut mem, &plan);
+        assert_eq!(v.waiting["c"].reason, WaitReason::Playbook);
+        assert_eq!(f.started_items(), ["b"]);
+        assert_eq!(global_used(&f), 1);
+    }
+
     fn agent(
         m: &mut AgentManager,
         roles: &[Role],
@@ -1211,8 +1334,12 @@ mod tests {
 
     #[test]
     fn three_real_failures_trip_once_and_notify() {
+        // Tre forskellige emner fejler inden for en time (et fejlet emne prøves først igen
+        // efter en time, review6d W1).
         let f = Fake::new();
         f.add("web", "a", &[], None);
+        f.add("web", "b", &[], None);
+        f.add("web", "c", &[], None);
         for _ in 0..3 {
             f.s()
                 .answers
@@ -1223,13 +1350,17 @@ mod tests {
         let plan = plan_of(&[("web", cfg(fixed("bug")))]);
         let v = e.tick(&mut mem, &plan);
         assert_eq!(v.waiting["a"].reason, WaitReason::Failed);
-        assert_eq!(v.waiting["a"].text, "vagt: start fejlede: netværk væk");
+        assert_eq!(
+            v.waiting["a"].text,
+            "vagt: start fejlede: netværk væk (prøves igen 13:00)"
+        );
+        assert_eq!(v.waiting["a"].next_at, Some(T + HOUR_MS));
         assert_eq!(global_used(&f), 0, "a failed start costs no budget");
         for _ in 0..2 {
             f.advance(MIN);
             e.tick(&mut mem, &plan);
         }
-        assert_eq!(f.s().starts.len(), 3);
+        assert_eq!(f.started_items(), ["a", "b", "c"]);
         let ps = f.s().state.projects["web"].clone();
         assert_eq!(ps.failures, 3);
         assert_eq!(ps.tripped_at, Some(T + 2 * MIN));
@@ -1261,6 +1392,187 @@ mod tests {
         e.tick(&mut mem, &plan5);
         assert_eq!(f.s().starts.len(), 4);
         assert_eq!(f.s().state.projects["web"].failures, 0);
+    }
+
+    #[test]
+    fn failed_item_waits_an_hour_and_does_not_block_the_next() {
+        // Review6d W1: et "giftigt" emne koster én fejl i timen og blokerer ikke projektet.
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        f.add("web", "b", &[], None);
+        f.add("web", "c", &[], None);
+        f.s().answers.push_back(Err(StartFailure::Real(
+            "svaret fra gh var for stort".into(),
+        )));
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let plan = plan_of(&[("web", cfg(fixed("bug")))]);
+        e.tick(&mut mem, &plan);
+        f.advance(MIN);
+        let v = e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["a", "b"], "b starts the next minute");
+        assert_eq!(v.waiting["a"].reason, WaitReason::Failed);
+        assert_eq!(
+            v.waiting["a"].text,
+            "vagt: start fejlede: svaret fra gh var for stort (prøves igen 13:00)"
+        );
+        f.advance(MIN);
+        e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["a", "b", "c"]);
+        // Kun a er tilbage; det springes over indtil en time efter fejlen.
+        for _ in 0..5 {
+            f.advance(10 * MIN);
+            let v = e.tick(&mut mem, &plan);
+            assert_eq!(f.s().starts.len(), 3);
+            assert_eq!(v.waiting["a"].reason, WaitReason::Failed);
+        }
+        assert_eq!(
+            f.s().state.projects["web"].failures,
+            0,
+            "b's start reset it"
+        );
+        f.s().now = T + HOUR_MS;
+        let v = e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["a", "b", "c", "a"]);
+        assert!(v.waiting.is_empty());
+        assert!(f.s().state.tripped().is_empty());
+    }
+
+    #[test]
+    fn failures_spread_over_more_than_an_hour_do_not_trip() {
+        // Review6d W1: tre uafhængige fejl med over en time imellem stopper ikke vagten.
+        let f = Fake::new();
+        for id in ["a", "b", "c", "d"] {
+            f.add("web", id, &[], None);
+        }
+        for _ in 0..4 {
+            f.s()
+                .answers
+                .push_back(Err(StartFailure::Real("netværk væk".into())));
+        }
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let plan = plan_of(&[("web", cfg(fixed("bug")))]);
+        for i in 0..4 {
+            f.s().now = T + i * (HOUR_MS + MIN);
+            e.tick(&mut mem, &plan);
+        }
+        assert_eq!(f.s().starts.len(), 4);
+        let ps = f.s().state.projects["web"].clone();
+        assert_eq!((ps.failures, ps.tripped_at), (1, None));
+        assert_eq!(f.notices_of(NoticeKind::WatchTripped), 0);
+    }
+
+    #[test]
+    fn gone_start_is_no_failure() {
+        // Review6d W1 (3): et lukket issue klassificeres som `Gone` (runtime); motoren tæller
+        // ingen fejl, annullerer reservationen og prøver næste emne.
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        f.add("web", "b", &[], None);
+        f.s().answers.push_back(Err(StartFailure::Gone));
+        let v = engine(&f).tick(
+            &mut WatchMemory::default(),
+            &plan_of(&[("web", cfg(fixed("bug")))]),
+        );
+        assert_eq!(f.started_items(), ["a", "b"]);
+        let ps = f.s().state.projects["web"].clone();
+        assert_eq!((ps.failures, ps.last_failure_at), (0, None));
+        assert!(!v.waiting.contains_key("a"));
+    }
+
+    #[test]
+    fn start_errors_are_short_single_lines_without_paths() {
+        // Review6d N2.
+        let long = format!("fejl {}", "x".repeat(300));
+        let cases: &[(&str, &str)] = &[
+            ("netværk væk", "netværk væk"),
+            ("linje 1\nlinje 2\u{202E}", "linje 1 linje 2"),
+            (
+                "gh: GraphQL: Could not resolve «hemmelig ekstern tekst»",
+                WATCH_GH_ERROR_TEXT,
+            ),
+            (
+                "kan ikke læse /home/bruger/projekter/web/x.md: findes ikke",
+                "kan ikke læse … findes ikke",
+            ),
+            (
+                r"kan ikke flytte C:\Users\b\inbox\a.md",
+                "kan ikke flytte …",
+            ),
+            ("se https://example.com/a/b for mere", "se … for mere"),
+            (
+                "repoet «o/r» findes ikke, eller gh har ikke adgang",
+                "repoet «o/r» findes ikke, eller gh har ikke adgang",
+            ),
+            ("  ", "ukendt fejl"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(short_error(raw), *want, "{raw}");
+        }
+        let s = short_error(&long);
+        assert_eq!(s.chars().count(), WATCH_ERROR_MAX_CHARS);
+        assert!(s.ends_with('…'));
+        // Gennem motoren: log, badge og `trippedReason` får den korte tekst.
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        f.s().answers.push_back(Err(StartFailure::Real(
+            "gh: stderr med ekstern tekst\nlinje 2".into(),
+        )));
+        let v = engine(&f).tick(
+            &mut WatchMemory::default(),
+            &plan_of(&[("web", cfg(fixed("bug")))]),
+        );
+        assert!(v.waiting["a"].text.contains(WATCH_GH_ERROR_TEXT));
+        assert!(!v.waiting["a"].text.contains("ekstern"));
+    }
+
+    #[test]
+    fn cap_zero_starts_nothing_with_its_own_text() {
+        // Review6d N5: et loft på 0 betyder "starter intet"; ingen budget-besked.
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        let c = WatchConfig {
+            max_per_hour: 0,
+            ..cfg(fixed("bug"))
+        };
+        let plan = plan_of(&[("web", c)]);
+        assert!(!can_start_anything(&plan, &f.s().state, T, CEST));
+        let v = engine(&f).tick(&mut WatchMemory::default(), &plan);
+        assert!(f.started_items().is_empty());
+        assert_eq!(v.waiting["a"].reason, WaitReason::Budget);
+        assert_eq!(v.waiting["a"].text, "loft 0: vagten starter intet");
+        assert_eq!(v.waiting["a"].next_at, None);
+        assert_eq!(f.notices_of(NoticeKind::BudgetReached), 0);
+        assert_eq!(v.projects[0].cap_hour, 0);
+    }
+
+    #[test]
+    fn panic_after_a_start_keeps_the_memory() {
+        // Review6d N8: reserve (1), record_success (2), view-kopien (3) går i panik — agenten
+        // fra startet er stadig i hukommelsen, og intet view publiceres.
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        f.s().answers.push_back(Ok(Started {
+            ticket_id: "t1".into(),
+            spawned: vec!["ag1".into()],
+            notes: vec![],
+        }));
+        f.s().live.insert("ag1".into());
+        f.s().panic_at_state_call = Some(3);
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let plan = plan_of(&[("web", cfg(fixed("bug")))]);
+        assert_eq!(e.tick_guarded(&mut mem, &plan), None);
+        assert_eq!(mem.agents_in("web"), 1);
+        // Næste tick kører normalt og tæller agenten mod `maxAgents` (2): `bug` mangler to
+        // agenter, men kun én er fri → "venter på plads".
+        f.advance(MIN);
+        f.add("web", "b", &[], None);
+        let v = e.tick_guarded(&mut mem, &plan).unwrap();
+        assert_eq!(v.projects[0].agents, 1);
+        assert_eq!(v.waiting["b"].reason, WaitReason::Seat);
+        assert_eq!(f.s().staffing_calls.last().unwrap().2, 1);
     }
 
     #[test]
@@ -1617,5 +1929,13 @@ mod tests {
             default: Some("feature".into()),
         };
         assert_eq!(playbook_text(&r).as_deref(), Some("byLabel (1) → feature"));
+        let empty = PlaybookRule::ByLabel {
+            by_label: vec![],
+            default: None,
+        };
+        assert_eq!(
+            playbook_text(&empty).as_deref(),
+            Some(PLAYBOOK_ONLY_KIND_TEXT)
+        );
     }
 }

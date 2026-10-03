@@ -193,6 +193,16 @@ pub trait TicketsHost: Send {
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
     ) -> Result<T, String>;
+    /// [`Self::mutate`], but the implementation emits only when `changed(&result)` (review6d
+    /// N4: a no-op note stays silent). By default it is `mutate`.
+    fn mutate_if<T>(
+        &self,
+        f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T, String> {
+        let _ = changed;
+        self.mutate(f)
+    }
     /// Read-only access under the service lock; no emits.
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T;
     /// Routes tickets in review without a reviewer (plan5 A.6; `TicketsCtx::route_reviews`).
@@ -1551,9 +1561,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     SESSION_MOVED_NOTE
                 };
                 let now = now_ms();
+                // Review6d N4: no `tickets-changed` when the note is already the last entry.
                 if let Err(e) = self
                     .host
-                    .mutate(|s| s.note_by_system(&ticket.id, note, now))
+                    .mutate_if(|s| s.note_by_system(&ticket.id, note, now), Option::is_some)
                 {
                     log::warn!("dispatch {agent_id}: noting the restart on {short} failed: {e}");
                 }
@@ -2013,6 +2024,18 @@ mod tests {
         ) -> Result<R, String> {
             let r = f(&mut lock(&self.svc)).map_err(String::from);
             if r.is_ok() {
+                self.mutations.fetch_add(1, Ordering::SeqCst);
+            }
+            r
+        }
+
+        fn mutate_if<R>(
+            &self,
+            f: impl FnOnce(&mut TicketService) -> Result<R, TicketError>,
+            changed: impl FnOnce(&R) -> bool,
+        ) -> Result<R, String> {
+            let r = f(&mut lock(&self.svc)).map_err(String::from);
+            if r.as_ref().is_ok_and(changed) {
                 self.mutations.fetch_add(1, Ordering::SeqCst);
             }
             r
@@ -3813,6 +3836,43 @@ mod tests {
             .filter_map(|e| e.note.clone())
             .collect();
         assert!(!notes.iter().any(|n| n == NEW_SESSION_NOTE), "{notes:?}");
+    }
+
+    #[test]
+    fn repeated_session_note_is_silent() {
+        // Review6d N4: when "ny session til ticketen" is already the last entry, the note is a
+        // no-op and the host is not told about a change (no empty `tickets-changed`).
+        let run = |seed: bool| {
+            let mut h = Harness::new();
+            h.agent("a1", AgentStatus::Idle);
+            h.had_ticket("a1");
+            let t = h.queued("a1", "A");
+            if seed {
+                lock(&h.d.host.svc)
+                    .note_by_system(&t.id, NEW_SESSION_NOTE, 1)
+                    .unwrap();
+            }
+            let len = h.ticket(&t.id).history.len();
+            let before = h.d.host.mutations.load(Ordering::SeqCst);
+            h.idle("a1");
+            h.advance(DISPATCH_DELAY_MS);
+            assert_eq!(h.restarts().len(), 1);
+            let after = h.ticket(&t.id);
+            let notes = after
+                .history
+                .iter()
+                .filter(|e| e.note.as_deref() == Some(NEW_SESSION_NOTE))
+                .count();
+            assert_eq!(notes, 1, "seed {seed}");
+            (
+                h.d.host.mutations.load(Ordering::SeqCst) - before,
+                after.history.len() - len,
+            )
+        };
+        let (fresh, fresh_len) = run(false);
+        let (seeded, seeded_len) = run(true);
+        assert_eq!((fresh_len, seeded_len), (1, 0));
+        assert_eq!(fresh, seeded + 1);
     }
 
     #[test]

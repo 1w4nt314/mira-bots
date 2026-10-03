@@ -529,10 +529,17 @@ pub const WATCH_WAIT_NO_PLAYBOOK: &str = "ingen playbook valgt for vagten";
 pub fn watch_unknown_playbook_text(name: &str) -> String {
     format!("playbook «{name}» findes ikke i workspace")
 }
-/// Parking text: the start failed.
-pub fn watch_start_failed_text(err: &str) -> String {
-    format!("vagt: start fejlede: {err}")
+/// Parking text: the start failed; the item is tried again at `retry_hhmm` (review6d W1).
+pub fn watch_start_failed_text(err: &str, retry_hhmm: &str) -> String {
+    format!("vagt: start fejlede: {err} (prøves igen {retry_hhmm})")
 }
+/// Parking text: a cap of 0 in `project.json` or the workspace file (review6d N5: 0 = the watch
+/// starts nothing).
+pub const WATCH_WAIT_CAP_ZERO: &str = "loft 0: vagten starter intet";
+/// A start error from `gh` with its own (external) stderr is shown as this (review6d N2).
+pub const WATCH_GH_ERROR_TEXT: &str = "gh fejlede (kør kommandoen i en terminal for detaljer)";
+/// Longest start error in log, badge and `trippedReason` (review6d N2).
+pub const WATCH_ERROR_MAX_CHARS: usize = 120;
 /// Inactive reason: no `watch.enabled: true` in the project's file.
 pub const WATCH_REASON_NOT_ENABLED: &str = "watch.enabled mangler i project.json";
 /// Inactive reason: the project is in `watchOff` (app settings).
@@ -892,7 +899,12 @@ mod tests {
             watch_unknown_playbook_text("docs"),
             "playbook «docs» findes ikke i workspace"
         );
-        assert_eq!(watch_start_failed_text("x"), "vagt: start fejlede: x");
+        assert_eq!(
+            watch_start_failed_text("x", "13:05"),
+            "vagt: start fejlede: x (prøves igen 13:05)"
+        );
+        assert_eq!(WATCH_WAIT_CAP_ZERO, "loft 0: vagten starter intet");
+        assert_eq!(WATCH_ERROR_MAX_CHARS, 120);
         assert_eq!(
             WATCH_REASON_NOT_ENABLED,
             "watch.enabled mangler i project.json"

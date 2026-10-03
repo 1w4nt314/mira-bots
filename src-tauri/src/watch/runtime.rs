@@ -27,9 +27,9 @@ use crate::agent::claude_path::find_claude;
 use crate::agent::{now_ms, AgentError, AgentInfo, Role, SeatKind};
 use crate::commands::AppState;
 use crate::config::{
-    watch_playbook_failed_note, watch_started_note, INBOX_ITEM_GONE, WATCH_MAX_AGENTS_TEXT,
-    WATCH_NO_STAFF_SPAWN, WATCH_REFRESH_MIN_MS, WATCH_REFRESH_WAIT_MAX_MS, WATCH_STOP_POLL_MS,
-    WATCH_TICK_SECS,
+    watch_playbook_failed_note, watch_started_note, INBOX_ISSUE_CLOSED, INBOX_ITEM_GONE,
+    WATCH_MAX_AGENTS_TEXT, WATCH_NO_STAFF_SPAWN, WATCH_REFRESH_MIN_MS, WATCH_REFRESH_WAIT_MAX_MS,
+    WATCH_STOP_POLL_MS, WATCH_TICK_SECS,
 };
 use crate::events::WATCH_CHANGED;
 use crate::hooks::status::AgentStatus;
@@ -41,9 +41,10 @@ use crate::tickets::playbook::{start_playbook_with, StartOpts, StartedBy};
 use crate::tickets::tools::{SpawnByProfile, SpawnPort};
 use crate::tickets::TicketsCtx;
 use crate::watch::engine::{
-    active_projects, build_view, can_start_anything, staffing_for, AgentsPort, Candidate, Clock,
-    InboxPort, Notifier, ProjectWatchFile, SeatRoom, Staffing, StartFailure, Started, StarterPort,
-    StatePort, TickPlan, WatchEngine, WatchMemory, WatchPort, WatchStart, WatchView,
+    active_projects, build_view, can_start_anything, short_error, staffing_for, AgentsPort,
+    Candidate, Clock, InboxPort, Notifier, ProjectWatchFile, SeatRoom, Staffing, StartFailure,
+    Started, StarterPort, StatePort, TickPlan, WatchEngine, WatchMemory, WatchPort, WatchStart,
+    WatchView,
 };
 use crate::watch::state::{WatchState, WatchStateFile};
 use crate::workspace::WorkspaceSnapshot;
@@ -198,14 +199,18 @@ pub fn watch_spawn_port(
     })
 }
 
-/// Fejlen fra `inbox_start` → [`StartFailure`]: emnet er væk eller allerede startet som ticket
-/// → `Gone` (ingen fejl); alt andet er reelt.
+/// Fejlen fra `inbox_start` → [`StartFailure`]: emnet er væk, allerede startet som ticket,
+/// eller issuen blev lukket mellem hentning og start (review6d W1) → `Gone` (ingen fejl, intet
+/// budget); alt andet er reelt, som én kort linje ([`short_error`], review6d N2).
+///
+/// Et lukket issue forbliver `new` i indbakken (der findes ingen vej til at markere ét emne
+/// `gone` uden en komplet hentning); næste komplette hentning markerer det `gone`.
 pub fn classify_start_error(e: &str) -> StartFailure {
     let started = TicketError::ExternalAlreadyStarted(String::new()).to_string();
-    if e == INBOX_ITEM_GONE || e.starts_with(started.trim_end()) {
+    if e == INBOX_ITEM_GONE || e == INBOX_ISSUE_CLOSED || e.starts_with(started.trim_end()) {
         StartFailure::Gone
     } else {
-        StartFailure::Real(e.to_string())
+        StartFailure::Real(short_error(e))
     }
 }
 
@@ -277,8 +282,12 @@ pub fn start_for_watch(
         })
         .map_err(|e| classify_start_error(&e))?;
     let now = now_ms();
+    // Review6d N4: ingen `tickets-changed` når noten allerede er den sidste.
     let note = |text: String| {
-        if let Err(e) = ctx.mutate(|s| s.note_by_system(&ticket.id, &text, now)) {
+        if let Err(e) = ctx.mutate_if(
+            |s| s.note_by_system(&ticket.id, &text, now),
+            Option::is_some,
+        ) {
             log::warn!(
                 "watch: note på ticket {} fejlede: {e}",
                 short_id(&ticket.id)
@@ -301,6 +310,7 @@ pub fn start_for_watch(
             })
         }
         Err(e) => {
+            let e = short_error(&e);
             note(watch_playbook_failed_note(&e));
             Err(StartFailure::AfterTicket {
                 ticket_id: ticket.id.clone(),
@@ -598,9 +608,14 @@ fn run_tick(app: &AppHandle, state: &AppState) {
     // (5) Motoren, også når alt venter på budgettet: så får de ventende emner deres
     // "venter på budget (næste: HH:MM)" og brugeren én besked pr. time (intet startes, for
     // reservationen siger nej). Kun indbakke-dokumentet læses; intet netværk.
-    let view = WatchEngine::new(port).tick(&mut mem, &plan);
+    //
+    // Review6d N8: en panik i motoren må ikke tabe hukommelsen (fx agent-id'er fra et start
+    // lige før panikken); den gemmes også da, og panikken logges som én linje.
+    let view = WatchEngine::new(port).tick_guarded(&mut mem, &plan);
     rt.store_mem(mem);
-    publish(app, rt, &view);
+    if let Some(view) = view {
+        publish(app, rt, &view);
+    }
 }
 
 /// Timeren (én task): første tick efter [`WATCH_TICK_SECS`], derefter hvert
@@ -775,13 +790,20 @@ mod tests {
         assert_eq!(classify_start_error(INBOX_ITEM_GONE), StartFailure::Gone);
         let started = TicketError::ExternalAlreadyStarted("ab12cd34".into()).to_string();
         assert_eq!(classify_start_error(&started), StartFailure::Gone);
+        // Review6d W1: et issue lukket mellem hentning og start er væk, ikke en fejl.
         assert_eq!(
             classify_start_error("Issuen er lukket på GitHub; den startes ikke"),
-            StartFailure::Real("Issuen er lukket på GitHub; den startes ikke".into())
+            StartFailure::Gone
+        );
+        assert_eq!(classify_start_error(INBOX_ISSUE_CLOSED), StartFailure::Gone);
+        // Review6d N2: reelle fejl er korte og uden gh's egen stderr.
+        assert_eq!(
+            classify_start_error("gh: netværk\nmere"),
+            StartFailure::Real(crate::config::WATCH_GH_ERROR_TEXT.into())
         );
         assert_eq!(
-            classify_start_error("gh: netværk"),
-            StartFailure::Real("gh: netværk".into())
+            classify_start_error("svaret fra gh var for stort"),
+            StartFailure::Real("svaret fra gh var for stort".into())
         );
     }
 

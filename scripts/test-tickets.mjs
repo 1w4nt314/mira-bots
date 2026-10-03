@@ -578,6 +578,25 @@ eq(
   "timeline system note kinds",
 );
 eq(k.buildTimeline(sys)[2], { at: T0 + 2, kind: "git", text: "worktree oprettet: ticket/ab12cd34", by: "systemet" }, "timeline worktree note");
+// Review6d N6: "tjek…"/"afvist af appen" er kun `checks` når systemet skrev dem.
+eq(
+  kindsOf(
+    k.buildTimeline(
+      full({
+        history: [
+          hist(T0, null, "backlog"),
+          noteAt(T0 + 1, "Tjek lige om login virker", "agent"),
+          noteAt(T0 + 2, "tjek din mail", "user"),
+          hist(T0 + 3, "review", "rejected", "user", "afvist af appen: det var mig"),
+          hist(T0 + 4, "rejected", "rejected", "system", "afvist af appen: Tjek fejlede"),
+          noteAt(T0 + 5, "tjek afbrudt af genstart", "system"),
+        ],
+      }),
+    ),
+  ),
+  ["created", "note", "note", "state", "checks", "checks"],
+  "timeline checks only by the system",
+);
 // git uden "worktree oprettet"-note udelades (ingen tid at opfinde).
 eq(
   kindsOf(k.buildTimeline(full({ git: { mode: "worktree", branch: "ticket/ab12cd34", base: "main", repo: "/r", worktree: "/w" } }))),

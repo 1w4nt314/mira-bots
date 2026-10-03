@@ -992,8 +992,11 @@ const CHECKS_REJECT_PREFIX = "afvist af appen";
  * | "worktree oprettet"                                                      | "git"       |
  * | "ny session", "session fortsat"                                          | "session"   |
  * | "meldt tilbage", "issue #", "kunne ikke melde tilbage", "resultat skrevet", "tilbagemelding" | "writeBack" |
- * | "tjek" (uanset store/små), "afvist af appen"                             | "checks"    |
+ * | "tjek" (uanset store/små), "afvist af appen" — kun når `by` er systemet  | "checks"    |
  * | andet                                                                    | "note"      |
+ *
+ * `checks` kræver `by === "system"` (review6d N6): en agent- eller brugernote der tilfældigvis
+ * begynder med "tjek…" er en almindelig note.
  */
 const NOTE_KINDS: ReadonlyArray<readonly [TimelineKind, readonly string[]]> = [
   ["watch", ["startet af vagten", "vagt:"]],
@@ -1003,9 +1006,10 @@ const NOTE_KINDS: ReadonlyArray<readonly [TimelineKind, readonly string[]]> = [
   ["checks", ["tjek", CHECKS_REJECT_PREFIX]],
 ];
 
-function noteKind(note: string): TimelineKind {
+function noteKind(note: string, by: TicketActor): TimelineKind {
   const lower = note.toLowerCase();
   for (const [kind, prefixes] of NOTE_KINDS) {
+    if (kind === "checks" && by !== "system") continue;
     if (prefixes.some((p) => lower.startsWith(p))) return kind;
   }
   return "note";
@@ -1020,11 +1024,12 @@ function historyEntry(h: TicketHistoryEntry): TimelineEntry {
     return { at: h.at, kind: "created", text: note === "" ? text : `${text} — ${note}`, by };
   }
   if (h.from === h.to) {
-    return { at: h.at, kind: note === "" ? "note" : noteKind(note), text: note === "" ? "(note)" : note, by };
+    return { at: h.at, kind: note === "" ? "note" : noteKind(note, h.by), text: note === "" ? "(note)" : note, by };
   }
   const move = `${STATE_LABEL[h.from]} → ${STATE_LABEL[h.to]}`;
   // Appens afvisning efter et fejlet tjek hører til tjekkene, ikke til de almindelige skift.
-  const kind: TimelineKind = note.toLowerCase().startsWith(CHECKS_REJECT_PREFIX) ? "checks" : "state";
+  const kind: TimelineKind =
+    h.by === "system" && note.toLowerCase().startsWith(CHECKS_REJECT_PREFIX) ? "checks" : "state";
   return { at: h.at, kind, text: note === "" ? move : `${move} — ${note}`, by };
 }
 

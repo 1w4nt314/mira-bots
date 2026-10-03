@@ -689,17 +689,17 @@ mod tests {
         assert_eq!(
             c.watch,
             WorkspaceWatch {
-                enabled: true,
+                enabled: false,
                 max_per_hour: 60,
-                max_per_day: 1
+                max_per_day: 0
             }
         );
         assert_eq!(
             notes,
             [
-                "watch.enabled skal være true/false; true bruges",
+                "watch.enabled skal være true/false; vagten er fra",
                 "watch.maxPerHour 90 er sat ned til 60 (vagtens loft)",
-                "watch.maxPerDay 0 er sat op til 1 (vagtens loft)",
+                "watch.maxPerDay er 0: vagten starter intet",
             ]
         );
         let (_, c, notes) = effective(&file(r#"{"watch": {"maxPerDay": 501}}"#));
@@ -715,11 +715,19 @@ mod tests {
 
     #[test]
     fn watch_wrong_shape_is_note_only() {
-        // Aldrig en afvist fil: de andre felter gælder, ingen advarsel.
+        // Aldrig en afvist fil: de andre felter gælder, ingen advarsel. Men vagten fejler
+        // lukket: `"watch": true/false` er ikke et objekt, så master-kontakten er fra.
         let s = parse(r#"{"maxWorkAgents": 2, "watch": true}"#);
         assert_eq!((s.warning, s.rules.max_work_agents), (None, 2));
-        assert_eq!(s.config.watch, WorkspaceWatch::default());
-        assert_eq!(s.notes, ["watch ignoreres: skal være et objekt"]);
+        assert!(!s.config.watch.enabled);
+        assert_eq!(
+            (s.config.watch.max_per_hour, s.config.watch.max_per_day),
+            (
+                WorkspaceWatch::default().max_per_hour,
+                WorkspaceWatch::default().max_per_day
+            )
+        );
+        assert_eq!(s.notes, ["watch skal være et objekt; vagten er fra"]);
         let s = parse(r#"{"watch": [1]}"#);
         assert_eq!((s.warning, s.notes.len()), (None, 1));
         // WorkspaceRules er uændret af vagten.

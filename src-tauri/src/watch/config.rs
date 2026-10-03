@@ -98,7 +98,9 @@ pub enum PlaybookRule {
     /// Altid denne playbook.
     Fixed(String),
     /// Første label (i filens rækkefølge, uden hensyn til store/små bogstaver) der matcher,
-    /// ellers `default`. En værdi `"task"` betyder "ingen playbook for denne label".
+    /// ellers `default`. En værdi `"task"` betyder "ingen playbook for denne label". Et objekt
+    /// er altid en regel, også uden gyldige poster (`{"default": "task"}`: kun emner med
+    /// `kind:` startes; review6d W2).
     ByLabel {
         by_label: Vec<(String, String)>,
         default: Option<String>,
@@ -110,9 +112,9 @@ pub enum PlaybookRule {
 pub struct WatchConfig {
     pub enabled: bool,
     pub playbook: PlaybookRule,
-    /// 1–[`WATCH_PER_HOUR_MAX`].
+    /// 1–[`WATCH_PER_HOUR_MAX`]; 0 = vagten starter intet (review6d N5).
     pub max_per_hour: u32,
-    /// 1–[`WATCH_PER_DAY_MAX`].
+    /// 1–[`WATCH_PER_DAY_MAX`]; 0 = vagten starter intet.
     pub max_per_day: u32,
     /// 1–[`MAX_WORK_SEATS`]: levende agenter vagten selv har startet i projektet.
     pub max_agents: usize,
@@ -198,6 +200,23 @@ fn clamp_number(
             }
         },
     }
+}
+
+/// Et loft (`maxPerHour`/`maxPerDay`): `0` betyder "vagten starter intet" (review6d N5,
+/// fail-closed) med noten "`{prefix}{key} er 0: vagten starter intet`"; ellers
+/// [`clamp_number`] med `lo` = 1.
+fn cap_number(
+    v: Option<&Value>,
+    (prefix, key): (&str, &str),
+    (hi, default): (u64, u64),
+    why: &str,
+    notes: &mut Vec<String>,
+) -> u32 {
+    if v.and_then(Value::as_u64) == Some(0) {
+        notes.push(format!("{prefix}{key} er 0: vagten starter intet"));
+        return 0;
+    }
+    clamp_number(v, (prefix, key), (1, hi, default), why, notes) as u32
 }
 
 const PJ: &str = "project.json: ";
@@ -294,11 +313,9 @@ fn parse_playbook(
                     }
                 },
             };
-            if by_label.is_empty() && default.is_none() {
-                PlaybookRule::None
-            } else {
-                PlaybookRule::ByLabel { by_label, default }
-            }
+            // Review6d W2: et objekt er en regel, også tomt — så kan "kun emnets `kind:`"
+            // udtrykkes (`{"default": "task"}`), mens udeladt/`"task"` betyder ingen regel.
+            PlaybookRule::ByLabel { by_label, default }
         }
         _ => {
             notes.push(format!(
@@ -331,28 +348,26 @@ pub fn parse_watch(
         )),
     }
     cfg.playbook = parse_playbook(w.get("playbook"), probe, notes);
-    cfg.max_per_hour = clamp_number(
+    cfg.max_per_hour = cap_number(
         w.get("maxPerHour"),
         (PJ, "watch.maxPerHour"),
         (
-            1,
             u64::from(WATCH_PER_HOUR_MAX),
             u64::from(WATCH_MAX_PER_HOUR_DEFAULT),
         ),
         &format!("1–{WATCH_PER_HOUR_MAX}"),
         notes,
-    ) as u32;
-    cfg.max_per_day = clamp_number(
+    );
+    cfg.max_per_day = cap_number(
         w.get("maxPerDay"),
         (PJ, "watch.maxPerDay"),
         (
-            1,
             u64::from(WATCH_PER_DAY_MAX),
             u64::from(WATCH_MAX_PER_DAY_DEFAULT),
         ),
         &format!("1–{WATCH_PER_DAY_MAX}"),
         notes,
-    ) as u32;
+    );
     cfg.max_agents = clamp_number(
         w.get("maxAgents"),
         (PJ, "watch.maxAgents"),
@@ -381,49 +396,57 @@ pub fn parse_watch(
 pub fn parse_workspace_watch(v: &Value, notes: &mut Vec<String>) -> WorkspaceWatch {
     let mut ws = WorkspaceWatch::default();
     let Value::Object(w) = v else {
-        notes.push("watch ignoreres: skal være et objekt".to_string());
+        // Fejler lukket: `"watch": false` (eller andet der ikke er et objekt) slukker vagten.
+        ws.enabled = false;
+        notes.push("watch skal være et objekt; vagten er fra".to_string());
         return ws;
     };
     match w.get("enabled") {
         None | Some(Value::Null) => {}
         Some(Value::Bool(b)) => ws.enabled = *b,
-        Some(_) => notes.push("watch.enabled skal være true/false; true bruges".to_string()),
+        // Review6d N5: master-kontakten fejler lukket (`"enabled": "false"` tænder den ikke).
+        Some(_) => {
+            ws.enabled = false;
+            notes.push("watch.enabled skal være true/false; vagten er fra".to_string());
+        }
     }
-    ws.max_per_hour = clamp_number(
+    ws.max_per_hour = cap_number(
         w.get("maxPerHour"),
         ("", "watch.maxPerHour"),
         (
-            1,
             u64::from(WATCH_PER_HOUR_MAX),
             u64::from(WATCH_WS_MAX_PER_HOUR),
         ),
         "vagtens loft",
         notes,
-    ) as u32;
-    ws.max_per_day = clamp_number(
+    );
+    ws.max_per_day = cap_number(
         w.get("maxPerDay"),
         ("", "watch.maxPerDay"),
         (
-            1,
             u64::from(WATCH_PER_DAY_MAX),
             u64::from(WATCH_WS_MAX_PER_DAY),
         ),
         "vagtens loft",
         notes,
-    ) as u32;
+    );
     ws
 }
 
-/// Playbooken for et emne (A.4): mappe-emnets `ticket_kind` vinder (`"task"` tæller som
-/// ingen); ellers reglen — `byLabel` i filens rækkefølge, uden hensyn til store/små bogstaver
-/// og omgivende mellemrum, første match (en værdi `"task"` giver `None`), ellers `default`.
-/// `None`: ingen playbook (vagten parkerer emnet). Om navnet findes i workspace tjekker
-/// kalderen.
+/// Playbooken for et emne (A.4): uden regel (`watch.playbook` udeladt, `"task"` eller
+/// ugyldig) ingen playbook — heller ikke for et emne med `kind:` (handoff6d 5, review6d W2).
+/// Med en regel vinder mappe-emnets `ticket_kind` (`"task"` tæller som ingen); ellers
+/// `byLabel` i filens rækkefølge, uden hensyn til store/små bogstaver og omgivende mellemrum,
+/// første match (en værdi `"task"` giver `None`), ellers `default`. `None`: ingen playbook
+/// (vagten parkerer emnet). Om navnet findes i workspace tjekker kalderen.
 pub fn pick_playbook<'a>(
     rule: &'a PlaybookRule,
     ticket_kind: Option<&'a str>,
     labels: &[String],
 ) -> Option<&'a str> {
+    if *rule == PlaybookRule::None {
+        return None;
+    }
     if let Some(k) = ticket_kind.map(str::trim) {
         if !k.is_empty() && k != NO_PLAYBOOK {
             return Some(k);
@@ -568,10 +591,12 @@ mod tests {
             pick_playbook(&r, Some("docs"), &labels(&["bug"])),
             Some("docs")
         );
-        assert_eq!(
-            pick_playbook(&PlaybookRule::None, Some("bug"), &[]),
-            Some("bug")
-        );
+        // Review6d W2: uden regel starter heller ikke et emne med `kind:`.
+        assert_eq!(pick_playbook(&PlaybookRule::None, Some("bug"), &[]), None);
+        // En tom regel (`{"default": "task"}`) lader `kind:` vinde, andre emner parkeres.
+        let only_kind = rule(&[], None);
+        assert_eq!(pick_playbook(&only_kind, Some("bug"), &[]), Some("bug"));
+        assert_eq!(pick_playbook(&only_kind, None, &labels(&["bug"])), None);
         // ticket_kind "task" tæller som ingen: reglen afgør.
         assert_eq!(
             pick_playbook(&r, Some("task"), &labels(&["bug"])),
@@ -585,11 +610,17 @@ mod tests {
             (cfg.unwrap().playbook, notes.len()),
             (PlaybookRule::None, 0)
         );
-        let (cfg, notes) = parse_text(r#"{"watch":{"playbook":{"byLabel":{},"default":"task"}}}"#);
-        assert_eq!(
-            (cfg.unwrap().playbook, notes.len()),
-            (PlaybookRule::None, 0)
-        );
+        // Et objekt er en regel, også tomt (kollapses ikke til `None`).
+        for text in [
+            r#"{"watch":{"playbook":{"byLabel":{},"default":"task"}}}"#,
+            r#"{"watch":{"playbook":{"default":"task"}}}"#,
+            r#"{"watch":{"playbook":{}}}"#,
+        ] {
+            let (cfg, notes) = parse_text(text);
+            assert_eq!((cfg.unwrap().playbook, notes.len()), (rule(&[], None), 0));
+        }
+        let (cfg, _) = parse_text(r#"{"watch":{"enabled":true}}"#);
+        assert_eq!(cfg.unwrap().playbook, PlaybookRule::None);
         let (cfg, _) = parse_text(r#"{"watch":{"playbook":" bug "}}"#);
         assert_eq!(cfg.unwrap().playbook, PlaybookRule::Fixed("bug".into()));
     }
@@ -632,7 +663,11 @@ mod tests {
             ),
             (
                 r#"{"maxPerHour": 0}"#,
-                &["project.json: watch.maxPerHour 0 er sat op til 1 (1–60)"],
+                &["project.json: watch.maxPerHour er 0: vagten starter intet"],
+            ),
+            (
+                r#"{"maxPerDay": 0}"#,
+                &["project.json: watch.maxPerDay er 0: vagten starter intet"],
             ),
             (
                 r#"{"maxPerHour": 999}"#,
@@ -705,6 +740,10 @@ mod tests {
         let cfg = cfg.unwrap();
         assert!(!cfg.enabled);
         assert_eq!((cfg.max_per_hour, cfg.max_agents, cfg.quiet), (60, 5, None));
+        // Review6d N5: et loft på 0 klemmes ikke op; det betyder "starter intet".
+        let (cfg, _) = parse_text(r#"{"watch": {"maxPerHour": 0, "maxPerDay": 0}}"#);
+        let cfg = cfg.unwrap();
+        assert_eq!((cfg.max_per_hour, cfg.max_per_day), (0, 0));
         let (cfg, _) = parse_text(
             r#"{"watch": {"enabled": true, "playbook": {"byLabel": {"Bug": "bug", "x": "nope!", "": "bug"}, "default": "task"}}}"#,
         );
@@ -809,16 +848,27 @@ mod tests {
             WorkspaceWatch {
                 enabled: false,
                 max_per_hour: 60,
-                max_per_day: 1
+                max_per_day: 0
             }
         );
         assert_eq!(
             notes,
             [
                 "watch.maxPerHour 90 er sat ned til 60 (vagtens loft)",
-                "watch.maxPerDay 0 er sat op til 1 (vagtens loft)"
+                "watch.maxPerDay er 0: vagten starter intet"
             ]
         );
+        // Review6d N5: en master-kontakt af forkert type slukker vagten (fail-closed).
+        for bad in [
+            serde_json::json!("false"),
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            let mut notes = Vec::new();
+            let ws = parse_workspace_watch(&serde_json::json!({ "enabled": bad }), &mut notes);
+            assert!(!ws.enabled, "{bad}");
+            assert_eq!(notes, ["watch.enabled skal være true/false; vagten er fra"]);
+        }
     }
 
     #[test]

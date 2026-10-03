@@ -561,12 +561,17 @@ impl AgentManager {
     }
 
     /// Spawns an arbitrary [`SpawnSpec`] as an agent (used by `spawn`, and directly by tests).
+    /// Refused once the app is closing (review6d N3: the check lives here too, so no caller can
+    /// go around it).
     pub(crate) fn spawn_spec(
         &mut self,
         spec: SpawnSpec,
         meta: AgentMeta,
         sink: EventSink,
     ) -> Result<AgentInfo, AgentError> {
+        if self.closing {
+            return Err(AgentError::Closing);
+        }
         self.check_limit(meta.seat_kind)?;
         let AgentMeta {
             id,
@@ -1933,6 +1938,29 @@ mod tests {
             m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
             Err(AgentError::Closing)
         ));
+        // Review6d N3: `spawn_spec` (the path under `spawn`) refuses too, before starting
+        // anything.
+        let spec = SpawnSpec {
+            program: PathBuf::from("/nope/claude"),
+            args: vec![],
+            cwd: PathBuf::from("/definitely/not/a/dir"),
+            env: vec![],
+            cols: PTY_COLS,
+            rows: PTY_ROWS,
+        };
+        let meta = AgentMeta {
+            id: "a1".into(),
+            session_id: "s1".into(),
+            profile: ProfileSnapshot::default(),
+            seat_kind: SeatKind::Work,
+            name: "bot-01".into(),
+            project: None,
+        };
+        assert!(matches!(
+            m.spawn_spec(spec, meta, null_sink()),
+            Err(AgentError::Closing)
+        ));
+        assert!(m.list().is_empty());
         // Idempotent; the text is the user-facing one.
         m.kill_all();
         assert!(m.is_closing());

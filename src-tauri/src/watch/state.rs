@@ -28,8 +28,12 @@ const TRIPPED_REASON_MAX_CHARS: usize = 300;
 pub struct ProjectState {
     #[serde(flatten)]
     pub ring: Ring,
-    /// Reelle startfejl i træk (nulstilles af et vellykket start).
+    /// Reelle startfejl i træk (nulstilles af et vellykket start, og når den sidste fejl er
+    /// mindst en time gammel — "3 fejl i træk inden for en time", review6d W1).
     pub failures: u32,
+    /// Hvornår den seneste reelle startfejl skete (UTC-ms). Udeladt i filen når `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<u64>,
     /// Sat når [`WATCH_TRIP_AFTER`] fejl i træk stoppede vagten for projektet.
     pub tripped_at: Option<u64>,
     pub tripped_reason: Option<String>,
@@ -128,10 +132,18 @@ impl WatchState {
     }
 
     /// En reel startfejl. `true` netop når denne fejl stoppede vagten for projektet
-    /// ([`WATCH_TRIP_AFTER`] i træk); et allerede stoppet projekt stoppes ikke igen.
+    /// ([`WATCH_TRIP_AFTER`] i træk inden for en time); et allerede stoppet projekt stoppes
+    /// ikke igen. Er den forrige fejl mindst [`HOUR_MS`] gammel, tæller denne som den første
+    /// (review6d W1: tre uafhængige fejl over uger stopper ikke vagten).
     pub fn record_failure(&mut self, id: &str, reason: &str, now: u64) -> bool {
         let p = self.project(id);
+        if p.last_failure_at
+            .is_some_and(|t| now.saturating_sub(t) >= HOUR_MS)
+        {
+            p.failures = 0;
+        }
         p.failures = p.failures.saturating_add(1);
+        p.last_failure_at = Some(now);
         if p.failures >= WATCH_TRIP_AFTER && p.tripped_at.is_none() {
             p.tripped_at = Some(now);
             p.tripped_reason = Some(
@@ -149,6 +161,7 @@ impl WatchState {
     pub fn record_success(&mut self, id: &str) {
         if let Some(p) = self.projects.get_mut(id) {
             p.failures = 0;
+            p.last_failure_at = None;
         }
     }
 
@@ -158,6 +171,7 @@ impl WatchState {
             Some(p) => {
                 let was = p.tripped_at.is_some();
                 p.failures = 0;
+                p.last_failure_at = None;
                 p.tripped_at = None;
                 p.tripped_reason = None;
                 was
@@ -488,8 +502,13 @@ mod tests {
         assert!(s.tripped().is_empty());
         let p = &s.projects["web"];
         assert_eq!(
-            (p.failures, p.tripped_at, p.tripped_reason.clone()),
-            (0, None, None)
+            (
+                p.failures,
+                p.last_failure_at,
+                p.tripped_at,
+                p.tripped_reason.clone()
+            ),
+            (0, None, None, None)
         );
         assert!(!s.reset_trip("web"));
         assert!(!s.reset_trip("ukendt"));
@@ -501,6 +520,48 @@ mod tests {
             s.projects["api"].tripped_reason.as_ref().unwrap().len(),
             TRIPPED_REASON_MAX_CHARS
         );
+    }
+
+    #[test]
+    fn failures_decay_after_an_hour() {
+        // Review6d W1 (Refuter-test c): tre fejl med en uge imellem stopper ikke vagten.
+        const WEEK: u64 = 7 * 24 * HOUR_MS;
+        let mut s = WatchState::default();
+        for i in 0..5 {
+            assert!(!s.record_failure("web", "x", T + i * WEEK));
+            assert_eq!(s.projects["web"].failures, 1);
+        }
+        assert!(s.tripped().is_empty());
+        // Tre inden for en time stopper; en time efter den sidste begynder tællingen forfra.
+        let mut s = WatchState::default();
+        assert!(!s.record_failure("web", "a", T));
+        assert!(!s.record_failure("web", "b", T + HOUR_MS - 1));
+        assert_eq!(s.projects["web"].failures, 2);
+        assert!(!s.record_failure("web", "c", T + 2 * HOUR_MS - 1));
+        assert_eq!(
+            (
+                s.projects["web"].failures,
+                s.projects["web"].last_failure_at
+            ),
+            (1, Some(T + 2 * HOUR_MS - 1))
+        );
+        assert!(!s.record_failure("web", "d", T + 2 * HOUR_MS));
+        assert!(s.record_failure("web", "e", T + 2 * HOUR_MS + 60_000));
+        assert_eq!(s.projects["web"].tripped_at, Some(T + 2 * HOUR_MS + 60_000));
+        // Et vellykket start glemmer tidspunktet.
+        let mut s = WatchState::default();
+        s.record_failure("web", "a", T);
+        s.record_success("web");
+        assert_eq!(s.projects["web"].last_failure_at, None);
+        // `lastFailureAt` står kun i filen når den er sat, og en gammel fil uden den læses.
+        let json = serde_json::to_string(&WatchState::default().projects).unwrap();
+        assert!(!json.contains("lastFailureAt"));
+        let mut s = WatchState::default();
+        s.record_failure("web", "a", 5);
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains("\"lastFailureAt\":5"), "{text}");
+        let back: WatchState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.projects["web"].last_failure_at, Some(5));
     }
 
     #[test]
