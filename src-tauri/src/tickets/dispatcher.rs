@@ -265,7 +265,8 @@ pub enum DispatchMsg {
     AgentGone { agent_id: String },
     /// The agent is restarted with `--resume` (model/effort change, plan5 A.5): any delivery
     /// state is dropped like for `AgentGone`; its queue continues at the next Idle. A
-    /// [`Delivery::AwaitingRestart`] (the dispatcher's own restart, step 6b) is kept.
+    /// [`Delivery::AwaitingRestart`] (the dispatcher's own restart, step 6b) and the ticket
+    /// delivered in the session (`delivered_in_session`, review6b W8) are kept.
     AgentRestarting { agent_id: String },
     /// `spawn_agent_with_ticket`: the line went in as the positional prompt.
     SpawnedWithTicket { agent_id: String, ticket_id: String },
@@ -471,8 +472,9 @@ pub struct Dispatcher<H, P, T> {
     /// as it is); cleared when a ticket is typed or the agent is gone.
     restarted_for: HashMap<String, String>,
     /// Per agent: the work ticket the app delivered (confirmed) in the agent's current session
-    /// (review6b W3/W5, [`fresh_decision`]'s `delivered`). Cleared by `AgentRestarting` and
-    /// `AgentGone`; only valid while the agent's session id is the recorded one (`/clear`).
+    /// (review6b W3/W5, [`fresh_decision`]'s `delivered`). Cleared by `AgentGone`; only valid
+    /// while the agent's session id is the recorded one (a fresh restart or `/clear` gives a
+    /// new id; a `--resume` restart keeps it and so keeps the record, review6b W8).
     delivered_in_session: HashMap<String, SessionDelivery>,
     next_token: u64,
     /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
@@ -557,9 +559,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.delivered_in_session.remove(&agent_id);
             }
             DispatchMsg::AgentRestarting { agent_id } => {
-                // A restarted agent's session holds no ticket from the app any more (a fresh
-                // session, or a resumed one the next ticket must not restart again).
-                self.delivered_in_session.remove(&agent_id);
+                // `delivered_in_session` is kept (review6b W8): a `--resume` restart ("Skift
+                // model", "Flyt til projekt") continues the same session, which still holds the
+                // delivered ticket. A fresh restart or `/clear` changes the session id, which
+                // the lookup filters on; the same ticket is guarded by `restarted_for`.
                 // Our own restart before a delivery announces itself too: keep waiting for it.
                 if !matches!(self.state(&agent_id), Delivery::AwaitingRestart { .. }) {
                     self.deliveries.remove(&agent_id);
@@ -894,7 +897,9 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             Err(e) => {
                 log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}")
             }
-            Ok(()) if kind == DeliveryKind::Work && !moved => {
+            // Recorded even when the ticket changed hands (review6b N18): its line was typed
+            // and submitted in this agent's session all the same.
+            Ok(()) if kind == DeliveryKind::Work => {
                 if let Some(s) = &snap {
                     self.delivered_in_session.insert(
                         agent_id.to_string(),
@@ -3554,6 +3559,11 @@ mod tests {
             );
         }
 
+        /// The agent's current snapshot (session id, cwd, …) in the fake port.
+        fn snapshot(&self, id: &str) -> AgentSnapshot {
+            lock(&self.port.0).snapshots[id].clone()
+        }
+
         fn restarts(&self) -> Vec<RestartForTicket> {
             lock(&self.port.0).restarts.clone()
         }
@@ -3901,11 +3911,14 @@ mod tests {
         let r = h.restarts();
         assert_eq!(r.len(), 1);
         assert!(r[0].force_fresh);
-        // The restart clears the record; the new session gets B and records it.
+        // The fresh restart gave a new session id, so the record (kept) no longer applies; the
+        // new session gets B and records it.
         h.send(DispatchMsg::AgentRestarting {
             agent_id: "a1".into(),
         });
-        assert!(!h.d.delivered_in_session.contains_key("a1"));
+        let old = h.d.delivered_in_session["a1"].clone();
+        assert_eq!(old.ticket_id, a.id);
+        assert_ne!(old.session_id, h.snapshot("a1").session_id);
         h.session_started("a1");
         h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
         h.submitted("a1", &line(&b));
@@ -3930,18 +3943,132 @@ mod tests {
         h.advance(DISPATCH_DELAY_MS);
         assert!(h.restarts().is_empty());
         assert_eq!(h.writes().last(), Some(&("a1".into(), line(&b))));
-        // AgentGone and AgentRestarting clear the record.
+        // AgentGone clears the record.
         h.had_ticket("a1");
         h.send(DispatchMsg::AgentGone {
             agent_id: "a1".into(),
         });
         assert!(h.d.delivered_in_session.is_empty());
+        // AgentRestarting keeps it (review6b W8): a `--resume` restart continues the session.
         h.agent("a2", AgentStatus::Thinking);
         h.had_ticket("a2");
         h.send(DispatchMsg::AgentRestarting {
             agent_id: "a2".into(),
         });
-        assert!(h.d.delivered_in_session.is_empty());
+        assert_eq!(h.d.delivered_in_session["a2"].ticket_id, "earlier");
+    }
+
+    #[test]
+    fn resumed_session_still_gets_a_fresh_one_before_the_next_ticket() {
+        // Review6b W8: "Skift model"/"Flyt til projekt" restart with `--resume` (same session
+        // id) after ticket X; ticket Y must still get a fresh session.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let x = h.queued("a1", "X");
+        deliver_and_submit(&mut h, "a1", &x);
+        let sid = h.snapshot("a1").session_id;
+        // The user's model change: a resume restart, the session id stays.
+        h.set_status("a1", AgentStatus::Starting);
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        h.session_started("a1");
+        assert_eq!(h.snapshot("a1").session_id, sid);
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, x.id);
+        let y = h.queued("a1", "Y");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a1", true));
+        assert!(!h.writes().iter().any(|(_, w)| *w == line(&y)));
+        // Y goes into the new session.
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().last(), Some(&enter("a1")));
+        h.submitted("a1", &line(&y));
+        let rec = h.d.delivered_in_session["a1"].clone();
+        assert_eq!(rec.ticket_id, y.id);
+        assert_ne!(rec.session_id, sid);
+        assert_eq!(h.restarts().len(), 1);
+    }
+
+    #[test]
+    fn delivery_is_recorded_even_when_the_ticket_changed_hands_but_not_for_reviews() {
+        // Review6b N18: the line was typed and submitted in a1's session, so the next ticket
+        // for a1 gets a fresh session even though A moved to a2 on the way.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("a2", AgentStatus::Thinking);
+        let a = h.queued("a1", "A");
+        deliver_until_enter(&mut h, "a1");
+        {
+            let mut s = h.svc();
+            s.unassign(&a.id, 10).unwrap();
+            s.assign(&a.id, "a2", 11).unwrap();
+        }
+        h.submitted("a1", &line(&a));
+        assert_eq!(h.ticket(&a.id).state, S::Assigned);
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, a.id);
+        h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a1", true));
+
+        // A confirmed review delivery records nothing.
+        h.agent("rev", AgentStatus::Idle);
+        let t = routed_review(&h, "a2", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        h.submitted("rev", &review_line(&h, &t, "a2"));
+        assert!(h
+            .svc()
+            .assignment_for_ticket(&t.id)
+            .unwrap()
+            .delivered_at
+            .is_some());
+        assert!(!h.d.delivered_in_session.contains_key("rev"));
+    }
+
+    #[test]
+    fn second_ticket_after_spawn_with_ticket_gets_a_fresh_session() {
+        // Review6b N19: the first ticket goes in as the positional prompt (AwaitingSession);
+        // its confirmation records it, so ticket 2 in the same session restarts first.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Starting);
+        let a = h.queued("a1", "A");
+        h.send(DispatchMsg::SpawnedWithTicket {
+            agent_id: "a1".into(),
+            ticket_id: a.id.clone(),
+        });
+        h.session_started("a1");
+        h.submitted("a1", &line(&a));
+        assert_eq!(h.ticket(&a.id).state, S::InProgress);
+        assert!(h.writes().is_empty());
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, a.id);
+        h.svc().submit_by_agent("a1", None, "Lavet", 10).unwrap();
+        let b = h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a1", true));
+        assert!(h.writes().is_empty());
+        assert!(matches!(
+            h.d.state("a1"),
+            Delivery::AwaitingRestart { ticket_id, .. } if *ticket_id == b.id
+        ));
     }
 
     #[test]

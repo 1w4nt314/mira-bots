@@ -467,6 +467,7 @@ pub(crate) mod fake {
         log: Mutex<Vec<(String, PathBuf)>>,
         held: Mutex<bool>,
         released: Condvar,
+        panics: Mutex<bool>,
     }
 
     impl FakeChecks {
@@ -505,6 +506,11 @@ pub(crate) mod fake {
             self.released.notify_all();
         }
 
+        /// Every `run` panics (an internal error on the checks thread, review6b N20).
+        pub(crate) fn panic(&self) {
+            *self.panics.lock().unwrap() = true;
+        }
+
         /// The checks run so far (name, folder), in order.
         pub(crate) fn calls(&self) -> Vec<(String, PathBuf)> {
             self.log.lock().unwrap().clone()
@@ -518,6 +524,9 @@ pub(crate) mod fake {
                 while *held {
                     held = self.released.wait(held).unwrap();
                 }
+            }
+            if *self.panics.lock().unwrap() {
+                panic!("fake check {} panicked", check.name);
             }
             self.log
                 .lock()

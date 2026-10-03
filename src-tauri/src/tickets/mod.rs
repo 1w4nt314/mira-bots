@@ -64,6 +64,9 @@ pub const NOT_SUBMITTED_NOTE: &str = "turn afsluttet uden aflevering";
 /// `assign_reviewer` on a ticket in review without an assignee (a finished flow parent, step 6b).
 pub const FLOW_REVIEW_IS_USERS: &str =
     "Et afsluttet forløb uden ejer reviewes af dig: godkend eller afvis det selv";
+/// History note (by the app) when the checks thread panicked (review6b N20): the run is
+/// `skipped`, so the ticket never stays `pending`.
+pub const CHECKS_ABORTED_NOTE: &str = "tjek afbrudt af en intern fejl";
 /// History note (by the app) when the «Ændringer» report of a review entry failed (review6b
 /// W4); the error on one line, clipped to 200 chars.
 pub fn changes_failed_note(err: &str) -> String {
@@ -894,7 +897,8 @@ impl TicketsCtx {
     }
 
     /// Runs the checks on a "mira-checks" thread (inline when this context is not
-    /// [`Self::shared`]) and finishes with [`Self::finish_checks`].
+    /// [`Self::shared`]) and finishes with [`Self::finish_checks`]. A panic on the thread is
+    /// caught (review6b N20): the run ends `skipped` via [`Self::abort_checks`].
     fn spawn_checks(
         &self,
         id: String,
@@ -912,8 +916,22 @@ impl TicketsCtx {
         let spawned = std::thread::Builder::new()
             .name("mira-checks".into())
             .spawn(move || {
-                let report = checks::run_checks(me.checks.as_ref(), &list, &cwd);
-                me.finish_checks(&thread_id, round, started_at, &report);
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let report = checks::run_checks(me.checks.as_ref(), &list, &cwd);
+                    me.finish_checks(&thread_id, round, started_at, &report);
+                }));
+                if let Err(panic) = run {
+                    let what = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    log::error!(
+                        "checks: the checks thread of ticket {} panicked: {what}",
+                        model::short_id(&thread_id)
+                    );
+                    me.abort_checks(&thread_id, round, started_at);
+                }
             });
         match spawned {
             Ok(_handle) => {
@@ -922,29 +940,62 @@ impl TicketsCtx {
             }
             Err(e) => {
                 log::warn!("checks: could not start the checks thread: {e}");
-                let report = ChecksReport::default();
                 // Nothing ran: the ticket must not wait forever.
-                let now = now_ms();
-                let _ = self.mutate_if(
-                    |s| match s.get(&id) {
-                        Some(t) if same_checks_run(&t, round, started_at) => s
-                            .set_checks(
-                                &t.id,
-                                TicketChecks {
-                                    state: ChecksState::Skipped,
-                                    failed: report.failed,
-                                    round,
-                                    started_at,
-                                },
-                                now,
-                            )
-                            .map(Some),
-                        _ => Ok(None),
-                    },
-                    Option::is_some,
+                self.skip_checks_run(&id, round, started_at);
+            }
+        }
+    }
+
+    /// Marks this run (still `pending`) `skipped`; `true` when it was stored.
+    fn skip_checks_run(&self, id: &str, round: u32, started_at: u64) -> bool {
+        let now = now_ms();
+        let r = self.mutate_if(
+            |s| match s.get(id) {
+                Some(t) if same_checks_run(&t, round, started_at) => s
+                    .set_checks(
+                        id,
+                        TicketChecks {
+                            state: ChecksState::Skipped,
+                            failed: None,
+                            round,
+                            started_at,
+                        },
+                        now,
+                    )
+                    .map(Some),
+                _ => Ok(None),
+            },
+            Option::is_some,
+        );
+        match r {
+            Ok(stored) => stored.is_some(),
+            Err(e) => {
+                log::warn!(
+                    "checks: skipping the run of ticket {} failed: {e}",
+                    model::short_id(id)
+                );
+                false
+            }
+        }
+    }
+
+    /// The checks thread panicked (review6b N20): like a run that never started, the run ends
+    /// `skipped` (an internal error never sends a ticket back) with [`CHECKS_ABORTED_NOTE`] by
+    /// the app, and the reviews are routed as after [`Self::finish_checks`]. A run that
+    /// already got its result (the panic came later) is left as it is.
+    fn abort_checks(&self, id: &str, round: u32, started_at: u64) {
+        if self.skip_checks_run(id, round, started_at) {
+            if let Err(e) = self.mutate_if(
+                |s| s.note_by_system(id, CHECKS_ABORTED_NOTE, now_ms()),
+                Option::is_some,
+            ) {
+                log::warn!(
+                    "checks: noting on ticket {} failed: {e}",
+                    model::short_id(id)
                 );
             }
         }
+        self.route_reviews();
     }
 
     /// The checks of `id` ended (on the checks thread; no lock held). A result for another run
@@ -3020,6 +3071,34 @@ mod tests {
             body,
             "Tjek: tests → OK (exit 0, 1 s)\nTjek: lint → OK (exit 0, 1 s)"
         );
+        assert_eq!(review_assigned(&c.t.sent()), 1);
+        cleanup(&c.t);
+    }
+
+    #[test]
+    fn a_panicking_checks_thread_skips_the_run_and_routes() {
+        // Review6b N20: the ticket must never stay pending.
+        let mut c = checks_setup("{}", Some(TWO_CHECKS));
+        let tk = submit_in_proj(&c);
+        c.fake.panic();
+        assert_eq!(c.t.ctx.route_reviews(), 0, "waits for the checks");
+        c.t.ctx.join_checks();
+        let t = get(&c, &tk.id);
+        assert_eq!(t.state, TicketState::Review, "never sent back");
+        assert_eq!(
+            t.checks.as_ref().map(|k| k.state),
+            Some(ChecksState::Skipped)
+        );
+        // Noted once by the app (before routing adds its own entry).
+        let notes: Vec<_> = t
+            .history
+            .iter()
+            .filter(|h| h.note.as_deref() == Some(CHECKS_ABORTED_NOTE))
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].by, TicketActor::System);
+        assert!(t.reports.is_empty(), "no «Tjek» report");
+        assert_eq!(t.reviewer_agent_id.as_deref(), Some(c.reviewer.as_str()));
         assert_eq!(review_assigned(&c.t.sent()), 1);
         cleanup(&c.t);
     }
