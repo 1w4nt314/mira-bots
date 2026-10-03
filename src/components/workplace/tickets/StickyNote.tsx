@@ -9,7 +9,22 @@ import {
   type SyntheticEvent,
 } from "react";
 import { useTheme } from "../../../lib/bots";
-import { deleteTicket, errorMessage, getTicket, unassignTicket } from "../../../lib/ipc";
+import {
+  canRetryWriteBack,
+  inboxLabel,
+  opensIssue,
+  showsWriteBack,
+  writeBackBadge,
+  writeBackFailureText,
+} from "../../../lib/inbox";
+import {
+  deleteTicket,
+  errorMessage,
+  getTicket,
+  openInboxUrl,
+  retryWriteBack,
+  unassignTicket,
+} from "../../../lib/ipc";
 import { isExited } from "../../../lib/status";
 import {
   ACTOR_LABEL,
@@ -112,6 +127,7 @@ function NoteFrame(props: FrameProps) {
   const theme = useTheme();
   const { state } = useStore();
   const showActions = interactive && !compact;
+  const run = useRun();
   // Relations are looked up in the whole list (not the filtered one), see tickets.ts.
   const all = state.tickets;
   const parent = t.parentId === null ? null : parentOf(t, all);
@@ -121,6 +137,8 @@ function NoteFrame(props: FrameProps) {
   const branch = gitBadge(t);
   const childrenDone =
     t.state === "backlog" && t.assigneeAgentId === null && progress.total > 0 && progress.done === progress.total;
+  // Step 6c: the source of a ticket started from the inbox ("GitHub #n" opens the issue).
+  const source = inboxLabel(t.external);
 
   return (
     <div
@@ -217,6 +235,30 @@ function NoteFrame(props: FrameProps) {
             uden review
           </span>
         )}
+        {source !== null &&
+          (opensIssue(t.external) && showActions ? (
+            <button
+              type="button"
+              onClick={() => void run(() => openInboxUrl(t.id))}
+              onPointerDown={stop}
+              onKeyDown={stop}
+              title="Startet fra indbakken — åbn issuen i browseren"
+              className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 underline decoration-dotted hover:text-[var(--accent)] dark:text-sky-200"
+            >
+              {source}
+            </button>
+          ) : (
+            <span
+              className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 dark:text-sky-200"
+              title={
+                t.external?.kind === "folder"
+                  ? `Startet fra indbakke-mappen${t.external.path !== null ? `: ${t.external.path}` : ""}`
+                  : "Startet fra indbakken"
+              }
+            >
+              {source}
+            </span>
+          ))}
         {t.source === "agent" && (
           <span
             className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 dark:text-sky-200"
@@ -285,6 +327,7 @@ function NoteFrame(props: FrameProps) {
             </div>
           )}
           {t.state === "waiting" && <div className="mt-1 text-[11px] opacity-80">{WAITING_HINT}</div>}
+          {showsWriteBack(t) && <WriteBackRow ticket={t} interactive={interactive} />}
         </>
       )}
 
@@ -295,6 +338,54 @@ function NoteFrame(props: FrameProps) {
           {t.state !== "review" && <ReportsSection ticket={t} />}
           <HistoryFold ticket={t} />
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Write-back status of a Done ticket from the inbox (step 6c): "meldt tilbage ✓" (title = the
+ * comment's address), "melder tilbage…", "ikke meldt tilbage" with the error as a line below
+ * and "Prøv igen" (`retry_write_back`; the backend's text, e.g. "Allerede meldt tilbage", goes to
+ * the error line). The history notes are shown by the history fold as usual.
+ */
+function WriteBackRow({ ticket: t, interactive }: { ticket: TicketSummary; interactive: boolean }) {
+  const run = useRun();
+  const [busy, setBusy] = useState(false);
+  if (t.external === null) return null;
+  const badge = writeBackBadge(t.external);
+  if (badge === null) return null;
+  const failure = writeBackFailureText(t.external);
+  const retry = async () => {
+    setBusy(true);
+    try {
+      await run(() => retryWriteBack(t.id));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div onPointerDown={stop} onKeyDown={stop} className="mt-1 cursor-auto text-[11px]">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className={`rounded px-1 text-[10px] ${badge.cls}`} title={badge.title}>
+          {badge.text}
+        </span>
+        {interactive && canRetryWriteBack(t.external) && (
+          <button
+            type="button"
+            onClick={() => void retry()}
+            disabled={busy || t.external.writeBack.comment === "inflight"}
+            title="Prøv tilbagemeldingen igen (der postes aldrig to gange)"
+            className={smallBtn}
+          >
+            Prøv igen
+          </button>
+        )}
+      </div>
+      {failure !== null && (
+        <p className="mt-0.5 break-words text-rose-700 dark:text-rose-300" role="status">
+          {failure}
+        </p>
       )}
     </div>
   );

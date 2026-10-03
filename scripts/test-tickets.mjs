@@ -40,6 +40,10 @@ eq(k.moveUp(["a", "b", "c"], 2), ["a", "c", "b"], "moveUp 2");
 eq(k.moveUp(["a", "b", "c"], 0), null, "moveUp 0");
 eq(k.dropTarget("empty:staff:0"), { kind: "empty", seatKind: "staff", index: 0 }, "dropTarget");
 eq(k.dropTarget("agent:"), null, "dropTarget empty agent");
+// Step 6c B5: inbox drag ids never parse as tickets or seats (and the other way round, test-inbox).
+eq(k.draggedTicketId("inbox:x"), null, "draggedTicketId inbox");
+eq(k.draggedTicketId("ticket:x"), "x", "draggedTicketId ticket");
+eq(k.dropTarget("inbox:x"), null, "dropTarget inbox");
 for (const [tab, want] of [
   ["tickets", "tickets"],
   ["permissions", "permissions"],

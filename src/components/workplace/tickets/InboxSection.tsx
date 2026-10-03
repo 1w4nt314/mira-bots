@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   cappedHint,
+  dismissedItems,
   fetchStatusText,
   groupInbox,
   inboxEmptyText,
@@ -10,7 +11,7 @@ import {
   sourceErrors,
   sourceNotes,
 } from "../../../lib/inbox";
-import { dismissInboxItem } from "../../../lib/ipc";
+import { dismissInboxItem, undismissInboxItem } from "../../../lib/ipc";
 import type { ProjectFilter } from "../../../lib/projects";
 import type { InboxItemSummary, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
@@ -120,6 +121,7 @@ export default function InboxSection({ filter, onNotice }: Props) {
               key={item.id}
               item={item}
               busy={busyIds.has(item.id)}
+              draggable
               onStart={setStartFor}
               onDismiss={(i) => void dismiss(i)}
             />
@@ -134,5 +136,41 @@ export default function InboxSection({ filter, onNotice }: Props) {
       </section>
       {dialog}
     </>
+  );
+}
+
+/**
+ * "Afviste (n)" (step 6c B5): dismissed items under the project filter, folded like Done, each
+ * with "Fortryd" (back to the inbox as new). Hidden when nothing is dismissed. The backend keeps
+ * dismissed items for 30 days.
+ */
+export function DismissedFold({ filter }: { filter: ProjectFilter }) {
+  const { state } = useStore();
+  const run = useRun();
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set());
+  const items = useMemo(() => dismissedItems(state.inbox?.items ?? [], filter), [state.inbox, filter]);
+  if (items.length === 0) return null;
+
+  const undo = async (item: InboxItemSummary) => {
+    setBusyIds((s) => new Set(s).add(item.id));
+    await run(() => undismissInboxItem(item.id));
+    setBusyIds((s) => {
+      const next = new Set(s);
+      next.delete(item.id);
+      return next;
+    });
+  };
+
+  return (
+    <details className="group">
+      <summary className="cursor-pointer select-none text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)] hover:text-[var(--fg)]">
+        Afviste ({items.length})
+      </summary>
+      <div className="mt-2 space-y-2">
+        {items.map((item) => (
+          <InboxCard key={item.id} item={item} busy={busyIds.has(item.id)} onUndismiss={(i) => void undo(i)} />
+        ))}
+      </div>
+    </details>
   );
 }

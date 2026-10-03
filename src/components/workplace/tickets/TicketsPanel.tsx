@@ -17,7 +17,7 @@ import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 import NewTicketForm from "./NewTicketForm";
 import { useTicketActions } from "./actions";
-import InboxSection from "./InboxSection";
+import InboxSection, { DismissedFold } from "./InboxSection";
 import StickyNote from "./StickyNote";
 
 const NOTICE_VISIBLE_MS = 5000;
@@ -254,6 +254,8 @@ export default function TicketsPanel() {
           )}
         </div>
       </details>
+
+      <DismissedFold filter={filter} />
     </div>
   );
 }

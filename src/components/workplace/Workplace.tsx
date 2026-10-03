@@ -38,6 +38,7 @@ import {
   type OfficeDetail,
   type TermMode,
 } from "../../lib/office";
+import { canDragInbox, draggedInboxId, inboxDragTitle } from "../../lib/inbox";
 import { readLocal, writeLocal } from "../../lib/persist";
 import { isMacShortcut } from "../../lib/platform";
 import { assignmentIssue, backlogHint, coordinatorHint, projectIdOf, type SeatHint } from "../../lib/projects";
@@ -52,6 +53,7 @@ import {
 } from "../../lib/tickets";
 import type {
   AgentInfo,
+  InboxItemSummary,
   ProjectRef,
   SeatKind,
   TicketSummary,
@@ -68,6 +70,8 @@ import Sidebar from "./Sidebar";
 import SpawnDialog from "./SpawnDialog";
 import TerminalPanel from "./TerminalPanel";
 import { TicketActionsContext, type TicketActions } from "./tickets/actions";
+import InboxCard from "./tickets/InboxCard";
+import StartInboxDialog, { type StartInboxTarget } from "./tickets/StartInboxDialog";
 import StickyNote from "./tickets/StickyNote";
 import { useInboxPolling } from "./tickets/useInboxPolling";
 
@@ -89,6 +93,14 @@ export default function Workplace() {
     null,
   );
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
+  // Step 6c B5: an inbox card being dragged, and the Start dialog its drop opens (with the seat
+  // as target). Nothing starts before the dialog's button is clicked.
+  const [activeInboxId, setActiveInboxId] = useState<string | null>(null);
+  const [startFor, setStartFor] = useState<{ item: InboxItemSummary; target: StartInboxTarget } | null>(
+    null,
+  );
+  // "Startet som ticket {short}" after a drop-started item (the panel shows its own for clicks).
+  const [notice, setNotice] = useState<string | null>(null);
   // Step 4b: an assignment that needs a project ("Hvilket projekt?") or meets another project
   // (explanation + "Flyt agenten til «p»"); opened after a drop or from "Tildel…", never during
   // the drag itself.
@@ -129,6 +141,17 @@ export default function Workplace() {
     () => new Map<string, TicketSummary>(tickets.map((t) => [t.id, t])),
     [tickets],
   );
+
+  const inboxById = useMemo(
+    () => new Map<string, InboxItemSummary>((state.inbox?.items ?? []).map((i) => [i.id, i])),
+    [state.inbox],
+  );
+
+  useEffect(() => {
+    if (notice === null) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
 
   useEffect(() => writeLocal(STORAGE_KEYS.detail, detail), [detail]);
   useEffect(() => writeLocal(STORAGE_KEYS.termMode, termMode), [termMode]);
@@ -361,11 +384,13 @@ export default function Workplace() {
 
   const titleOf = useCallback(
     (id: string | number) => {
+      const iid = draggedInboxId(String(id));
+      if (iid !== null) return inboxDragTitle(inboxById.get(iid));
       const tid = draggedTicketId(String(id));
       const t = tid === null ? undefined : ticketsById.get(tid);
       return t === undefined ? "ticketen" : `ticket ${t.shortId}`;
     },
-    [ticketsById],
+    [ticketsById, inboxById],
   );
   const seatOf = useCallback(
     (id: string | number) => {
@@ -394,12 +419,34 @@ export default function Workplace() {
       "Tryk mellemrum eller Enter for at tage ticketen. Flyt med piletasterne, slip med mellemrum eller Enter, annuller med Escape. Eller brug knappen Tildel.",
   };
 
-  const onDragStart = (e: DragStartEvent) => setActiveTicketId(draggedTicketId(String(e.active.id)));
+  const onDragStart = (e: DragStartEvent) => {
+    setActiveTicketId(draggedTicketId(String(e.active.id)));
+    setActiveInboxId(draggedInboxId(e.active.id));
+  };
+  const clearDrag = () => {
+    setActiveTicketId(null);
+    setActiveInboxId(null);
+  };
 
   const onDragEnd = (e: DragEndEvent) => {
-    setActiveTicketId(null);
-    const ticketId = draggedTicketId(String(e.active.id));
+    clearDrag();
     const target = e.over ? dropTarget(String(e.over.id)) : null;
+    // Step 6c B5: an inbox item opens the Start dialog with the seat as target (agent → "Start
+    // og tildel til {agent}", project locked to the agent's; empty seat → the spawn dialog after
+    // the ticket is created). Only new items; the dialog's click is the confirmation.
+    const inboxId = draggedInboxId(e.active.id);
+    if (inboxId !== null) {
+      const item = inboxById.get(inboxId);
+      if (target === null || item === undefined || !canDragInbox(item)) return;
+      if (target.kind === "agent") {
+        const agent = agents.find((a) => a.id === target.agentId);
+        if (agent !== undefined) setStartFor({ item, target: { kind: "agent", agent } });
+      } else {
+        setStartFor({ item, target: { kind: "empty", seatKind: target.seatKind } });
+      }
+      return;
+    }
+    const ticketId = draggedTicketId(String(e.active.id));
     if (ticketId === null || target === null) return;
     const ticket = ticketsById.get(ticketId);
     if (ticket === undefined || !canDrag(ticket)) return;
@@ -414,6 +461,7 @@ export default function Workplace() {
   };
 
   const activeTicket = activeTicketId === null ? null : (ticketsById.get(activeTicketId) ?? null);
+  const activeInbox = activeInboxId === null ? null : (inboxById.get(activeInboxId) ?? null);
 
   // Height for the floor and the terminal in normal mode: the column minus the splitter and the
   // overflow list. Before the first measurement it is NaN: clampFloorHeight then skips the upper
@@ -474,8 +522,13 @@ export default function Workplace() {
           >
             Kontor: {detail === "more" ? "Lidt mere" : "Diskret"}
           </button>
+          {notice !== null && (
+            <span className="ml-auto truncate text-xs text-emerald-700 dark:text-emerald-300" role="status">
+              {notice}
+            </span>
+          )}
           {error !== null && (
-            <span className="ml-auto truncate text-xs text-rose-500" role="alert" title={error}>
+            <span className={`${notice === null ? "ml-auto " : ""}truncate text-xs text-rose-500`} role="alert" title={error}>
               {error}
             </span>
           )}
@@ -486,7 +539,7 @@ export default function Workplace() {
           accessibility={{ announcements, screenReaderInstructions }}
           onDragStart={onDragStart}
           onDragEnd={onDragEnd}
-          onDragCancel={() => setActiveTicketId(null)}
+          onDragCancel={clearDrag}
         >
           <main className="grid min-h-0 flex-1 grid-cols-[1fr_340px]">
             <section ref={sectionRef} className="relative flex min-h-0 min-w-0 flex-col">
@@ -506,7 +559,7 @@ export default function Workplace() {
                   spawnDisabled={spawnDisabled}
                   limits={{ work: liveWork >= maxWork, staff: liveStaff >= maxStaff }}
                   tickets={ticketsById}
-                  dragging={activeTicket !== null}
+                  dragging={activeTicket !== null || activeInbox !== null}
                   draggedTicket={activeTicket}
                   hintFor={hintFor}
                   onSelect={selectAgent}
@@ -551,6 +604,7 @@ export default function Workplace() {
             {activeTicket !== null && (
               <StickyNote ticket={activeTicket} agent={null} draggable={false} compact interactive={false} />
             )}
+            {activeInbox !== null && <InboxCard item={activeInbox} compact />}
           </DragOverlay>
         </DndContext>
         {spawnFor !== null && (
@@ -564,6 +618,17 @@ export default function Workplace() {
               setSpawnFor(null);
               selectAgent(id);
               void refreshProjects();
+            }}
+          />
+        )}
+        {startFor !== null && (
+          <StartInboxDialog
+            item={startFor.item}
+            target={startFor.target}
+            onClose={() => setStartFor(null)}
+            onStarted={(t) => {
+              setStartFor(null);
+              setNotice(`Startet som ticket ${t.shortId}`);
             }}
           />
         )}

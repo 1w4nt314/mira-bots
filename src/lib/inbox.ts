@@ -5,8 +5,11 @@ import type {
   ExternalRef,
   InboxItemSummary,
   InboxRefreshReason,
+  InboxSourceDiag,
+  InboxSourceStatus,
   InboxStatus,
   SeatKind,
+  TicketState,
 } from "./types";
 import type { ProjectFilter } from "./projects";
 
@@ -189,6 +192,38 @@ export function writeBackBadge(e: ExternalRef): { text: string; cls: string; tit
   }
 }
 
+/** Whether "Prøv igen" is offered: the comment (or the folder move) failed, or the issue's
+ * close failed after the comment was posted (the backend then only closes again). */
+export function canRetryWriteBack(e: ExternalRef): boolean {
+  const w = e.writeBack;
+  if (w.comment === "failed") return true;
+  return e.kind === "github" && w.comment === "done" && w.close === "failed";
+}
+
+/**
+ * The visible line under a failed write back (the badge's title holds the same error):
+ * "ikke meldt tilbage: <fejl>" / "issue #n ikke lukket: <fejl>"; null when nothing failed.
+ */
+export function writeBackFailureText(e: ExternalRef): string | null {
+  const w = e.writeBack;
+  const err = (s: string) => (w.lastError === null || w.lastError === "" ? s : `${s}: ${w.lastError}`);
+  if (w.comment === "failed") return err("ikke meldt tilbage");
+  if (e.kind === "github" && w.comment === "done" && w.close === "failed") {
+    return err(e.number === null ? "issue ikke lukket" : `issue #${e.number} ikke lukket`);
+  }
+  return null;
+}
+
+/** The write-back status belongs to Done tickets from the inbox (the hook runs at Done). */
+export function showsWriteBack(t: { state: TicketState; external: ExternalRef | null }): boolean {
+  return t.state === "done" && t.external !== null && writeBackBadge(t.external) !== null;
+}
+
+/** The "GitHub #n" badge is a button that opens the issue (only a GitHub ref with a number). */
+export function opensIssue(e: ExternalRef | null): boolean {
+  return e !== null && e.kind === "github" && e.number !== null;
+}
+
 // --- status text ------------------------------------------------------------------------------
 
 const two = (n: number) => String(n).padStart(2, "0");
@@ -230,6 +265,72 @@ export function sourceNotes(s: InboxStatus): string[] {
 /** The section shows when something is new, or a source failed (so the error is not hidden). */
 export function showInboxSection(newCount: number, s: InboxStatus | null): boolean {
   return newCount > 0 || (s !== null && sourceErrors(s).length > 0);
+}
+
+/** "Afviste ({n})": dismissed items under the project filter, newest first. */
+export function dismissedItems(
+  items: readonly InboxItemSummary[],
+  f: ProjectFilter,
+): InboxItemSummary[] {
+  return groupInbox(items).dismissed.filter((i) => matchesInboxFilter(i, f));
+}
+
+// --- Diagnostik: "Kilder" ---------------------------------------------------------------------
+
+/** One row of Diagnostik's "Kilder" (one per source and project). */
+export interface SourceDiagRow {
+  key: string;
+  label: string;
+  /** "projekt web" / "projektroden". */
+  project: string;
+  /** The source id of the latest fetch (`folder:web`, `github:o/r[bug]`), when known. */
+  id: string | null;
+  /** "seneste hentning kl. hh:mm" / "ikke hentet endnu". */
+  fetched: string;
+  error: string | null;
+  notes: string[];
+  items: number;
+}
+
+/**
+ * Diagnostik's rows (`Diagnostics.inboxSources`) joined with the inbox status of the store for
+ * the source id and the notes of the latest fetch: same kind and label, and the status' project
+ * either the row's or none (a GitHub source shared by several projects).
+ */
+export function sourceDiagRows(
+  diag: readonly InboxSourceDiag[],
+  status: readonly InboxSourceStatus[] | null,
+): SourceDiagRow[] {
+  return diag.map((d, i) => {
+    const st =
+      (status ?? []).find(
+        (s) =>
+          s.kind === d.kind &&
+          s.label === d.label &&
+          (s.project === null ? true : d.project !== null && fold(s.project) === fold(d.project)),
+      ) ?? null;
+    return {
+      key: `${i}:${d.kind}:${d.project ?? ""}:${d.label}`,
+      label: d.label,
+      project: d.project === null ? "projektroden" : `projekt ${d.project}`,
+      id: st?.id ?? null,
+      fetched:
+        d.lastFetchAt === null ? "ikke hentet endnu" : `seneste hentning kl. ${clockText(d.lastFetchAt)}`,
+      error: d.error,
+      notes: st?.notes ?? [],
+      items: d.items,
+    };
+  });
+}
+
+/** One line per source for Diagnostik's "Kopiér" text. */
+export function sourceDiagCopyLines(rows: readonly SourceDiagRow[]): string[] {
+  return rows.map(
+    (r) =>
+      `inboxSource: ${r.label} · ${r.project}${r.id === null ? "" : ` · ${r.id}`} · ${r.fetched} · ${r.items} emner${
+        r.error === null ? "" : ` · fejl: ${r.error}`
+      }`,
+  );
 }
 
 // --- polling rules ----------------------------------------------------------------------------
@@ -275,6 +376,16 @@ export function pollReason(
 // --- drag and drop ----------------------------------------------------------------------------
 
 export const inboxDragId = (id: string): string => `${INBOX_DRAG_PREFIX}${id}`;
+
+/** Only new items can be dragged onto a seat (started/dismissed ones are not in the list). */
+export function canDragInbox(item: Pick<InboxItemSummary, "state">): boolean {
+  return item.state === "new";
+}
+
+/** The dragged item in screen-reader announcements: "emnet {titel}". */
+export function inboxDragTitle(item: Pick<InboxItemSummary, "title"> | null | undefined): string {
+  return item == null ? "emnet" : `emnet ${item.title}`;
+}
 
 /** The inbox item id of a drag id, or null for anything else. */
 export function draggedInboxId(id: string | number | null | undefined): string | null {

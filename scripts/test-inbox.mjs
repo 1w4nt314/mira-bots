@@ -152,4 +152,82 @@ check(x.draggedInboxId("agent:abc"), null);
 check(x.draggedInboxId(null), null);
 check(x.draggedInboxId(42), null);
 
+check(x.canDragInbox({ state: "new" }), true);
+check(x.canDragInbox({ state: "started" }), false);
+check(x.canDragInbox({ state: "dismissed" }), false);
+check(x.inboxDragTitle({ title: "Login fejler" }), "emnet Login fejler");
+check(x.inboxDragTitle(undefined), "emnet");
+
+// write-back: retry, failure line, when it shows, the issue button
+check(x.canRetryWriteBack(ext()), false);
+check(x.canRetryWriteBack(ext({ writeBack: wb({ comment: "failed" }) })), true);
+check(x.canRetryWriteBack(ext({ writeBack: wb({ comment: "inflight" }) })), false);
+check(x.canRetryWriteBack(ext({ writeBack: wb({ comment: "done" }) })), false);
+check(x.canRetryWriteBack(ext({ writeBack: wb({ comment: "done", close: "failed" }) })), true);
+check(x.canRetryWriteBack(ext({ kind: "folder", number: null, writeBack: wb({ comment: "failed" }) })), true);
+check(x.canRetryWriteBack(ext({ kind: "folder", number: null, writeBack: wb({ comment: "done", close: "failed" }) })), false);
+check(x.writeBackFailureText(ext()), null);
+check(x.writeBackFailureText(ext({ writeBack: wb({ comment: "done" }) })), null);
+check(
+  x.writeBackFailureText(ext({ writeBack: wb({ comment: "failed", lastError: "ingen forbindelse til GitHub" }) })),
+  "ikke meldt tilbage: ingen forbindelse til GitHub",
+);
+check(x.writeBackFailureText(ext({ writeBack: wb({ comment: "failed" }) })), "ikke meldt tilbage");
+check(
+  x.writeBackFailureText(ext({ writeBack: wb({ comment: "done", close: "failed", lastError: "GitHub: rate limit" }) })),
+  "issue #7 ikke lukket: GitHub: rate limit",
+);
+check(x.showsWriteBack({ state: "done", external: null }), false);
+check(x.showsWriteBack({ state: "done", external: ext() }), false);
+check(x.showsWriteBack({ state: "done", external: ext({ writeBack: wb({ comment: "done" }) }) }), true);
+check(x.showsWriteBack({ state: "review", external: ext({ writeBack: wb({ comment: "failed" }) }) }), false);
+check(x.opensIssue(null), false);
+check(x.opensIssue(ext()), true);
+check(x.opensIssue(ext({ number: null })), false);
+check(x.opensIssue(ext({ kind: "folder", number: null, path: "a.md" })), false);
+
+// "Afviste": dismissed items under the project filter
+{
+  const items = [
+    item({ id: "a", state: "dismissed", project: "web", seenAt: 1 }),
+    item({ id: "b", state: "new", project: "web" }),
+    item({ id: "c", state: "dismissed", project: "api", seenAt: 2 }),
+    item({ id: "d", state: "dismissed", project: null, candidates: ["web"], seenAt: 3 }),
+  ];
+  check(x.dismissedItems(items, "all").map((i) => i.id), ["d", "c", "a"]);
+  check(x.dismissedItems(items, { id: "WEB" }).map((i) => i.id), ["d", "a"]);
+  check(x.dismissedItems(items, "none").map((i) => i.id), ["d"]);
+  check(x.dismissedItems([], "all"), []);
+}
+
+// Diagnostik "Kilder": diag rows joined with the store's status
+{
+  const at = new Date(2026, 9, 3, 9, 5).getTime();
+  const diag = [
+    { project: null, kind: "folder", label: "mappen inbox/", lastFetchAt: at, error: null, items: 2 },
+    { project: "web", kind: "folder", label: "mappen .mira-bots/inbox/", lastFetchAt: null, error: null, items: 0 },
+    { project: "web", kind: "github", label: "o/r (bug)", lastFetchAt: at, error: "ingen forbindelse til GitHub", items: 0 },
+    { project: "api", kind: "github", label: "o/r (bug)", lastFetchAt: at, error: null, items: 0 },
+    { project: "api", kind: "github", label: "project.json", lastFetchAt: null, error: "project.json: github ignoreres: x", items: 0 },
+  ];
+  const st = [
+    source({ id: "folder:_rod", kind: "folder", label: "mappen inbox/", project: null, notes: ["kun de første 200 filer læses"] }),
+    source({ id: "folder:web", kind: "folder", label: "mappen .mira-bots/inbox/", project: "Web" }),
+    source({ id: "github:o/r[bug]", label: "o/r (bug)", project: null }),
+  ];
+  const rows = x.sourceDiagRows(diag, st);
+  check(rows.map((r) => r.id), ["folder:_rod", "folder:web", "github:o/r[bug]", "github:o/r[bug]", null]);
+  check(rows.map((r) => r.project), ["projektroden", "projekt web", "projekt web", "projekt api", "projekt api"]);
+  check(rows[0].fetched, "seneste hentning kl. 09:05");
+  check(rows[1].fetched, "ikke hentet endnu");
+  check(rows[0].notes, ["kun de første 200 filer læses"]);
+  check(rows[2].error, "ingen forbindelse til GitHub");
+  check(new Set(rows.map((r) => r.key)).size, rows.length);
+  check(x.sourceDiagRows(diag.slice(0, 1), null)[0].id, null);
+  // a folder status of another project never matches
+  check(x.sourceDiagRows([diag[1]], [source({ id: "folder:api", kind: "folder", label: "mappen .mira-bots/inbox/", project: "api" })])[0].id, null);
+  check(x.sourceDiagCopyLines(rows.slice(0, 1)), ["inboxSource: mappen inbox/ · projektroden · folder:_rod · seneste hentning kl. 09:05 · 2 emner"]);
+  check(x.sourceDiagCopyLines(rows.slice(2, 3))[0].endsWith(" · fejl: ingen forbindelse til GitHub"), true);
+}
+
 console.log(`test-inbox: ${n} cases ok`);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  checkGhAuth,
   createProject,
   errorMessage,
   getDiagnostics,
@@ -17,14 +18,25 @@ import {
   PROJECT_NAME_MAX,
   validateProjectName,
 } from "../../lib/projects";
+import { sourceDiagCopyLines, sourceDiagRows } from "../../lib/inbox";
 import { openFolderTitle } from "../../lib/platform";
-import type { Diagnostics, LastHookEvent, LastToolCall, WorkspaceRules } from "../../lib/types";
+import type {
+  Diagnostics,
+  GhAuthResult,
+  InboxSourceStatus,
+  LastHookEvent,
+  LastToolCall,
+  WorkspaceRules,
+} from "../../lib/types";
 import { useStore } from "../../state/store";
 
 export const DIAG_REFRESH_MS = 2000;
 
+/** The fields shown as plain rows; `inboxSources` has its own section ("Kilder"). */
+type FieldKey = Exclude<keyof Diagnostics, "inboxSources">;
+
 /** Danish labels in display order; keys are the raw field names (used in the copied text). */
-const FIELDS: { key: keyof Diagnostics; label: string }[] = [
+const FIELDS: { key: FieldKey; label: string }[] = [
   { key: "appVersion", label: "App-version" },
   { key: "platform", label: "Platform" },
   { key: "claudePath", label: "Claude Code-sti" },
@@ -66,6 +78,13 @@ const FIELDS: { key: keyof Diagnostics; label: string }[] = [
   { key: "reviewAssignmentsOpen", label: "Åbne reviews (agenter)" },
   { key: "ticketsEscalated", label: "Eskalerede tickets" },
   { key: "reportsTotal", label: "Rapporter" },
+  // Step 6c: the inbox and `gh`.
+  { key: "ghPath", label: "gh-sti" },
+  { key: "ghVersion", label: "gh-version" },
+  { key: "ghVersionNote", label: "gh-note" },
+  { key: "inboxPath", label: "Indbakke-fil" },
+  { key: "inboxWarning", label: "Indbakke-advarsel" },
+  { key: "inboxNew", label: "Nye emner i indbakken" },
   { key: "logPath", label: "Logfil" },
 ];
 
@@ -77,11 +96,9 @@ function formatLastTool(c: LastToolCall): string {
   return `${c.tool} ${c.agentId ?? "-"} ${c.ok ? "ok" : "fejl"} ${new Date(c.at).toISOString()}`;
 }
 
-function formatValue(v: Diagnostics[keyof Diagnostics]): string {
+function formatValue(v: Diagnostics[FieldKey]): string {
   if (v === null) return "–";
   if (typeof v === "boolean") return v ? "ja" : "nej";
-  // Lists (`inboxSources`, step 6c) are shown by their own section (B5); here only the count.
-  if (Array.isArray(v)) return String(v.length);
   if (typeof v === "object") return "tool" in v ? formatLastTool(v) : formatLast(v);
   return String(v);
 }
@@ -101,10 +118,15 @@ function ruleRows(rules: WorkspaceRules | undefined): { key: string; label: stri
   ];
 }
 
-function copyText(d: Diagnostics, rules: WorkspaceRules | undefined): string {
+function copyText(
+  d: Diagnostics,
+  rules: WorkspaceRules | undefined,
+  sources: InboxSourceStatus[] | null,
+): string {
   const lines = [`mira-bots ${d.appVersion}`];
   for (const f of FIELDS) lines.push(`${f.key}: ${formatValue(d[f.key])}`);
   for (const r of ruleRows(rules)) lines.push(`${r.key}: ${r.value}`);
+  lines.push(...sourceDiagCopyLines(sourceDiagRows(d.inboxSources, sources)));
   return lines.join("\n");
 }
 
@@ -131,6 +153,7 @@ function warningsFor(d: Diagnostics, maxReviewRounds: number): string[] {
   if (d.ticketsWarning !== null) out.push(d.ticketsWarning);
   if (d.workspaceWarning !== null) out.push(d.workspaceWarning);
   if (d.profilesWarning !== null) out.push(d.profilesWarning);
+  if (d.inboxWarning !== null) out.push(d.inboxWarning);
   if (d.ticketsEscalated > 0) {
     out.push(
       `${d.ticketsEscalated} ${d.ticketsEscalated === 1 ? "ticket er eskaleret" : "tickets er eskaleret"} efter ${maxReviewRounds} afvisninger — afgør dem under Tickets`,
@@ -203,7 +226,7 @@ export default function DiagnosticsPanel() {
   // selected fallback text field is shown (plan D.26).
   const copy = async () => {
     if (diag === null) return;
-    const text = copyText(diag, state.appInfo?.rules);
+    const text = copyText(diag, state.appInfo?.rules, state.inbox?.status.sources ?? null);
     try {
       await navigator.clipboard.writeText(text);
       setFallback(null);
@@ -286,6 +309,10 @@ export default function DiagnosticsPanel() {
         onChanged={() => void refresh()}
       />
 
+      {diag !== null && (
+        <InboxSourcesSection diag={diag} sources={state.inbox?.status.sources ?? null} btn={btn} />
+      )}
+
       {diag === null ? (
         loadError === null && <p className="text-[var(--muted)]">Henter diagnostik…</p>
       ) : (
@@ -312,6 +339,113 @@ export default function DiagnosticsPanel() {
         </dl>
       )}
     </div>
+  );
+}
+
+/**
+ * "Kilder" (step 6c): one row per inbox source and project (label, project, source id, latest
+ * fetch, error, notes of the latest fetch) and "Tjek gh-login", which runs `gh auth status` only
+ * on a click (never automatically) and shows its output without token lines.
+ */
+// TODO(windows-verify): "Tjek gh-login" shows the account without a token, also when gh was
+// installed after the app started (plan6c D.108).
+function InboxSourcesSection({
+  diag,
+  sources,
+  btn,
+}: {
+  diag: Diagnostics;
+  sources: InboxSourceStatus[] | null;
+  btn: string;
+}) {
+  const rows = sourceDiagRows(diag.inboxSources, sources);
+  const [checking, setChecking] = useState(false);
+  const [auth, setAuth] = useState<GhAuthResult | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const check = async () => {
+    setChecking(true);
+    setAuthError(null);
+    try {
+      const r = await checkGhAuth();
+      if (alive.current) setAuth(r);
+    } catch (e) {
+      if (alive.current) {
+        setAuth(null);
+        setAuthError(errorMessage(e));
+      }
+    } finally {
+      if (alive.current) setChecking(false);
+    }
+  };
+
+  return (
+    <section className="space-y-2" aria-labelledby="diag-sources">
+      <h3 id="diag-sources" className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+        Kilder
+      </h3>
+      {rows.length === 0 ? (
+        <p className="text-[var(--muted)]">Ingen indbakke-kilder</p>
+      ) : (
+        <ul className="space-y-1">
+          {rows.map((r) => (
+            <li key={r.key} className="rounded-lg border border-[var(--border)] px-2 py-1">
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <span className="font-medium">{r.label}</span>
+                <span className="text-[var(--muted)]">{r.project}</span>
+                <span className="ml-auto text-[11px] text-[var(--muted)]">{r.fetched}</span>
+              </div>
+              {r.id !== null && (
+                <div className="break-all font-mono text-[11px] text-[var(--muted)] select-text">
+                  {r.id} · {r.items} {r.items === 1 ? "emne" : "emner"}
+                </div>
+              )}
+              {r.error !== null && (
+                <p className="mt-0.5 break-words text-rose-600 dark:text-rose-300">{r.error}</p>
+              )}
+              {r.notes.map((n, i) => (
+                <p key={`${i}:${n}`} className="text-[11px] text-amber-700 dark:text-amber-300">
+                  ⚠ {n}
+                </p>
+              ))}
+            </li>
+          ))}
+        </ul>
+      )}
+      <button
+        type="button"
+        onClick={() => void check()}
+        disabled={checking}
+        title="Kør gh auth status (viser kontoen, aldrig et token)"
+        className={btn}
+      >
+        {checking ? "Tjekker…" : "Tjek gh-login"}
+      </button>
+      {authError !== null && (
+        <p className="text-rose-500" role="alert">
+          {authError}
+        </p>
+      )}
+      {auth !== null && (
+        <pre
+          className={`whitespace-pre-wrap break-all rounded-lg border p-2 font-mono text-[11px] select-text ${
+            auth.ok
+              ? "border-emerald-500/40 bg-emerald-400/10 text-emerald-800 dark:text-emerald-200"
+              : "border-rose-500/40 bg-rose-400/10 text-rose-700 dark:text-rose-300"
+          }`}
+          role="status"
+        >
+          {auth.text}
+        </pre>
+      )}
+    </section>
   );
 }
 
