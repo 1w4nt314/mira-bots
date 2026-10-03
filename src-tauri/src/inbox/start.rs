@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::external::{clean_external_title, sanitize_external_body, Sanitized};
+use super::external::{clean_external_title, clean_notes, sanitize_external_body, Sanitized};
 use super::folder::{folder_dir_for, move_with_retry};
 use super::github::fetch_issue;
 use super::{ExternalKind, InboxItem, InboxState};
@@ -23,8 +23,7 @@ use crate::config::{
 use crate::gh::error_text;
 use crate::projects::ProjectRef;
 use crate::tickets::model::{ExternalRef, TicketError, TicketSummary, WriteBack};
-use crate::tickets::prompt::one_line;
-use crate::tickets::service::{norm_title, validate_kind};
+use crate::tickets::service::validate_kind;
 use crate::tickets::TicketsCtx;
 
 /// `start_inbox_item` (C6c.6): the item, the ticket type (task/feature/bug/playbook name), the
@@ -58,6 +57,7 @@ pub fn external_ref_for(item: &InboxItem) -> ExternalRef {
         inbox_item_id: item.id.clone(),
         imported_at: 0,
         write_back: WriteBack::default(),
+        inherited: false,
     }
 }
 
@@ -68,9 +68,9 @@ pub fn duplicate_hint(
     project: Option<&ProjectRef>,
     title: &str,
 ) -> Option<String> {
-    let norm = norm_title(&clean_external_title(title));
-    ctx.read(|s| s.find_open_by_title(&norm, project).into_iter().next())
-        .map(|t| duplicate_hint_text(&t.short_id(), &one_line(&t.title)))
+    let tickets = ctx.read(|s| s.list());
+    super::ipc::duplicate_of(&tickets, project.map(ProjectRef::name), title)
+        .map(|d| duplicate_hint_text(&d.short_id, &d.title))
 }
 
 /// Starts `req.item_id` as a ticket (plan punkt 5): under `inbox_lock` the item must be `new`
@@ -88,6 +88,8 @@ pub fn start_core(
     body: Sanitized,
     mut external: ExternalRef,
 ) -> Result<TicketSummary, String> {
+    // Review6c W3: the workspace file is read before `inbox_lock`.
+    let kinds = ctx.workspace.config().playbook_kinds();
     let _serial = ctx.lock_inbox_serial();
     let item = ctx
         .inbox_read(|i| i.get(&req.item_id))
@@ -108,10 +110,7 @@ pub fn start_core(
     if item.state != InboxState::New {
         return Err(INBOX_ITEM_GONE.to_string());
     }
-    let kind = validate_kind(
-        req.kind.as_deref(),
-        &ctx.workspace.config().playbook_kinds(),
-    )?;
+    let kind = validate_kind(req.kind.as_deref(), &kinds)?;
     let project = req
         .project
         .or_else(|| item.project.clone().map(ProjectRef::Existing))
@@ -130,6 +129,8 @@ pub fn start_core(
             external.notes.push(n);
         }
     }
+    // Review6c C2: cleaned once more (the caller's ref may come straight from an item).
+    external.notes = clean_notes(&external.notes);
     let ticket = ctx.mutate(|s| {
         s.create_external(
             &title,
@@ -394,6 +395,39 @@ mod tests {
         assert_eq!(
             t.ctx.inbox_read(|i| i.get("ok")).unwrap().state,
             InboxState::New
+        );
+    }
+
+    #[test]
+    fn dialog_warning_and_card_duplicate_use_one_rule() {
+        // Review6c W4: `duplicateOf` in the payload and `duplicate_hint` agree.
+        let mut item = github_item("i1", 1);
+        item.title = "Crash  ved\u{200B} START".into();
+        let (t, _) = ctx_with(vec![item.clone()]);
+        let mk = |title: &str, project: &str, at: u64| {
+            t.ctx
+                .mutate(|s| {
+                    s.create_in(
+                        title,
+                        "",
+                        false,
+                        Some(ProjectRef::Existing(project.into())),
+                        None,
+                        at,
+                    )
+                })
+                .unwrap()
+        };
+        mk("Crash ved start", "api", 3);
+        let older = mk("CRASH ved start", "WEB", 4);
+        mk("Crash ved start", "web", 5);
+        let payload = t.ctx.inbox_payload();
+        let card = payload.items[0].duplicate_of.clone().unwrap();
+        assert_eq!(card.short_id, older.short_id());
+        let web = ProjectRef::Existing("web".into());
+        assert_eq!(
+            duplicate_hint(&t.ctx, Some(&web), &item.title),
+            Some(duplicate_hint_text(&card.short_id, &card.title))
         );
     }
 

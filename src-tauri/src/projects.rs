@@ -167,6 +167,7 @@ pub fn project_file(root: &Path, id: &str) -> PathBuf {
 /// prefix, e.g. `.mira-bots`), the root inbox folder `inbox` (step 6c), files and folders whose
 /// names are not valid project ids are skipped. A missing root gives an empty list.
 pub fn list_projects(root: &Path) -> Vec<Project> {
+    crate::tickets::assert_not_under_inbox_lock("the projects folder");
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(e) => {
@@ -202,6 +203,7 @@ pub fn list_projects(root: &Path) -> Vec<Project> {
 
 /// The project named `name` (case-insensitive), with the name as it is on disk.
 pub fn find_project(root: &Path, name: &str) -> Option<Project> {
+    crate::tickets::assert_not_under_inbox_lock("the projects folder");
     list_projects(root)
         .into_iter()
         .find(|p| same_id(&p.id, name))

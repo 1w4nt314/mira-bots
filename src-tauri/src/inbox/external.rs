@@ -151,6 +151,54 @@ pub fn clean_label(raw: &str) -> Option<String> {
     Some(clip_chars(&s, INBOX_LABEL_MAX_CHARS)).filter(|s| !s.is_empty())
 }
 
+/// Longest quoted value (frontmatter key, `kind:`, `project:`, file name) in a note.
+pub const NOTE_VALUE_MAX_CHARS: usize = 40;
+/// Longest note.
+pub const NOTE_MAX_CHARS: usize = 200;
+/// Most notes kept per item.
+pub const NOTES_MAX: usize = 20;
+
+/// A foreign value quoted in a note (review6c C2): cleaned like a title ([`sanitize_title`]:
+/// one line, no invisible/bidi chars) and clipped to [`NOTE_VALUE_MAX_CHARS`] with "…".
+pub fn clean_note_value(raw: &str) -> String {
+    let s = sanitize_title(raw);
+    if s.chars().count() <= NOTE_VALUE_MAX_CHARS {
+        return s;
+    }
+    format!("{}…", clip_chars(&s, NOTE_VALUE_MAX_CHARS - 1))
+}
+
+/// One note as stored on an item or a ticket (review6c C2, last guard): one line, without
+/// invisible chars ([`is_hidden_char`]), whitespace collapsed, at most [`NOTE_MAX_CHARS`].
+pub fn clean_note(raw: &str) -> String {
+    let s: String = raw
+        .chars()
+        .filter(|c| !is_hidden_char(*c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if s.chars().count() <= NOTE_MAX_CHARS {
+        return s;
+    }
+    format!("{}…", clip_chars(&s, NOTE_MAX_CHARS - 1))
+}
+
+/// [`clean_note`] on every note; empty and repeated notes dropped, at most [`NOTES_MAX`].
+pub fn clean_notes<'a>(raw: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in raw {
+        let n = clean_note(n);
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+            if out.len() == NOTES_MAX {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// A GitHub login: only `[A-Za-z0-9-]`, 1–39 chars, optionally followed by `[bot]` (an app);
 /// anything else is [`UNKNOWN_LOGIN`].
 pub fn clean_login(raw: &str) -> String {

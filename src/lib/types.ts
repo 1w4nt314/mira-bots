@@ -436,6 +436,8 @@ export interface ExternalRef {
   /** Milliseconds since the Unix epoch. */
   importedAt: number;
   writeBack: WriteBack;
+  /** A playbook child of an external ticket: shows the source, never writes back. */
+  inherited: boolean;
 }
 
 export type InboxState = "new" | "started" | "dismissed";

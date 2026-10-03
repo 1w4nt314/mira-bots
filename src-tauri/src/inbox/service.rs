@@ -14,7 +14,9 @@
 use std::collections::HashSet;
 use std::io;
 
-use super::external::{clean_external_title, clean_label, clean_login, sanitize_external_body};
+use super::external::{
+    clean_external_title, clean_label, clean_login, clean_notes, sanitize_external_body,
+};
 use super::source::{Fetched, FetchedItem, SourceId};
 use super::store::InboxStore;
 use super::{ExternalKind, InboxDoc, InboxItem, InboxItemSummary, InboxState};
@@ -53,6 +55,8 @@ pub struct Applied {
     pub added: usize,
     pub updated: usize,
     pub gone: usize,
+    /// Listed items that belong to another source (review6c W1); left as they are.
+    pub elsewhere: usize,
 }
 
 pub struct InboxService {
@@ -80,6 +84,8 @@ fn clean(f: &FetchedItem) -> Cleaned {
         notes.extend(s.notes);
         s.text
     });
+    // Review6c C2: notes may quote the source (frontmatter keys, `kind:`, `project:`).
+    let notes = clean_notes(&notes);
     let labels = f
         .labels
         .iter()
@@ -292,7 +298,17 @@ impl InboxService {
                     .iter_mut()
                     .find(|i| i.kind == source.kind && i.external_id == f.external_id);
                 match existing {
+                    // Review6c W1: an item belongs to the first source that listed it (two
+                    // projects on one repo with other labels are two sources); another source
+                    // takes it over only once the owner no longer lists it (`gone`), so
+                    // `project`/`candidates` never flip between refreshes.
+                    Some(it) if it.source_id != source.key && !it.gone => {
+                        applied.elsewhere += 1;
+                    }
                     Some(it) => {
+                        if it.source_id != source.key {
+                            it.source_id = source.key.clone();
+                        }
                         it.seen_at = now;
                         match it.state {
                             InboxState::New => {
@@ -493,7 +509,8 @@ mod tests {
             Applied {
                 added: 2,
                 updated: 0,
-                gone: 0
+                gone: 0,
+                elsewhere: 0
             }
         );
         let a = s
@@ -534,6 +551,79 @@ mod tests {
         assert_eq!(it.body.as_deref(), Some("xy"));
         assert_eq!(it.notes, vec!["1 HTML-kommentar(er) fjernet".to_string()]);
         assert_eq!(it.source_id, "folder:_rod");
+    }
+
+    #[test]
+    fn apply_cleans_notes() {
+        let (mut s, _) = svc();
+        let mut f = gh(1, "T");
+        f.notes = vec![
+            "ukendt kind «a\u{202E}b\u{200B}c» ignoreret".into(),
+            format!("ukendt nøgle «{}» ignoreret", "k".repeat(1_000)),
+            "  linje\r\nto\t ".into(),
+            "".into(),
+        ];
+        f.notes.extend((0..30).map(|i| format!("note {i}")));
+        s.apply(&SourceId::folder(None), fetched(vec![f], true), 1)
+            .unwrap();
+        let notes = &s.doc.items[0].notes;
+        assert_eq!(notes[0], "ukendt kind «abc» ignoreret");
+        assert_eq!(notes[1].chars().count(), 200);
+        assert!(notes[1].ends_with('…'));
+        assert_eq!(notes[2], "linje to");
+        assert_eq!(notes.len(), 20, "at most 20 notes, empty ones dropped");
+    }
+
+    #[test]
+    fn same_repo_different_labels_first_source_keeps_the_item() {
+        let (mut s, _) = svc();
+        let a = SourceId {
+            kind: ExternalKind::Github,
+            key: "github:o/r".into(),
+        };
+        let b = SourceId {
+            kind: ExternalKind::Github,
+            key: "github:o/r[bug]".into(),
+        };
+        let item = |project: &str| {
+            let mut f = gh(1, "Crash");
+            f.project = Some(project.into());
+            f
+        };
+        for round in 0..3 {
+            let ra = s
+                .apply(&a, fetched(vec![item("web")], true), 10 + round)
+                .unwrap();
+            let rb = s
+                .apply(&b, fetched(vec![item("api")], true), 10 + round)
+                .unwrap();
+            let it = &s.doc.items[0];
+            assert_eq!(s.doc.items.len(), 1);
+            assert_eq!(
+                (it.source_id.as_str(), it.project.as_deref()),
+                ("github:o/r", Some("web"))
+            );
+            assert_eq!(rb.elsewhere, 1, "round {round}");
+            assert_eq!((rb.added, rb.updated, rb.gone), (0, 0, 0), "round {round}");
+            if round > 0 {
+                assert_eq!(ra, Applied::default(), "nothing flips back (round {round})");
+            }
+        }
+        // The owner no longer lists it: gone, then the other source takes it over.
+        s.apply(&a, fetched(vec![], true), 20).unwrap();
+        assert!(s.doc.items[0].gone);
+        let rb = s.apply(&b, fetched(vec![item("api")], true), 21).unwrap();
+        let it = &s.doc.items[0];
+        assert_eq!(rb.updated, 1);
+        assert!(!it.gone);
+        assert_eq!(
+            (it.source_id.as_str(), it.project.as_deref()),
+            ("github:o/r[bug]", Some("api"))
+        );
+        // ... and keeps it while both list it again.
+        let ra = s.apply(&a, fetched(vec![item("web")], true), 22).unwrap();
+        assert_eq!(ra.elsewhere, 1);
+        assert_eq!(s.doc.items[0].project.as_deref(), Some("api"));
     }
 
     #[test]
@@ -588,7 +678,8 @@ mod tests {
             Applied {
                 added: 0,
                 updated: 1,
-                gone: 0
+                gone: 0,
+                elsewhere: 0
             }
         );
         assert_eq!(s.get(&id_of(&s, "github:o/r#1")).unwrap().title, "A2");
@@ -636,7 +727,8 @@ mod tests {
             Applied {
                 added: 0,
                 updated: 1,
-                gone: 0
+                gone: 0,
+                elsewhere: 0
             }
         );
         assert_eq!(s.list().len(), 3);

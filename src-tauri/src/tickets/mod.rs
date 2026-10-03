@@ -136,6 +136,33 @@ pub struct ReportContent {
     pub body: String,
 }
 
+/// The held inbox serial lock ([`TicketsCtx::lock_inbox_serial`]). In tests it also marks the
+/// thread, so file system reads can check that they never run under it (review6c W3).
+pub struct InboxSerialGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INBOX_SERIAL_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for InboxSerialGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        INBOX_SERIAL_HELD.with(|h| h.set(h.get().saturating_sub(1)));
+    }
+}
+
+/// Plan A.1/F (review6c W3): `gh` and file system work never run under `inbox_lock`. Tests
+/// panic when `what` is read while this thread holds it; release builds do nothing.
+pub fn assert_not_under_inbox_lock(what: &str) {
+    #[cfg(test)]
+    INBOX_SERIAL_HELD.with(|h| assert_eq!(h.get(), 0, "{what} read under inbox_lock"));
+    #[cfg(not(test))]
+    let _ = what;
+}
+
 /// Shared ticket state of the app (in `AppState`, the pipe glue and the dispatcher).
 pub struct TicketsCtx {
     pub service: Mutex<TicketService>,
@@ -250,9 +277,13 @@ impl TicketsCtx {
         self
     }
 
-    /// Takes the inbox serial lock (step 6c): before, never inside, the service lock.
-    pub fn lock_inbox_serial(&self) -> MutexGuard<'_, ()> {
-        lock(&self.inbox_lock)
+    /// Takes the inbox serial lock (step 6c): before, never inside, the service lock. No file
+    /// system read runs under it ([`assert_not_under_inbox_lock`], review6c W3).
+    pub fn lock_inbox_serial(&self) -> InboxSerialGuard<'_> {
+        let guard = lock(&self.inbox_lock);
+        #[cfg(test)]
+        INBOX_SERIAL_HELD.with(|h| h.set(h.get() + 1));
+        InboxSerialGuard { _guard: guard }
     }
 
     /// Read-only access to the inbox document (its own short lock).

@@ -467,6 +467,22 @@ fn waited_at(t: &Ticket) -> Option<u64> {
 
 /// Normalised title for the duplicate check (plan A.8): one line, whitespace runs collapsed,
 /// lowercase (Unicode).
+/// The duplicate rule (C6c.5 "Ligner ticket …", `mira_create_ticket`'s warning; review6c W4:
+/// one rule for every caller) apart from the title: the ticket is open (not Done) and in the
+/// same project (both none, or the same id). The caller compares [`norm_title`]s.
+pub(crate) fn is_open_duplicate(
+    state: TicketState,
+    project: Option<&str>,
+    want: Option<&str>,
+) -> bool {
+    state != TicketState::Done
+        && match (project, want) {
+            (None, None) => true,
+            (Some(a), Some(b)) => same_id(a, b),
+            _ => false,
+        }
+}
+
 pub(crate) fn norm_title(s: &str) -> String {
     one_line(s)
         .split_whitespace()
@@ -954,15 +970,14 @@ impl TicketService {
     /// Open (not Done) tickets whose [`norm_title`] is `norm`, in the same project as `project`
     /// (both without one, or the same name per `projects::same_id`); oldest first.
     pub fn find_open_by_title(&self, norm: &str, project: Option<&ProjectRef>) -> Vec<Ticket> {
+        let want = project.map(ProjectRef::name);
         let mut v: Vec<Ticket> = self
             .doc
             .tickets
             .iter()
-            .filter(|t| t.state != TicketState::Done && norm_title(&t.title) == norm)
-            .filter(|t| match (t.project.as_ref(), project) {
-                (None, None) => true,
-                (Some(a), Some(b)) => same_id(a.name(), b.name()),
-                _ => false,
+            .filter(|t| {
+                is_open_duplicate(t.state, t.project.as_ref().map(ProjectRef::name), want)
+                    && norm_title(&t.title) == norm
             })
             .cloned()
             .collect();
@@ -1117,11 +1132,12 @@ impl TicketService {
     }
 
     /// The ticket started from the external item `(kind, external_id)` (step 6c), any state.
+    /// Playbook children that only inherited the source (review6c C1) never count.
     pub fn find_by_external(&self, kind: ExternalKind, external_id: &str) -> Option<&Ticket> {
         self.doc.tickets.iter().find(|t| {
             t.external
                 .as_ref()
-                .is_some_and(|e| e.kind == kind && e.external_id == external_id)
+                .is_some_and(|e| !e.inherited && e.kind == kind && e.external_id == external_id)
         })
     }
 
@@ -1800,6 +1816,9 @@ impl TicketService {
                 )
                 .map_err(|e| TicketError::PlaybookStepsInvalid(format!("trin {}: {e}", i + 1)))?;
             c.parent_id = Some(parent.id.clone());
+            // Review6c C1: a child of an external ticket keeps the source (fixed label in the
+            // typed line), but only the parent writes back.
+            c.external = parent.external.as_ref().map(ExternalRef::inherited_copy);
             if step.blocked_by_previous {
                 if let Some(prev) = children.last() {
                     c.blocked_by = vec![prev.id.clone()];

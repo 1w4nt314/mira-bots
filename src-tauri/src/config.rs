@@ -420,6 +420,13 @@ pub const WRITE_BACK_ALREADY_DONE: &str = "Allerede meldt tilbage";
 pub const WRITE_BACK_RUNNING: &str = "Tilbagemeldingen er i gang";
 /// `retry_write_back` on a ticket that is not Done or has no external source.
 pub const WRITE_BACK_NOT_POSSIBLE: &str = "Kun færdige tickets fra indbakken kan meldes tilbage";
+/// `retry_write_back` on a playbook child of an external ticket (review6c C1).
+pub const WRITE_BACK_CHILD: &str = "Del-tickets melder ikke tilbage; det gør forælder-ticketen";
+/// Source note: items of this source already belong to another source on the same repo
+/// (review6c W1: the first source keeps an item).
+pub fn shared_items_note(n: usize) -> String {
+    format!("{n} emne(r) hører allerede til en anden kilde på samme repo")
+}
 /// `retry_write_back` on a GitHub ticket whose project has `writeBack.comment` off.
 pub const WRITE_BACK_OFF: &str =
     "Tilbagemelding til GitHub er slået fra (project.json: github.writeBack.comment)";

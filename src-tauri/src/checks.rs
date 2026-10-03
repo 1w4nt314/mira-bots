@@ -108,6 +108,17 @@ fn parse_github(v: &Value, notes: &mut Vec<String>) -> Result<GithubConfig, Stri
             .ok_or_else(|| labels_rule.clone())?,
         Some(_) => return Err(labels_rule),
     };
+    // Review6c W5: gh's `--label` splits on commas (two labels, AND) and a leading `-` reads
+    // like an option; such a label turns the source off.
+    if let Some(bad) = labels
+        .iter()
+        .find(|l| l.contains(',') || l.starts_with('-'))
+    {
+        return Err(format!(
+            "label «{}» må ikke indeholde komma eller starte med «-»",
+            crate::tickets::prompt::one_line(bad)
+        ));
+    }
     match g.get("state") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) if s.trim() == "open" => {}
@@ -273,6 +284,7 @@ impl ProjectFileReader {
 
     /// The project file of `project_dir`: cached while its mtime and length are unchanged.
     pub fn read(&self, project_dir: &Path) -> Result<Option<ProjectFile>, String> {
+        crate::tickets::assert_not_under_inbox_lock("project.json");
         let path = project_file_path(project_dir);
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let meta = match std::fs::metadata(&path) {
@@ -834,6 +846,19 @@ mod tests {
             (
                 r#"{"github": {"repo": "o/r", "writeBack": true}}"#,
                 "writeBack skal være et objekt",
+            ),
+            // Review6c W5: a comma would be two labels for gh, a leading `-` reads like an option.
+            (
+                r#"{"github": {"repo": "o/r", "labels": ["ok", "bug, ui"]}}"#,
+                "label «bug, ui» må ikke indeholde komma eller starte med «-»",
+            ),
+            (
+                r#"{"github": {"repo": "o/r", "labels": ["-x"]}}"#,
+                "label «-x» må ikke indeholde komma eller starte med «-»",
+            ),
+            (
+                r#"{"github": {"repo": "o/r", "labels": [" --label=evil "]}}"#,
+                "label «--label=evil» må ikke indeholde komma eller starte med «-»",
             ),
         ];
         for (text, reason) in cases {

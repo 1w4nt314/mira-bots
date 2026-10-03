@@ -246,7 +246,8 @@ pub struct ExternalRef {
     /// Cleaned author login (B1 addition to C6c.2: the ticket file's "oprindelig forfatter").
     #[serde(default)]
     pub author: Option<String>,
-    /// Sanitising notes ("2 HTML-kommentar(er) fjernet", …), shown in the ticket file.
+    /// Sanitising notes ("2 HTML-kommentar(er) fjernet", …), cleaned by the inbox; the ticket
+    /// file shows only their number (review6c C2).
     #[serde(default)]
     pub notes: Vec<String>,
     /// The inbox item this ticket was started from.
@@ -255,9 +256,23 @@ pub struct ExternalRef {
     pub imported_at: u64,
     #[serde(default)]
     pub write_back: WriteBack,
+    /// A playbook child of an external ticket (review6c C1): it carries the parent's source, so
+    /// its typed line shows the fixed label and its file the fenced text, but it never writes
+    /// back (only the parent does) and never counts as "the ticket of" the item.
+    #[serde(default)]
+    pub inherited: bool,
 }
 
 impl ExternalRef {
+    /// The parent's source for a playbook child (review6c C1): `inherited`, no write-back state.
+    pub fn inherited_copy(&self) -> ExternalRef {
+        ExternalRef {
+            write_back: WriteBack::default(),
+            inherited: true,
+            ..self.clone()
+        }
+    }
+
     /// The `{kilde}` of C6c.4/C6c.5: `GitHub issue #{n} i {repo}` or `filen {path} i indbakken`
     /// (repo and path sanitised like a title: one line, no invisible chars).
     pub fn source_label(&self) -> String {
@@ -783,6 +798,7 @@ pub(crate) mod test_support {
             inbox_item_id: "item-1".into(),
             imported_at: 5,
             write_back: WriteBack::default(),
+            inherited: false,
         }
     }
 }
@@ -1034,7 +1050,8 @@ mod tests {
             "path":null,"url":"https://github.com/o/r/issues/123","title":"Crash ved start",
             "labels":["bug"],"author":"alice","notes":[],"inboxItemId":"item-1","importedAt":5,
             "writeBack":{"comment":"none","close":"none","commentUrl":null,"commentedAt":null,
-                "closedAt":null,"attempts":0,"lastError":null,"lastBody":null}});
+                "closedAt":null,"attempts":0,"lastError":null,"lastBody":null},
+            "inherited":false});
         assert_eq!(v["external"], want);
         assert_eq!(s["external"], want);
         assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);

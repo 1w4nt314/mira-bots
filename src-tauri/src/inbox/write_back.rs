@@ -28,8 +28,8 @@ use crate::checks::WriteBackConfig;
 use crate::config::{
     issue_closed_note, result_written_note, write_back_failed_note, written_back_note,
     INBOX_DONE_DIR, INBOX_MOVE_FAILED_NOTE, INBOX_STARTED_DIR, INBOX_TMP_DIR,
-    WRITE_BACK_ALREADY_DONE, WRITE_BACK_MAX_CHARS, WRITE_BACK_NOT_POSSIBLE, WRITE_BACK_OFF,
-    WRITE_BACK_RUNNING, WRITE_BACK_SUMMARY_MAX_CHARS,
+    WRITE_BACK_ALREADY_DONE, WRITE_BACK_CHILD, WRITE_BACK_MAX_CHARS, WRITE_BACK_NOT_POSSIBLE,
+    WRITE_BACK_OFF, WRITE_BACK_RUNNING, WRITE_BACK_SUMMARY_MAX_CHARS,
 };
 use crate::gh::{error_text, valid_repo, GhCall};
 use crate::tickets::model::{
@@ -240,8 +240,12 @@ pub fn render_write_back(t: &Ticket, roots: &[PathBuf]) -> String {
 }
 
 /// Whether the Done hook writes back for this external ticket: never tried (`none`), or failed
-/// without an attempt. Anything else needs "Prøv igen" (B3).
+/// without an attempt. Anything else needs "Prøv igen" (B3). A playbook child that inherited
+/// the source never writes back; only its parent does (review6c C1).
 pub fn wants_write_back(e: &ExternalRef) -> bool {
+    if e.inherited {
+        return false;
+    }
     match e.write_back.comment {
         WriteBackState::None => true,
         WriteBackState::Failed => e.write_back.attempts == 0,
@@ -329,7 +333,7 @@ fn folder_write_back_with(
         let ext = t
             .external
             .clone()
-            .filter(|e| e.kind == ExternalKind::Folder)
+            .filter(|e| e.kind == ExternalKind::Folder && !e.inherited)
             .ok_or_else(|| "ingen mappe-kilde".to_string())?;
         if manual {
             match ext.write_back.comment {
@@ -427,6 +431,7 @@ fn folder_write_back_with(
 
 /// The project's `github.writeBack` of ticket `t` (`project.json`; absent: nothing).
 fn write_back_config(ctx: &TicketsCtx, t: &Ticket) -> WriteBackConfig {
+    crate::tickets::assert_not_under_inbox_lock("project.json");
     t.project
         .as_ref()
         .and_then(|p| p.id())
@@ -502,6 +507,11 @@ pub fn github_write_back(
     id: &str,
     manual: bool,
 ) -> Result<WriteBack, String> {
+    // Review6c W3: the project file is read before `inbox_lock` (never file I/O under it).
+    let cfg = ctx
+        .read(|s| s.get(id))
+        .map(|t| write_back_config(ctx, &t))
+        .unwrap_or_default();
     let (t, ext, cfg, mut wb, step) = {
         let _serial = ctx.lock_inbox_serial();
         let t = ctx
@@ -510,9 +520,10 @@ pub fn github_write_back(
         let ext = t
             .external
             .clone()
-            .filter(|e| e.kind == ExternalKind::Github && t.state == TicketState::Done)
+            .filter(|e| {
+                e.kind == ExternalKind::Github && !e.inherited && t.state == TicketState::Done
+            })
             .ok_or_else(|| WRITE_BACK_NOT_POSSIBLE.to_string())?;
-        let cfg = write_back_config(ctx, &t);
         if !cfg.comment {
             return if manual {
                 Err(WRITE_BACK_OFF.into())
@@ -661,10 +672,14 @@ pub fn github_write_back(
 /// `retry_write_back` ("Prøv igen", C6c.1 `write_back`): the folder or GitHub write back of a
 /// Done external ticket, also after earlier attempts. "Allerede meldt tilbage" when it is done.
 pub fn write_back(ctx: &Arc<TicketsCtx>, id: &str) -> Result<WriteBack, String> {
-    let kind = ctx
+    let ext = ctx
         .read(|s| s.get(id))
-        .and_then(|t| t.external.map(|e| e.kind))
+        .and_then(|t| t.external)
         .ok_or_else(|| WRITE_BACK_NOT_POSSIBLE.to_string())?;
+    if ext.inherited {
+        return Err(WRITE_BACK_CHILD.into());
+    }
+    let kind = ext.kind;
     match kind {
         ExternalKind::Folder => folder_write_back_with(ctx, id, true),
         ExternalKind::Github => github_write_back(ctx, id, true),
@@ -1170,6 +1185,112 @@ mod tests {
         );
         let kinds: Vec<String> = gh.calls().iter().map(|c| c[1].clone()).collect();
         assert_eq!(kinds, ["comment", "close", "close"]);
+    }
+
+    #[test]
+    fn project_file_is_never_read_under_inbox_lock() {
+        // Review6c W3: in tests every project.json/projects/workspace read panics while the
+        // thread holds `inbox_lock`; the write back reads its config before taking it.
+        let (env, gh) = gh_env(r#"{"comment": true}"#);
+        let ctx = &env.t.ctx;
+        let t = ticket("ab12cd34-0000-0000-0000-000000000000", TicketState::Done);
+        {
+            let _serial = ctx.lock_inbox_serial();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_back_config(ctx, &t)
+            }));
+            assert!(r.is_err(), "the guard catches a read under the lock");
+        }
+        assert_eq!(write_back_config(ctx, &t), WriteBackConfig::default());
+        // A project file that fails to parse: read before the lock, the write back is silent.
+        env.project_json("{ ødelagt");
+        let id = github_done(&env);
+        assert!(gh.calls().is_empty());
+        assert_eq!(wb_of(ctx, &id), WriteBack::default());
+        assert_eq!(
+            write_back(ctx, &id).unwrap_err(),
+            WRITE_BACK_OFF.to_string()
+        );
+    }
+
+    #[test]
+    fn second_done_never_writes_back_again() {
+        // Review6c W6 (plan G2): Done → Backlog (reopen) → Done posts no second comment.
+        let (env, gh) = gh_env(r#"{"comment": true, "close": true}"#);
+        gh.reply(&["issue", "comment"], 0, COMMENT_URL, "");
+        gh.reply(&["issue", "close"], 0, "", "");
+        let id = github_done(&env);
+        let ctx = &env.t.ctx;
+        assert_eq!(gh.calls().len(), 2);
+        let before = wb_of(ctx, &id);
+        ctx.mutate(|x| x.set_state(&id, TicketState::Backlog, None, false, 6))
+            .unwrap();
+        finish(ctx, &id);
+        ctx.join_inbox_threads();
+        assert_eq!(ctx.read(|x| x.get(&id)).unwrap().state, TicketState::Done);
+        assert_eq!(gh.calls().len(), 2, "no second comment or close");
+        assert_eq!(gh.bodies().len(), 1);
+        assert_eq!(wb_of(ctx, &id), before);
+        let posted = notes_of(ctx, &id)
+            .iter()
+            .filter(|n| **n == written_back_note(7))
+            .count();
+        assert_eq!(posted, 1);
+        // A failed attempt is not repeated by a second Done either (only "Prøv igen", which
+        // looks for the marker first).
+        let (env, gh) = gh_env(r#"{"comment": true}"#);
+        gh.reply(&["issue", "comment"], 1, "", OFFLINE);
+        let id = github_done(&env);
+        let ctx = &env.t.ctx;
+        ctx.mutate(|x| x.set_state(&id, TicketState::Backlog, None, false, 6))
+            .unwrap();
+        finish(ctx, &id);
+        ctx.join_inbox_threads();
+        assert_eq!(gh.calls().len(), 1);
+        assert_eq!(wb_of(ctx, &id).attempts, 1);
+    }
+
+    #[test]
+    fn playbook_child_done_never_writes_back() {
+        // Review6c C1: only the parent reports to the issue.
+        let (env, gh) = gh_env(r#"{"comment": true, "close": true}"#);
+        let ctx = &env.t.ctx;
+        let parent = ctx
+            .mutate(|x| {
+                x.create_external(
+                    "Crash",
+                    "Trin",
+                    false,
+                    Some(ProjectRef::Existing("web".into())),
+                    Some("bug".into()),
+                    crate::tickets::model::test_support::github_ref(7),
+                    1,
+                )
+            })
+            .unwrap();
+        let r = crate::tickets::playbook::start_playbook(
+            ctx,
+            &parent.id,
+            crate::tickets::playbook::StartedBy::User,
+            None,
+        )
+        .unwrap();
+        let child = &r.children[0].ticket.id;
+        finish(ctx, child);
+        ctx.join_inbox_threads();
+        assert_eq!(ctx.read(|x| x.get(child)).unwrap().state, TicketState::Done);
+        assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+        assert_eq!(wb_of(ctx, child), WriteBack::default());
+        assert!(!notes_of(ctx, child).iter().any(|n| n.contains("melde")));
+        assert!(
+            env.t
+                .ctx
+                .read(|x| x.get(child))
+                .unwrap()
+                .external
+                .unwrap()
+                .inherited
+        );
     }
 
     #[test]

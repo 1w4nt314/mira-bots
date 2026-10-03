@@ -23,7 +23,7 @@ use super::source::{InboxStatus, Source, SourceError, SourceErrorKind, SourceSta
 use super::write_back::locate_folder_file;
 use super::InboxItem;
 use crate::agent::now_ms;
-use crate::config::{INBOX_DONE_DIR, INBOX_MOVE_FAILED_NOTE, INBOX_STARTED_DIR};
+use crate::config::{shared_items_note, INBOX_DONE_DIR, INBOX_MOVE_FAILED_NOTE, INBOX_STARTED_DIR};
 use crate::tickets::model::{TicketState, WriteBackState};
 use crate::tickets::TicketsCtx;
 
@@ -216,7 +216,12 @@ pub fn run_refresh(
                             a.updated,
                             a.gone
                         );
-                        rt.with_source(&id.key, |s| s.succeeded(now, &fetched));
+                        rt.with_source(&id.key, |s| {
+                            s.succeeded(now, &fetched);
+                            if a.elsewhere > 0 {
+                                s.notes.push(shared_items_note(a.elsewhere));
+                            }
+                        });
                     }
                     Err(e) => {
                         let e = SourceError::new(SourceErrorKind::Internal, e);
@@ -236,7 +241,11 @@ pub fn run_refresh(
         let pairs: Vec<(String, String)> = ctx.read(|s| {
             s.list()
                 .into_iter()
-                .filter_map(|t| t.external.map(|e| (e.external_id, t.id)))
+                .filter_map(|t| {
+                    t.external
+                        .filter(|e| !e.inherited)
+                        .map(|e| (e.external_id, t.id))
+                })
                 .collect()
         });
         match ctx.inbox_mutate_quiet(|i| i.reconcile(&pairs)) {

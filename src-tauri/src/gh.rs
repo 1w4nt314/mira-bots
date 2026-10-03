@@ -394,19 +394,34 @@ fn stale(entry: &Option<(Instant, Option<PathBuf>)>, now: Instant, ttl: Duration
 }
 
 /// [`find_gh`] with an explicit cache, clock and lookup (tests). A hit is kept for the process,
-/// a miss for `ttl`. The lookup runs under the cache lock (two callers never probe twice).
+/// a miss for `ttl`. Double-checked (review6c W2): the lookup (`gh --version` per candidate, up
+/// to 5 s each) runs WITHOUT the cache lock, so [`known_gh`]/[`gh_lookup_due`] (Diagnostik)
+/// never wait on a probe; afterwards the result is stored unless another caller stored a fresh
+/// one meanwhile (a hit always wins over a miss). Two callers may then probe at the same time.
 pub(crate) fn cached_lookup(
     cache: &GhCache,
     now: Instant,
     ttl: Duration,
     lookup: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
+    {
+        let entry = lock_cache(cache);
+        if !stale(&entry, now, ttl) {
+            return entry.as_ref().and_then(|(_, p)| p.clone());
+        }
+    }
+    let found = lookup();
     let mut entry = lock_cache(cache);
-    if stale(&entry, now, ttl) {
-        let found = lookup();
+    let other_hit = matches!(&*entry, Some((_, Some(_))));
+    if stale(&entry, now, ttl) || (found.is_some() && !other_hit) {
         *entry = Some((now, found));
     }
     entry.as_ref().and_then(|(_, p)| p.clone())
+}
+
+/// The cached path of `cache` without a lookup.
+fn known_in(cache: &GhCache) -> Option<PathBuf> {
+    lock_cache(cache).as_ref().and_then(|(_, p)| p.clone())
 }
 
 /// The gh executable: PATH (the login PATH on Unix), then the usual install folders; each
@@ -440,7 +455,7 @@ pub fn find_gh() -> Option<PathBuf> {
 
 /// The cached gh path without a lookup (Diagnostik; never blocks on a probe).
 pub fn known_gh() -> Option<PathBuf> {
-    lock_cache(cache()).as_ref().and_then(|(_, p)| p.clone())
+    known_in(cache())
 }
 
 /// Whether [`find_gh`] would look again now (no lookup yet, or an expired miss).
@@ -1117,6 +1132,38 @@ mod tests {
             Some(PathBuf::from("/usr/bin/gh"))
         );
         assert_eq!(lookups.get(), 2, "a hit is kept");
+    }
+
+    #[test]
+    fn slow_probe_never_holds_the_cache_lock() {
+        // Review6c W2: a lookup that hangs (a slow `gh --version`) must not block Diagnostik.
+        static SLOW: GhCache = Mutex::new(None);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let prober = std::thread::spawn(move || {
+            cached_lookup(&SLOW, Instant::now(), GH_NONE_TTL, || {
+                assert!(SLOW.try_lock().is_ok(), "the lookup runs without the lock");
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Some(PathBuf::from("/opt/gh"))
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // While the probe runs, the cached path and "due" answer at once.
+        let t = Instant::now();
+        assert_eq!(known_in(&SLOW), None);
+        assert!(stale(&lock_cache(&SLOW), Instant::now(), GH_NONE_TTL));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        assert_eq!(prober.join().unwrap(), Some(PathBuf::from("/opt/gh")));
+        assert_eq!(known_in(&SLOW), Some(PathBuf::from("/opt/gh")));
+        // A late miss from a second prober does not replace the hit stored meanwhile.
+        let cache: GhCache = Mutex::new(None);
+        let got = cached_lookup(&cache, Instant::now(), GH_NONE_TTL, || {
+            *lock_cache(&cache) = Some((Instant::now(), Some(PathBuf::from("/b/gh"))));
+            None
+        });
+        assert_eq!(got, Some(PathBuf::from("/b/gh")));
     }
 
     #[test]

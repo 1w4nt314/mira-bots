@@ -2,7 +2,6 @@
 //! `commands.rs` are thin wrappers. Also the `inbox-changed` payload ([`InboxPayload`]) with the
 //! Start dialog's duplicate warning (`duplicateOf`).
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,10 +21,10 @@ use crate::config::INBOX_NO_URL;
 use crate::diagnostics::InboxSourceDiag;
 use crate::events::INBOX_CHANGED;
 use crate::gh::{check_auth, issue_url_ok, GhAuthResult};
-use crate::tickets::model::{short_id, TicketState, TicketSummary};
+use crate::tickets::model::{short_id, TicketSummary};
 use crate::tickets::model::{ExternalKind, WriteBack};
 use crate::tickets::prompt::one_line;
-use crate::tickets::service::norm_title;
+use crate::tickets::service::{is_open_duplicate, norm_title};
 use crate::tickets::TicketsCtx;
 
 /// `get_inbox` and the `inbox-changed` event (C6c.2): every item the sources still list
@@ -37,41 +36,32 @@ pub struct InboxPayload {
     pub status: InboxStatus,
 }
 
-/// The duplicate key of a project (`""`: none), case-folded like `projects::same_id`.
-fn project_key(p: Option<&str>) -> String {
-    p.map(str::to_lowercase).unwrap_or_default()
-}
-
-/// Fills `duplicate_of` of the `new` items: the oldest open ticket in the same project whose
-/// normalised title equals the item's (C6c.5 "Ligner ticket …"; the same rule as
-/// [`super::start::duplicate_hint`], one pass over the tickets).
-fn fill_duplicates(items: &mut [InboxItemSummary], tickets: &[TicketSummary]) {
-    if !items.iter().any(|i| i.state == InboxState::New) {
-        return;
-    }
-    let mut open: HashMap<(String, String), &TicketSummary> = HashMap::new();
-    for t in tickets.iter().filter(|t| t.state != TicketState::Done) {
-        let key = (
-            project_key(t.project.as_ref().map(|p| p.name())),
-            norm_title(&t.title),
-        );
-        open.entry(key)
-            .and_modify(|o| {
-                if t.created_at < o.created_at {
-                    *o = t;
-                }
-            })
-            .or_insert(t);
-    }
-    for it in items.iter_mut().filter(|i| i.state == InboxState::New) {
-        let key = (
-            project_key(it.project.as_deref()),
-            norm_title(&clean_external_title(&it.title)),
-        );
-        it.duplicate_of = open.get(&key).map(|t| DuplicateRef {
+/// The oldest open ticket in project `project` whose normalised title equals `title`'s
+/// (C6c.5 "Ligner ticket …"), by [`is_open_duplicate`] — the rule `mira_create_ticket` and
+/// [`super::start::duplicate_hint`] use too (review6c W4).
+pub(crate) fn duplicate_of(
+    tickets: &[TicketSummary],
+    project: Option<&str>,
+    title: &str,
+) -> Option<DuplicateRef> {
+    let norm = norm_title(&clean_external_title(title));
+    tickets
+        .iter()
+        .filter(|t| {
+            is_open_duplicate(t.state, t.project.as_ref().map(|p| p.name()), project)
+                && norm_title(&t.title) == norm
+        })
+        .min_by_key(|t| t.created_at)
+        .map(|t| DuplicateRef {
             short_id: short_id(&t.id),
             title: one_line(&t.title),
-        });
+        })
+}
+
+/// Fills `duplicate_of` of the `new` items ([`duplicate_of`]).
+fn fill_duplicates(items: &mut [InboxItemSummary], tickets: &[TicketSummary]) {
+    for it in items.iter_mut().filter(|i| i.state == InboxState::New) {
+        it.duplicate_of = duplicate_of(tickets, it.project.as_deref(), &it.title);
     }
 }
 

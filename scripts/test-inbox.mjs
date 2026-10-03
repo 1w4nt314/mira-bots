@@ -32,7 +32,7 @@ const wb = (o = {}) => ({
 });
 const ext = (o = {}) => ({
   kind: "github", externalId: "github:o/r#7", repo: "o/r", number: 7, path: null, url: null, title: "t", labels: [],
-  author: null, notes: [], inboxItemId: "i1", importedAt: 0, writeBack: wb(), ...o,
+  author: null, notes: [], inboxItemId: "i1", importedAt: 0, writeBack: wb(), inherited: false, ...o,
 });
 const status = (o = {}) => ({ refreshing: false, lastRefreshAt: null, sources: [], ...o });
 const source = (o = {}) => ({
@@ -61,6 +61,9 @@ check(x.sourceIdText({ sourceId: "other", repo: null }), "other");
 
 // writeBackBadge
 check(x.writeBackBadge(ext()), null);
+// A playbook child of an external ticket (review6c C1) never writes back: no badge, no retry.
+check(x.showsWriteBack({ state: "done", external: ext({ inherited: true }) }), false);
+check(x.canRetryWriteBack(ext({ inherited: true })), false);
 check(x.writeBackBadge(ext({ writeBack: wb({ comment: "inflight" }) })).text, "melder tilbage…");
 const done = x.writeBackBadge(ext({ writeBack: wb({ comment: "done", commentUrl: "https://github.com/o/r/issues/7#c1" }) }));
 check([done.text, done.title], ["meldt tilbage ✓", "https://github.com/o/r/issues/7#c1"]);

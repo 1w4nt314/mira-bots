@@ -297,6 +297,7 @@ impl WorkspaceReader {
     // TODO(windows-verify): a save from Notepad/VS Code (new mtime, maybe the same length) is
     // read at the next spawn/assignment; invalid JSON shows the warning (plan4b D.83).
     pub fn snapshot(&self) -> WorkspaceSnapshot {
+        crate::tickets::assert_not_under_inbox_lock("the workspace file");
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let meta = match std::fs::metadata(&self.path) {
             Ok(m) => m,
