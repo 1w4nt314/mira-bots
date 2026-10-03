@@ -898,7 +898,9 @@ impl TicketsCtx {
 
     /// Runs the checks on a "mira-checks" thread (inline when this context is not
     /// [`Self::shared`]) and finishes with [`Self::finish_checks`]. A panic on the thread is
-    /// caught (review6b N20): the run ends `skipped` via [`Self::abort_checks`].
+    /// caught (review6b N20): the run ends `skipped` via [`Self::abort_checks`]. Release builds
+    /// use `panic = "abort"` (workspace Cargo.toml), so there the process ends as before and
+    /// `load_and_recover` clears the pending run at the next start (review6b N23).
     fn spawn_checks(
         &self,
         id: String,
