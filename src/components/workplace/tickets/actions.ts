@@ -1,7 +1,8 @@
 // Workplace-level callbacks the ticket components need (selection and the spawn dialog live in
 // Workplace). A context instead of threading them through Sidebar -> TicketsPanel -> StickyNote.
 import { createContext, useCallback, useContext } from "react";
-import { errorMessage } from "../../../lib/ipc";
+import { errorMessage, startPlaybook } from "../../../lib/ipc";
+import { playbookStartedText } from "../../../lib/tickets";
 import type { AgentInfo, SeatKind, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 
@@ -54,5 +55,30 @@ export function useRun(): (action: () => Promise<unknown>) => Promise<boolean> {
       }
     },
     [dispatch],
+  );
+}
+
+/**
+ * "Start forløb" (step 6b): asks the backend to create the playbook's child tickets. Only ever
+ * called from a click. On success `onNotice` gets "Forløb startet: n del-tickets" plus the
+ * backend's notes (what could not be assigned); a failure goes to the store's error line.
+ */
+export function useStartPlaybook(): (
+  ticket: TicketSummary,
+  onNotice?: (text: string) => void,
+) => Promise<boolean> {
+  const run = useRun();
+  return useCallback(
+    async (ticket: TicketSummary, onNotice?: (text: string) => void) => {
+      const box: { result: Awaited<ReturnType<typeof startPlaybook>> | null } = { result: null };
+      const ok = await run(async () => {
+        box.result = await startPlaybook(ticket.id);
+      });
+      const result = box.result;
+      if (!ok || result === null) return false;
+      onNotice?.(playbookStartedText(result.children.length, result.notes));
+      return true;
+    },
+    [run],
   );
 }

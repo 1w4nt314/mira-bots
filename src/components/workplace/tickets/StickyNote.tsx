@@ -14,7 +14,11 @@ import { isExited } from "../../../lib/status";
 import {
   ACTOR_LABEL,
   canDelete,
+  canStartPlaybook,
   canReturnWaiting,
+  checksBadge,
+  gitBadge,
+  kindLabel,
   canDrag,
   canHandOver,
   BLOCKED_HINT,
@@ -35,7 +39,7 @@ import type { AgentInfo, TicketHistoryEntry, TicketSummary } from "../../../lib/
 import { useStore } from "../../../state/store";
 import BotFigure from "../../BotFigure";
 import Markdown from "../../Markdown";
-import { smallBtn, useRun } from "./actions";
+import { smallBtn, useRun, useStartPlaybook } from "./actions";
 import AssignMenu from "./AssignMenu";
 import ReportsSection from "./ReportsSection";
 import ReviewActions from "./ReviewActions";
@@ -113,6 +117,8 @@ function NoteFrame(props: FrameProps) {
   const parent = t.parentId === null ? null : parentOf(t, all);
   const progress = progressOf(t.id, all);
   const blockers = t.state === "done" ? [] : blockersOf(t, all);
+  const checks = checksBadge(t);
+  const branch = gitBadge(t);
   const childrenDone =
     t.state === "backlog" && t.assigneeAgentId === null && progress.total > 0 && progress.done === progress.total;
 
@@ -147,6 +153,35 @@ function NoteFrame(props: FrameProps) {
               uden projekt
             </span>
           )
+        )}
+        {t.kind !== null && (
+          <span
+            className="rounded bg-indigo-500/15 px-1 text-[10px] text-indigo-800 dark:text-indigo-200"
+            title={`Type: ${kindLabel(t.kind)}`}
+          >
+            {kindLabel(t.kind)}
+          </span>
+        )}
+        {t.playbookStartedAt !== null && (
+          <span
+            className="rounded bg-indigo-500/15 px-1 text-[10px] text-indigo-800 dark:text-indigo-200"
+            title="Forløbet er startet"
+          >
+            forløb
+          </span>
+        )}
+        {checks !== null && (
+          <span className={`max-w-[45%] truncate rounded px-1 text-[10px] ${checks.cls}`} title={checks.title}>
+            {checks.text}
+          </span>
+        )}
+        {branch !== null && (
+          <span
+            className="max-w-[45%] truncate rounded bg-neutral-500/15 px-1 font-mono text-[10px]"
+            title={branch.title}
+          >
+            {branch.text}
+          </span>
         )}
         {t.parentId !== null && (
           <span
@@ -275,7 +310,11 @@ function NoteActions({
   onNotice?: (text: string) => void;
 }) {
   const run = useRun();
+  const startPlaybook = useStartPlaybook();
+  const { state } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const canStart = canStartPlaybook(t, state.tickets, state.appInfo?.playbookKinds ?? []);
 
   useEffect(() => {
     if (!confirmDelete) return;
@@ -292,8 +331,31 @@ function NoteActions({
     void run(() => deleteTicket(t.id));
   };
 
+  const start = async () => {
+    setStarting(true);
+    try {
+      await startPlaybook(t, onNotice);
+    } finally {
+      setStarting(false);
+    }
+  };
+
   const buttons: ReactNode[] = [];
-  if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
+  if (canStart) {
+    buttons.push(
+      <button
+        key="start"
+        type="button"
+        onClick={() => void start()}
+        disabled={starting}
+        title={`Opretter del-ticketsene for ${kindLabel(t.kind)} og giver dem til agenter med den rette rolle`}
+        className={`${smallBtn} font-medium`}
+      >
+        {starting ? "Starter…" : "Start forløb"}
+      </button>,
+    );
+  }
+  if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} onNotice={onNotice} />);
   if (canReturnWaiting(t)) {
     // Review 6a N3: the user frees a waiting parent (its children stay where they are).
     buttons.push(

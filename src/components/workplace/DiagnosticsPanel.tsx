@@ -18,7 +18,7 @@ import {
   validateProjectName,
 } from "../../lib/projects";
 import { openFolderTitle } from "../../lib/platform";
-import type { Diagnostics, LastHookEvent, LastToolCall } from "../../lib/types";
+import type { Diagnostics, LastHookEvent, LastToolCall, WorkspaceRules } from "../../lib/types";
 import { useStore } from "../../state/store";
 
 export const DIAG_REFRESH_MS = 2000;
@@ -84,9 +84,25 @@ function formatValue(v: Diagnostics[keyof Diagnostics]): string {
   return String(v);
 }
 
-function copyText(d: Diagnostics): string {
+/** The step 6b workspace rules shown after the workspace fields (raw key, label, value). */
+function ruleRows(rules: WorkspaceRules | undefined): { key: string; label: string; value: string }[] {
+  if (rules === undefined) return [];
+  const yesNo = (b: boolean) => (b ? "ja" : "nej");
+  return [
+    { key: "rules.git", label: "Git pr. ticket", value: rules.git },
+    { key: "rules.checksGate", label: "Projekt-tjek afviser ved fejl", value: yesNo(rules.checksGate) },
+    {
+      key: "rules.freshSessionPerTicket",
+      label: "Ny session pr. ticket",
+      value: yesNo(rules.freshSessionPerTicket),
+    },
+  ];
+}
+
+function copyText(d: Diagnostics, rules: WorkspaceRules | undefined): string {
   const lines = [`mira-bots ${d.appVersion}`];
   for (const f of FIELDS) lines.push(`${f.key}: ${formatValue(d[f.key])}`);
+  for (const r of ruleRows(rules)) lines.push(`${r.key}: ${r.value}`);
   return lines.join("\n");
 }
 
@@ -185,7 +201,7 @@ export default function DiagnosticsPanel() {
   // selected fallback text field is shown (plan D.26).
   const copy = async () => {
     if (diag === null) return;
-    const text = copyText(diag);
+    const text = copyText(diag, state.appInfo?.rules);
     try {
       await navigator.clipboard.writeText(text);
       setFallback(null);
@@ -283,6 +299,14 @@ export default function DiagnosticsPanel() {
               </div>
             );
           })}
+          {ruleRows(state.appInfo?.rules).map((r) => (
+            <div key={r.key}>
+              <dt className="text-[var(--muted)]">{r.label}</dt>
+              <dd className="break-all font-mono text-[11px] select-text" title={r.value}>
+                {r.value}
+              </dd>
+            </div>
+          ))}
         </dl>
       )}
     </div>

@@ -12,6 +12,7 @@ import type {
   Effort,
   HookEventPayload,
   PermissionRequestInfo,
+  PlaybookStarted,
   PermissionResolvedPayload,
   Project,
   ProjectRef,
@@ -51,6 +52,7 @@ export const COMMANDS = {
   listTickets: "list_tickets",
   getTicket: "get_ticket",
   createTicket: "create_ticket",
+  startTicketPlaybook: "ticket_start_playbook",
   updateTicket: "update_ticket",
   deleteTicket: "delete_ticket",
   assignTicket: "assign_ticket",
@@ -158,7 +160,15 @@ export const createTicket = (
   body: string,
   skipReview: boolean,
   project: ProjectRef | null = null,
-) => invoke<TicketSummary>(COMMANDS.createTicket, { title, body, skipReview, project });
+  /** The ticket type (step 6b); null = plain task. */
+  kind: string | null = null,
+) => invoke<TicketSummary>(COMMANDS.createTicket, { title, body, skipReview, project, kind });
+/**
+ * "Start forløb" (step 6b): creates the playbook's child tickets and assigns them by role. Only
+ * a Backlog ticket whose `kind` has a playbook; `notes` says what could not be done.
+ */
+export const startPlaybook = (ticketId: string) =>
+  invoke<PlaybookStarted>(COMMANDS.startTicketPlaybook, { ticketId });
 export const updateTicket = (id: string, patch: TicketPatch) =>
   invoke<TicketSummary>(COMMANDS.updateTicket, { id, patch });
 /** Only backlog/done tickets and rejected ones without an agent. */

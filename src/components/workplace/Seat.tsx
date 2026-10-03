@@ -5,7 +5,7 @@ import { COMPACT, itemsFor, type OfficeDetail } from "../../lib/office";
 import { assignmentIssue, type SeatHint } from "../../lib/projects";
 import { rolesText } from "../../lib/roles";
 import { isExited, statusLabel } from "../../lib/status";
-import { agentDropId, emptyDropId } from "../../lib/tickets";
+import { agentDropId, emptyDropId, shortCwd } from "../../lib/tickets";
 import type { AgentInfo, BotState, SeatKind, TicketSummary } from "../../lib/types";
 import BotFigure from "../BotFigure";
 import DeskArt from "./office/DeskArt";
@@ -134,7 +134,7 @@ export default function Seat(props: Props) {
       ref={setNodeRef}
       type="button"
       onClick={() => onSelect(agent.id)}
-      title={`${agent.name} — ${label}${agent.detail ? `: ${agent.detail}` : ""}\n${agent.cwd}${
+      title={`${agent.name} — ${label}${agent.detail ? `: ${agent.detail}` : ""}\n${shortCwd(agent.cwd)}${
         projectTitle !== "" ? `\n${projectTitle}` : ""
       }${currentTicket !== null ? `\nI gang: ${currentTicket.title}` : ""}${
         dragging && exited ? "\nAfsluttet: kan ikke få tickets" : ""

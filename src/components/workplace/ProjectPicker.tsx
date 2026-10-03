@@ -107,7 +107,7 @@ export default function ProjectPicker(props: Props) {
         {missing && <option value={current}>{current}</option>}
         {projects.map((p) => (
           <option key={p.id} value={p.id} title={p.path}>
-            {p.id}
+            {p.isGitRepo ? `${p.id} (git)` : p.id}
           </option>
         ))}
         {allowNew && (

@@ -3,7 +3,18 @@ import { useTheme } from "../../../lib/bots";
 import { approveTicket, assignReviewer, rejectTicket } from "../../../lib/ipc";
 import { rolesText } from "../../../lib/roles";
 import { isExited } from "../../../lib/status";
-import { childrenOf, progressOf, reviewerCandidates, reviewRoundText, STATE_LABEL } from "../../../lib/tickets";
+import {
+  checksBadge,
+  checksLineText,
+  childrenOf,
+  gitLineText,
+  isFlowParent,
+  progressOf,
+  reviewerCandidates,
+  reviewRoundText,
+  shortCwd,
+  STATE_LABEL,
+} from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 import BotFigure from "../../BotFigure";
@@ -188,16 +199,49 @@ function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
   );
 }
 
+/** The project checks of this review entry (step 6b); nothing when none ran. */
+function ChecksLine({ ticket }: { ticket: TicketSummary }) {
+  const text = checksLineText(ticket);
+  const badge = checksBadge(ticket);
+  if (text === null || badge === null) return null;
+  return (
+    <div className="text-[11px]" title={badge.title}>
+      <span className={`rounded px-1 font-medium ${badge.cls}`}>{text}</span>
+    </div>
+  );
+}
+
+/** The ticket's branch (step 6b): "Branch {branch} fra {base}" and the worktree folder. */
+function GitLine({ ticket }: { ticket: TicketSummary }) {
+  const g = ticket.git;
+  if (g === null) return null;
+  return (
+    <div className="text-[11px]">
+      <span className="font-mono" title={g.repo}>
+        {gitLineText(g)}
+      </span>
+      {g.worktree !== null && (
+        <span className="ml-1 font-mono opacity-70" title={g.worktree}>
+          · {shortCwd(g.worktree)}
+        </span>
+      )}
+    </div>
+  );
+}
+
 /**
  * Review of a finished ticket: the reviewer (agent or "venter på dig"), the round of 3 and the
  * "Eskaleret til dig" badge, "Vælg reviewer…" / "Fjern reviewer", the agent's summary above the
  * buttons, "Godkend" (→ Done),
  * "Afvis…" with a required note (the ticket goes back first in the agent's queue, or to the
  * backlog when the agent no longer runs; it leaves the Review list either way), and "Åbn
- * terminal" to look at the agent's work.
+ * terminal" to look at the agent's work. A flow parent (step 6b: `isFlowParent`, no assignee) has
+ * no sender and no reviewer agent: it shows "venter på dig" and neither "Åbn terminal" nor the
+ * reviewer menu.
  */
 export default function ReviewActions({ ticket, agent, onNotice }: Props) {
   const run = useRun();
+  const flowParent = isFlowParent(ticket);
   const { selectAgent } = useTicketActions();
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
@@ -225,13 +269,17 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
     onNotice?.(
       after.state === "assigned"
         ? `Ticket ${ticket.shortId} er afvist og sendt tilbage forrest i køen hos ${agent?.name ?? "agenten"}`
-        : `Ticket ${ticket.shortId} er afvist; agenten kører ikke, så den ligger nu i Backlog`,
+        : flowParent
+          ? `Ticket ${ticket.shortId} er afvist og ligger nu i Backlog`
+          : `Ticket ${ticket.shortId} er afvist; agenten kører ikke, så den ligger nu i Backlog`,
     );
   };
 
   return (
     <div className="mt-1.5 space-y-1.5">
       <ReviewerLine ticket={ticket} />
+      <ChecksLine ticket={ticket} />
+      <GitLine ticket={ticket} />
       <AgentSummary summary={ticket.summary} />
       <ChildrenSummaries ticket={ticket} />
       <div className="flex flex-wrap gap-1.5">
@@ -254,17 +302,19 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
         >
           Afvis…
         </button>
-        <button
-          type="button"
-          onClick={() => ticket.assigneeAgentId !== null && selectAgent(ticket.assigneeAgentId)}
-          disabled={agent === null}
-          title={agent === null ? "Agenten findes ikke længere" : `Vis terminalen for ${agent.name}`}
-          className={smallBtn}
-        >
-          Åbn terminal
-        </button>
-        <ReviewerMenu ticket={ticket} />
-        {ticket.reviewerAgentId !== null && (
+        {!flowParent && (
+          <button
+            type="button"
+            onClick={() => ticket.assigneeAgentId !== null && selectAgent(ticket.assigneeAgentId)}
+            disabled={agent === null}
+            title={agent === null ? "Agenten findes ikke længere" : `Vis terminalen for ${agent.name}`}
+            className={smallBtn}
+          >
+            Åbn terminal
+          </button>
+        )}
+        {!flowParent && <ReviewerMenu ticket={ticket} />}
+        {!flowParent && ticket.reviewerAgentId !== null && (
           <button
             type="button"
             onClick={() => void run(() => assignReviewer(ticket.id, null))}

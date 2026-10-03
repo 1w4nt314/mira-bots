@@ -5,6 +5,7 @@ import type {
   AgentInfo,
   SeatKind,
   TicketActor,
+  TicketGit,
   TicketIssue,
   TicketSource,
   TicketState,
@@ -715,4 +716,210 @@ export function movePendingText(queue: number, waiting: number, project: string 
         : `${waiting} ventende ${waiting === 1 ? "ticket" : "tickets"}`;
   const where = project === null ? "" : ` til «${project}»`;
   return `${what}${where} lægges tilbage i Backlog`;
+}
+
+// --- ticket types, playbooks, checks and git (step 6b) -----------------------------------------
+// The payload carries `kind`, `playbookStartedAt`, `checks` and `git` (see `TicketSummary`); the
+// playbook names come from `appInfo.playbookKinds`. Nothing here starts anything by itself: "Start
+// forløb" is always a click.
+
+/**
+ * The ticket type as shown in badges and the dropdown.
+ *
+ * | kind      | kindLabel   |
+ * |-----------|-------------|
+ * | null      | "Opgave"    |
+ * | "feature" | "Feature"   |
+ * | "bug"     | "Bug"       |
+ * | "docs"    | "docs"      |
+ */
+export function kindLabel(kind: string | null): string {
+  if (kind === null) return "Opgave";
+  if (kind === "feature") return "Feature";
+  if (kind === "bug") return "Bug";
+  return kind;
+}
+
+export interface KindOption {
+  /** `null` = plain task (the backend stores no kind). */
+  value: string | null;
+  label: string;
+}
+
+/**
+ * The "Type" dropdown: Opgave, Feature, Bug, then the other playbook names sorted. `feature` and
+ * `bug` are always offered (they are built in); `task` is never a playbook name.
+ *
+ * | playbookKinds          | values                                  |
+ * |------------------------|-----------------------------------------|
+ * | []                     | [null, "feature", "bug"]                |
+ * | ["bug", "feature"]     | [null, "feature", "bug"]                |
+ * | ["feature", "docs", "api", "docs"] | [null, "feature", "bug", "api", "docs"] |
+ * | ["task"]               | [null, "feature", "bug"]                |
+ */
+export function KIND_OPTIONS(playbookKinds: readonly string[]): KindOption[] {
+  const extra = [...new Set(playbookKinds)]
+    .filter((k) => k !== "" && k !== "task" && k !== "feature" && k !== "bug")
+    .sort();
+  return [null, "feature", "bug", ...extra].map((value) => ({ value, label: kindLabel(value) }));
+}
+
+/**
+ * Whether "Start forløb" may be offered (mirrors `create_playbook_children`/`start_playbook`):
+ * a Backlog ticket whose kind has a playbook, not started before and without children.
+ *
+ * | state   | kind      | in playbookKinds | started | children | canStartPlaybook |
+ * |---------|-----------|------------------|---------|----------|------------------|
+ * | backlog | "feature" | yes              | no      | none     | true             |
+ * | backlog | null      | -                | no      | none     | false            |
+ * | backlog | "docs"    | no               | no      | none     | false            |
+ * | backlog | "feature" | yes              | yes     | none     | false            |
+ * | backlog | "feature" | yes              | no      | some     | false            |
+ * | review  | "feature" | yes              | no      | none     | false            |
+ * | rejected| "feature" | yes              | no      | none     | false            |
+ */
+export function canStartPlaybook(
+  t: TicketSummary,
+  all: readonly TicketSummary[],
+  playbookKinds: readonly string[],
+): boolean {
+  return (
+    t.state === "backlog" &&
+    t.kind !== null &&
+    playbookKinds.includes(t.kind) &&
+    t.playbookStartedAt === null &&
+    !all.some((x) => x.parentId === t.id)
+  );
+}
+
+/**
+ * Whether the ticket is a flow parent: "Start forløb" ran and the ticket has no owner (the user
+ * started it). Its review has no sender and no reviewer agent; only the user decides.
+ *
+ * | playbookStartedAt | assigneeAgentId | isFlowParent |
+ * |-------------------|-----------------|--------------|
+ * | 1700000000000     | null            | true         |
+ * | 1700000000000     | "A"             | false        |
+ * | null              | null            | false        |
+ */
+export function isFlowParent(t: Pick<TicketSummary, "playbookStartedAt" | "assigneeAgentId">): boolean {
+  return t.playbookStartedAt !== null && t.assigneeAgentId === null;
+}
+
+export interface ChecksBadge {
+  text: string;
+  /** Full Tailwind class string. */
+  cls: string;
+  title: string;
+}
+
+/**
+ * The "Tjek" badge. `skipped` (nothing ran) and no checks at all show nothing.
+ *
+ * | checks.state | failed  | text                  | title                |
+ * |--------------|---------|-----------------------|----------------------|
+ * | null         | -       | null                  |                      |
+ * | skipped      | -       | null                  |                      |
+ * | pending      | -       | "Tjek: kører"         | "Projekt-tjek"       |
+ * | passed       | -       | "Tjek: OK"            | "Projekt-tjek"       |
+ * | failed       | "tests" | "Tjek: FEJL (tests)"  | "tests"              |
+ * | failed       | null    | "Tjek: FEJL"          | "Projekt-tjek"       |
+ */
+export function checksBadge(t: Pick<TicketSummary, "checks">): ChecksBadge | null {
+  const c = t.checks;
+  if (c === null) return null;
+  switch (c.state) {
+    case "pending":
+      return {
+        text: "Tjek: kører",
+        cls: "bg-sky-500/15 text-sky-800 dark:text-sky-200",
+        title: "Projekt-tjek",
+      };
+    case "passed":
+      return {
+        text: "Tjek: OK",
+        cls: "bg-emerald-500/15 text-emerald-800 dark:text-emerald-200",
+        title: "Projekt-tjek",
+      };
+    case "failed":
+      return {
+        text: c.failed === null ? "Tjek: FEJL" : `Tjek: FEJL (${c.failed})`,
+        cls: "bg-rose-500/15 text-rose-700 dark:text-rose-300",
+        title: c.failed ?? "Projekt-tjek",
+      };
+    case "skipped":
+      return null;
+  }
+}
+
+/**
+ * The review card's check line (same states as `checksBadge`; "se rapport" points at the «Tjek»
+ * report below).
+ *
+ * | checks.state | failed  | checksLineText                     |
+ * |--------------|---------|------------------------------------|
+ * | null/skipped | -       | null                               |
+ * | pending      | -       | "Tjek: kører…"                     |
+ * | passed       | -       | "Tjek: OK"                         |
+ * | failed       | "tests" | "Tjek: FEJL (tests) · se rapport"  |
+ * | failed       | null    | "Tjek: FEJL · se rapport"          |
+ */
+export function checksLineText(t: Pick<TicketSummary, "checks">): string | null {
+  const c = t.checks;
+  if (c === null) return null;
+  switch (c.state) {
+    case "pending":
+      return "Tjek: kører…";
+    case "passed":
+      return "Tjek: OK";
+    case "failed":
+      return `${c.failed === null ? "Tjek: FEJL" : `Tjek: FEJL (${c.failed})`} · se rapport`;
+    case "skipped":
+      return null;
+  }
+}
+
+/**
+ * The note's branch badge: "⎇ branch", title = worktree folder, else the repository.
+ *
+ * | git                                   | gitBadge                                      |
+ * |---------------------------------------|-----------------------------------------------|
+ * | null                                  | null                                          |
+ * | branch ticket/ab12cd34, worktree "W"  | { text: "⎇ ticket/ab12cd34", title: "W" }     |
+ * | branch ticket/ab12cd34, worktree null | { text: "⎇ ticket/ab12cd34", title: <repo> }  |
+ */
+export function gitBadge(t: Pick<TicketSummary, "git">): { text: string; title: string } | null {
+  const g = t.git;
+  if (g === null) return null;
+  return { text: `⎇ ${g.branch}`, title: g.worktree ?? g.repo };
+}
+
+/** The review card's git line: "Branch {branch} fra {base}". */
+export function gitLineText(g: Pick<TicketGit, "branch" | "base">): string {
+  return `Branch ${g.branch} fra ${g.base}`;
+}
+
+/** The confirmation after "Start forløb": "Forløb startet: n del-tickets", then the backend's notes. */
+export function playbookStartedText(children: number, notes: readonly string[]): string {
+  const head = `Forløb startet: ${children} ${children === 1 ? "del-ticket" : "del-tickets"}`;
+  return notes.length === 0 ? head : `${head} · ${notes.join(" · ")}`;
+}
+
+/**
+ * An agent's folder, shortened when it is a ticket worktree (`<projekt>/.mira-bots/wt/<kort>`,
+ * any slash style): "…/.mira-bots/wt/<kort>" (a subfolder is kept). Other paths are unchanged.
+ *
+ * | cwd                                              | shortCwd                          |
+ * |--------------------------------------------------|-----------------------------------|
+ * | "C:\\p\\app\\.mira-bots\\wt\\ab12cd34"        | "…/.mira-bots/wt/ab12cd34"        |
+ * | "/home/u/p/app/.mira-bots/wt/ab12cd34/"          | "…/.mira-bots/wt/ab12cd34"        |
+ * | "/home/u/p/app/.mira-bots/wt/ab12cd34/src/x"     | "…/.mira-bots/wt/ab12cd34/src/x"  |
+ * | "/home/u/p/app"                                  | "/home/u/p/app"                   |
+ * | "/home/u/.mira-bots/wt/not-a-short-id"           | unchanged                         |
+ */
+export function shortCwd(cwd: string): string {
+  const m = /[\\/]\.mira-bots[\\/]wt[\\/]([0-9a-f]{8})(?:[\\/](.*?))?[\\/]*$/.exec(cwd);
+  if (m === null) return cwd;
+  const rest = m[2] === undefined || m[2] === "" ? "" : `/${m[2].replace(/\\/g, "/")}`;
+  return `…/.mira-bots/wt/${m[1]}${rest}`;
 }

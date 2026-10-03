@@ -98,6 +98,8 @@ export type ProjectRef = string | { new: string };
 export interface Project {
   id: string;
   path: string;
+  /** The folder has `.git` (step 6b); false for a project that was just created. */
+  isGitRepo: boolean;
 }
 
 export interface PermissionRequestInfo {
@@ -297,6 +299,32 @@ export interface TicketHistoryEntry {
   note: string | null;
 }
 
+/** State of a ticket's project checks (step 6b). `skipped`: nothing ran (no file or no checks). */
+export type ChecksState = "pending" | "passed" | "failed" | "skipped";
+
+/** The project checks of the ticket's current review entry (step 6b); reset on submit. */
+export interface TicketChecks {
+  state: ChecksState;
+  /** Name of the first failed check. */
+  failed: string | null;
+  /** The ticket's `reviewRound` when the checks started. */
+  round: number;
+  /** Milliseconds since the Unix epoch. */
+  startedAt: number;
+}
+
+/** The ticket's git branch, prepared by the app at delivery (step 6b). */
+export interface TicketGit {
+  mode: "branch" | "worktree";
+  /** `ticket/<shortId>`. */
+  branch: string;
+  base: string;
+  /** The project's repository folder. */
+  repo: string;
+  /** The worktree folder (`worktree` mode only). */
+  worktree: string | null;
+}
+
 /** A ticket without its history and body (`list_tickets`, `tickets-changed`); `getTicket` has both. */
 export interface TicketSummary {
   id: string;
@@ -330,11 +358,19 @@ export interface TicketSummary {
   parentId: string | null;
   /** Full ids of the tickets that must be done before this one is delivered (step 6a). */
   blockedBy: string[];
+  /** The ticket type (step 6b): `feature`, `bug`, a playbook name; null = plain task ("Opgave"). */
+  kind: string | null;
+  /** Milliseconds since the Unix epoch; set when "Start forløb" created the children. */
+  playbookStartedAt: number | null;
+  /** Project checks of the current review entry; null before/without a review. */
+  checks: TicketChecks | null;
+  /** The ticket's branch/worktree; null when `git` is off or not prepared yet. */
+  git: TicketGit | null;
 }
 
-/** Who wrote a report: an agent (`agentId`) or the user. */
+/** Who wrote a report: an agent (`agentId`), the user or the app itself (`system`, step 6b). */
 export interface ReportAuthor {
-  kind: "agent" | "user";
+  kind: "agent" | "user" | "system";
   agentId: string | null;
 }
 
@@ -387,6 +423,24 @@ export interface TicketPatch {
   skipReview?: boolean;
   /** `null` removes the project; only while the ticket is in the backlog. */
   project?: ProjectRef | null;
+}
+
+/** One child created by "Start forløb" and whom it went to. */
+export interface StartedChild {
+  ticket: TicketSummary;
+  role: Role;
+  /** The agent it was assigned to; null = it waits in the backlog. */
+  assignee: string | null;
+}
+
+/** `ticket_start_playbook` result (step 6b). */
+export interface PlaybookStarted {
+  parent: TicketSummary;
+  children: StartedChild[];
+  /** Ids of agents started for the playbook (`autoSpawnForPlaybook`). */
+  spawned: string[];
+  /** What could not be done (no agent, refused assignment, failed spawn); Danish. */
+  notes: string[];
 }
 
 /** Sidebar tabs `openWorkplace` may select. */

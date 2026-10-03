@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { createTicket, errorMessage } from "../../../lib/ipc";
-import { BODY_MAX, TITLE_MAX } from "../../../lib/tickets";
+import { BODY_MAX, KIND_OPTIONS, TITLE_MAX } from "../../../lib/tickets";
 import type { ProjectRef } from "../../../lib/types";
 import { useRefreshProjects, useStore } from "../../../state/store";
 import ProjectPicker from "../ProjectPicker";
@@ -26,6 +26,11 @@ export default function NewTicketForm({ onClose }: Props) {
   // Step 4b: an existing project, a new one (created at assignment) or "Vælg senere" (null).
   const [project, setProject] = useState<ProjectRef | null>(null);
   const [projectIncomplete, setProjectIncomplete] = useState(false);
+  // Step 6b: the ticket type ("Opgave" = no kind). The playbook names come from the workspace file.
+  const kindOptions = KIND_OPTIONS(state.appInfo?.playbookKinds ?? []);
+  const [pickedKind, setKind] = useState<string | null>(null);
+  // A playbook removed from the workspace file while the form is open falls back to "Opgave".
+  const kind = kindOptions.some((o) => o.value === pickedKind) ? pickedKind : null;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const titleRef = useRef<HTMLInputElement>(null);
@@ -41,7 +46,7 @@ export default function NewTicketForm({ onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await createTicket(title.trim(), body, skipReview, project);
+      await createTicket(title.trim(), body, skipReview, project, kind);
       setTitle("");
       setBody("");
       void refreshProjects();
@@ -102,6 +107,21 @@ export default function NewTicketForm({ onClose }: Props) {
           />
         </div>
       </div>
+      <label className="block">
+        <span className="text-[var(--muted)]">Type</span>
+        <select
+          value={kind ?? ""}
+          onChange={(e) => setKind(e.target.value === "" ? null : e.target.value)}
+          disabled={busy}
+          className={field}
+        >
+          {kindOptions.map((o) => (
+            <option key={o.value ?? ""} value={o.value ?? ""}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </label>
       <label className="block">
         <span className="text-[var(--muted)]">Beskrivelse</span>
         <textarea

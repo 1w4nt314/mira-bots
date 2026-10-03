@@ -19,6 +19,8 @@ function Author({ report }: { report: TicketReport }) {
   const { state } = useStore();
   const theme = useTheme();
   if (report.author.kind === "user") return <span className="opacity-80">dig</span>;
+  // Step 6b: the «Tjek»/«Ændringer» reports are written by the app itself.
+  if (report.author.kind === "system") return <span className="opacity-80">appen</span>;
   const agent = state.agents.find((a) => a.id === report.author.agentId);
   if (agent === undefined) return <span className="opacity-70">agent (findes ikke længere)</span>;
   return (

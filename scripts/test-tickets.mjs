@@ -266,4 +266,114 @@ for (const [q, w, p, want] of [
   eq(k.movePendingText(q, w, p), want, `movePendingText ${q} ${w} ${p}`);
 eq(k.WAKE_UNCONFIRMED_TEXT, "Vækning ikke bekræftet, se terminalen", "WAKE_UNCONFIRMED_TEXT mirrors Rust");
 
+// --- step 6b: kinds, playbooks, checks, git, worktree paths -------------------------------------
+const t6 = (over = {}) => ({
+  id: "t",
+  state: "backlog",
+  assigneeAgentId: null,
+  parentId: null,
+  kind: null,
+  playbookStartedAt: null,
+  checks: null,
+  git: null,
+  ...over,
+});
+
+// kindLabel
+for (const [kind, want] of [
+  [null, "Opgave"],
+  ["feature", "Feature"],
+  ["bug", "Bug"],
+  ["docs", "docs"],
+  ["Docs", "Docs"],
+])
+  eq(k.kindLabel(kind), want, `kindLabel ${kind}`);
+
+// KIND_OPTIONS
+const values = (kinds) => k.KIND_OPTIONS(kinds).map((o) => o.value);
+eq(values([]), [null, "feature", "bug"], "KIND_OPTIONS without playbooks keeps the built-ins");
+eq(values(["bug", "feature"]), [null, "feature", "bug"], "KIND_OPTIONS built-ins only");
+eq(values(["feature", "docs", "api", "docs"]), [null, "feature", "bug", "api", "docs"], "KIND_OPTIONS extras sorted and deduped");
+eq(values(["task", ""]), [null, "feature", "bug"], "KIND_OPTIONS ignores task and blank");
+eq(
+  k.KIND_OPTIONS(["docs"]).map((o) => o.label),
+  ["Opgave", "Feature", "Bug", "docs"],
+  "KIND_OPTIONS labels",
+);
+
+// canStartPlaybook: backlog + kind with a playbook + not started + no children
+const kinds = ["bug", "feature"];
+const start = (over, all = []) => k.canStartPlaybook(t6(over), all, kinds);
+eq(start({ kind: "feature" }), true, "canStartPlaybook feature in backlog");
+eq(start({ kind: "bug" }), true, "canStartPlaybook bug in backlog");
+eq(start({ kind: null }), false, "canStartPlaybook needs a kind");
+eq(start({ kind: "docs" }), false, "canStartPlaybook kind without playbook");
+eq(start({ kind: "feature", playbookStartedAt: 1 }), false, "canStartPlaybook already started");
+eq(start({ kind: "feature" }, [t6({ id: "c", parentId: "t" })]), false, "canStartPlaybook has children");
+eq(start({ kind: "feature" }, [t6({ id: "c", parentId: "other" })]), true, "canStartPlaybook other family's child");
+for (const state of ["assigned", "inProgress", "waiting", "review", "done", "rejected"])
+  eq(start({ kind: "feature", state }), false, `canStartPlaybook not in ${state}`);
+eq(k.canStartPlaybook(t6({ kind: "feature" }), [], []), false, "canStartPlaybook before appInfo (no kinds)");
+
+// isFlowParent
+eq(k.isFlowParent(t6({ playbookStartedAt: 1 })), true, "isFlowParent started without owner");
+eq(k.isFlowParent(t6({ playbookStartedAt: 1, assigneeAgentId: "A" })), false, "isFlowParent with owner");
+eq(k.isFlowParent(t6()), false, "isFlowParent not started");
+
+// checksBadge / checksLineText
+const chk = (state, failed = null) => t6({ checks: { state, failed, round: 0, startedAt: 1 } });
+eq(k.checksBadge(t6()), null, "checksBadge null");
+eq(k.checksBadge(chk("skipped")), null, "checksBadge skipped");
+eq(k.checksBadge(chk("pending")).text, "Tjek: kører", "checksBadge pending");
+eq(k.checksBadge(chk("passed")).text, "Tjek: OK", "checksBadge passed");
+eq(k.checksBadge(chk("failed", "tests")).text, "Tjek: FEJL (tests)", "checksBadge failed with name");
+eq(k.checksBadge(chk("failed", "tests")).title, "tests", "checksBadge failed title is the name");
+eq(k.checksBadge(chk("failed")).text, "Tjek: FEJL", "checksBadge failed without name");
+eq(k.checksBadge(chk("failed")).title, "Projekt-tjek", "checksBadge failed title fallback");
+eq(k.checksBadge(chk("passed")).title, "Projekt-tjek", "checksBadge passed title");
+eq(
+  new Set(["pending", "passed", "failed"].map((s) => k.checksBadge(chk(s)).cls)).size,
+  3,
+  "checksBadge: one class per state",
+);
+eq(k.checksLineText(t6()), null, "checksLineText null");
+eq(k.checksLineText(chk("skipped")), null, "checksLineText skipped");
+eq(k.checksLineText(chk("pending")), "Tjek: kører…", "checksLineText pending");
+eq(k.checksLineText(chk("passed")), "Tjek: OK", "checksLineText passed");
+eq(k.checksLineText(chk("failed", "tests")), "Tjek: FEJL (tests) · se rapport", "checksLineText failed");
+eq(k.checksLineText(chk("failed")), "Tjek: FEJL · se rapport", "checksLineText failed without name");
+
+// gitBadge / gitLineText
+const git = (worktree) => ({ mode: "worktree", branch: "ticket/ab12cd34", base: "main", repo: "/r", worktree });
+eq(k.gitBadge(t6()), null, "gitBadge null");
+eq(k.gitBadge(t6({ git: git("/r/.mira-bots/wt/ab12cd34") })), { text: "⎇ ticket/ab12cd34", title: "/r/.mira-bots/wt/ab12cd34" }, "gitBadge worktree title");
+eq(k.gitBadge(t6({ git: git(null) })), { text: "⎇ ticket/ab12cd34", title: "/r" }, "gitBadge repo title");
+eq(k.gitLineText(git(null)), "Branch ticket/ab12cd34 fra main", "gitLineText");
+
+// playbookStartedText
+eq(k.playbookStartedText(2, []), "Forløb startet: 2 del-tickets", "playbookStartedText");
+eq(k.playbookStartedText(1, []), "Forløb startet: 1 del-ticket", "playbookStartedText singular");
+eq(
+  k.playbookStartedText(2, ["trin 2: a", "trin 1: b"]),
+  "Forløb startet: 2 del-tickets · trin 2: a · trin 1: b",
+  "playbookStartedText with notes",
+);
+
+// shortCwd
+eq(k.shortCwd("C:\\p\\app\\.mira-bots\\wt\\ab12cd34"), "…/.mira-bots/wt/ab12cd34", "shortCwd windows");
+eq(k.shortCwd("C:\\p\\app\\.mira-bots\\wt\\ab12cd34\\"), "…/.mira-bots/wt/ab12cd34", "shortCwd windows trailing slash");
+eq(k.shortCwd("/home/u/p/app/.mira-bots/wt/ab12cd34"), "…/.mira-bots/wt/ab12cd34", "shortCwd unix");
+eq(k.shortCwd("/home/u/p/app/.mira-bots/wt/ab12cd34/"), "…/.mira-bots/wt/ab12cd34", "shortCwd unix trailing slash");
+eq(k.shortCwd("/home/u/p/app/.mira-bots/wt/ab12cd34/src/x"), "…/.mira-bots/wt/ab12cd34/src/x", "shortCwd subfolder kept");
+eq(k.shortCwd("C:\\p\\.mira-bots\\wt\\ab12cd34\\src\\x"), "…/.mira-bots/wt/ab12cd34/src/x", "shortCwd windows subfolder");
+eq(k.shortCwd("/home/u/p/app"), "/home/u/p/app", "shortCwd plain project");
+eq(k.shortCwd("/home/u/.mira-bots/wt/not-a-short-id"), "/home/u/.mira-bots/wt/not-a-short-id", "shortCwd bad short id");
+eq(k.shortCwd("/home/u/.mira-bots/wt/ab12cd34ef"), "/home/u/.mira-bots/wt/ab12cd34ef", "shortCwd longer id");
+eq(k.shortCwd("/home/u/.mira-bots/tickets"), "/home/u/.mira-bots/tickets", "shortCwd other .mira-bots folder");
+eq(k.shortCwd(""), "", "shortCwd empty");
+
+// reviewRoundText with the workspace maximum (unchanged from 6a; guards the card text)
+eq(k.reviewRoundText({ reviewRound: 0 }, 5), "Runde 1 af 5", "reviewRoundText workspace max");
+eq(k.reviewRoundText({ reviewRound: 9 }, 5), "Runde 5 af 5", "reviewRoundText capped");
+
 console.log(`tickets.ts: ${n} cases ok`);
