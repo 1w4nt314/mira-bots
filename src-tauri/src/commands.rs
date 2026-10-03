@@ -130,6 +130,9 @@ pub struct AppState {
     pub workspace: Arc<WorkspaceReader>,
     /// Profiles copied from the step 1–5 agents root at this start (Diagnostik).
     pub profiles_migrated: usize,
+    /// `app-settings.json` as loaded at start (step 6d A.7). Changed only through
+    /// [`AppState::update_settings`] (read-modify-write + save), never by a struct literal.
+    pub settings: Mutex<AppSettings>,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -167,6 +170,13 @@ fn path_string(p: &Option<PathBuf>) -> Option<String> {
 }
 
 impl AppState {
+    /// The only write path for `app-settings.json` (6d A.7): `f` changes a copy of the current
+    /// settings under the lock, the file is written, and only then does the copy become the
+    /// live settings (a failed write changes nothing in memory). Returns the new settings.
+    pub fn update_settings(&self, f: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
+        update_settings_in(&self.paths.data_dir, &self.settings, f)
+    }
+
     /// Recomputes the `claude` lookup on every call.
     pub fn app_info(&self) -> AppInfo {
         let snap = self.workspace.snapshot();
@@ -366,6 +376,21 @@ pub fn check_spawn(spawn: Option<&str>) -> Result<(), String> {
     match spawn {
         Some(s) if !WORKPLACE_SPAWN_KINDS.contains(&s) => Err(format!("Ukendt pladstype: {s}")),
         _ => Ok(()),
+    }
+}
+
+/// `open_workplace`'s `ticket_id` (step 6d A.9): `None`, or a ticket that exists (full or short
+/// id) → its full id for the payload.
+pub fn check_ticket(
+    ticket_id: Option<&str>,
+    tickets: &TicketsCtx,
+) -> Result<Option<String>, String> {
+    match ticket_id {
+        None => Ok(None),
+        Some(id) => tickets
+            .read(|s| s.get_by_any_id(id))
+            .map(|t| Some(t.id))
+            .ok_or_else(|| "Ukendt ticket".to_string()),
     }
 }
 
@@ -1584,9 +1609,30 @@ pub fn open_project_folder(
 /// [`store_projects_root`] with a relative path.
 pub const PROJECTS_ROOT_NOT_ABSOLUTE: &str = "Projektroden skal være en absolut sti";
 
+/// [`AppState::update_settings`] without the state: lock → `f` on a copy → `app_settings::save`
+/// → the copy becomes the live settings. The error text is the user-facing one.
+pub fn update_settings_in(
+    data_dir: &std::path::Path,
+    settings: &Mutex<AppSettings>,
+    f: impl FnOnce(&mut AppSettings),
+) -> Result<AppSettings, String> {
+    let mut live = lock(settings);
+    let mut next = live.clone();
+    f(&mut next);
+    app_settings::save(data_dir, &next)
+        .map_err(|e| format!("Indstillingen kunne ikke gemmes: {e}"))?;
+    *live = next.clone();
+    Ok(next)
+}
+
 /// Stores a new projects root in `app-settings.json` (created if missing). It applies after a
-/// restart of mira-bots (plan4b A.1); returns the stored path.
-pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<String, String> {
+/// restart of mira-bots (plan4b A.1); returns the stored path. The other settings (watch and
+/// notice preferences, 6d A.7) are kept: read-modify-write through [`update_settings_in`].
+pub fn store_projects_root(
+    data_dir: &std::path::Path,
+    settings: &Mutex<AppSettings>,
+    path: &str,
+) -> Result<String, String> {
     let path = path.trim();
     if path.is_empty() {
         return Err("Vælg en mappe til projektroden".into());
@@ -1599,11 +1645,9 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir).map_err(|e| format!("Mappen kunne ikke oprettes: {e}"))?;
     }
-    let settings = AppSettings {
-        projects_root: Some(path.to_string()),
-    };
-    app_settings::save(data_dir, &settings)
-        .map_err(|e| format!("Indstillingen kunne ikke gemmes: {e}"))?;
+    update_settings_in(data_dir, settings, |s| {
+        s.projects_root = Some(path.to_string());
+    })?;
     Ok(path.to_string())
 }
 
@@ -1614,7 +1658,7 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
 // (plan7 M.16).
 #[tauri::command]
 pub fn set_projects_root(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    let stored = store_projects_root(&state.paths.data_dir, &path)?;
+    let stored = store_projects_root(&state.paths.data_dir, &state.settings, &path)?;
     log::info!("projects root set to {stored} (applies after a restart)");
     Ok(stored)
 }
@@ -1826,8 +1870,9 @@ pub fn resize_island(
 
 /// Opens (or focuses) the workplace window and selects `agent_id` and/or the sidebar `tab`
 /// ("permissions" | "diagnostics" | "tickets") in it; `spawn` ("work" | "staff") makes it open the
-/// "Ny agent" dialog for that seat kind (the island's "+ Ny agent"). Async on purpose: creating a window from a
-/// synchronous command deadlocks on Windows (research2 §5).
+/// "Ny agent" dialog for that seat kind (the island's "+ Ny agent"); `ticket_id` (step 6d A.9,
+/// full or short id of an existing ticket) selects that ticket on the Tickets tab. Async on
+/// purpose: creating a window from a synchronous command deadlocks on Windows (research2 §5).
 // TODO(windows-verify): the "n i review" chip in the non-focusable island opens the workplace on
 // the Tickets tab, both when the window is created and when it is already open (plan D.36).
 #[tauri::command]
@@ -1837,26 +1882,36 @@ pub async fn open_workplace(
     agent_id: Option<String>,
     tab: Option<String>,
     spawn: Option<String>,
+    ticket_id: Option<String>,
 ) -> Result<(), String> {
     check_tab(tab.as_deref())?;
     check_spawn(spawn.as_deref())?;
+    let ticket_id = check_ticket(ticket_id.as_deref(), &state.tickets)?;
     let selection = WorkplaceSelection {
         agent_id,
         tab,
         spawn,
+        ticket_id,
     };
     *lock(&state.workplace_select) = Some(selection.clone());
     let created =
         workplace::open_or_focus(&app).map_err(|e| format!("Kunne ikke åbne Workplace: {e}"))?;
     log::info!(
-        "workplace {} (select {:?}, tab {:?}, spawn {:?})",
+        "workplace {} (select {:?}, tab {:?}, spawn {:?}, ticket {:?})",
         if created { "created" } else { "focused" },
         selection.agent_id,
         selection.tab,
-        selection.spawn
+        selection.spawn,
+        selection
+            .ticket_id
+            .as_deref()
+            .map(crate::tickets::model::short_id)
     );
     if !created
-        && (selection.agent_id.is_some() || selection.tab.is_some() || selection.spawn.is_some())
+        && (selection.agent_id.is_some()
+            || selection.tab.is_some()
+            || selection.spawn.is_some()
+            || selection.ticket_id.is_some())
     {
         // A new window fetches the selection itself via take_workplace_selection. The slot is
         // kept here too, in case the existing window is still loading and misses the event.
@@ -2404,6 +2459,7 @@ mod tests {
                 dir.join("projects").join(crate::config::WORKSPACE_FILE),
             )),
             profiles_migrated: 0,
+            settings: Mutex::new(app_settings::load(dir)),
         }
     }
 
@@ -2525,10 +2581,37 @@ mod tests {
             agent_id: Some("a1".into()),
             tab: Some("tickets".into()),
             spawn: Some("work".into()),
+            ticket_id: None,
         };
         let slot = Mutex::new(Some(sel.clone()));
         assert_eq!(take_selection(&slot), Some(sel));
         assert_eq!(take_selection(&slot), None);
+    }
+
+    #[test]
+    fn open_workplace_rejects_unknown_ticket() {
+        // Step 6d A.9: `check_ticket` is the pure part of `open_workplace`: None passes, a
+        // short or full id of an existing ticket becomes the full id, anything else is refused.
+        let (state, dir) = temp_state();
+        assert_eq!(check_ticket(None, &state.tickets), Ok(None));
+        let t = state
+            .tickets
+            .mutate(|s| s.create("Ret login", "", false, 1))
+            .unwrap();
+        assert_eq!(
+            check_ticket(Some(&t.short_id()), &state.tickets),
+            Ok(Some(t.id.clone()))
+        );
+        assert_eq!(check_ticket(Some(&t.id), &state.tickets), Ok(Some(t.id)));
+        assert_eq!(
+            check_ticket(Some("nope"), &state.tickets),
+            Err("Ukendt ticket".to_string())
+        );
+        assert_eq!(
+            check_ticket(Some(""), &state.tickets),
+            Err("Ukendt ticket".to_string())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3897,22 +3980,85 @@ mod tests {
         std::fs::create_dir_all(root.join("X")).unwrap();
         assert_eq!(project_folder(&root, Some("x")).unwrap(), root.join("X"));
         assert_eq!(
-            store_projects_root(&dir, "  ").unwrap_err(),
+            store_projects_root(&dir, &state.settings, "  ").unwrap_err(),
             "Vælg en mappe til projektroden"
         );
         // N5: relative paths are refused; nothing is created or stored.
         for rel in ["x", "andet/rod", "./x"] {
             assert_eq!(
-                store_projects_root(&dir, rel).unwrap_err(),
+                store_projects_root(&dir, &state.settings, rel).unwrap_err(),
                 PROJECTS_ROOT_NOT_ABSOLUTE
             );
         }
         assert_eq!(app_settings::load(&dir).projects_root(), None);
         let other = dir.join("andet").join("rod");
-        let stored = store_projects_root(&dir, &format!(" {} ", other.display())).unwrap();
+        let stored =
+            store_projects_root(&dir, &state.settings, &format!(" {} ", other.display())).unwrap();
         assert_eq!(stored, other.to_string_lossy());
         assert!(other.is_dir());
-        assert_eq!(app_settings::load(&dir).projects_root(), Some(other));
+        assert_eq!(
+            app_settings::load(&dir).projects_root(),
+            Some(other.clone())
+        );
+        // The live settings follow the file.
+        assert_eq!(lock(&state.settings).projects_root(), Some(other));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_projects_root_keeps_watch_fields() {
+        // 6d A.7 (handoff "Øvrigt"): "Vælg projektrod…" used to write a struct literal and would
+        // have reset the watch/notice fields; now it is a read-modify-write.
+        let (state, dir) = temp_state();
+        state
+            .update_settings(|s| {
+                s.watch_paused = true;
+                s.watch_off = vec!["shop".into()];
+                s.notify_off = vec!["escalated".into()];
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(app_settings::settings_path(&dir)).unwrap();
+        assert!(text.contains("\"watchPaused\": true"), "{text}");
+        let root = dir.join("ny").join("rod");
+        store_projects_root(&dir, &state.settings, &root.to_string_lossy()).unwrap();
+        let on_disk = app_settings::load(&dir);
+        assert_eq!(
+            on_disk,
+            AppSettings {
+                projects_root: Some(root.to_string_lossy().into_owned()),
+                watch_paused: true,
+                watch_off: vec!["shop".into()],
+                notify_off: vec!["escalated".into()],
+            }
+        );
+        assert_eq!(*lock(&state.settings), on_disk);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn update_settings_is_read_modify_write_and_keeps_memory_on_failure() {
+        let (state, dir) = temp_state();
+        let got = state
+            .update_settings(|s| s.watch_off.push("a".into()))
+            .unwrap();
+        assert_eq!(got.watch_off, vec!["a".to_string()]);
+        let got = state
+            .update_settings(|s| s.watch_off.push("b".into()))
+            .unwrap();
+        assert_eq!(got.watch_off, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(app_settings::load(&dir), got);
+        // A write that fails (the settings path is a directory) changes nothing in memory.
+        let path = app_settings::settings_path(&dir);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = state
+            .update_settings(|s| s.watch_paused = true)
+            .unwrap_err();
+        assert!(
+            err.starts_with("Indstillingen kunne ikke gemmes: "),
+            "{err}"
+        );
+        assert_eq!(*lock(&state.settings), got);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

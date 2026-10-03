@@ -205,6 +205,8 @@ pub struct AgentManager {
     by_session: HashMap<String, AgentId>,
     max_work: usize,
     max_staff: usize,
+    /// Step 6d (A.11): set by [`AgentManager::kill_all`]; `spawn`/`restart` refuse afterwards.
+    closing: bool,
 }
 
 fn is_exited(s: &AgentStatus) -> bool {
@@ -418,7 +420,13 @@ impl AgentManager {
             by_session: HashMap::new(),
             max_work,
             max_staff,
+            closing: false,
         }
+    }
+
+    /// `true` after [`Self::kill_all`]: no new children are started (step 6d A.11).
+    pub fn is_closing(&self) -> bool {
+        self.closing
     }
 
     /// Agents that have not exited, all seat kinds.
@@ -509,14 +517,17 @@ impl AgentManager {
             .any(|a| !is_exited(&a.info.status) && a.info.roles.contains(&Role::Coordinator))
     }
 
-    /// Starts `claude` in `req.cwd`. Checks, in order: seat limit, prompt does not start with
-    /// `-`, cwd is a directory, claude binary exists.
+    /// Starts `claude` in `req.cwd`. Checks, in order: the app is not closing, seat limit, prompt
+    /// does not start with `-`, cwd is a directory, claude binary exists.
     pub fn spawn(
         &mut self,
         req: SpawnRequest,
         ctx: &SpawnContext,
         sink: EventSink,
     ) -> Result<AgentInfo, AgentError> {
+        if self.closing {
+            return Err(AgentError::Closing);
+        }
         self.check_limit(req.seat_kind)?;
         if prompt_looks_like_flag(req.prompt.as_deref()) {
             return Err(AgentError::InvalidPrompt);
@@ -610,6 +621,9 @@ impl AgentManager {
         effort: Option<String>,
         sink: EventSink,
     ) -> (Result<AgentInfo, AgentError>, Option<PtyHandle>) {
+        if self.closing {
+            return (Err(AgentError::Closing), None);
+        }
         let Some(agent) = self.agents.get_mut(id) else {
             return (Err(AgentError::NotFound), None);
         };
@@ -847,8 +861,10 @@ impl AgentManager {
     /// Kills every child (app exit / `quit_app`). Idempotent; errors are only logged.
     /// Blocks at most [`QUIT_KILL_BUDGET`] on unix (waits for the process groups, then SIGKILL);
     /// returns at once on Windows. Safe under the manager lock: the waiter threads set the exit
-    /// flags before they report (and need this lock).
+    /// flags before they report (and need this lock). Sets `closing` first (step 6d A.11), so a
+    /// `spawn`/`restart` that arrives afterwards (e.g. from the watch) starts nothing.
     pub fn kill_all(&mut self) {
+        self.closing = true;
         let mut children = Vec::new();
         for (id, agent) in &mut self.agents {
             if let Some(pty) = agent.pty.as_mut() {
@@ -1865,6 +1881,65 @@ mod tests {
         let mut c = m.cwds();
         c.sort();
         assert_eq!(c, [PathBuf::from("/w/bot-01"), PathBuf::from("/w/bot-02")]);
+    }
+
+    #[test]
+    fn spawn_after_kill_all_is_refused() {
+        // Step 6d A.11: `kill_all` sets `closing`; a spawn afterwards is refused before every
+        // other check (here the seat limit would pass and the cwd check fail).
+        let mut m = AgentManager::new(5);
+        assert!(!m.is_closing());
+        let c = ctx(PathBuf::from("/nope/claude"));
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Work), &c, null_sink()),
+            Err(AgentError::InvalidCwd)
+        ));
+        m.kill_all();
+        assert!(m.is_closing());
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Work), &c, null_sink()),
+            Err(AgentError::Closing)
+        ));
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
+            Err(AgentError::Closing)
+        ));
+        // Idempotent; the text is the user-facing one.
+        m.kill_all();
+        assert!(m.is_closing());
+        assert_eq!(
+            AgentError::Closing.to_string(),
+            "Appen lukker — ingen nye agenter"
+        );
+    }
+
+    #[test]
+    fn restart_after_kill_all_is_refused() {
+        let mut m = AgentManager::new(5);
+        let a = m.insert_fake("s1", "/w/a");
+        let spec = SpawnSpec {
+            program: PathBuf::from("/nope/claude"),
+            args: Vec::new(),
+            cwd: PathBuf::from("/w/a"),
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+        };
+        m.kill_all();
+        // Refused before the agent lookup: an unknown id gives Closing too, nothing is killed.
+        let (res, old) = m.restart(
+            &a,
+            spec,
+            &RestartSession::Fresh("s2".into()),
+            None,
+            None,
+            null_sink(),
+        );
+        assert!(matches!(res, Err(AgentError::Closing)));
+        assert!(old.is_none());
+        let info = m.get(&a).unwrap();
+        assert_eq!(info.session_id, "s1");
+        assert!(!matches!(info.status, AgentStatus::Exited { .. }));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::model::{Ticket, TicketActor, TicketError, TicketSource, TicketSummary};
+use super::model::{Ticket, TicketActor, TicketError, TicketSource, TicketSummary, WorkspaceRules};
 use super::prompt::{external_line_label, external_section, one_line};
 use super::service::ChildSpec;
 use super::tools::{SpawnByProfile, SpawnPort};
@@ -340,19 +340,55 @@ pub fn pick_agent(agents: &[AgentInfo], role: Role, project: Option<&str>) -> Op
     best(&in_project).or_else(|| best(&|a: &&AgentInfo| a.seat_kind == SeatKind::Staff))
 }
 
-/// Who starts the playbook: the user ("Start forløb") or an agent (`mira_start_playbook`).
+/// Who starts the playbook: the user ("Start forløb"), an agent (`mira_start_playbook`) or
+/// the watch (step 6d).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartedBy {
     User,
-    Agent { id: String, name: String },
+    Agent {
+        id: String,
+        name: String,
+    },
+    /// Step 6d (A.6): the watch, on the user's behalf; the children's history says "System".
+    Watch,
 }
 
 impl StartedBy {
-    /// The children's origin (plan A.2: no new enum variants).
-    fn origin(&self) -> (TicketSource, TicketActor) {
+    /// The children's origin (plan A.2: no new enum variants; 6d A.6: the watch is the user's
+    /// source with the system as actor).
+    pub fn origin(&self) -> (TicketSource, TicketActor) {
         match self {
             StartedBy::User => (TicketSource::User, TicketActor::User),
             StartedBy::Agent { .. } => (TicketSource::Agent, TicketActor::Agent),
+            StartedBy::Watch => (TicketSource::User, TicketActor::System),
+        }
+    }
+}
+
+/// How [`start_playbook_with`] rolls out (step 6d A.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartOpts {
+    /// Start one agent per missing role through the `spawn` port (the workspace rule
+    /// `autoSpawnForPlaybook` for the user's and agents' starts; always for the watch).
+    pub spawn_missing: bool,
+    /// Every child gets `skip_review: false`, whatever `reviewByDefault` says (the watch).
+    pub force_review: bool,
+}
+
+impl StartOpts {
+    /// The user's/agents' start: spawn by the workspace rule, review by `reviewByDefault`.
+    pub fn from_rules(rules: &WorkspaceRules) -> Self {
+        Self {
+            spawn_missing: rules.auto_spawn_for_playbook,
+            force_review: false,
+        }
+    }
+
+    /// The watch's start (handoff 6): spawn what is missing, review always.
+    pub fn watch() -> Self {
+        Self {
+            spawn_missing: true,
+            force_review: true,
         }
     }
 }
@@ -388,11 +424,28 @@ pub struct PlaybookStarted {
 /// started from the built-in profile of that role (with the child as its first ticket unless
 /// the child is blocked, then assigned afterwards). Failures after the save become `notes` —
 /// the children always exist.
+///
+/// [`start_playbook_with`] with [`StartOpts::from_rules`] (the workspace rules): the user's and
+/// agents' start, unchanged by step 6d.
 pub fn start_playbook(
     ctx: &TicketsCtx,
     parent_id: &str,
     by: StartedBy,
     spawn: Option<&SpawnPort>,
+) -> Result<PlaybookStarted, String> {
+    let opts = StartOpts::from_rules(&ctx.workspace.rules());
+    start_playbook_with(ctx, parent_id, by, spawn, opts)
+}
+
+/// [`start_playbook`] with explicit [`StartOpts`] (step 6d A.6): `spawn_missing` replaces the
+/// workspace rule `autoSpawnForPlaybook`, `force_review` makes every child reviewed whatever
+/// `reviewByDefault` says. The watch calls it with [`StartOpts::watch`].
+pub fn start_playbook_with(
+    ctx: &TicketsCtx,
+    parent_id: &str,
+    by: StartedBy,
+    spawn: Option<&SpawnPort>,
+    opts: StartOpts,
 ) -> Result<PlaybookStarted, String> {
     let parent = ctx
         .read(|s| s.get_by_any_id(parent_id))
@@ -409,7 +462,13 @@ pub fn start_playbook(
     let specs: Vec<ChildSpec> = playbook
         .steps
         .iter()
-        .map(|st| render_step(st, &parent, review_by_default))
+        .map(|st| {
+            let mut spec = render_step(st, &parent, review_by_default);
+            if opts.force_review {
+                spec.skip_review = false;
+            }
+            spec
+        })
         .collect();
     let now = now_ms();
     let origin = by.origin();
@@ -424,8 +483,12 @@ pub fn start_playbook(
             "forløb: {short} ({kind}) startet af agent {id}: {} del-tickets",
             children.len()
         ),
+        StartedBy::Watch => log::info!(
+            "forløb: {short} ({kind}) startet af vagten: {} del-tickets",
+            children.len()
+        ),
     }
-    let auto_spawn = ctx.workspace.rules().auto_spawn_for_playbook;
+    let auto_spawn = opts.spawn_missing;
     let mut spawned_roles: BTreeSet<Role> = BTreeSet::new();
     let mut spawned: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -1210,5 +1273,199 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
         assert_eq!(r.children[0].assignee, None);
         let _ = std::fs::remove_dir_all(ws.root());
+    }
+
+    // ---- step 6d (A.6): StartOpts and StartedBy::Watch ----
+
+    #[test]
+    fn start_opts_from_rules_and_watch() {
+        let rules = WorkspaceRules::defaults();
+        assert!(!rules.auto_spawn_for_playbook);
+        assert_eq!(
+            StartOpts::from_rules(&rules),
+            StartOpts {
+                spawn_missing: false,
+                force_review: false
+            }
+        );
+        let on = WorkspaceRules {
+            auto_spawn_for_playbook: true,
+            ..rules
+        };
+        assert_eq!(
+            StartOpts::from_rules(&on),
+            StartOpts {
+                spawn_missing: true,
+                force_review: false
+            }
+        );
+        assert_eq!(
+            StartOpts::watch(),
+            StartOpts {
+                spawn_missing: true,
+                force_review: true
+            }
+        );
+    }
+
+    #[test]
+    fn watch_opts_force_review_on_children_even_when_review_by_default_is_false() {
+        // Handoff 6: the watch never lets a child skip review, whatever `reviewByDefault` says.
+        let (t, _) = ctx_with(&[]);
+        let path = t.ctx.workspace.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"reviewByDefault": false}"#).unwrap();
+        assert!(!t.ctx.workspace.rules().review_by_default);
+        let parent = feature(&t, "Login");
+        let r = start_playbook_with(
+            &t.ctx,
+            &parent.id,
+            StartedBy::Watch,
+            None,
+            StartOpts::watch(),
+        )
+        .unwrap();
+        assert_eq!(r.children.len(), 2);
+        assert!(r.children.iter().all(|c| !c.ticket.skip_review));
+        // The same workspace through the thin wrapper: the children follow the rule.
+        let other = feature(&t, "Logout");
+        let r = start_playbook(&t.ctx, &other.id, StartedBy::User, None).unwrap();
+        assert!(r.children.iter().all(|c| c.ticket.skip_review));
+        // `force_review` alone does not spawn (opts are independent).
+        let third = feature(&t, "Søg");
+        let r = start_playbook_with(
+            &t.ctx,
+            &third.id,
+            StartedBy::User,
+            None,
+            StartOpts {
+                spawn_missing: false,
+                force_review: true,
+            },
+        )
+        .unwrap();
+        assert!(r.children.iter().all(|c| !c.ticket.skip_review));
+        let _ = std::fs::remove_dir_all(t.ctx.workspace.root());
+    }
+
+    #[test]
+    fn watch_opts_spawn_without_workspace_rule() {
+        // The watch spawns the missing role although `autoSpawnForPlaybook` is not set; the
+        // user's start in the same workspace does not.
+        let (t, _) = ctx_with(&[]);
+        let ws = &t.ctx.workspace;
+        std::fs::create_dir_all(ws.root()).unwrap();
+        std::fs::write(
+            ws.path(),
+            r#"{"playbooks": {"enkelt": {"steps": [{"role": "coder", "title": "A: {title}"}]}}}"#,
+        )
+        .unwrap();
+        assert!(!ws.rules().auto_spawn_for_playbook);
+        let requests: Arc<Mutex<Vec<SpawnByProfile>>> = Arc::default();
+        let manager = Arc::clone(&t.ctx.manager);
+        let ctx = Arc::clone(&t.ctx);
+        let log = Arc::clone(&requests);
+        let port: SpawnPort = Arc::new(move |req: SpawnByProfile| {
+            log.lock().unwrap().push(req.clone());
+            let id = manager.lock().unwrap().insert_fake_in(
+                "s-watch",
+                "/w/new",
+                &[Role::Coder],
+                SeatKind::Work,
+                Some("p"),
+            );
+            if let Some(first) = &req.first_ticket_id {
+                ctx.mutate(|s| s.assign(first, &id, 5)).unwrap();
+            }
+            Ok(manager.lock().unwrap().get(&id).unwrap())
+        });
+        let mk = |title: &str, now: u64| {
+            t.ctx
+                .mutate(|s| {
+                    s.create_in(
+                        title,
+                        "",
+                        false,
+                        Some(ProjectRef::Existing("p".into())),
+                        Some("enkelt".into()),
+                        now,
+                    )
+                })
+                .unwrap()
+        };
+        let parent = mk("Vagt", 1);
+        let r = start_playbook_with(
+            &t.ctx,
+            &parent.id,
+            StartedBy::Watch,
+            Some(&port),
+            StartOpts::watch(),
+        )
+        .unwrap();
+        let reqs = requests.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert_eq!(reqs[0].profile_id, "coder");
+        assert_eq!(
+            reqs[0].first_ticket_id,
+            Some(r.children[0].ticket.id.clone())
+        );
+        assert_eq!(r.spawned.len(), 1);
+        assert_eq!(
+            r.children[0].assignee.as_deref(),
+            Some(r.spawned[0].as_str())
+        );
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        // Mark it exited, so the user's start finds no coder and (without the rule) no spawn.
+        let spawned = r.spawned[0].clone();
+        t.ctx
+            .manager
+            .lock()
+            .unwrap()
+            .mark_exited(&spawned, 0, Some(0));
+        requests.lock().unwrap().clear();
+        let plain = mk("Bruger", 2);
+        let r = start_playbook(&t.ctx, &plain.id, StartedBy::User, Some(&port)).unwrap();
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(r.children[0].assignee, None);
+        assert_eq!(r.notes.len(), 1);
+        let _ = std::fs::remove_dir_all(ws.root());
+    }
+
+    #[test]
+    fn started_by_watch_origin_is_user_source_system_actor() {
+        assert_eq!(
+            StartedBy::Watch.origin(),
+            (TicketSource::User, TicketActor::System)
+        );
+        assert_eq!(
+            StartedBy::User.origin(),
+            (TicketSource::User, TicketActor::User)
+        );
+        assert_eq!(
+            StartedBy::Agent {
+                id: "a".into(),
+                name: "A".into()
+            }
+            .origin(),
+            (TicketSource::Agent, TicketActor::Agent)
+        );
+        // Through the roll-out: the children are the user's tickets, created by the system.
+        let (t, _) = ctx_with(&[]);
+        let parent = feature(&t, "Login");
+        let r = start_playbook_with(
+            &t.ctx,
+            &parent.id,
+            StartedBy::Watch,
+            None,
+            StartOpts::watch(),
+        )
+        .unwrap();
+        for c in &r.children {
+            let full = t.ctx.read(|s| s.get(&c.ticket.id)).unwrap();
+            assert_eq!(
+                (full.source, full.history[0].by),
+                (TicketSource::User, TicketActor::System)
+            );
+        }
     }
 }

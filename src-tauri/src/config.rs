@@ -560,6 +560,25 @@ pub fn watch_state_unreadable_warning(err: &str) -> String {
     format!("{WATCH_STATE_FILE} kunne ikke læses ({err}); vagten venter en time")
 }
 
+// ---- step 6d, System-noter til tidslinjen (plan A.10, C6d.5; `note_by_system`) ----
+
+/// Historiknote når ticketens worktree netop er oprettet (`prepare_ticket_git`).
+pub fn worktree_created_note(branch: &str) -> String {
+    format!("worktree oprettet: {branch}")
+}
+/// Historiknote når agenten fik en ny session til ticketen (`deliver_work`, `force_fresh`).
+pub const NEW_SESSION_NOTE: &str = "ny session til ticketen";
+/// Historiknote når agenten fortsatte sin session i ticketens mappe (`deliver_work`, kun cwd).
+pub const SESSION_MOVED_NOTE: &str = "session fortsat i ny mappe";
+/// Historiknote på forælderen når vagten startede forløbet (Batch 4 kalder den).
+pub fn watch_started_note(playbook: &str) -> String {
+    format!("startet af vagten (forløb «{playbook}»)")
+}
+/// Historiknote på forælderen når vagten ikke kunne starte forløbet.
+pub fn watch_playbook_failed_note(err: &str) -> String {
+    format!("vagt: forløbet kunne ikke startes: {err}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +916,24 @@ mod tests {
         assert_eq!(
             watch_state_quarantined_warning("watch-state.json.broken-7"),
             "watch-state.json kunne ikke læses og blev omdøbt til watch-state.json.broken-7; vagten venter en time"
+        );
+    }
+
+    #[test]
+    fn step6d_history_notes_are_verbatim() {
+        assert_eq!(
+            worktree_created_note("ticket/ab12cd34"),
+            "worktree oprettet: ticket/ab12cd34"
+        );
+        assert_eq!(NEW_SESSION_NOTE, "ny session til ticketen");
+        assert_eq!(SESSION_MOVED_NOTE, "session fortsat i ny mappe");
+        assert_eq!(
+            watch_started_note("bug"),
+            "startet af vagten (forløb «bug»)"
+        );
+        assert_eq!(
+            watch_playbook_failed_note("ingen agent"),
+            "vagt: forløbet kunne ikke startes: ingen agent"
         );
     }
 

@@ -44,6 +44,10 @@ pub struct WorkplaceSelection {
     pub tab: Option<String>,
     #[serde(default)]
     pub spawn: Option<String>,
+    /// Step 6d (A.9): the ticket to select on the Tickets tab (full id; the UI uses it in
+    /// Batch 5). Last and `default`, so older payloads still parse.
+    #[serde(default)]
+    pub ticket_id: Option<String>,
 }
 
 /// In-process notification (not a Tauri event) from the pipe handler after a hook frame was
@@ -111,16 +115,20 @@ mod tests {
             agent_id: Some("a".into()),
             tab: Some("tickets".into()),
             spawn: Some("work".into()),
+            ticket_id: Some("t-1".into()),
         };
         let v = serde_json::to_value(&sel).unwrap();
-        assert_eq!(v, json!({"agentId":"a","tab":"tickets","spawn":"work"}));
+        assert_eq!(
+            v,
+            json!({"agentId":"a","tab":"tickets","spawn":"work","ticketId":"t-1"})
+        );
         assert_eq!(
             serde_json::from_value::<WorkplaceSelection>(v).unwrap(),
             sel
         );
         assert_eq!(
             serde_json::to_value(WorkplaceSelection::default()).unwrap(),
-            json!({"agentId":null,"tab":null,"spawn":null})
+            json!({"agentId":null,"tab":null,"spawn":null,"ticketId":null})
         );
     }
 
@@ -134,6 +142,11 @@ mod tests {
         let new = json!({"agentId":null,"tab":null,"spawn":"staff"});
         let sel = serde_json::from_value::<WorkplaceSelection>(new).unwrap();
         assert_eq!(sel.spawn.as_deref(), Some("staff"));
+        // Step 6d: a payload without `ticketId` (before 6d) parses with `ticket_id` = None.
+        assert_eq!(sel.ticket_id, None);
+        let with = json!({"agentId":null,"tab":"tickets","spawn":null,"ticketId":"t-9"});
+        let sel = serde_json::from_value::<WorkplaceSelection>(with).unwrap();
+        assert_eq!(sel.ticket_id.as_deref(), Some("t-9"));
     }
 
     #[test]

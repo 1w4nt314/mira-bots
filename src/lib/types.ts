@@ -626,4 +626,6 @@ export interface WorkplaceSelection {
   tab: string | null;
   /** "work" | "staff": open the "Ny agent" dialog for that seat kind. */
   spawn: string | null;
+  /** Step 6d: the ticket to select on the Tickets tab (full id); absent in older payloads. */
+  ticketId?: string | null;
 }

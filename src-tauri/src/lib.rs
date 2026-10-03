@@ -607,6 +607,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         profiles,
         workspace,
         profiles_migrated,
+        settings: Mutex::new(settings),
     });
 
     // After `manage`: the exit handler's `kill_all` needs `AppState` (review7 W5).

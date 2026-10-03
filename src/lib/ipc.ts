@@ -152,12 +152,16 @@ export const resizeIsland = (width: number, height: number) =>
   invoke<void>(COMMANDS.resizeIsland, { width: Math.round(width), height: Math.round(height) });
 export const quitApp = () => invoke<void>(COMMANDS.quitApp);
 export const getDiagnostics = () => invoke<Diagnostics>(COMMANDS.getDiagnostics);
-/** Opens or focuses the workplace window and selects `agentId` and/or the sidebar `tab` there. */
+/**
+ * Opens or focuses the workplace window and selects `agentId` and/or the sidebar `tab` there;
+ * `ticketId` (step 6d) selects that ticket on the Tickets tab.
+ */
 export const openWorkplace = (
   agentId: string | null,
   tab: WorkplaceTab | null = null,
   spawn: SeatKind | null = null,
-) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn });
+  ticketId: string | null = null,
+) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn, ticketId });
 /** Closes the workplace window (Cmd+W on macOS); `true` when a window was open. */
 export const closeWorkplace = () => invoke<boolean>(COMMANDS.closeWorkplace);
 /** Takes the selection stored by `openWorkplace` for a newly created window (once). */

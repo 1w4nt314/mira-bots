@@ -71,6 +71,11 @@ pub enum AgentError {
     SameProject(String),
     #[error("Stabsagenter står i projektroden og kan ikke flyttes")]
     StaffHasNoProject,
+    // ---- step 6d (A.11) ----
+    /// `spawn`/`restart` after `kill_all()`: the app is closing, no new children (the watch's
+    /// timer may still be running).
+    #[error("Appen lukker — ingen nye agenter")]
+    Closing,
 }
 
 impl From<AgentError> for String {

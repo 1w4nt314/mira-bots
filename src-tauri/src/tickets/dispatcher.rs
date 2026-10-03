@@ -28,9 +28,9 @@ use crate::agent::roles::has_work_role;
 use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
     CHILDREN_DONE_NOTE, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
-    ENTER_DELAY_MS, NOT_SUBMITTED_TEXT, RESTART_TIMEOUT_MS, RETRY_TIMEOUT_MS,
-    SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT, WAKE_MAX_ATTEMPTS, WAKE_UNCONFIRMED_TEXT,
-    WOKEN_NOTE,
+    ENTER_DELAY_MS, NEW_SESSION_NOTE, NOT_SUBMITTED_TEXT, RESTART_TIMEOUT_MS, RETRY_TIMEOUT_MS,
+    SESSION_MOVED_NOTE, SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT, WAKE_MAX_ATTEMPTS,
+    WAKE_UNCONFIRMED_TEXT, WOKEN_NOTE,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -1544,6 +1544,19 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         };
         match self.port.restart_fresh(req) {
             Ok(()) => {
+                // Step 6d (A.10): the timeline's session note (state unchanged).
+                let note = if force_fresh {
+                    NEW_SESSION_NOTE
+                } else {
+                    SESSION_MOVED_NOTE
+                };
+                let now = now_ms();
+                if let Err(e) = self
+                    .host
+                    .mutate(|s| s.note_by_system(&ticket.id, note, now))
+                {
+                    log::warn!("dispatch {agent_id}: noting the restart on {short} failed: {e}");
+                }
                 self.schedule(
                     agent_id,
                     token,
@@ -3737,6 +3750,69 @@ mod tests {
         assert_eq!(h.writes().len(), 2);
         assert_eq!(h.restarts().len(), 1);
         assert!(h.d.restarted_for.is_empty());
+    }
+
+    #[test]
+    fn fresh_session_adds_history_note() {
+        // Step 6d (A.10): an accepted restart notes "ny session til ticketen" (fresh) or
+        // "session fortsat i ny mappe" (only the cwd changed) on the ticket, by the system.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "A");
+        let before = h.ticket(&t.id).history.len();
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.restarts().len(), 1);
+        assert!(h.restarts()[0].force_fresh);
+        let after = h.ticket(&t.id);
+        assert_eq!(after.history.len(), before + 1);
+        let last = after.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some("ny session til ticketen"))
+        );
+        assert_eq!(last.note.as_deref(), Some(NEW_SESSION_NOTE));
+        assert_eq!(after.state, S::Assigned, "state unchanged by the note");
+
+        // First ticket of the session, worktree elsewhere: the session is kept, only the cwd
+        // changes.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        let (_wt, git) = h.worktree_for(&t);
+        *lock(&h.git) = Some(git);
+        let before = h.ticket(&t.id).history.len();
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].force_fresh);
+        assert!(r[0].cwd.is_some());
+        let after = h.ticket(&t.id);
+        assert_eq!(after.history.len(), before + 1);
+        let last = after.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some("session fortsat i ny mappe"))
+        );
+        assert_eq!(last.note.as_deref(), Some(SESSION_MOVED_NOTE));
+
+        // A refused restart notes the failure, not a session note.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "B");
+        lock(&h.port.0).fail_restart = Some("nej".into());
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        let notes: Vec<String> = h
+            .ticket(&t.id)
+            .history
+            .iter()
+            .filter_map(|e| e.note.clone())
+            .collect();
+        assert!(!notes.iter().any(|n| n == NEW_SESSION_NOTE), "{notes:?}");
     }
 
     #[test]

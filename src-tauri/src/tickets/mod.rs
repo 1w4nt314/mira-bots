@@ -32,8 +32,8 @@ use crate::agent::roles::Role;
 use crate::agent::{now_ms, AgentManager};
 use crate::checks::{self, CheckRunner, ChecksReport, ProcessChecks, ProjectFileReader};
 use crate::config::{
-    CHANGES_REPORT_TITLE, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS, REPORT_TITLE_MAX_CHARS,
-    TURN_FAILED_TEXT,
+    worktree_created_note, CHANGES_REPORT_TITLE, NOT_SUBMITTED_TEXT, REPORT_BODY_MAX_CHARS,
+    REPORT_TITLE_MAX_CHARS, TURN_FAILED_TEXT,
 };
 use crate::events::{EmitFn, AGENTS_CHANGED, TICKETS_CHANGED};
 use crate::git::{self, GitRunner};
@@ -897,6 +897,15 @@ impl TicketsCtx {
                         info.branch,
                         info.worktree.as_deref().unwrap_or(&info.repo)
                     );
+                    // Step 6d (A.10): the timeline's "worktree oprettet" note, only here (this
+                    // branch is reached once: `current.git` was `None`).
+                    let note = worktree_created_note(&info.branch);
+                    if let Err(e) = self.mutate_if(
+                        |s| s.note_by_system(&ticket.id, &note, now),
+                        Option::is_some,
+                    ) {
+                        log::warn!("git: noting the worktree on ticket {short} failed: {e}");
+                    }
                     Some(info)
                 }
                 Err(e) => {
@@ -2971,6 +2980,43 @@ mod tests {
         // Again (e.g. after a rejection): the stored value, no git call.
         assert_eq!(t.ctx.prepare_ticket_git(&stored), Some(g.clone()));
         assert_eq!(t.ctx.prepare_ticket_git(&tk), Some(g));
+        assert_eq!(fake.calls().len(), 4);
+        cleanup(&t);
+    }
+
+    #[test]
+    fn prepare_ticket_git_notes_worktree_once() {
+        // Step 6d (A.10): the system notes "worktree oprettet: ticket/<short>" when the
+        // worktree is created; a second call (stored value) adds nothing.
+        let (t, fake, _proj, _) = git_ctx(r#"{"git": "worktree", "gitBase": "develop"}"#, true);
+        let tk = ticket_in(&t, Some("proj"));
+        let short = tk.short_id();
+        let before = t.ctx.read(|s| s.get(&tk.id)).unwrap().history.len();
+        t.ctx.prepare_ticket_git(&tk).expect("git");
+        let stored = t.ctx.read(|s| s.get(&tk.id)).unwrap();
+        assert_eq!(stored.history.len(), before + 1);
+        let last = stored.history.last().unwrap();
+        assert_eq!(last.by, TicketActor::System);
+        assert_eq!(
+            last.note.as_deref(),
+            Some(format!("worktree oprettet: ticket/{short}").as_str())
+        );
+        assert_eq!(
+            last.note.as_deref(),
+            Some(worktree_created_note(&format!("ticket/{short}")).as_str())
+        );
+        assert_eq!(
+            (last.from, last.to),
+            (Some(stored.state), stored.state),
+            "state unchanged"
+        );
+        assert_eq!(t.ctx.prepare_ticket_git(&stored), stored.git);
+        assert_eq!(t.ctx.prepare_ticket_git(&tk), stored.git);
+        assert_eq!(
+            t.ctx.read(|s| s.get(&tk.id)).unwrap().history.len(),
+            before + 1,
+            "one note only"
+        );
         assert_eq!(fake.calls().len(), 4);
         cleanup(&t);
     }
