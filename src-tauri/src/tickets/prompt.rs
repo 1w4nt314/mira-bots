@@ -554,7 +554,7 @@ pub fn render_file(t: &Ticket, now_ms: u64, delivery: &TicketDelivery) -> String
     out.push_str(
         "## Regler\n\
          - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
-         - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/.\n\
+         - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/, ud over din egen worktree under .mira-bots/wt/.\n\
          - Læg en rapport på ticketen med mira_add_report (eller `report` i mira_submit_for_review) når du har lavet noget brugeren skal kunne læse om.\n",
     );
     out
@@ -701,6 +701,8 @@ fn child_summary(summary: Option<&str>) -> String {
 /// ticket with `git` gets `## Git` after `## Rapporter` (from `ticket.git`, never the sender's
 /// cwd), and `## Regler` is the Refuter template; `checks` are the project's checks as
 /// "name: `run`" lines (empty: "(ingen tjek defineret)").
+// TODO(windows-verify): the review file in `.mira-bots\reviews\` has `## Git` with
+// `git -C "C:\…\project" diff main...ticket/x` and the Refuter rules (plan6b D.105).
 pub fn render_review_file(
     t: &Ticket,
     sender: Option<&ReviewSender>,
@@ -1021,7 +1023,7 @@ mod tests {
         assert!(f.ends_with(
             "## Regler\n\
              - Opgaven er en ticket fra mira-bots. Når den er løst, kald værktøjet mira_submit_for_review med en kort opsummering, og afslut så dit svar.\n\
-             - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/.\n\
+             - Opret opfølgende opgaver med mira_create_ticket. Opret eller redigér ikke selv filer i .mira-bots/, ud over din egen worktree under .mira-bots/wt/.\n\
              - Læg en rapport på ticketen med mira_add_report (eller `report` i mira_submit_for_review) når du har lavet noget brugeren skal kunne læse om.\n"
         ));
         assert!(f.contains("mira_submit_for_review"));

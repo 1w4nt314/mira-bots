@@ -1937,7 +1937,8 @@ pub fn create_ticket(
 /// user ([`playbook::start_playbook`]); with `autoSpawnForPlaybook` agents are started through
 /// the same path as `mira_spawn_agent`.
 // TODO(windows-verify): "Start forløb" on a feature ticket creates "Plan: …" and "Byg: …" as
-// children, the second blocked by the first, each assigned to a running agent with the role.
+// children, the second blocked by the first, each assigned to a running agent with the role
+// (plan6b D.103).
 #[tauri::command]
 pub fn ticket_start_playbook(
     app: AppHandle,

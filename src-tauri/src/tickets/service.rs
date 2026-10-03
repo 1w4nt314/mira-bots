@@ -79,6 +79,8 @@ pub fn checkable(t: &Ticket, sender: Option<&AgentInfo>, children: usize) -> boo
 }
 
 /// `"eskaleret efter {max} runder"` (`max` = the workspace's `maxReviewRounds`).
+// TODO(windows-verify): with `maxReviewRounds: 2` the review file and the card say "Runde 1 af 2",
+// the ticket escalates after two rejections and the rules tool shows 2 (plan6b D.104).
 pub fn escalated_note(max: u32) -> String {
     format!("eskaleret efter {max} runder")
 }

@@ -715,6 +715,7 @@ pub fn run() {
                 lock(&state.manager).kill_all();
             }
             // Step 6b: git and project-check children still running (with their trees).
+            // TODO(windows-verify): closing the app mid-check leaves no process behind (plan6b D.107).
             proc::registry().kill_running();
         }
         // The process exits without dropping the pipe server task (and its SocketGuard).

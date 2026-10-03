@@ -126,6 +126,8 @@ pub enum FreshDecision {
 ///
 /// `Restart { cwd, force_fresh: needs_fresh }` when either holds; a rejected ticket that must
 /// change folders continues its session there (`--resume`).
+// TODO(windows-verify): a rejected ticket coming back to the same agent does not restart the
+// session (the conversation continues, round 1) (plan6b D.102).
 pub fn fresh_decision(
     rules: &WorkspaceRules,
     snap: &AgentSnapshot,

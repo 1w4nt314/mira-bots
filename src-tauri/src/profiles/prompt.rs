@@ -19,7 +19,7 @@ Regler:
 - Opdager du opfølgende arbejde, så opret en ny ticket med mira_create_ticket i stedet for at udvide opgaven.
 - Er din igangværende ticket ikke til dig, så giv den videre med mira_handoff_ticket (med agentId til en anden agent; uden agentId tilbage i backlog) og afslut dit svar.
 - mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje; mira_add_report lægger en rapport (markdown) på ticketen, så brugeren og revieweren kan se hvad du har lavet — gør det ved større opgaver, gerne som `report` i mira_submit_for_review; mira_get_workspace_rules viser reglerne; mira_list_projects viser projekterne (mapperne under projektroden).
-- Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den.
+- Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den. Undtagelsen er din egen worktree under .mira-bots/wt/, når din ticket peger dertil.
 - Filerne mira-bots.workspace.json (projektroden) og .mira-bots/project.json (projektet) er brugerens; de er låst for dig — bed brugeren om ændringer i stedet for at forsøge at redigere dem.
 ";
 
