@@ -80,6 +80,8 @@ function formatLastTool(c: LastToolCall): string {
 function formatValue(v: Diagnostics[keyof Diagnostics]): string {
   if (v === null) return "–";
   if (typeof v === "boolean") return v ? "ja" : "nej";
+  // Lists (`inboxSources`, step 6c) are shown by their own section (B5); here only the count.
+  if (Array.isArray(v)) return String(v.length);
   if (typeof v === "object") return "tool" in v ? formatLastTool(v) : formatLast(v);
   return String(v);
 }

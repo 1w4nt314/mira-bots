@@ -244,6 +244,39 @@ export interface Diagnostics {
   projectsTotal: number;
   /** Profiles copied from the old agents folder at this start. */
   profilesMigrated: number;
+  /** Set when `inbox.json` could not be read (renamed as broken; the inbox starts empty). */
+  inboxWarning: string | null;
+  /** The found `gh` executable; null = not found (step 6c). */
+  ghPath: string | null;
+  /** `gh --version`, e.g. "2.102.0". */
+  ghVersion: string | null;
+  /** "ikke fundet" | "kører stadig" | "ældre end 2.40.0 — ikke afprøvet" | a probe error. */
+  ghVersionNote: string | null;
+  /** `<app data>/inbox.json`. */
+  inboxPath: string;
+  /** Items in state `new`. */
+  inboxNew: number;
+  /** One row per source and project. */
+  inboxSources: InboxSourceDiag[];
+}
+
+/** One inbox source of one project in Diagnostik (`Diagnostics.inboxSources`). */
+export interface InboxSourceDiag {
+  /** null = the projects root's `inbox/`. */
+  project: string | null;
+  kind: ExternalKind;
+  label: string;
+  /** Milliseconds since the Unix epoch of the last successful fetch. */
+  lastFetchAt: number | null;
+  /** The last fetch's error, or why `project.json`'s `github` is ignored. */
+  error: string | null;
+  items: number;
+}
+
+/** Result of `check_gh_auth` (never contains a token). */
+export interface GhAuthResult {
+  ok: boolean;
+  text: string;
 }
 
 export interface AgentOutputPayload {
@@ -366,6 +399,145 @@ export interface TicketSummary {
   checks: TicketChecks | null;
   /** The ticket's branch/worktree; null when `git` is off or not prepared yet. */
   git: TicketGit | null;
+  /** Where the ticket came from (step 6c: an inbox item); null for tickets made in the app. */
+  external: ExternalRef | null;
+}
+
+/** Where an inbox item came from: a file in an `inbox/` folder or a GitHub issue. */
+export type ExternalKind = "folder" | "github";
+/** State of one write-back step (comment / close). */
+export type WriteBackState = "none" | "inflight" | "done" | "failed";
+
+/** The write-back to the source when the ticket reaches Done (step 6c). */
+export interface WriteBack {
+  comment: WriteBackState;
+  close: WriteBackState;
+  commentUrl: string | null;
+  commentedAt: number | null;
+  closedAt: number | null;
+  attempts: number;
+  lastError: string | null;
+  lastBody: string | null;
+}
+
+/** The inbox item a ticket was started from; every text is cleaned by the backend. */
+export interface ExternalRef {
+  kind: ExternalKind;
+  externalId: string;
+  repo: string | null;
+  number: number | null;
+  path: string | null;
+  url: string | null;
+  title: string;
+  labels: string[];
+  author: string | null;
+  notes: string[];
+  inboxItemId: string;
+  /** Milliseconds since the Unix epoch. */
+  importedAt: number;
+  writeBack: WriteBack;
+}
+
+export type InboxState = "new" | "started" | "dismissed";
+
+/** An inbox item as listed (`get_inbox`, `inbox-changed`): without its body. */
+export interface InboxItemSummary {
+  id: string;
+  /** The source type. */
+  kind: ExternalKind;
+  externalId: string;
+  sourceId: string;
+  title: string;
+  hasBody: boolean;
+  labels: string[];
+  url: string | null;
+  number: number | null;
+  repo: string | null;
+  path: string | null;
+  author: string | null;
+  /** The project the item belongs to; null = unknown (see `candidates`). */
+  project: string | null;
+  /** Projects sharing the item's repo and labels when `project` is null. */
+  candidates: string[];
+  updatedAt: string | null;
+  /** Milliseconds since the Unix epoch. */
+  seenAt: number;
+  state: InboxState;
+  ticketId: string | null;
+  notes: string[];
+  /** The ticket type from a file's `kind:` (`feature`, `bug`, a playbook); null = plain task. */
+  ticketKind: string | null;
+  /** An open ticket with the same title in the item's project. */
+  duplicateOf: { shortId: string; title: string } | null;
+}
+
+/** `get_inbox_item`: the summary fields plus the body (null for GitHub items before Start). */
+export interface InboxItem extends Omit<InboxItemSummary, "hasBody" | "duplicateOf"> {
+  body: string | null;
+  fingerprint: string | null;
+  gone: boolean;
+  /** Folder items: whether the file was moved to `started/` (null = not started). */
+  moved: boolean | null;
+}
+
+export type InboxErrorKind =
+  | "folder"
+  | "ghMissing"
+  | "notLoggedIn"
+  | "badCredentials"
+  | "repoNotFound"
+  | "rateLimited"
+  | "issuesDisabled"
+  | "network"
+  | "timeout"
+  | "tooLarge"
+  | "badJson"
+  | "other"
+  | "internal";
+
+export interface InboxSourceStatus {
+  /** `folder:…`, `github:owner/name` or `github:owner/name[a,b]` (with labels, sorted). */
+  id: string;
+  kind: ExternalKind;
+  label: string;
+  project: string | null;
+  /** Milliseconds since the Unix epoch of the last successful fetch. */
+  lastFetchAt: number | null;
+  ok: boolean;
+  /** The backend's Danish text (with the retry time for a rate limit); shown as it is. */
+  error: string | null;
+  errorKind: InboxErrorKind | null;
+  nextRetryAt: number | null;
+  items: number;
+  /** More issues exist than were fetched (the limit is 100 per repo). */
+  capped: boolean;
+  /** Notes of the latest fetch (files skipped, …). */
+  notes: string[];
+}
+
+export interface InboxStatus {
+  refreshing: boolean;
+  /** Milliseconds since the Unix epoch. */
+  lastRefreshAt: number | null;
+  sources: InboxSourceStatus[];
+}
+
+/** `get_inbox` and the `inbox-changed` event. */
+export interface InboxPayload {
+  items: InboxItemSummary[];
+  status: InboxStatus;
+}
+
+export type InboxRefreshReason = "startup" | "timer" | "focus" | "manual";
+
+/** The argument of `start_inbox_item`. */
+export interface StartInboxRequest {
+  itemId: string;
+  /** The ticket type; null = plain task. */
+  kind: string | null;
+  /** null = the item's own project (the backend asks for one when it has none). */
+  project: ProjectRef | null;
+  skipReview: boolean;
 }
 
 /** Who wrote a report: an agent (`agentId`), the user or the app itself (`system`, step 6b). */

@@ -10,7 +10,12 @@ import type {
   AppInfo,
   Diagnostics,
   Effort,
+  GhAuthResult,
   HookEventPayload,
+  InboxItem,
+  InboxItemSummary,
+  InboxPayload,
+  InboxRefreshReason,
   PermissionRequestInfo,
   PlaybookStarted,
   PermissionResolvedPayload,
@@ -20,11 +25,13 @@ import type {
   ReviewAssignment,
   SeatKind,
   SpawnOverrides,
+  StartInboxRequest,
   Ticket,
   TicketPatch,
   TicketReport,
   TicketState,
   TicketSummary,
+  WriteBack,
   WorkplaceSelection,
   WorkplaceTab,
 } from "./types";
@@ -81,6 +88,15 @@ export const COMMANDS = {
   openProjectFolder: "open_project_folder",
   setProjectsRoot: "set_projects_root",
   moveAgentToProject: "move_agent_to_project",
+  getInbox: "get_inbox",
+  getInboxItem: "get_inbox_item",
+  refreshInbox: "refresh_inbox",
+  startInboxItem: "start_inbox_item",
+  dismissInboxItem: "dismiss_inbox_item",
+  undismissInboxItem: "undismiss_inbox_item",
+  retryWriteBack: "retry_write_back",
+  openInboxUrl: "open_inbox_url",
+  checkGhAuth: "check_gh_auth",
 } as const;
 
 export const EVENTS = {
@@ -92,6 +108,7 @@ export const EVENTS = {
   workplaceSelect: "workplace-select",
   ticketsChanged: "tickets-changed",
   profilesChanged: "profiles-changed",
+  inboxChanged: "inbox-changed",
 } as const;
 
 /** Commands reject with the Rust error string (Danish, user-facing). */
@@ -263,6 +280,34 @@ export const setProjectsRoot = (path: string) =>
 export const moveAgentToProject = (agentId: string, project: ProjectRef, force: boolean) =>
   invoke<AgentInfo>(COMMANDS.moveAgentToProject, { agentId, project, force });
 
+// inbox (step 6c)
+/** The listed items (without body) and the status per source. */
+export const getInbox = () => invoke<InboxPayload>(COMMANDS.getInbox);
+/** One item with its body (GitHub items have none before Start). */
+export const getInboxItem = (id: string) => invoke<InboxItem>(COMMANDS.getInboxItem, { id });
+/**
+ * Asks the backend to refresh the sources on its own thread; `false` when a refresh is already
+ * running. Only `manual` overrides the per-source minimum interval and back-off.
+ */
+export const refreshInbox = (reason: InboxRefreshReason) =>
+  invoke<boolean>(COMMANDS.refreshInbox, { reason });
+/** "Start": the item becomes a backlog ticket (GitHub: fetches the issue first). */
+export const startInboxItem = (req: StartInboxRequest) =>
+  invoke<TicketSummary>(COMMANDS.startInboxItem, { req });
+/** "Afvis". */
+export const dismissInboxItem = (id: string) =>
+  invoke<InboxItemSummary>(COMMANDS.dismissInboxItem, { id });
+/** "Fortryd" on a dismissed item. */
+export const undismissInboxItem = (id: string) =>
+  invoke<InboxItemSummary>(COMMANDS.undismissInboxItem, { id });
+/** "Prøv igen": the write-back of a Done ticket from the inbox, once more (only from a click). */
+export const retryWriteBack = (ticketId: string) =>
+  invoke<WriteBack>(COMMANDS.retryWriteBack, { ticketId });
+/** Opens the GitHub issue in the browser; `id` is an inbox item id or a ticket id. */
+export const openInboxUrl = (id: string) => invoke<void>(COMMANDS.openInboxUrl, { id });
+/** "Tjek gh-login" (Diagnostik): `gh auth status`, never automatic. */
+export const checkGhAuth = () => invoke<GhAuthResult>(COMMANDS.checkGhAuth);
+
 // --- events (each returns the unlisten function) ----------------------------------------------
 
 export const onAgentsChanged = (cb: (agents: AgentInfo[]) => void): Promise<UnlistenFn> =>
@@ -288,6 +333,9 @@ export const onTicketsChanged = (cb: (tickets: TicketSummary[]) => void): Promis
 /** Full profile list after a profile was saved, deleted or reset. */
 export const onProfilesChanged = (cb: (profiles: AgentProfile[]) => void): Promise<UnlistenFn> =>
   listen<AgentProfile[]>(EVENTS.profilesChanged, (e) => cb(e.payload));
+/** Items and source status after any inbox change (also when a refresh starts and ends). */
+export const onInboxChanged = (cb: (inbox: InboxPayload) => void): Promise<UnlistenFn> =>
+  listen<InboxPayload>(EVENTS.inboxChanged, (e) => cb(e.payload));
 
 // --- dialog -----------------------------------------------------------------------------------
 

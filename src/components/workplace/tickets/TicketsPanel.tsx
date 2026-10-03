@@ -17,6 +17,7 @@ import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 import NewTicketForm from "./NewTicketForm";
 import { useTicketActions } from "./actions";
+import InboxSection from "./InboxSection";
 import StickyNote from "./StickyNote";
 
 const NOTICE_VISIBLE_MS = 5000;
@@ -38,7 +39,7 @@ function Empty({ text }: { text: string }) {
 }
 
 /**
- * The sidebar's Tickets tab: Review (only when something waits), Backlog with "Ny ticket", and
+ * The sidebar's Tickets tab: Indbakke (new items from files and GitHub, step 6c), Review (only when something waits), Backlog with "Ny ticket", and
  * a folded Done list. Queued and running tickets are shown at the seats and under the terminal.
  * Backlog notes are draggable onto seats (the DndContext lives in Workplace).
  */
@@ -166,6 +167,8 @@ export default function TicketsPanel() {
           {notice}
         </p>
       )}
+
+      <InboxSection filter={filter} onNotice={setNotice} />
 
       {shown.review.length > 0 && (
         <Section title="Review" count={shown.review.length}>

@@ -69,6 +69,7 @@ import SpawnDialog from "./SpawnDialog";
 import TerminalPanel from "./TerminalPanel";
 import { TicketActionsContext, type TicketActions } from "./tickets/actions";
 import StickyNote from "./tickets/StickyNote";
+import { useInboxPolling } from "./tickets/useInboxPolling";
 
 /** The pointer decides the target; keyboard drags have no pointer, so the nearest seat wins. */
 const collision: CollisionDetection = (args) =>
@@ -77,6 +78,8 @@ const collision: CollisionDetection = (args) =>
 export default function Workplace() {
   const { state, dispatch } = useStore();
   const { agents, appInfo, error, tickets } = state;
+  // Step 6c: the inbox polling lives here and nowhere else (never in the island).
+  const { refreshNow: refreshInbox } = useInboxPolling();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [spawnFor, setSpawnFor] = useState<{
     seatKind: SeatKind;
@@ -317,8 +320,9 @@ export default function Workplace() {
       spawnWithTicket: (seatKind, ticket) => setSpawnFor({ seatKind, ticket }),
       spawnBlocked: { work: spawnBlockedWork, staff: spawnBlockedStaff },
       assignTo,
+      refreshInbox,
     }),
-    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo],
+    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo, refreshInbox],
   );
   // Office hints per work agent (step 6a): "n agenter, ingen koordinator" for the project, plus
   // the backlog hint ("coder-01 er ledig: n tickets uden ejer") on the one idle agent it names.

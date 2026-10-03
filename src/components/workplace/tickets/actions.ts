@@ -19,6 +19,8 @@ export interface TicketActions {
    * "Flyt agenten til «p»".
    */
   assignTo: (ticket: TicketSummary, agent: AgentInfo) => void;
+  /** "Opdatér" in the inbox (step 6c): a manual fetch with a 5 s floor (Workplace's polling hook). */
+  refreshInbox: () => void;
 }
 
 const noop = () => {};
@@ -32,6 +34,7 @@ export const TicketActionsContext = createContext<TicketActions>({
   spawnWithTicket: noop,
   spawnBlocked: { work: null, staff: null },
   assignTo: noop,
+  refreshInbox: noop,
 });
 
 export function useTicketActions(): TicketActions {

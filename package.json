@@ -12,7 +12,7 @@
     "copy:hook": "node scripts/copy-hook.mjs",
     "check:mac": "CC_aarch64_apple_darwin=\"$PWD/scripts/mac-cc.sh\" cargo check --workspace --all-targets --target aarch64-apple-darwin",
     "clippy:mac": "CC_aarch64_apple_darwin=\"$PWD/scripts/mac-cc.sh\" cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings",
-    "test:node": "node scripts/test-terminal-input.mjs && node scripts/test-bot-core.mjs && node scripts/test-markdown.mjs && node scripts/test-models.mjs && node scripts/test-tickets.mjs && node scripts/test-office.mjs && node scripts/test-projects.mjs && node scripts/test-platform.mjs"
+    "test:node": "node scripts/test-terminal-input.mjs && node scripts/test-bot-core.mjs && node scripts/test-markdown.mjs && node scripts/test-models.mjs && node scripts/test-tickets.mjs && node scripts/test-office.mjs && node scripts/test-projects.mjs && node scripts/test-platform.mjs && node scripts/test-inbox.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "~6.3.1",
