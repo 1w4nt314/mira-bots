@@ -459,10 +459,12 @@ pub fn external_line_label(e: &ExternalRef) -> String {
 
 /// The title for typed lines and file headings (step 6c, C6c.4): an external ticket's fixed
 /// label ([`external_line_label`]), otherwise the ticket's own title; sanitised either way.
+/// A playbook child that inherited the source keeps its own step title (the app wrote it from
+/// the label, never from the external text; review6c W7), so "Find årsag" and "Ret" differ.
 pub fn line_title(t: &Ticket) -> String {
     match &t.external {
-        Some(e) => sanitize_title(&external_line_label(e)),
-        None => sanitize_title(&t.title),
+        Some(e) if !e.inherited => sanitize_title(&external_line_label(e)),
+        _ => sanitize_title(&t.title),
     }
 }
 
@@ -2099,6 +2101,15 @@ mod tests {
         let mut plain = ticket(ID, TicketState::Assigned);
         plain.title = "Ret @login".into();
         assert_eq!(line_title(&plain), "Ret (at)login");
+        // An inherited copy (playbook child) keeps its step title, which the app wrote from the
+        // label, so two children of one external parent get different lines (review6c W7).
+        let mut child = external_ticket("x");
+        child.external.as_mut().unwrap().inherited = true;
+        child.title = "Find årsag: ekstern opgave (GitHub #123 i o/r)".into();
+        assert_eq!(
+            line_title(&child),
+            "Find årsag: ekstern opgave (GitHub #123 i o/r)"
+        );
     }
 
     #[test]
