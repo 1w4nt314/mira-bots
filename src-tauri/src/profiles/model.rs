@@ -402,7 +402,14 @@ pub const FILE_EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookE
 
 /// Denied to every profile (step 6b, plan6b A.4): the app never lets an agent push; the user
 /// merges. A deny rule cannot be overridden by `extraAllow` (deny wins). `gitPush` comes later.
-pub const WORK_GIT_DENY: [&str; 2] = ["Bash(git push *)", "Bash(git -C * push *)"];
+/// A trailing ` *` also matches the bare command only when it is the rule's only wildcard
+/// (research6b §4.1), so `git -C <folder> push` without arguments needs its own rule (review6b
+/// W1).
+pub const WORK_GIT_DENY: [&str; 3] = [
+    "Bash(git push *)",
+    "Bash(git -C * push *)",
+    "Bash(git -C * push)",
+];
 
 /// The projects root (or any absolute path) as an absolute permission path (research6b §4.1):
 /// `//` + the POSIX form. Unix `/home/x` → `//home/x`; Windows `C:\Users\x` → `//c/Users/x`
@@ -471,12 +478,15 @@ const REVIEWER_ALLOW: [&str; 4] = [
     "Bash(git -C * show *)",
 ];
 /// … and never commit or push, also not in the `git -C <folder> …` form the review file asks
-/// for (`Bash(git commit *)` only matches a command line that starts with `git commit`).
-const REVIEWER_DENY: [&str; 4] = [
+/// for (`Bash(git commit *)` only matches a command line that starts with `git commit`); the
+/// bare `git -C <folder> commit`/`push` have their own rules (two wildcards, review6b W1).
+const REVIEWER_DENY: [&str; 6] = [
     "Bash(git commit *)",
     "Bash(git push *)",
     "Bash(git -C * commit *)",
+    "Bash(git -C * commit)",
     "Bash(git -C * push *)",
+    "Bash(git -C * push)",
 ];
 /// The specialist's prompt addition (C5.7).
 pub const SPECIALIST_PROMPT_APPEND: &str = "Du har flere roller; brug den der passer til ticketen.";
@@ -616,7 +626,8 @@ mod tests {
                 "defaultSeat": "staff",
                 "extraAllow": ["Bash(git -C * diff *)", "Bash(git -C * log *)", "Bash(git -C * status *)", "Bash(git -C * show *)"],
                 "extraDeny": ["Bash(git commit *)", "Bash(git push *)", "Bash(git -C * commit *)",
-                    "Bash(git -C * push *)"], "updatedAt": 0 })
+                    "Bash(git -C * commit)", "Bash(git -C * push *)", "Bash(git -C * push)"],
+                "updatedAt": 0 })
         );
         let spec = builtin_profile("specialist").unwrap();
         assert_eq!(spec.specialist, Some(true));
@@ -821,7 +832,11 @@ mod tests {
             "mira_unassign_ticket",
         ]);
         let edit = owned(&["Edit", "Write", "MultiEdit", "NotebookEdit"]);
-        let push = owned(&["Bash(git push *)", "Bash(git -C * push *)"]);
+        let push = owned(&[
+            "Bash(git push *)",
+            "Bash(git -C * push *)",
+            "Bash(git -C * push)",
+        ]);
         let root = Path::new("/home/x/mira-bots/projects");
         let locked = owned(&[
             "Edit(//home/x/mira-bots/projects/mira-bots.workspace.json)",
@@ -851,7 +866,11 @@ mod tests {
         let mut want = coordinator_set.clone();
         want.extend(edit.iter().cloned());
         want.extend(push.iter().cloned());
-        want.extend(owned(&["Bash(git commit *)", "Bash(git -C * commit *)"]));
+        want.extend(owned(&[
+            "Bash(git commit *)",
+            "Bash(git -C * commit *)",
+            "Bash(git -C * commit)",
+        ]));
         assert_eq!(deny("reviewer"), want);
         let mut want = mira(&["mira_approve_ticket", "mira_reject_ticket"]);
         want.extend(edit.iter().cloned());
@@ -949,6 +968,9 @@ mod tests {
         }
         assert!(rules.contains(&"Bash(git commit *)".to_string()));
         assert!(rules.contains(&"Bash(git -C * commit *)".to_string()));
+        // Review6b W1: the bare `git -C <folder> commit`/`push` (two wildcards) are denied too.
+        assert!(rules.contains(&"Bash(git -C * commit)".to_string()));
+        assert!(rules.contains(&"Bash(git -C * push)".to_string()));
         // An extraAllow for push cannot lift the deny (deny wins in Claude Code); the rule
         // stays in the deny list.
         let p = AgentProfile {

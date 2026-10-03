@@ -356,6 +356,7 @@ mod tests {
                         "mcp__mira-bots__mira_unassign_ticket",
                         "Bash(git push *)",
                         "Bash(git -C * push *)",
+                        "Bash(git -C * push)",
                         "Edit(//home/ann/mira-bots/projects/mira-bots.workspace.json)",
                         "Edit(//home/ann/mira-bots/projects/**/.mira-bots/project.json)",
                         "Edit(**/.mira-bots/project.json)"
@@ -395,8 +396,10 @@ mod tests {
                         "NotebookEdit",
                         "Bash(git push *)",
                         "Bash(git -C * push *)",
+                        "Bash(git -C * push)",
                         "Bash(git commit *)",
-                        "Bash(git -C * commit *)"
+                        "Bash(git -C * commit *)",
+                        "Bash(git -C * commit)"
                     ]
                 },
                 "statusLine": {"type": "command", "command": "/opt/mira-hook", "padding": 0}
@@ -481,7 +484,7 @@ mod tests {
         assert_eq!(
             v["permissions"],
             json!({"allow": ["mcp__mira-bots__*"],
-                   "deny": ["Bash(git push *)", "Bash(git -C * push *)"]})
+                   "deny": ["Bash(git push *)", "Bash(git -C * push *)", "Bash(git -C * push)"]})
         );
         // A profile with every role and some toolDeny: the tool first.
         let p = AgentProfile {
@@ -495,7 +498,8 @@ mod tests {
             json!([
                 "mcp__mira-bots__mira_add_report",
                 "Bash(git push *)",
-                "Bash(git -C * push *)"
+                "Bash(git -C * push *)",
+                "Bash(git -C * push)"
             ])
         );
     }

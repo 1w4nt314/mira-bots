@@ -51,17 +51,22 @@ pub fn needs_changes_report(t: &Ticket) -> bool {
     if t.git.is_none() || t.state != TicketState::Review {
         return false;
     }
-    let since = t
-        .history
-        .iter()
-        .rev()
-        .find(|h| h.to == TicketState::Review && h.from != Some(TicketState::Review))
-        .map_or(0, |h| h.at);
+    let since = review_entry_at(t);
     !t.reports.iter().any(|r| {
         r.author.kind == ReportAuthorKind::System
             && r.title == CHANGES_REPORT_TITLE
             && r.created_at >= since
     })
+}
+
+/// When `t` last entered review (its last `→ Review` history entry from another state; 0 when
+/// there is none): identifies one review entry (the «Ændringer» report is once per entry).
+pub fn review_entry_at(t: &Ticket) -> u64 {
+    t.history
+        .iter()
+        .rev()
+        .find(|h| h.to == TicketState::Review && h.from != Some(TicketState::Review))
+        .map_or(0, |h| h.at)
 }
 
 /// Whether the app runs the project checks for this ticket on entering review (step 6b, plan
@@ -113,6 +118,10 @@ pub struct ChildSpec {
     pub body: String,
     /// Blocked by the child created just before it (ignored for the first).
     pub blocked_by_previous: bool,
+    /// The child's `skip_review`: `!reviewByDefault` like a new ticket, not the parent's flag
+    /// (review6b W6: the parent's "Spring review over" must not skip review and checks for the
+    /// whole flow).
+    pub skip_review: bool,
 }
 
 /// Whether `t` is a flow parent (step 6b, plan A.2): its playbook was started and it has no
@@ -1612,8 +1621,8 @@ impl TicketService {
     }
 
     /// Creates a playbook's children of `parent_id` (full or short id) in one save (step 6b,
-    /// plan A.2, research §7.3): each child gets the parent as `parent_id`, the parent's project
-    /// and `skip_review`, `blocked_by` = the previous child when `blocked_by_previous`, and its
+    /// plan A.2, research §7.3): each child gets the parent as `parent_id`, the parent's project,
+    /// its step's `skip_review`, `blocked_by` = the previous child when `blocked_by_previous`, and its
     /// creation entry carries [`playbook_created_note`]; the parent gets `playbook_started_at`
     /// in the same save. `origin` is the children's source and the creation entries' actor.
     ///
@@ -1663,7 +1672,7 @@ impl TicketService {
                     &mut next_id,
                     &step.title,
                     &step.body,
-                    parent.skip_review,
+                    step.skip_review,
                     parent.project.clone(),
                     origin,
                     now,
@@ -5194,6 +5203,7 @@ mod tests {
                 title: format!("Trin {}", i + 1),
                 body: format!("tekst {i}"),
                 blocked_by_previous: i > 0,
+                skip_review: false,
             })
             .collect()
     }
@@ -5208,6 +5218,28 @@ mod tests {
             now,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn playbook_children_do_not_inherit_the_parents_skip_review() {
+        // Review6b W6: "Spring review over" on the parent is not passed on to the flow.
+        let (mut s, _) = svc();
+        let p = feature_parent(&mut s, 1);
+        let p = s
+            .update(
+                &p.id,
+                TicketPatch {
+                    skip_review: Some(true),
+                    ..Default::default()
+                },
+                2,
+            )
+            .unwrap();
+        assert!(p.skip_review);
+        let kids = s
+            .create_playbook_children(&p.id, &specs(2), (TicketSource::User, TicketActor::User), 3)
+            .unwrap();
+        assert!(kids.iter().all(|k| !k.skip_review));
     }
 
     #[test]
@@ -5388,10 +5420,18 @@ mod tests {
             )
             .unwrap();
         assert!(q.skip_review);
+        // Review6b W6: the children follow their step (reviewByDefault), not the parent.
+        let skip: Vec<ChildSpec> = specs(1)
+            .into_iter()
+            .map(|c| ChildSpec {
+                skip_review: true,
+                ..c
+            })
+            .collect();
         let kids = s
-            .create_playbook_children(&q.id, &specs(1), origin, 10)
+            .create_playbook_children(&q.id, &skip, origin, 10)
             .unwrap();
-        assert!(kids[0].skip_review, "children inherit skip_review");
+        assert!(kids[0].skip_review, "the step's skip_review");
         s.assign(&kids[0].id, "a1", 11).unwrap();
         s.mark_dispatched(&kids[0].id, "a1", 11).unwrap();
         s.submit_by_agent("a1", Some(&kids[0].id), "klar", 11)

@@ -343,6 +343,14 @@ eq(k.checksLineText(chk("passed")), "Tjek: OK", "checksLineText passed");
 eq(k.checksLineText(chk("failed", "tests")), "Tjek: FEJL (tests) · se rapport", "checksLineText failed");
 eq(k.checksLineText(chk("failed")), "Tjek: FEJL · se rapport", "checksLineText failed without name");
 
+// reviewerChoiceBlocked (review6b W7)
+eq(k.CHECKS_RUNNING_REVIEWER, "Tjek kører; vælg reviewer når det er færdigt", "CHECKS_RUNNING_REVIEWER text");
+eq(k.reviewerChoiceBlocked(chk("pending"), true), k.CHECKS_RUNNING_REVIEWER, "reviewerChoiceBlocked pending with gate");
+eq(k.reviewerChoiceBlocked(chk("pending"), false), null, "reviewerChoiceBlocked pending without gate");
+for (const s of ["passed", "failed", "skipped"])
+  eq(k.reviewerChoiceBlocked(chk(s), true), null, `reviewerChoiceBlocked ${s}`);
+eq(k.reviewerChoiceBlocked(t6(), true), null, "reviewerChoiceBlocked no checks");
+
 // gitBadge / gitLineText
 const git = (worktree) => ({ mode: "worktree", branch: "ticket/ab12cd34", base: "main", repo: "/r", worktree });
 eq(k.gitBadge(t6()), null, "gitBadge null");

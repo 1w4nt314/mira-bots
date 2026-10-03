@@ -879,6 +879,23 @@ export function checksLineText(t: Pick<TicketSummary, "checks">): string | null 
   }
 }
 
+/** Why "Vælg reviewer…" is off while the checks run (same text as the backend's refusal). */
+export const CHECKS_RUNNING_REVIEWER = "Tjek kører; vælg reviewer når det er færdigt";
+
+/**
+ * Review6b W7: a manual reviewer choice waits while the project checks run with the gate on (a
+ * failing check would move the ticket away from that reviewer); the backend refuses it too.
+ *
+ * | checks.state | checksGate | reviewerChoiceBlocked     |
+ * |--------------|------------|---------------------------|
+ * | pending      | true       | CHECKS_RUNNING_REVIEWER   |
+ * | pending      | false      | null                      |
+ * | other/null   | any        | null                      |
+ */
+export function reviewerChoiceBlocked(t: Pick<TicketSummary, "checks">, checksGate: boolean): string | null {
+  return checksGate && t.checks?.state === "pending" ? CHECKS_RUNNING_REVIEWER : null;
+}
+
 /**
  * The note's branch badge: "⎇ branch", title = worktree folder, else the repository.
  *

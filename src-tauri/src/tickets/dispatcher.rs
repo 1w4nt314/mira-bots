@@ -80,9 +80,10 @@ pub struct AgentSnapshot {
     pub roles: Vec<Role>,
     /// The agent's project (plan4b A.1); `None` on a staff seat.
     pub project: Option<String>,
-    /// The current session has had a turn (`AgentManager::has_conversation`): a fresh session
-    /// per ticket restarts only such a session (step 6b, plan A.7); a new session has none.
-    pub has_conversation: bool,
+    /// The agent's current Claude session id (changes on a fresh restart and after `/clear`):
+    /// the dispatcher's record of the ticket it delivered in a session is only valid for this
+    /// session (review6b W3/W5).
+    pub session_id: String,
 }
 
 /// The restart the dispatcher asks for before a work delivery (step 6b, plan A.7): `cwd` is the
@@ -120,12 +121,16 @@ pub enum FreshDecision {
 ///   cwd ([`crate::git::same_path`]) → restart in it; without one, an agent that sits in an app
 ///   worktree (`<project>/.mira-bots/wt/<short>`, [`crate::git::worktree_project`]) goes back
 ///   to the project folder (it must not work on another ticket's branch);
-/// - `needs_fresh`: rule `freshSessionPerTicket`, the session has had a turn
-///   (`has_conversation`; the first ticket after a spawn never restarts) and the ticket is not a
-///   rejected one coming back (`review_round > 0` or a rejection note: the context is kept).
+/// - `needs_fresh`: rule `freshSessionPerTicket`, the app itself delivered a ticket in the
+///   agent's current session (`delivered`: its id, see `Dispatcher::delivered_in_session`) and
+///   that ticket is not this one (review6b W3/W5). So the user's own conversation before the
+///   first ticket survives, a rejected ticket coming back to the same agent and session keeps
+///   its context, and a rejected ticket that comes to another agent (or after another ticket's
+///   session) gets a fresh session. Whether the session has had a turn decides nothing here; it
+///   only picks `--resume` or a new session for a restart without `force_fresh`.
 ///
-/// `Restart { cwd, force_fresh: needs_fresh }` when either holds; a rejected ticket that must
-/// change folders continues its session there (`--resume`).
+/// `Restart { cwd, force_fresh: needs_fresh }` when either holds; a ticket that must change
+/// folders without a fresh session continues its session there (`--resume`).
 // TODO(windows-verify): a rejected ticket coming back to the same agent does not restart the
 // session (the conversation continues, round 1) (plan6b D.102).
 pub fn fresh_decision(
@@ -133,6 +138,7 @@ pub fn fresh_decision(
     snap: &AgentSnapshot,
     ticket: &Ticket,
     git: Option<&TicketGit>,
+    delivered: Option<&str>,
 ) -> FreshDecision {
     if snap.seat_kind != SeatKind::Work || !has_work_role(&snap.roles) {
         return FreshDecision::None;
@@ -145,8 +151,7 @@ pub fn fresh_decision(
         .filter(|want| {
             !crate::git::same_path(&want.to_string_lossy(), &snap.cwd.to_string_lossy())
         });
-    let rejected_back = ticket.review_round > 0 || ticket.rejection_note.is_some();
-    let force_fresh = rules.fresh_session_per_ticket && snap.has_conversation && !rejected_back;
+    let force_fresh = rules.fresh_session_per_ticket && delivered.is_some_and(|d| d != ticket.id);
     if cwd.is_none() && !force_fresh {
         return FreshDecision::None;
     }
@@ -437,6 +442,13 @@ struct WakeMiss {
     misses: u8,
 }
 
+/// The ticket the app delivered in one session of an agent (review6b W3/W5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionDelivery {
+    ticket_id: String,
+    session_id: String,
+}
+
 /// A pending [`prompt::handed_over_line`] for an agent (review 5c W4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StopNotice {
@@ -458,6 +470,10 @@ pub struct Dispatcher<H, P, T> {
     /// for again by the same agent (no loop when the new cwd does not match, a timeout delivers
     /// as it is); cleared when a ticket is typed or the agent is gone.
     restarted_for: HashMap<String, String>,
+    /// Per agent: the work ticket the app delivered (confirmed) in the agent's current session
+    /// (review6b W3/W5, [`fresh_decision`]'s `delivered`). Cleared by `AgentRestarting` and
+    /// `AgentGone`; only valid while the agent's session id is the recorded one (`/clear`).
+    delivered_in_session: HashMap<String, SessionDelivery>,
     next_token: u64,
     /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
     auto_review_on_stop: Option<bool>,
@@ -473,6 +489,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             stop_notices: HashMap::new(),
             wake_misses: HashMap::new(),
             restarted_for: HashMap::new(),
+            delivered_in_session: HashMap::new(),
             next_token: 0,
             auto_review_on_stop: None,
         }
@@ -537,8 +554,12 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.stop_notices.remove(&agent_id);
                 self.wake_misses.remove(&agent_id);
                 self.restarted_for.remove(&agent_id);
+                self.delivered_in_session.remove(&agent_id);
             }
             DispatchMsg::AgentRestarting { agent_id } => {
+                // A restarted agent's session holds no ticket from the app any more (a fresh
+                // session, or a resumed one the next ticket must not restart again).
+                self.delivered_in_session.remove(&agent_id);
                 // Our own restart before a delivery announces itself too: keep waiting for it.
                 if !matches!(self.state(&agent_id), Delivery::AwaitingRestart { .. }) {
                     self.deliveries.remove(&agent_id);
@@ -735,8 +756,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.consider(agent_id);
             }
             Delivery::AwaitingRestart { ticket_id, .. } => {
-                // The new session is up (step 6b): deliver as usual; it has no conversation and
-                // `restarted_for` holds the ticket, so it is not restarted again.
+                // The new session is up (step 6b): deliver as usual; it holds no ticket from the
+                // app and `restarted_for` holds the ticket, so it is not restarted again.
                 log::info!(
                     "dispatch {agent_id}: restarted for ticket {}; delivering",
                     super::model::short_id(&ticket_id)
@@ -869,8 +890,22 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 .map(|_| ()),
             DeliveryKind::Wake => Ok(()),
         };
-        if let Err(e) = r {
-            log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}");
+        match r {
+            Err(e) => {
+                log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}")
+            }
+            Ok(()) if kind == DeliveryKind::Work && !moved => {
+                if let Some(s) = &snap {
+                    self.delivered_in_session.insert(
+                        agent_id.to_string(),
+                        SessionDelivery {
+                            ticket_id: ticket_id.to_string(),
+                            session_id: s.session_id.clone(),
+                        },
+                    );
+                }
+            }
+            Ok(()) => {}
         }
         if snap.is_some_and(|s| {
             matches!(
@@ -1472,7 +1507,12 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         let decision = if self.restarted_for.get(agent_id) == Some(&ticket.id) {
             FreshDecision::None
         } else {
-            fresh_decision(&self.host.rules(), snap, ticket, git.as_ref())
+            let delivered = self
+                .delivered_in_session
+                .get(agent_id)
+                .filter(|d| d.session_id.eq_ignore_ascii_case(&snap.session_id))
+                .map(|d| d.ticket_id.as_str());
+            fresh_decision(&self.host.rules(), snap, ticket, git.as_ref(), delivered)
         };
         let FreshDecision::Restart { cwd, force_fresh } = decision else {
             self.type_prepared(agent_id, snap, ticket, token, delivery.with_git(git));
@@ -2002,7 +2042,8 @@ mod tests {
             lock(&self.0).coordinator_live
         }
 
-        /// Like the app: the agent starts again (no conversation, the new cwd); the test sends
+        /// Like the app: the agent starts again (a new session id when fresh, the new cwd); the
+        /// test sends
         /// `AgentRestarting` and the Idle of the new session itself.
         fn restart_fresh(&self, req: RestartForTicket) -> Result<(), String> {
             let mut s = lock(&self.0);
@@ -2020,7 +2061,9 @@ mod tests {
                 .get_mut(&req.agent_id)
                 .ok_or("Agenten kører ikke")?;
             snap.status = AgentStatus::Starting;
-            snap.has_conversation = false;
+            if req.force_fresh {
+                snap.session_id = uuid::Uuid::new_v4().to_string();
+            }
             if let Some(cwd) = req.cwd {
                 snap.cwd = cwd;
             }
@@ -2118,6 +2161,12 @@ mod tests {
             }
         }
 
+        /// Turns `freshSessionPerTicket` off: for tests that deliver several tickets into one
+        /// session (since review6b W3/W5 the next ticket after a confirmed one restarts).
+        fn one_session(&mut self) {
+            self.d.host.rules.fresh_session_per_ticket = false;
+        }
+
         /// A live agent with its own cwd (work seat, coder: gets the plain work delivery; review
         /// 5c W1).
         fn agent(&self, id: &str, status: AgentStatus) {
@@ -2139,7 +2188,7 @@ mod tests {
                     seat_kind,
                     roles: roles.to_vec(),
                     project: None,
-                    has_conversation: false,
+                    session_id: format!("s-{id}"),
                 },
             );
         }
@@ -2512,6 +2561,7 @@ mod tests {
     #[test]
     fn turn_end_moves_the_ticket_to_review_or_done() {
         let mut h = Harness::new();
+        h.one_session();
         h.d.auto_review_on_stop = Some(true);
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
@@ -3005,7 +3055,7 @@ mod tests {
             seat_kind: SeatKind::Work,
             roles: vec![],
             project: None,
-            has_conversation: false,
+            session_id: "s".into(),
         };
         assert_eq!(h.d.user_grace_left(&snap), Some(USER_INPUT_GRACE_MS));
         let mut host = h.d.host.clone();
@@ -3044,6 +3094,7 @@ mod tests {
     #[test]
     fn stop_with_auto_review_moves_on_to_the_next_ticket() {
         let mut h = Harness::new();
+        h.one_session();
         h.d.auto_review_on_stop = Some(true);
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
@@ -3072,6 +3123,7 @@ mod tests {
     #[test]
     fn submit_by_the_tool_before_stop_lets_the_next_ticket_go() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.svc()
             .submit_by_agent("a1", None, "Rettet login", 50)
@@ -3092,6 +3144,7 @@ mod tests {
     #[test]
     fn submit_after_a_not_submitted_stop_clears_it_and_the_queue_moves() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
         assert_eq!(h.ticket(&a.id).issue, Some(TicketIssue::NotSubmitted));
@@ -3216,6 +3269,7 @@ mod tests {
     #[test]
     fn confirm_clears_the_not_submitted_detail() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
         assert_eq!(h.detail("a1").as_deref(), Some(NOT_SUBMITTED_TEXT));
@@ -3488,13 +3542,16 @@ mod tests {
     // ---- step 6b: fresh session per ticket (plan A.7, punkt 19) ----
 
     impl Harness {
-        /// Whether `id`'s current session has had a turn.
-        fn conversation(&self, id: &str, had: bool) {
-            lock(&self.port.0)
-                .snapshots
-                .get_mut(id)
-                .unwrap()
-                .has_conversation = had;
+        /// The app delivered an earlier ticket in `id`'s current session (review6b W3/W5).
+        fn had_ticket(&mut self, id: &str) {
+            let session_id = lock(&self.port.0).snapshots[id].session_id.clone();
+            self.d.delivered_in_session.insert(
+                id.to_string(),
+                SessionDelivery {
+                    ticket_id: "earlier".into(),
+                    session_id,
+                },
+            );
         }
 
         fn restarts(&self) -> Vec<RestartForTicket> {
@@ -3520,7 +3577,7 @@ mod tests {
         }
     }
 
-    fn snap_for(seat_kind: SeatKind, roles: &[Role], cwd: &Path, conv: bool) -> AgentSnapshot {
+    fn snap_for(seat_kind: SeatKind, roles: &[Role], cwd: &Path) -> AgentSnapshot {
         AgentSnapshot {
             name: "a".into(),
             cwd: cwd.to_path_buf(),
@@ -3530,17 +3587,19 @@ mod tests {
             seat_kind,
             roles: roles.to_vec(),
             project: Some("proj".into()),
-            has_conversation: conv,
+            session_id: "s".into(),
         }
     }
 
-    /// One row of [`fresh_decision_table`]: name, rules, agent, ticket, git, expected.
+    /// One row of [`fresh_decision_table`]: name, rules, agent, ticket, git, the ticket the app
+    /// delivered in the agent's current session, expected.
     type Row<'a> = (
         &'a str,
         &'a WorkspaceRules,
         AgentSnapshot,
         &'a Ticket,
         Option<&'a TicketGit>,
+        Option<&'a str>,
         FreshDecision,
     );
 
@@ -3558,11 +3617,11 @@ mod tests {
             ..on
         };
         let coder = &[Role::Coder][..];
-        let work = |conv| snap_for(SeatKind::Work, coder, &cwd, conv);
-        let in_wt = |conv| snap_for(SeatKind::Work, coder, &wt, conv);
+        let work = || snap_for(SeatKind::Work, coder, &cwd);
+        let in_wt = || snap_for(SeatKind::Work, coder, &wt);
         let other_wt = cwd.join(".mira-bots/wt/ffffffff");
         fs::create_dir_all(&other_wt).unwrap();
-        let in_other = |conv| snap_for(SeatKind::Work, coder, &other_wt, conv);
+        let in_other = || snap_for(SeatKind::Work, coder, &other_wt);
         let rejected = Ticket {
             review_round: 1,
             ..t.clone()
@@ -3583,34 +3642,43 @@ mod tests {
             worktree: Some(format!("{}/", wt.to_string_lossy())),
             ..git.clone()
         };
+        // `other`: the app delivered another ticket in this session; `same`: this ticket.
+        let (other, same) = (Some("other-ticket"), Some(t.id.as_str()));
         #[rustfmt::skip]
         let rows: Vec<Row> = vec![
-            ("normal: new ticket after a turn", &on, work(true), &t, None, restart(None, true)),
-            ("rule off", &off, work(true), &t, None, FreshDecision::None),
-            ("staff seat", &on, snap_for(SeatKind::Staff, &[Role::Planner], &cwd, true), &t, Some(&git), FreshDecision::None),
-            ("staff seat with a work role", &on, snap_for(SeatKind::Staff, &[Role::Researcher], &cwd, true), &t, Some(&git), FreshDecision::None),
-            ("work seat without a work role", &on, snap_for(SeatKind::Work, &[Role::Reviewer], &cwd, true), &t, Some(&git), FreshDecision::None),
-            ("first ticket (no turn yet)", &on, work(false), &t, None, FreshDecision::None),
-            ("first ticket, spawned in its worktree", &on, in_wt(false), &t, Some(&git), FreshDecision::None),
-            ("first ticket, worktree elsewhere", &on, work(false), &t, Some(&git), restart(Some(&wt), false)),
-            ("rejected back (round)", &on, work(true), &rejected, None, FreshDecision::None),
-            ("rejected back (note)", &on, work(true), &noted, None, FreshDecision::None),
-            ("rejected back, already in its worktree", &on, in_wt(true), &rejected, Some(&git), FreshDecision::None),
-            ("rejected back, worktree elsewhere", &on, work(true), &rejected, Some(&git), restart(Some(&wt), false)),
-            ("rule off, worktree elsewhere", &off, work(true), &t, Some(&git), restart(Some(&wt), false)),
-            ("normal, worktree elsewhere", &on, work(true), &t, Some(&git), restart(Some(&wt), true)),
-            ("normal, already in the worktree", &on, in_wt(true), &t, Some(&git), restart(None, true)),
-            ("same folder written differently", &on, in_wt(false), &t, Some(&trailing), FreshDecision::None),
-            ("worktree folder missing", &on, work(false), &t, Some(&missing), FreshDecision::None),
-            ("worktree folder missing after a turn", &on, work(true), &t, Some(&missing), restart(None, true)),
-            ("no git, in another ticket's worktree", &on, in_other(false), &t, None, restart(Some(&cwd), false)),
-            ("no git, in another ticket's worktree after a turn", &on, in_other(true), &t, None, restart(Some(&cwd), true)),
-            ("rejected back without git, in another worktree", &on, in_other(true), &rejected, None, restart(Some(&cwd), false)),
-            ("worktree missing, in another ticket's worktree", &off, in_other(true), &t, Some(&missing), restart(Some(&cwd), false)),
-            ("own worktree, from another ticket's worktree", &on, in_other(false), &t, Some(&git), restart(Some(&wt), false)),
+            ("normal: new ticket after another one", &on, work(), &t, None, other, restart(None, true)),
+            ("rule off", &off, work(), &t, None, other, FreshDecision::None),
+            ("staff seat", &on, snap_for(SeatKind::Staff, &[Role::Planner], &cwd), &t, Some(&git), other, FreshDecision::None),
+            ("staff seat with a work role", &on, snap_for(SeatKind::Staff, &[Role::Researcher], &cwd), &t, Some(&git), other, FreshDecision::None),
+            ("work seat without a work role", &on, snap_for(SeatKind::Work, &[Role::Reviewer], &cwd), &t, Some(&git), other, FreshDecision::None),
+            ("first ticket (nothing delivered in this session)", &on, work(), &t, None, None, FreshDecision::None),
+            ("first ticket, spawned in its worktree", &on, in_wt(), &t, Some(&git), None, FreshDecision::None),
+            ("first ticket, worktree elsewhere", &on, work(), &t, Some(&git), None, restart(Some(&wt), false)),
+            ("rejected back to the same session (round)", &on, work(), &rejected, None, same, FreshDecision::None),
+            ("rejected back to the same session (note)", &on, work(), &noted, None, same, FreshDecision::None),
+            ("rejected back, already in its worktree", &on, in_wt(), &rejected, Some(&git), same, FreshDecision::None),
+            ("rejected back, worktree elsewhere", &on, work(), &rejected, Some(&git), same, restart(Some(&wt), false)),
+            ("rejected back after another ticket's session", &on, work(), &rejected, None, other, restart(None, true)),
+            ("rejected, to an agent with another ticket, worktree elsewhere", &on, work(), &noted, Some(&git), other, restart(Some(&wt), true)),
+            ("rejected, to an agent with nothing delivered yet", &on, work(), &rejected, None, None, FreshDecision::None),
+            ("rule off, worktree elsewhere", &off, work(), &t, Some(&git), other, restart(Some(&wt), false)),
+            ("normal, worktree elsewhere", &on, work(), &t, Some(&git), other, restart(Some(&wt), true)),
+            ("normal, already in the worktree", &on, in_wt(), &t, Some(&git), other, restart(None, true)),
+            ("same folder written differently", &on, in_wt(), &t, Some(&trailing), None, FreshDecision::None),
+            ("worktree folder missing", &on, work(), &t, Some(&missing), None, FreshDecision::None),
+            ("worktree folder missing after another ticket", &on, work(), &t, Some(&missing), other, restart(None, true)),
+            ("no git, in another ticket's worktree", &on, in_other(), &t, None, None, restart(Some(&cwd), false)),
+            ("no git, in another ticket's worktree after it", &on, in_other(), &t, None, other, restart(Some(&cwd), true)),
+            ("rejected back without git, in another worktree", &on, in_other(), &rejected, None, same, restart(Some(&cwd), false)),
+            ("worktree missing, in another ticket's worktree", &off, in_other(), &t, Some(&missing), other, restart(Some(&cwd), false)),
+            ("own worktree, from another ticket's worktree", &on, in_other(), &t, Some(&git), None, restart(Some(&wt), false)),
         ];
-        for (name, rules, snap, ticket, git, want) in rows {
-            assert_eq!(fresh_decision(rules, &snap, ticket, git), want, "{name}");
+        for (name, rules, snap, ticket, git, delivered, want) in rows {
+            assert_eq!(
+                fresh_decision(rules, &snap, ticket, git, delivered),
+                want,
+                "{name}"
+            );
         }
     }
 
@@ -3618,7 +3686,7 @@ mod tests {
     fn work_ticket_restarts_agent_before_delivery_and_delivers_after_idle() {
         let mut h = Harness::new();
         h.agent("a1", AgentStatus::Idle);
-        h.conversation("a1", true);
+        h.had_ticket("a1");
         let t = h.queued("a1", "A");
         h.idle("a1");
         h.advance(DISPATCH_DELAY_MS);
@@ -3664,7 +3732,7 @@ mod tests {
     fn restart_moves_agent_into_the_worktree_and_writes_the_file_there() {
         let mut h = Harness::new();
         h.agent("a1", AgentStatus::Idle);
-        h.conversation("a1", true);
+        h.had_ticket("a1");
         let t = h.queued("a1", "Ret login");
         let (wt, git) = h.worktree_for(&t);
         *lock(&h.git) = Some(git.clone());
@@ -3702,7 +3770,7 @@ mod tests {
     fn restart_failure_falls_back_to_typing() {
         let mut h = Harness::new();
         h.agent("a1", AgentStatus::Idle);
-        h.conversation("a1", true);
+        h.had_ticket("a1");
         lock(&h.port.0).fail_restart = Some("Agenten arbejder".into());
         let t = h.queued("a1", "A");
         h.idle("a1");
@@ -3724,7 +3792,7 @@ mod tests {
     fn restart_failure_with_the_agent_gone_types_nothing() {
         let mut h = Harness::new();
         h.agent("a1", AgentStatus::Idle);
-        h.conversation("a1", true);
+        h.had_ticket("a1");
         {
             let mut p = lock(&h.port.0);
             p.fail_restart = Some("kunne ikke starte".into());
@@ -3744,7 +3812,7 @@ mod tests {
     fn restart_timeout_frees_and_delivers() {
         let mut h = Harness::new();
         h.agent("a1", AgentStatus::Idle);
-        h.conversation("a1", true);
+        h.had_ticket("a1");
         let t = h.queued("a1", "A");
         h.idle("a1");
         h.advance(DISPATCH_DELAY_MS);
@@ -3767,7 +3835,7 @@ mod tests {
 
         // Already idle at the timeout (the Idle got lost): delivered right after it.
         h.agent("a2", AgentStatus::Idle);
-        h.conversation("a2", true);
+        h.had_ticket("a2");
         let t2 = h.queued("a2", "B");
         h.idle("a2");
         h.advance(DISPATCH_DELAY_MS);
@@ -3787,7 +3855,6 @@ mod tests {
         deliver_until_enter(&mut h, "a1");
         assert!(h.restarts().is_empty());
         h.submitted("a1", &line(&a));
-        h.conversation("a1", true);
         h.set_status("a1", AgentStatus::Thinking);
         h.send(DispatchMsg::TurnEnded {
             agent_id: "a1".into(),
@@ -3806,6 +3873,99 @@ mod tests {
         assert!(h.restarts().is_empty());
         let a_now = h.ticket(&a.id);
         assert_eq!(h.writes().last(), Some(&("a1".into(), line(&a_now))));
+    }
+
+    /// Delivers `t` (queued for `agent`) without a restart, confirms it and submits it.
+    fn deliver_and_submit(h: &mut Harness, agent: &str, t: &Ticket) {
+        deliver_until_enter(h, agent);
+        h.submitted(agent, &line(t));
+        assert_eq!(h.ticket(&t.id).state, S::InProgress);
+        h.svc().submit_by_agent(agent, None, "Lavet", 10).unwrap();
+    }
+
+    #[test]
+    fn fresh_session_only_after_a_ticket_the_app_delivered_in_this_session() {
+        // Review6b W5: the user's own conversation before the first ticket is kept; only a
+        // session the app typed a ticket into is restarted for the next one.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        deliver_and_submit(&mut h, "a1", &a);
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, a.id);
+        let b = h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].force_fresh);
+        // The restart clears the record; the new session gets B and records it.
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        assert!(!h.d.delivered_in_session.contains_key("a1"));
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        h.submitted("a1", &line(&b));
+        let rec = h.d.delivered_in_session["a1"].clone();
+        assert_eq!(rec.ticket_id, b.id);
+        assert_ne!(rec.session_id, "s-a1");
+        assert_eq!(h.restarts().len(), 1);
+    }
+
+    #[test]
+    fn a_new_session_or_a_gone_agent_forgets_the_delivered_ticket() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        deliver_and_submit(&mut h, "a1", &a);
+        // `/clear`: the agent's session id changes; the next ticket goes into the new session.
+        lock(&h.port.0).snapshots.get_mut("a1").unwrap().session_id = "cleared".into();
+        let b = h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.writes().last(), Some(&("a1".into(), line(&b))));
+        // AgentGone and AgentRestarting clear the record.
+        h.had_ticket("a1");
+        h.send(DispatchMsg::AgentGone {
+            agent_id: "a1".into(),
+        });
+        assert!(h.d.delivered_in_session.is_empty());
+        h.agent("a2", AgentStatus::Thinking);
+        h.had_ticket("a2");
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a2".into(),
+        });
+        assert!(h.d.delivered_in_session.is_empty());
+    }
+
+    #[test]
+    fn rejected_ticket_to_another_agent_gets_a_fresh_session() {
+        // Review6b W3: a rejected ticket handed to an agent that just did another ticket must
+        // not be typed into that ticket's session.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let x = h.queued("a1", "X");
+        deliver_and_submit(&mut h, "a1", &x);
+        h.svc()
+            .reject(&x.id, "Mangler test", RejectReturn::Moved, 11)
+            .unwrap();
+        h.agent("a2", AgentStatus::Idle);
+        h.had_ticket("a2");
+        let x = h.svc().assign(&x.id, "a2", 12).unwrap();
+        assert!(x.review_round > 0 || x.rejection_note.is_some());
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a2".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a2", true));
     }
 
     #[test]
@@ -3835,7 +3995,7 @@ mod tests {
     fn staff_agent_is_never_restarted() {
         let mut h = Harness::new();
         h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
-        h.conversation("p1", true);
+        h.had_ticket("p1");
         let t = h.queued("p1", "Plan noget");
         deliver_until_enter(&mut h, "p1");
         assert!(h.restarts().is_empty());
@@ -3847,7 +4007,7 @@ mod tests {
     fn agent_gone_while_awaiting_restart_clears_everything() {
         let mut h = Harness::new();
         h.agent("a1", AgentStatus::Idle);
-        h.conversation("a1", true);
+        h.had_ticket("a1");
         h.queued("a1", "A");
         h.idle("a1");
         h.advance(DISPATCH_DELAY_MS);
@@ -4100,6 +4260,7 @@ mod tests {
     #[test]
     fn user_handoff_mid_turn_tells_the_old_agent_to_stop_before_its_next_ticket() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.agent("w", AgentStatus::Thinking);
         h.set_status("a1", AgentStatus::Thinking);
@@ -4176,6 +4337,7 @@ mod tests {
     #[test]
     fn stop_line_only_for_a_foreign_handoff_and_not_after_it_came_back() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.agent("w", AgentStatus::Thinking);
         h.svc()
@@ -4195,6 +4357,7 @@ mod tests {
 
         // Came back: the user hands it over, then straight back before a1 is idle.
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.agent("w", AgentStatus::Thinking);
         h.set_status("a1", AgentStatus::Thinking);
@@ -4688,6 +4851,7 @@ mod tests {
     #[test]
     fn blocked_ticket_is_skipped_and_delivered_when_blocker_is_done() {
         let mut h = Harness::new();
+        h.one_session();
         h.agent("a1", AgentStatus::Idle);
         // The blocker: in review with the portless agent "x".
         let blocker = {

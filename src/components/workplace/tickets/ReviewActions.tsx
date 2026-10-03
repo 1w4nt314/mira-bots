@@ -11,6 +11,7 @@ import {
   isFlowParent,
   progressOf,
   reviewerCandidates,
+  reviewerChoiceBlocked,
   reviewRoundText,
   shortCwd,
   STATE_LABEL,
@@ -103,6 +104,7 @@ function ReviewerMenu({ ticket }: { ticket: TicketSummary }) {
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   const candidates = reviewerCandidates(state.agents, ticket);
+  const blocked = reviewerChoiceBlocked(ticket, state.appInfo?.rules.checksGate ?? true);
 
   useEffect(() => {
     if (!open) return;
@@ -118,18 +120,19 @@ function ReviewerMenu({ ticket }: { ticket: TicketSummary }) {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        disabled={candidates.length === 0}
+        disabled={candidates.length === 0 || blocked !== null}
         aria-expanded={open}
         title={
-          candidates.length === 0
+          blocked ??
+          (candidates.length === 0
             ? "Ingen anden kørende agent med reviewer-rollen"
-            : "Vælg hvilken reviewer-agent der skal reviewe ticketen"
+            : "Vælg hvilken reviewer-agent der skal reviewe ticketen")
         }
         className={smallBtn}
       >
         Vælg reviewer…
       </button>
-      {open && (
+      {open && blocked === null && (
         <ul
           role="menu"
           className="absolute left-0 top-full z-30 mt-1 w-[220px] space-y-0.5 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-1 text-[11px] text-[var(--fg)] shadow-lg"

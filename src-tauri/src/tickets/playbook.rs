@@ -248,7 +248,9 @@ fn clip(s: &str, max: usize) -> String {
 /// A step rendered for `parent` (C6b.1): `{title}` = the parent's title on one line, `{body}` =
 /// its text, `{parent}` = its short id. The title is one line, the body trimmed at the end;
 /// both are clipped to the ticket limits, so a long parent title never refuses the rollout.
-pub fn render_step(step: &PlaybookStep, parent: &Ticket) -> ChildSpec {
+/// `skip_review` = `!reviewByDefault` (review6b W6): a child is reviewed like a new ticket,
+/// whatever the parent's "Spring review over" says.
+pub fn render_step(step: &PlaybookStep, parent: &Ticket, review_by_default: bool) -> ChildSpec {
     let short = parent.short_id();
     let title = one_line(&parent.title);
     let title_line = one_line(&fill(&step.title, &title, &one_line(&parent.body), &short));
@@ -257,6 +259,7 @@ pub fn render_step(step: &PlaybookStep, parent: &Ticket) -> ChildSpec {
         title: clip(title_line.trim(), TICKET_TITLE_MAX_CHARS),
         body: clip(body.trim_end(), TICKET_BODY_MAX_CHARS),
         blocked_by_previous: step.blocked_by_previous,
+        skip_review: !review_by_default,
     }
 }
 
@@ -354,10 +357,11 @@ pub fn start_playbook(
         .get(&kind)
         .cloned()
         .ok_or_else(|| TicketError::NoPlaybook(kind.clone()))?;
+    let review_by_default = ctx.workspace.rules().review_by_default;
     let specs: Vec<ChildSpec> = playbook
         .steps
         .iter()
-        .map(|st| render_step(st, &parent))
+        .map(|st| render_step(st, &parent, review_by_default))
         .collect();
     let now = now_ms();
     let origin = by.origin();
@@ -676,7 +680,7 @@ mod tests {
     fn render_step_substitutes_and_one_lines_title() {
         let b = builtin_playbooks();
         let p = parent_ticket("Login\nmed  2FA", "Brug {title} og {parent} ordret.");
-        let c = render_step(&b["feature"].steps[0], &p);
+        let c = render_step(&b["feature"].steps[0], &p, true);
         assert_eq!(c.title, "Plan: Login med  2FA");
         assert!(!c.blocked_by_previous);
         assert!(c
@@ -684,11 +688,11 @@ mod tests {
             .starts_with("Lav en plan for «Login med  2FA» (forældre-ticket ab12cd34)."));
         // The parent's text goes in as is; its placeholders are not expanded again.
         assert!(c.body.ends_with("\n\nBrug {title} og {parent} ordret."));
-        let c2 = render_step(&b["feature"].steps[1], &p);
+        let c2 = render_step(&b["feature"].steps[1], &p, true);
         assert!(c2.blocked_by_previous);
         assert!(c2.body.contains("mira_get_ticket ab12cd34"));
         // Without a parent text the body ends without blank lines.
-        let empty = render_step(&b["bug"].steps[0], &parent_ticket("Nedbrud", ""));
+        let empty = render_step(&b["bug"].steps[0], &parent_ticket("Nedbrud", ""), true);
         assert_eq!(empty.title, "Find årsag: Nedbrud");
         assert!(empty.body.ends_with("lille og sikker."));
         // Long titles and texts are clipped to the ticket limits.
@@ -696,7 +700,7 @@ mod tests {
             &"x".repeat(TICKET_TITLE_MAX_CHARS),
             &"y".repeat(TICKET_BODY_MAX_CHARS),
         );
-        let c = render_step(&b["feature"].steps[1], &long);
+        let c = render_step(&b["feature"].steps[1], &long, true);
         assert_eq!(c.title.chars().count(), TICKET_TITLE_MAX_CHARS);
         assert!(c.title.starts_with("Byg: x"));
         assert_eq!(c.body.chars().count(), TICKET_BODY_MAX_CHARS);
@@ -707,7 +711,7 @@ mod tests {
             body: "{body}{".into(),
             blocked_by_previous: false,
         };
-        let c = render_step(&st, &parent_ticket("T", "B"));
+        let c = render_step(&st, &parent_ticket("T", "B"), true);
         assert_eq!((c.title.as_str(), c.body.as_str()), ("{x} T", "B{"));
     }
 
@@ -864,6 +868,35 @@ mod tests {
             (c.source, c.history[0].by),
             (TicketSource::User, TicketActor::User)
         );
+    }
+
+    #[test]
+    fn playbook_children_follow_review_by_default_not_the_parent() {
+        // Review6b W6: the parent's "Spring review over" does not skip review (and checks) for
+        // the whole flow; the children are reviewed like any new ticket.
+        let (t, _) = ctx_with(&[]);
+        let parent = feature(&t, "Login");
+        t.ctx
+            .mutate(|s| {
+                s.update(
+                    &parent.id,
+                    crate::tickets::model::TicketPatch {
+                        skip_review: Some(true),
+                        ..Default::default()
+                    },
+                    2,
+                )
+            })
+            .unwrap();
+        let r = start_playbook(&t.ctx, &parent.id, StartedBy::User, None).unwrap();
+        assert!(r.children.iter().all(|c| !c.ticket.skip_review));
+        // reviewByDefault false: the children skip review like a new ticket would.
+        let path = t.ctx.workspace.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"reviewByDefault": false}"#).unwrap();
+        let other = feature(&t, "Logout");
+        let r = start_playbook(&t.ctx, &other.id, StartedBy::User, None).unwrap();
+        assert!(r.children.iter().all(|c| c.ticket.skip_review));
     }
 
     #[test]

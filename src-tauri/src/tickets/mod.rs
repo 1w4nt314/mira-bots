@@ -21,7 +21,7 @@ pub mod state;
 pub mod store;
 pub mod tools;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
@@ -64,6 +64,16 @@ pub const NOT_SUBMITTED_NOTE: &str = "turn afsluttet uden aflevering";
 /// `assign_reviewer` on a ticket in review without an assignee (a finished flow parent, step 6b).
 pub const FLOW_REVIEW_IS_USERS: &str =
     "Et afsluttet forløb uden ejer reviewes af dig: godkend eller afvis det selv";
+/// History note (by the app) when the «Ændringer» report of a review entry failed (review6b
+/// W4); the error on one line, clipped to 200 chars.
+pub fn changes_failed_note(err: &str) -> String {
+    let e: String = one_line(err).chars().take(200).collect();
+    format!("Ændringer kunne ikke læses: {e}")
+}
+/// `assign_reviewer` with a reviewer while the project checks run and `checksGate` is on
+/// (review6b W7): a failing check would move the ticket away from that reviewer. The card's
+/// reviewer menu shows the same text (`src/lib/tickets.ts` `CHECKS_RUNNING_REVIEWER`).
+pub const CHECKS_RUNNING_REVIEWER: &str = "Tjek kører; vælg reviewer når det er færdigt";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -142,6 +152,11 @@ pub struct TicketsCtx {
     /// never prepare the same worktree or add the report twice. Taken before, never inside, the
     /// service and report locks; git runs under it but never under the service lock.
     git_lock: Mutex<()>,
+    /// Review entries `(ticket id, review_entry_at)` whose «Ændringer» report failed (review6b
+    /// W4): not tried again for that entry, so a broken worktree or a hanging git does not run
+    /// (and hold `git_lock`) on every `route_reviews`. In memory only; taken briefly, never
+    /// around another lock.
+    changes_failed: Mutex<HashSet<(String, u64)>>,
     /// Runs the project checks (step 6b; [`ProcessChecks`] in the app, a fake in tests).
     pub checks: Arc<dyn CheckRunner>,
     /// `<project>/.mira-bots/project.json` with an `(mtime, len)` cache.
@@ -173,6 +188,7 @@ impl TicketsCtx {
             workspace,
             git,
             git_lock: Mutex::new(()),
+            changes_failed: Mutex::new(HashSet::new()),
             checks: Arc::new(ProcessChecks::new()),
             project_files: ProjectFileReader::new(),
             me: OnceLock::new(),
@@ -697,8 +713,9 @@ impl TicketsCtx {
 
     /// Adds the app's «Ændringer» report (diff stat `base...branch`, commits `base..branch`,
     /// uncommitted files in the worktree; author System) to a ticket in review with git info,
-    /// once per review entry ([`needs_changes_report`]). A git failure is logged only. Returns
-    /// whether a report was added.
+    /// once per review entry ([`needs_changes_report`]). A failure (git or the report) is tried
+    /// once per review entry: it is logged, noted on the ticket by the app ([`changes_failed_note`])
+    /// and remembered in `changes_failed` (review6b W4). Returns whether a report was added.
     pub fn attach_changes(&self, ticket_id: &str) -> bool {
         let _guard = lock(&self.git_lock);
         let Some(t) = self.read(|s| s.get(ticket_id)) else {
@@ -710,7 +727,21 @@ impl TicketsCtx {
         let Some(g) = t.git.as_ref() else {
             return false;
         };
+        let entry = (t.id.clone(), service::review_entry_at(&t));
+        if lock(&self.changes_failed).contains(&entry) {
+            return false;
+        }
         let short = t.short_id();
+        let failed = |e: &str| {
+            lock(&self.changes_failed).insert(entry.clone());
+            let note = changes_failed_note(e);
+            if let Err(e) = self.mutate_if(
+                |s| s.note_by_system(&t.id, &note, now_ms()),
+                Option::is_some,
+            ) {
+                log::warn!("git: noting the changes failure on ticket {short} failed: {e}");
+            }
+        };
         let summary = git::change_summary(
             self.git.as_ref(),
             Path::new(&g.repo),
@@ -722,6 +753,7 @@ impl TicketsCtx {
             Ok(s) => git::render_changes(&s),
             Err(e) => {
                 log::warn!("git: changes of ticket {short} could not be read: {e}");
+                failed(&e.to_string());
                 return false;
             }
         };
@@ -732,6 +764,7 @@ impl TicketsCtx {
             }
             Err(e) => {
                 log::warn!("git: adding the changes report to ticket {short} failed: {e}");
+                failed(&e);
                 false
             }
         }
@@ -1025,6 +1058,13 @@ impl TicketsCtx {
         let now = now_ms();
         match agent_id {
             Some(agent) => {
+                let pending = t
+                    .checks
+                    .as_ref()
+                    .is_some_and(|c| c.state == ChecksState::Pending);
+                if pending && self.workspace.rules().checks_gate {
+                    return Err(CHECKS_RUNNING_REVIEWER.into());
+                }
                 let info = lock(&self.manager)
                     .get(agent)
                     .filter(|a| !matches!(a.status, AgentStatus::Exited { .. }))
@@ -1204,9 +1244,9 @@ impl AgentPort for ManagerPort {
     }
 
     fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
-        let (a, last_user_input_at, has_conversation) = {
+        let (a, last_user_input_at) = {
             let m = lock(&self.manager);
-            (m.get(id)?, m.last_user_input_at(id), m.has_conversation(id))
+            (m.get(id)?, m.last_user_input_at(id))
         };
         Some(AgentSnapshot {
             name: a.name,
@@ -1217,7 +1257,7 @@ impl AgentPort for ManagerPort {
             seat_kind: a.seat_kind,
             roles: a.roles,
             project: a.project,
-            has_conversation,
+            session_id: a.session_id,
         })
     }
 
@@ -1377,18 +1417,16 @@ mod tests {
             .unwrap()
     }
 
-    /// Step 6b: the port tells whether the session had a turn and passes a restart to the
-    /// installed path (refused without one); it holds no manager lock while calling it.
+    /// Step 6b: the port tells the agent's session id (review6b W3/W5) and passes a restart to
+    /// the installed path (refused without one); it holds no manager lock while calling it.
     #[test]
-    fn manager_port_has_conversation_and_restart_fresh() {
+    fn manager_port_session_id_and_restart_fresh() {
         let m = Arc::new(Mutex::new(AgentManager::new(5)));
         let id =
             lock(&m).insert_fake_with("s-1", "/w/a", &[Role::Coder], crate::agent::SeatKind::Work);
         let emit: EmitFn = Arc::new(|_, _| {});
         let port = ManagerPort::new(Arc::clone(&m), emit);
-        assert!(!port.snapshot(&id).unwrap().has_conversation);
-        lock(&m).mark_conversation(&id);
-        assert!(port.snapshot(&id).unwrap().has_conversation);
+        assert_eq!(port.snapshot(&id).unwrap().session_id, "s-1");
         let req = RestartForTicket {
             agent_id: id.clone(),
             cwd: Some(PathBuf::from("/w/a/.mira-bots/wt/ab12cd34")),
@@ -1992,6 +2030,26 @@ mod tests {
     }
 
     #[test]
+    fn assign_reviewer_waits_for_running_checks_with_the_gate() {
+        // Review6b W7: a manual reviewer while the checks run could lose the ticket to the gate.
+        let (t, _m, a1, _r1, r2) = review_setup();
+        let id = submitted(&t, &a1, "x");
+        t.ctx.mutate(|s| s.start_checks(&id, 0, 5)).unwrap();
+        assert_eq!(
+            t.ctx.assign_reviewer(&id, Some(&r2)),
+            Err(CHECKS_RUNNING_REVIEWER.to_string())
+        );
+        // Removing the reviewer (routing again) is still allowed.
+        assert!(t.ctx.assign_reviewer(&id, None).is_ok());
+        // Without the gate a failing check only shows a badge: the choice is allowed.
+        let path = t.ctx.workspace.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"checksGate": false}"#).unwrap();
+        t.ctx.assign_reviewer(&id, Some(&r2)).unwrap();
+        assert_eq!(reviewer_of(&t, &id).as_deref(), Some(r2.as_str()));
+    }
+
+    #[test]
     fn assign_reviewer_rules() {
         let (t, m, a1, r1, r2) = review_setup();
         let id = submitted(&t, &a1, "x");
@@ -2468,6 +2526,7 @@ mod tests {
                 title: format!("trin {i}"),
                 body: String::new(),
                 blocked_by_previous: i > 0,
+                skip_review: false,
             })
             .collect();
         let kids = c
@@ -2745,7 +2804,7 @@ mod tests {
     }
 
     #[test]
-    fn changes_report_failure_is_logged_only() {
+    fn changes_report_failure_is_noted_once_per_review_entry() {
         let (t, fake, _proj, ids) = git_ctx(r#"{"git": "worktree"}"#, true);
         fake.reply(&["diff"], 128, "", "fatal: bad revision");
         let a = &ids[0];
@@ -2756,11 +2815,43 @@ mod tests {
         t.ctx
             .mutate(|s| s.submit_by_agent(a, None, "klar", 4))
             .unwrap();
+        let before = fake.calls().len();
         assert!(!t.ctx.attach_changes(&tk.id));
+        let after_first = fake.calls().len();
+        assert!(after_first > before, "git was asked once");
+        // Review6b W4: no second git run for the same review entry (routing, a direct call).
         assert_eq!(t.ctx.route_reviews(), 0);
+        assert!(!t.ctx.attach_changes(&tk.id));
+        assert_eq!(fake.calls().len(), after_first);
         let stored = t.ctx.read(|s| s.get(&tk.id)).unwrap();
         assert!(stored.reports.is_empty());
         assert_eq!(stored.state, TicketState::Review);
+        // One note by the app says why.
+        let notes: Vec<_> = stored
+            .history
+            .iter()
+            .filter(|h| {
+                h.by == TicketActor::System
+                    && h.note
+                        .as_deref()
+                        .is_some_and(|n| n.starts_with("Ændringer kunne ikke læses: "))
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "{:?}", stored.history);
+        assert!(!notes[0].note.as_deref().unwrap().contains('\n'));
+        // A new review entry tries again.
+        let later = now_ms() + 1_000;
+        t.ctx
+            .mutate(|s| s.reject(&tk.id, "mere", RejectReturn::Sender, later))
+            .unwrap();
+        t.ctx
+            .mutate(|s| s.mark_dispatched(&tk.id, a, later + 1))
+            .unwrap();
+        t.ctx
+            .mutate(|s| s.submit_by_agent(a, None, "igen", later + 2))
+            .unwrap();
+        assert!(!t.ctx.attach_changes(&tk.id));
+        assert!(fake.calls().len() > after_first);
         // A ticket without git never gets the report.
         let plain = submitted(&t, a, "uden git");
         assert!(!t.ctx.attach_changes(&plain));

@@ -2598,6 +2598,7 @@ mod tests {
         let deny = v["permissions"]["deny"].as_array().unwrap();
         assert!(deny.contains(&json!(format!("Edit({root}/mira-bots.workspace.json)"))));
         assert!(deny.contains(&json!("Bash(git push *)")));
+        assert!(deny.contains(&json!("Bash(git -C * push)")));
         let bad = AgentProfile {
             name: " ".into(),
             ..saved
