@@ -219,6 +219,10 @@ pub fn classify_start_error(e: &str) -> StartFailure {
     if e == INBOX_ITEM_GONE || e == INBOX_ISSUE_CLOSED || e.starts_with(started.trim_end()) {
         return StartFailure::Gone;
     }
+    // Review6d N19: GitHub svarer 5xx på `gh issue view` → kilden, ikke emnet.
+    if e.starts_with("gh: ") && e.contains("HTTP 5") {
+        return StartFailure::Source(short_error(e));
+    }
     let source = [
         GhError::GhMissing,
         GhError::NotLoggedIn,
@@ -871,6 +875,11 @@ mod tests {
                 "{g:?}"
             );
         }
+        // Review6d N19: 5xx fra GitHub er kilden; andre gh-fejl er reelle.
+        assert!(matches!(
+            classify_start_error("gh: HTTP 502: Bad Gateway (https://api.github.com/...)"),
+            StartFailure::Source(_)
+        ));
         for g in [
             GhError::RepoNotFound,
             GhError::IssuesDisabled,

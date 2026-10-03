@@ -93,13 +93,23 @@ pub fn source_blocked(
 ) -> Option<(String, String, u64)> {
     if let Some(err) = &h.error {
         let err = short_error(err);
-        return Some(match h.next_retry_at.filter(|t| *t > now) {
+        // Review6d N20: et ur stillet tilbage må ikke forlænge ventetiden ud over en time.
+        let retry = h
+            .next_retry_at
+            .filter(|t| *t > now)
+            .map(|t| t.min(now + HOUR_MS));
+        return Some(match retry {
             Some(t) => (err, watch_source_when_at(&hhmm(t, off)), t),
             None if h.waits_for_user => (err, WATCH_SOURCE_WHEN_MANUAL.into(), now + HOUR_MS),
             None => (err, WATCH_SOURCE_WHEN_NEXT_FETCH.into(), now + HOUR_MS),
         });
     }
     let f = fail?;
+    // Review6d N20: en fejl "i fremtiden" (ur stillet tilbage) holder ikke kilden nede; fejler
+    // startet igen, registreres den med det nye ur.
+    if f.at > now {
+        return None;
+    }
     let until = f.at + HOUR_MS;
     let fetched_since = h.last_fetch_at.is_some_and(|t| t > f.at);
     (now < until && !fetched_since).then(|| {
@@ -352,9 +362,10 @@ impl Waiting {
     /// Et emne hvis start fejlede, og som først prøves igen ved `next_at` (review6d W1). Sådan en
     /// parkering huskes også, mens projektet er inaktivt (pause/genoptag, review6d N11).
     pub fn failed_until_later(&self, now: u64) -> bool {
+        // Review6d N20: mere end en time ude i fremtiden = uret er stillet tilbage; prøv igen.
         self.reason == WaitReason::Failed
             && !self.by_source
-            && self.next_at.is_some_and(|t| t > now)
+            && self.next_at.is_some_and(|t| t > now && t - now <= HOUR_MS)
     }
 }
 
@@ -2356,6 +2367,37 @@ mod tests {
         };
         assert_eq!(source_blocked(&new_fetch, Some(&fail), T + MIN, off), None);
         assert_eq!(source_blocked(&ok, Some(&fail), T + HOUR_MS, off), None);
+        // Review6d N20: uret stillet 5 t tilbage → en fejl "i fremtiden" holder ikke kilden nede.
+        let future_fail = SourceFail {
+            text: fail.text.clone(),
+            at: T + 5 * HOUR_MS,
+        };
+        assert_eq!(source_blocked(&ok, Some(&future_fail), T, off), None);
+        let far_backoff = SourceHealth {
+            error: Some("GitHub: rate limit".into()),
+            next_retry_at: Some(T + 6 * HOUR_MS),
+            ..SourceHealth::default()
+        };
+        assert_eq!(
+            source_blocked(&far_backoff, None, T, off).map(|b| b.2),
+            Some(T + HOUR_MS)
+        );
+        let w = Waiting {
+            reason: WaitReason::Failed,
+            text: String::new(),
+            next_at: Some(T + 5 * HOUR_MS),
+            project: "web".into(),
+            by_source: false,
+        };
+        assert!(
+            !w.failed_until_later(T),
+            "mere end en time frem = ur stillet tilbage"
+        );
+        assert!(Waiting {
+            next_at: Some(T + MIN),
+            ..w.clone()
+        }
+        .failed_until_later(T));
         // Kildens egen fejl: back-off, "Opdatér", udløbet back-off; teksten renses.
         let backoff = SourceHealth {
             error: Some("ingen forbindelse til GitHub".into()),
