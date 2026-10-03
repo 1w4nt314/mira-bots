@@ -664,11 +664,18 @@ mod tests {
             // freshly exec'd `sleep` can sit in uninterruptible IO for seconds (seen on GitHub's
             // ubuntu runner: alive after 3 s, gone a few seconds later). `sleep 30` on its own
             // would outlive this window, so a survivor is still a real failure.
+            // The verdict is taken once: on CI (run 116) the pid read as dead inside the loop and
+            // as alive again right after, so a second look can land on a reused pid number.
             let until = Instant::now() + Duration::from_secs(15);
-            while !dead_or_zombie(grandchild) && Instant::now() < until {
+            let mut dead = false;
+            while Instant::now() < until {
+                if dead_or_zombie(grandchild) {
+                    dead = true;
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            assert!(dead_or_zombie(grandchild), "sleep {grandchild} survived");
+            assert!(dead, "sleep {grandchild} survived");
         }
 
         #[test]
