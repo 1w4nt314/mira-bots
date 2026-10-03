@@ -456,6 +456,110 @@ pub const TERM_DEFAULT: &str = "xterm-256color";
 /// `COLORTERM` for the agent's child when the app's own environment has none.
 pub const COLORTERM_DEFAULT: &str = "truecolor";
 
+// --- vagt-tilstand og budget (step 6d, plan6d punkt 1, C6d.1/C6d.5) ---
+
+/// The watch's own state in the app's data dir (budget rings, failures; plan6d C6d.2).
+pub const WATCH_STATE_FILE: &str = "watch-state.json";
+/// Schema of [`WATCH_STATE_FILE`]; another version is quarantined (`.broken-<ms>`).
+pub const WATCH_STATE_SCHEMA_VERSION: u32 = 1;
+/// `project.json` → `watch.maxPerHour` when absent.
+pub const WATCH_MAX_PER_HOUR_DEFAULT: u32 = 3;
+/// `project.json` → `watch.maxPerDay` when absent.
+pub const WATCH_MAX_PER_DAY_DEFAULT: u32 = 10;
+/// `project.json` → `watch.maxAgents` when absent.
+pub const WATCH_MAX_AGENTS_DEFAULT: usize = 2;
+/// Workspace file → `watch.maxPerHour` when absent (cap per project and for the sum).
+pub const WATCH_WS_MAX_PER_HOUR: u32 = 6;
+/// Workspace file → `watch.maxPerDay` when absent (cap per project and for the sum).
+pub const WATCH_WS_MAX_PER_DAY: u32 = 20;
+/// Highest `maxPerHour` (project and workspace).
+pub const WATCH_PER_HOUR_MAX: u32 = 60;
+/// Highest `maxPerDay` (project and workspace).
+pub const WATCH_PER_DAY_MAX: u32 = 500;
+/// Most entries of `watch.playbook.byLabel`.
+pub const WATCH_BY_LABEL_MAX: usize = 20;
+/// Real start failures in a row that stop the watch for a project.
+pub const WATCH_TRIP_AFTER: u32 = 3;
+/// Entries kept in a budget ring at least (`max(cap, this)`).
+pub const WATCH_RING_KEEP: usize = 64;
+/// The watch timer's period (first tick after one period).
+pub const WATCH_TICK_SECS: u64 = 60;
+/// The watch asks for an inbox refresh at most this often.
+pub const WATCH_REFRESH_MIN_MS: u64 = 120_000;
+/// Longest wait for a refresh the watch asked for.
+pub const WATCH_REFRESH_WAIT_MAX_MS: u64 = 120_000;
+/// Poll step while the watch waits for a refresh (and checks `stopping`).
+pub const WATCH_STOP_POLL_MS: u64 = 250;
+/// Most notices kept in the queue.
+pub const NOTICES_MAX: usize = 100;
+/// How long a notice key is remembered (dedup).
+pub const NOTICE_SEEN_TTL_MS: u64 = 86_400_000;
+/// A permission/trust wait older than this gives a notice.
+pub const WAITING_NOTICE_AFTER_MS: u64 = 60_000;
+/// One hour in ms (the budget's sliding window).
+pub const HOUR_MS: u64 = 3_600_000;
+
+/// Parking text (`Waiting.text`): the budget waits until `hhmm` (local time).
+pub fn watch_wait_budget_text(hhmm: &str) -> String {
+    format!("venter på budget (næste: {hhmm})")
+}
+/// Parking title: quiet hours `q` (`HH-HH`).
+pub fn watch_quiet_title(q: &str) -> String {
+    format!("stille timer ({q})")
+}
+/// Parking title: the hourly cap `n` is reached.
+pub fn watch_hour_cap_title(n: u32) -> String {
+    format!("timeloft {n} nået")
+}
+/// Parking title: the daily cap `n` is reached.
+pub fn watch_day_cap_title(n: u32) -> String {
+    format!("dagsloft {n} nået")
+}
+/// Parking title: the workspace's sum cap is reached.
+pub const WATCH_WS_CAP_TITLE: &str = "workspace-loft nået";
+/// Parking text: no free seat for the playbook.
+pub const WATCH_WAIT_SEAT: &str = "venter på plads";
+/// Parking text: the playbook needs a staff agent that is not running.
+pub const WATCH_WAIT_PLANNER: &str = "venter på planlægger (stabsplads)";
+/// Parking text: the item looks like an open ticket.
+pub const WATCH_WAIT_DUPLICATE: &str = "mulig dublet, start manuelt";
+/// Parking text: no playbook chosen (`task`, absent, no match without default).
+pub const WATCH_WAIT_NO_PLAYBOOK: &str = "ingen playbook valgt for vagten";
+/// Parking text: the chosen playbook is not in the workspace.
+pub fn watch_unknown_playbook_text(name: &str) -> String {
+    format!("playbook «{name}» findes ikke i workspace")
+}
+/// Parking text: the start failed.
+pub fn watch_start_failed_text(err: &str) -> String {
+    format!("vagt: start fejlede: {err}")
+}
+/// Inactive reason: no `watch.enabled: true` in the project's file.
+pub const WATCH_REASON_NOT_ENABLED: &str = "watch.enabled mangler i project.json";
+/// Inactive reason: the project is in `watchOff` (app settings).
+pub const WATCH_REASON_PROJECT_PAUSED: &str = "vagt er sat på pause for projektet";
+/// Inactive reason: `watchPaused` (app settings).
+pub const WATCH_REASON_PAUSED: &str = "vagten er sat på pause";
+/// Inactive reason: `watch.enabled: false` in the workspace file.
+pub const WATCH_REASON_WS_OFF: &str = "slået fra i workspace-filen";
+/// Inactive reason: tripped after `n` failures in a row.
+pub fn watch_tripped_reason(n: u32) -> String {
+    format!("stoppet efter {n} fejl — tryk Genstart vagt")
+}
+/// Inactive reason: agents cannot be spawned at all.
+pub const WATCH_REASON_CANNOT_SPAWN: &str = "agenter kan ikke startes (pipe/claude/hook mangler)";
+/// The watch's spawn port refuses staff roles.
+pub const WATCH_NO_STAFF_SPAWN: &str = "vagten starter ikke stabsagenter";
+/// The watch's spawn port refuses above `watch.maxAgents`.
+pub const WATCH_MAX_AGENTS_TEXT: &str = "vagtens agentloft er nået";
+/// Diagnostik warning: the state file was quarantined as `name` (conservative start).
+pub fn watch_state_quarantined_warning(name: &str) -> String {
+    format!("{WATCH_STATE_FILE} kunne ikke læses og blev omdøbt til {name}; vagten venter en time")
+}
+/// Diagnostik warning: the state file could not be read and not be renamed either.
+pub fn watch_state_unreadable_warning(err: &str) -> String {
+    format!("{WATCH_STATE_FILE} kunne ikke læses ({err}); vagten venter en time")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +820,83 @@ mod tests {
         assert_eq!(
             duplicate_hint_text("ab12cd34", "Fix"),
             "Ligner ticket ab12cd34: «Fix»"
+        );
+    }
+
+    #[test]
+    fn step6d_constants() {
+        assert_eq!(
+            (WATCH_STATE_FILE, WATCH_STATE_SCHEMA_VERSION),
+            ("watch-state.json", 1)
+        );
+        assert_eq!(
+            (
+                WATCH_MAX_PER_HOUR_DEFAULT,
+                WATCH_MAX_PER_DAY_DEFAULT,
+                WATCH_MAX_AGENTS_DEFAULT
+            ),
+            (3, 10, 2)
+        );
+        assert_eq!((WATCH_WS_MAX_PER_HOUR, WATCH_WS_MAX_PER_DAY), (6, 20));
+        assert_eq!((WATCH_PER_HOUR_MAX, WATCH_PER_DAY_MAX), (60, 500));
+        assert_eq!(
+            (WATCH_BY_LABEL_MAX, WATCH_TRIP_AFTER, WATCH_RING_KEEP),
+            (20, 3, 64)
+        );
+        assert_eq!(WATCH_TICK_SECS, 60);
+        assert_eq!(
+            (
+                WATCH_REFRESH_MIN_MS,
+                WATCH_REFRESH_WAIT_MAX_MS,
+                WATCH_STOP_POLL_MS
+            ),
+            (120_000, 120_000, 250)
+        );
+        assert_eq!(
+            (NOTICES_MAX, NOTICE_SEEN_TTL_MS, WAITING_NOTICE_AFTER_MS),
+            (100, 86_400_000, 60_000)
+        );
+        assert_eq!(HOUR_MS, 3_600_000);
+        assert_eq!(
+            watch_wait_budget_text("14:05"),
+            "venter på budget (næste: 14:05)"
+        );
+        assert_eq!(watch_quiet_title("23-07"), "stille timer (23-07)");
+        assert_eq!(watch_hour_cap_title(3), "timeloft 3 nået");
+        assert_eq!(watch_day_cap_title(10), "dagsloft 10 nået");
+        assert_eq!(WATCH_WS_CAP_TITLE, "workspace-loft nået");
+        assert_eq!(WATCH_WAIT_SEAT, "venter på plads");
+        assert_eq!(WATCH_WAIT_PLANNER, "venter på planlægger (stabsplads)");
+        assert_eq!(WATCH_WAIT_DUPLICATE, "mulig dublet, start manuelt");
+        assert_eq!(WATCH_WAIT_NO_PLAYBOOK, "ingen playbook valgt for vagten");
+        assert_eq!(
+            watch_unknown_playbook_text("docs"),
+            "playbook «docs» findes ikke i workspace"
+        );
+        assert_eq!(watch_start_failed_text("x"), "vagt: start fejlede: x");
+        assert_eq!(
+            WATCH_REASON_NOT_ENABLED,
+            "watch.enabled mangler i project.json"
+        );
+        assert_eq!(
+            WATCH_REASON_PROJECT_PAUSED,
+            "vagt er sat på pause for projektet"
+        );
+        assert_eq!(WATCH_REASON_PAUSED, "vagten er sat på pause");
+        assert_eq!(WATCH_REASON_WS_OFF, "slået fra i workspace-filen");
+        assert_eq!(
+            watch_tripped_reason(3),
+            "stoppet efter 3 fejl — tryk Genstart vagt"
+        );
+        assert_eq!(
+            WATCH_REASON_CANNOT_SPAWN,
+            "agenter kan ikke startes (pipe/claude/hook mangler)"
+        );
+        assert_eq!(WATCH_NO_STAFF_SPAWN, "vagten starter ikke stabsagenter");
+        assert_eq!(WATCH_MAX_AGENTS_TEXT, "vagtens agentloft er nået");
+        assert_eq!(
+            watch_state_quarantined_warning("watch-state.json.broken-7"),
+            "watch-state.json kunne ikke læses og blev omdøbt til watch-state.json.broken-7; vagten venter en time"
         );
     }
 

@@ -18,6 +18,7 @@ pub mod proc;
 pub mod profiles;
 pub mod projects;
 pub mod tickets;
+pub mod watch;
 pub mod workplace;
 pub mod workspace;
 

@@ -593,9 +593,11 @@ pub fn local_hhmm(ms: u64) -> String {
     format!("{:02}:{:02}", day / 3600, (day % 3600) / 60)
 }
 
+/// Local time minus UTC in seconds at Unix second `secs` (Unix: per instant, DST included;
+/// Windows: the *current* bias, `secs` is ignored — so call it only with "now"; plan6d A.3).
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // `tm_gmtoff` is a `c_long`
-fn local_offset_secs(secs: i64) -> i64 {
+pub(crate) fn local_offset_secs(secs: i64) -> i64 {
     let t: libc::time_t = secs as libc::time_t;
     // SAFETY: `tm` is a plain C struct (zeroed is valid); localtime_r only writes into it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -607,8 +609,9 @@ fn local_offset_secs(secs: i64) -> i64 {
     }
 }
 
+/// See the Unix variant: the current bias from `GetTimeZoneInformation`.
 #[cfg(windows)]
-fn local_offset_secs(_secs: i64) -> i64 {
+pub(crate) fn local_offset_secs(_secs: i64) -> i64 {
     // TODO(windows-verify): the rate-limit text shows the local clock (summer time included; plan6c D.114).
     #[repr(C)]
     struct SystemTime {
@@ -1258,6 +1261,15 @@ mod tests {
         assert_eq!(run(&["issue", "view", "1"]), Ok("c".into()));
         assert_eq!(run(&["issue", "view", "1"]), Ok("c".into()));
         assert!(matches!(run(&["auth"]), Err(GhError::Other(_))));
+    }
+
+    #[test]
+    fn local_offset_is_within_a_day() {
+        let now = (crate::agent::now_ms() / 1000) as i64;
+        let off = local_offset_secs(now);
+        // Real zones lie within −12 h … +14 h, whole quarter hours.
+        assert!((-12 * 3600..=14 * 3600).contains(&off), "{off}");
+        assert_eq!(off % 900, 0, "{off}");
     }
 
     #[test]

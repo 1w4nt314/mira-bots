@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::config::{MAX_REVIEW_ROUNDS_MAX, WORKSPACE_FILE};
 use crate::tickets::model::{GitMode, WorkspaceRules};
 use crate::tickets::playbook::{builtin_playbooks, validate_playbooks, Playbook};
+use crate::watch::config::{parse_workspace_watch, WorkspaceWatch};
 
 /// Number of work seats (= `WORK_SEATS` in seats.ts); `maxWorkAgents` is clamped to it.
 pub const MAX_WORK_SEATS: usize = 5;
@@ -55,14 +56,22 @@ pub struct WorkspaceFile {
     pub auto_spawn_for_playbook: Option<bool>,
     pub fresh_session_per_ticket: Option<bool>,
     pub cleanup_worktrees_on_done: Option<bool>,
+    // ---- step 6d ----
+    /// Vagtens master-kontakt og øvre lofter; valideret i hånden i [`effective`] (forkert form
+    /// er en note, ikke en afvist fil).
+    pub watch: Option<serde_json::Value>,
 }
 
 /// The non-`Copy` part of the workspace settings (step 6b): the playbooks (built-in ones merged
-/// with the file's, the file wins per name) and the configured git base branch.
+/// with the file's, the file wins per name), the configured git base branch and the watch's
+/// master switch and caps (step 6d).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub playbooks: BTreeMap<String, Playbook>,
     pub git_base: Option<String>,
+    /// Vagtens master-kontakt og lofter (trin 6d; ikke i `WorkspaceRules`, der er `Copy` og
+    /// serialiseres i `AppInfo`).
+    pub watch: WorkspaceWatch,
 }
 
 impl Default for WorkspaceConfig {
@@ -71,6 +80,7 @@ impl Default for WorkspaceConfig {
         WorkspaceConfig {
             playbooks: builtin_playbooks(),
             git_base: None,
+            watch: WorkspaceWatch::default(),
         }
     }
 }
@@ -216,6 +226,10 @@ pub fn effective(file: &WorkspaceFile) -> (WorkspaceRules, WorkspaceConfig, Vec<
     if let Some(v) = &file.playbooks {
         // Built-in names the file does not mention stay.
         c.playbooks.extend(validate_playbooks(v, &mut notes));
+    }
+    // ---- step 6d ----
+    if let Some(v) = &file.watch {
+        c.watch = parse_workspace_watch(v, &mut notes);
     }
     (r, c, notes)
 }
@@ -637,6 +651,79 @@ mod tests {
         assert!(!c.playbooks.contains_key("task"));
         assert_eq!(c.playbook_kinds(), ["bug", "feature"]);
         assert_eq!(notes, ["playbooks.task ignoreres: ugyldigt navn"]);
+    }
+
+    #[test]
+    fn watch_defaults_when_absent() {
+        let (_, c, notes) = effective(&file("{}"));
+        assert_eq!(
+            c.watch,
+            WorkspaceWatch {
+                enabled: true,
+                max_per_hour: 6,
+                max_per_day: 20
+            }
+        );
+        assert!(notes.is_empty());
+        let (_, c, notes) = effective(&file(r#"{"watch": null}"#));
+        assert_eq!((c.watch, notes.len()), (WorkspaceWatch::default(), 0));
+        let (_, c, notes) = effective(&file(
+            r#"{"watch": {"enabled": false, "maxPerHour": 4, "maxPerDay": 12}}"#,
+        ));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(
+            c.watch,
+            WorkspaceWatch {
+                enabled: false,
+                max_per_hour: 4,
+                max_per_day: 12
+            }
+        );
+    }
+
+    #[test]
+    fn watch_clamps_and_notes() {
+        let (_, c, notes) = effective(&file(
+            r#"{"watch": {"maxPerHour": 90, "maxPerDay": 0, "enabled": "nej"}}"#,
+        ));
+        assert_eq!(
+            c.watch,
+            WorkspaceWatch {
+                enabled: true,
+                max_per_hour: 60,
+                max_per_day: 1
+            }
+        );
+        assert_eq!(
+            notes,
+            [
+                "watch.enabled skal være true/false; true bruges",
+                "watch.maxPerHour 90 er sat ned til 60 (vagtens loft)",
+                "watch.maxPerDay 0 er sat op til 1 (vagtens loft)",
+            ]
+        );
+        let (_, c, notes) = effective(&file(r#"{"watch": {"maxPerDay": 501}}"#));
+        assert_eq!(c.watch.max_per_day, 500);
+        assert_eq!(
+            notes,
+            ["watch.maxPerDay 501 er sat ned til 500 (vagtens loft)"]
+        );
+        let (_, c, notes) = effective(&file(r#"{"watch": {"maxPerHour": "5"}}"#));
+        assert_eq!(c.watch.max_per_hour, 6);
+        assert_eq!(notes, ["watch.maxPerHour skal være et helt tal; 6 bruges"]);
+    }
+
+    #[test]
+    fn watch_wrong_shape_is_note_only() {
+        // Aldrig en afvist fil: de andre felter gælder, ingen advarsel.
+        let s = parse(r#"{"maxWorkAgents": 2, "watch": true}"#);
+        assert_eq!((s.warning, s.rules.max_work_agents), (None, 2));
+        assert_eq!(s.config.watch, WorkspaceWatch::default());
+        assert_eq!(s.notes, ["watch ignoreres: skal være et objekt"]);
+        let s = parse(r#"{"watch": [1]}"#);
+        assert_eq!((s.warning, s.notes.len()), (None, 1));
+        // WorkspaceRules er uændret af vagten.
+        assert_eq!(s.rules, WorkspaceRules::defaults());
     }
 
     #[test]

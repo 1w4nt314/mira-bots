@@ -23,6 +23,7 @@ use crate::config::{
     CHECK_TIMEOUT_MAX_SEC, PROJECT_FILE, REPORT_BODY_MAX_CHARS,
 };
 use crate::proc::{self, ProcRunner, SystemProc};
+use crate::watch::config::{parse_watch, probe_playbook, WatchConfig};
 
 /// Most chars of a check's `name` (one line).
 pub const CHECK_NAME_MAX_CHARS: usize = 40;
@@ -50,6 +51,9 @@ pub struct ProjectFile {
     pub notes: Vec<String>,
     /// The project's GitHub issues source (step 6c, C6c.2); `None`: absent or invalid (a note).
     pub github: Option<GithubConfig>,
+    /// Vagt-tilstand (trin 6d, C6d.2); `None`: fraværende eller ikke et objekt (en note). Vagten
+    /// er kun til når `enabled` er `true`.
+    pub watch: Option<WatchConfig>,
 }
 
 /// `project.json` → `github` (step 6c, plan punkt 13): the repo whose open issues the inbox
@@ -169,8 +173,9 @@ fn one_line_text(v: &Value, max: usize) -> Option<String> {
 /// Parses and validates the file's text (plan A.3): an object; `checks` a list of at most
 /// [`CHECKS_MAX`] objects with `name` (1–40 chars, one line), `run` (1–1000 chars, one line) and
 /// an optional `timeoutSec` (whole seconds, clamped to 1–3600 with a note, default 600);
-/// `gitBase` optional (an invalid value is ignored with a note). Any other error rejects the
-/// whole file with a text starting "project.json: ".
+/// `gitBase` optional (an invalid value is ignored with a note); `github` and `watch` (step 6d)
+/// are validated with notes, never a rejected file. Any other error rejects the whole file with
+/// a text starting "project.json: ".
 pub fn parse_project_file(text: &str) -> Result<ProjectFile, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("project.json: {e}"))?;
     let Value::Object(map) = v else {
@@ -253,6 +258,11 @@ pub fn parse_project_file(text: &str) -> Result<ProjectFile, String> {
             Ok(c) => out.github = Some(c),
             Err(reason) => out.notes.push(format!("{GITHUB_IGNORED_PREFIX}{reason}")),
         },
+    }
+    match map.get("watch") {
+        None | Some(Value::Null) => {}
+        // Andet pas over teksten: `byLabel` i filens rækkefølge (plan6d A.4).
+        Some(w) => out.watch = parse_watch(w, probe_playbook(text).as_ref(), &mut out.notes),
     }
     Ok(out)
 }
@@ -904,6 +914,71 @@ mod tests {
                 close: true
             }
         );
+    }
+
+    #[test]
+    fn watch_config_parses_with_file_order() {
+        use crate::watch::config::PlaybookRule;
+        let f = parse_project_file(
+            r#"{"checks": [], "watch": {"enabled": true, "playbook": {"byLabel": {"zeta": "bug", "Alpha": "feature"}, "default": "task"}, "maxPerHour": 2, "maxPerDay": 5, "maxAgents": 1, "quietHours": "22-06"}}"#,
+        )
+        .unwrap();
+        assert!(f.notes.is_empty(), "{:?}", f.notes);
+        let w = f.watch.unwrap();
+        assert!(w.enabled);
+        assert_eq!(
+            w.playbook,
+            PlaybookRule::ByLabel {
+                by_label: vec![
+                    ("zeta".into(), "bug".into()),
+                    ("Alpha".into(), "feature".into())
+                ],
+                default: None
+            }
+        );
+        assert_eq!((w.max_per_hour, w.max_per_day, w.max_agents), (2, 5, 1));
+        assert_eq!(
+            (w.quiet, w.quiet_text.as_deref()),
+            (Some((1320, 360)), Some("22-06"))
+        );
+        let f = parse_project_file(r#"{"watch": {"enabled": true, "playbook": "bug"}}"#).unwrap();
+        assert_eq!(f.watch.unwrap().playbook, PlaybookRule::Fixed("bug".into()));
+    }
+
+    #[test]
+    fn watch_invalid_is_note_not_error() {
+        let f = parse_project_file(
+            r#"{"gitBase": "main", "watch": {"enabled": "ja", "maxPerHour": 90, "quietHours": "07-07", "playbook": 5}}"#,
+        )
+        .unwrap();
+        assert_eq!(f.git_base.as_deref(), Some("main"));
+        assert_eq!(
+            f.notes,
+            [
+                "project.json: watch.enabled skal være true/false; vagten er fra",
+                "project.json: watch.playbook skal være et navn eller et objekt med byLabel/default; ingen playbook valgt",
+                "project.json: watch.maxPerHour 90 er sat ned til 60 (1–60)",
+                "project.json: watch.quietHours «07-07» ignoreres (formen HH-HH, fx 23-07)",
+            ]
+        );
+        let w = f.watch.unwrap();
+        assert!(!w.enabled);
+        assert_eq!((w.max_per_hour, w.quiet), (60, None));
+        let f = parse_project_file(r#"{"watch": "on", "github": {"repo": "o/r"}}"#).unwrap();
+        assert_eq!(f.watch, None);
+        assert!(f.github.is_some());
+        assert_eq!(
+            f.notes,
+            ["project.json: watch ignoreres: skal være et objekt"]
+        );
+    }
+
+    #[test]
+    fn watch_missing_is_none() {
+        for text in [r#"{}"#, r#"{"watch": null}"#, r#"{"checks": []}"#] {
+            let f = parse_project_file(text).unwrap();
+            assert_eq!((f.watch, f.notes.len()), (None, 0), "{text}");
+        }
     }
 
     #[test]
