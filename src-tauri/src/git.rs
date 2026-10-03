@@ -330,6 +330,19 @@ pub fn normalize_path_str(s: &str) -> String {
     p
 }
 
+/// Whether two existing folders are the same: textually ([`same_path`]) or, when the text
+/// differs, by canonical path (git reports worktrees canonically: `/private/var` for `/var` on
+/// macOS, long names for 8.3 names on Windows).
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    if same_path(&a.to_string_lossy(), &b.to_string_lossy()) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Whether `a` and `b` name the same folder textually ([`normalize_path_str`]; Windows also
 /// ignores case).
 pub fn same_path(a: &str, b: &str) -> bool {
@@ -401,10 +414,16 @@ pub fn prepare_worktree(
     crate::tickets::prompt::ensure_mira_gitignore(repo)
         .map_err(|e| format!("git: kunne ikke skrive .mira-bots/.gitignore: {e}"))?;
     run_ok(git, repo, &["worktree", "prune"])?;
-    if let Some(dir) = existing_worktree(git, repo, &branch)? {
-        return Ok(dir);
-    }
     let dir = worktree_dir(repo, short);
+    if let Some(found) = existing_worktree(git, repo, &branch)? {
+        // Git lists the canonical path; the ticket keeps the app's own spelling of the same
+        // folder so later comparisons with the agent's cwd stay textual.
+        return Ok(if same_folder(&found, &dir) {
+            dir
+        } else {
+            found
+        });
+    }
     let dir_arg = path_arg(&dir)?;
     let listed = run_ok(git, repo, &["branch", "--list", &branch])?;
     if listed.stdout.trim().is_empty() {
@@ -643,6 +662,28 @@ mod tests {
         ] {
             assert_eq!(branch_name(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn same_folder_sees_through_symlinks_and_spelling() {
+        let tmp = std::env::temp_dir().join(format!("mira-sf-{}", std::process::id()));
+        let real = tmp.join("real");
+        fs::create_dir_all(&real).unwrap();
+        // Same spelling: textual.
+        assert!(same_folder(&real, &real));
+        // Different spelling of the same folder (trailing separator, `.` component).
+        assert!(same_folder(&real, &tmp.join("real").join(".")));
+        // Different folders.
+        assert!(!same_folder(&real, &tmp));
+        // Missing folders fall back to the textual comparison only.
+        assert!(!same_folder(&tmp.join("nope"), &tmp.join("nope2")));
+        #[cfg(unix)]
+        {
+            let link = tmp.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(same_folder(&real, &link), "a symlink names the same folder");
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
