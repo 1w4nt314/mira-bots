@@ -237,6 +237,12 @@ mod tests {
         panic!("no {name}=<pid> in output: {:?}", text(c));
     }
 
+    /// How long a killed process may take to disappear. SIGKILL lands when the process leaves
+    /// the kernel; on a loaded CI runner a child in uninterruptible IO has been seen alive for
+    /// more than 3 s and gone a few seconds later. `sleep 30` outlives this, so a survivor is
+    /// still a real failure.
+    const KILL_WAIT: Duration = Duration::from_secs(15);
+
     fn wait_dead(pid: u32, within: Duration) -> bool {
         let t = Instant::now();
         while t.elapsed() < within {
@@ -261,8 +267,8 @@ mod tests {
         c.exit
             .recv_timeout(Duration::from_secs(10))
             .expect("Exited within 10 s");
-        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
-        assert!(wait_dead(p2, Duration::from_secs(3)), "P2 {p2} survived");
+        assert!(wait_dead(p1, KILL_WAIT), "P1 {p1} survived");
+        assert!(wait_dead(p2, KILL_WAIT), "P2 {p2} survived");
     }
 
     #[test]
@@ -280,7 +286,7 @@ mod tests {
             t.elapsed() >= Duration::from_millis(250),
             "SIGTERM was ignored, so only SIGKILL ends it"
         );
-        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
+        assert!(wait_dead(p1, KILL_WAIT), "P1 {p1} survived");
     }
 
     #[test]
@@ -363,7 +369,7 @@ mod tests {
         c.exit
             .recv_timeout(Duration::from_secs(3))
             .expect("Exited within 3 s");
-        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
+        assert!(wait_dead(p1, KILL_WAIT), "P1 {p1} survived");
     }
 
     #[test]
@@ -396,7 +402,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("the leader exits on SIGTERM");
         assert!(c.handle.exit_flag().load(Ordering::SeqCst));
-        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
+        assert!(wait_dead(p1, KILL_WAIT), "P1 {p1} survived");
     }
 
     #[test]
@@ -414,6 +420,6 @@ mod tests {
         let t = Instant::now();
         process::finish_all(&[(pid, c.handle.exit_flag())], Duration::from_millis(300));
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
-        assert!(wait_dead(p1, Duration::from_secs(3)), "P1 {p1} survived");
+        assert!(wait_dead(p1, KILL_WAIT), "P1 {p1} survived");
     }
 }

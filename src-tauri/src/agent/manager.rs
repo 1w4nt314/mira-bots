@@ -2821,7 +2821,9 @@ mod tests {
                     && took < QUIT_KILL_BUDGET + Duration::from_secs(1),
                 "{took:?}"
             );
-            let deadline = Instant::now() + Duration::from_secs(3);
+            // SIGKILL lands when the shell leaves the kernel; on a loaded CI runner that has taken
+            // more than 3 s (run 115). `sleep 30` outlives this window, so a survivor still fails.
+            let deadline = Instant::now() + Duration::from_secs(15);
             for pid in [a.pid.unwrap(), b.pid.unwrap()] {
                 while !process::pid_is_dead(pid) && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
