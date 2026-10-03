@@ -594,7 +594,7 @@ fn local_offset_secs(secs: i64) -> i64 {
 
 #[cfg(windows)]
 fn local_offset_secs(_secs: i64) -> i64 {
-    // TODO(windows-verify): the rate-limit text shows the local clock (summer time included).
+    // TODO(windows-verify): the rate-limit text shows the local clock (summer time included; plan6c D.114).
     #[repr(C)]
     struct SystemTime {
         parts: [u16; 8],
