@@ -4,9 +4,12 @@
 import type {
   AgentInfo,
   SeatKind,
+  Ticket,
   TicketActor,
   TicketGit,
+  TicketHistoryEntry,
   TicketIssue,
+  TicketReport,
   TicketSource,
   TicketState,
   TicketSummary,
@@ -939,4 +942,203 @@ export function shortCwd(cwd: string): string {
   if (m === null) return cwd;
   const rest = m[2] === undefined || m[2] === "" ? "" : `/${m[2].replace(/\\/g, "/")}`;
   return `…/.mira-bots/wt/${m[1]}${rest}`;
+}
+
+// --- tidslinje (step 6d, plan A.10 / C6d.6) --------------------------------------------------
+
+/** Kilden til en linje i tidslinjen; `note` er en historiknote som ingen anden kind genkender. */
+export type TimelineKind =
+  | "created"
+  | "state"
+  | "note"
+  | "report"
+  | "playbook"
+  | "checks"
+  | "git"
+  | "writeBack"
+  | "watch"
+  | "session";
+
+export interface TimelineEntry {
+  /** Milliseconds since the Unix epoch. */
+  at: number;
+  kind: TimelineKind;
+  text: string;
+  /** Hvem: "dig", "agenten", "systemet" (historik) eller "appen"/"agenten"/"dig" (rapporter). */
+  by: string;
+}
+
+/** Rapportforfatter i tidslinjen (som `ReportsSection`): appen, agenten eller dig. */
+const REPORT_AUTHOR_LABEL: Record<TicketReport["author"]["kind"], string> = {
+  system: "appen",
+  agent: "agenten",
+  user: "dig",
+};
+
+/** Titelpræfiks på appens tjek-rapport (`CHECKS_REPORT_TITLE` i Rust). */
+const CHECKS_REPORT_TITLE = "Tjek";
+/** Titel på appens rapport med ticketens git-ændringer (`CHANGES_REPORT_TITLE` i Rust). */
+const CHANGES_REPORT_TITLE = "Ændringer";
+/** Appens afvisningspræfiks når et tjek fejlede (`CHECKS_REJECT_PREFIX` i Rust). */
+const CHECKS_REJECT_PREFIX = "afvist af appen";
+
+/**
+ * Genkendelse af System-noterne (ordret fra `config.rs`, `dispatcher.rs`, `write_back.rs`):
+ * første match vinder; ukendte noter er `note`.
+ *
+ * | note begynder med                                                        | kind        |
+ * |--------------------------------------------------------------------------|-------------|
+ * | "startet af vagten", "vagt:"                                             | "watch"     |
+ * | "worktree oprettet"                                                      | "git"       |
+ * | "ny session", "session fortsat"                                          | "session"   |
+ * | "meldt tilbage", "issue #", "kunne ikke melde tilbage", "resultat skrevet", "tilbagemelding" | "writeBack" |
+ * | "tjek" (uanset store/små), "afvist af appen"                             | "checks"    |
+ * | andet                                                                    | "note"      |
+ */
+const NOTE_KINDS: ReadonlyArray<readonly [TimelineKind, readonly string[]]> = [
+  ["watch", ["startet af vagten", "vagt:"]],
+  ["git", ["worktree oprettet"]],
+  ["session", ["ny session", "session fortsat"]],
+  ["writeBack", ["meldt tilbage", "issue #", "kunne ikke melde tilbage", "resultat skrevet", "tilbagemelding"]],
+  ["checks", ["tjek", CHECKS_REJECT_PREFIX]],
+];
+
+function noteKind(note: string): TimelineKind {
+  const lower = note.toLowerCase();
+  for (const [kind, prefixes] of NOTE_KINDS) {
+    if (prefixes.some((p) => lower.startsWith(p))) return kind;
+  }
+  return "note";
+}
+
+/** Historikpost → linje: oprettelse, tilstandsskift (med note bagved) eller note (`from == to`). */
+function historyEntry(h: TicketHistoryEntry): TimelineEntry {
+  const by = ACTOR_LABEL[h.by];
+  const note = h.note === null ? "" : h.note.trim();
+  if (h.from === null) {
+    const text = `oprettet i ${STATE_LABEL[h.to]}`;
+    return { at: h.at, kind: "created", text: note === "" ? text : `${text} — ${note}`, by };
+  }
+  if (h.from === h.to) {
+    return { at: h.at, kind: note === "" ? "note" : noteKind(note), text: note === "" ? "(note)" : note, by };
+  }
+  const move = `${STATE_LABEL[h.from]} → ${STATE_LABEL[h.to]}`;
+  // Appens afvisning efter et fejlet tjek hører til tjekkene, ikke til de almindelige skift.
+  const kind: TimelineKind = note.toLowerCase().startsWith(CHECKS_REJECT_PREFIX) ? "checks" : "state";
+  return { at: h.at, kind, text: note === "" ? move : `${move} — ${note}`, by };
+}
+
+function isChecksReport(r: TicketReport): boolean {
+  return r.author.kind === "system" && r.title.startsWith(CHECKS_REPORT_TITLE);
+}
+
+/** Rapport → linje "rapport {id}: {titel}"; appens «Tjek …» er `checks`, «Ændringer» er `git`. */
+function reportEntry(r: TicketReport): TimelineEntry {
+  const kind: TimelineKind = isChecksReport(r)
+    ? "checks"
+    : r.author.kind === "system" && r.title === CHANGES_REPORT_TITLE
+      ? "git"
+      : "report";
+  return { at: r.createdAt, kind, text: `rapport ${r.id}: ${r.title}`, by: REPORT_AUTHOR_LABEL[r.author.kind] };
+}
+
+/**
+ * Ticketens tidslinje, ældst først, sammensat af det `get_ticket` allerede har: historik (oprettelse,
+ * tilstandsskift, noter — System-noterne genkendes på teksten, se `noteKind`), rapporter (titel og
+ * forfatter, aldrig brødtekst), `playbookStartedAt` ("forløb startet ({type}), n del-tickets" når
+ * `children` er givet, ellers uden antal) og `checks.startedAt` ("tjek kører" mens tjekkene er
+ * `pending` og ingen «Tjek»-rapport er kommet efter starten). `git` uden "worktree oprettet"-note
+ * udelades: der er ingen tid at opfinde. Stabil sortering på `at`, dernæst kilde (historik,
+ * rapporter, afledte); en afledt linje med samme `at` og tekst som en historiklinje fjernes.
+ *
+ * | ticket                                             | buildTimeline                                   |
+ * |----------------------------------------------------|-------------------------------------------------|
+ * | kun oprettet                                       | [created "oprettet i Backlog" (dig)]            |
+ * | playbookStartedAt, children 2                      | … playbook "forløb startet (Feature), 2 del-tickets" (systemet) |
+ * | note "startet af vagten (forløb «bug»)"            | … watch (systemet)                              |
+ * | rapport "Tjek: 1 fejlede" af system                | … checks "rapport 02: Tjek: 1 fejlede" (appen)  |
+ */
+export function buildTimeline(t: Ticket, opts: { children?: readonly TicketSummary[] } = {}): TimelineEntry[] {
+  const fromHistory = t.history.map(historyEntry);
+  const fromReports = t.reports.map(reportEntry);
+  const derived: TimelineEntry[] = [];
+  if (t.playbookStartedAt !== null) {
+    const head = `forløb startet (${kindLabel(t.kind)})`;
+    const children = opts.children;
+    const text =
+      children === undefined
+        ? head
+        : `${head}, ${children.length} ${children.length === 1 ? "del-ticket" : "del-tickets"}`;
+    derived.push({ at: t.playbookStartedAt, kind: "playbook", text, by: ACTOR_LABEL.system });
+  }
+  const checks = t.checks;
+  if (checks !== null && checks.state === "pending") {
+    const reported = t.reports.some((r) => isChecksReport(r) && r.createdAt >= checks.startedAt);
+    if (!reported) derived.push({ at: checks.startedAt, kind: "checks", text: "tjek kører", by: ACTOR_LABEL.system });
+  }
+  const kept = derived.filter((d) => !fromHistory.some((h) => h.at === d.at && h.text === d.text));
+  const all = [...fromHistory, ...fromReports, ...kept].map((entry, index) => ({ entry, index }));
+  all.sort((a, b) => a.entry.at - b.entry.at || a.index - b.index);
+  return all.map((x) => x.entry);
+}
+
+/**
+ * Kopiértekst: overskrift "{kort-id} {titel}", så en linje pr. post "{formatAt} · {text} ({by})".
+ *
+ * | entries           | timelineText                                              |
+ * |-------------------|-----------------------------------------------------------|
+ * | []                | "ab12cd34 Titel"                                          |
+ * | [created, state]  | "ab12cd34 Titel\n01.10. 14.05 · oprettet i Backlog (dig)\n…" |
+ */
+export function timelineText(entries: readonly TimelineEntry[], t: Pick<Ticket, "id" | "title">): string {
+  const lines = entries.map((e) => `${formatAt(e.at)} · ${e.text} (${e.by})`);
+  return [`${shortId(t.id)} ${t.title}`, ...lines].join("\n");
+}
+
+/**
+ * Antallet i foldens overskrift før `get_ticket` er hentet (tidslinjen selv kan afvige lidt):
+ * historik + rapporter + 1 for et startet forløb.
+ *
+ * | historyLen | reportCount | playbookStartedAt | timelineCount |
+ * |------------|-------------|-------------------|---------------|
+ * | 1          | 0           | null              | 1             |
+ * | 4          | 2           | 1700000000000     | 7             |
+ */
+export function timelineCount(t: Pick<TicketSummary, "historyLen" | "reportCount" | "playbookStartedAt">): number {
+  return t.historyLen + t.reportCount + (t.playbookStartedAt === null ? 0 : 1);
+}
+
+/** Lokal kalenderdag som tal (år·10000 + måned·100 + dag) til sammenligning. */
+function localDay(ms: number): number {
+  const d = new Date(ms);
+  return d.getFullYear() * 10_000 + (d.getMonth() + 1) * 100 + d.getDate();
+}
+
+/** Lokalt klokkeslæt "14.05" (da-DK). */
+function clockText(ms: number): string {
+  return new Date(ms).toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * Relativ tid på dansk ud fra `now` (uret må gerne være bagud: fremtid = "lige nu").
+ *
+ * | now − ms                        | relativeText        |
+ * |---------------------------------|---------------------|
+ * | < 60 s (eller negativ)          | "lige nu"           |
+ * | 3 min                           | "for 3 min siden"   |
+ * | 2 t, samme lokale dag           | "for 2 t siden"     |
+ * | i går (lokal kalenderdag)       | "i går 14.05"       |
+ * | ældre                           | formatAt(ms)        |
+ */
+export function relativeText(ms: number, now: number): string {
+  const diff = Math.max(0, now - ms);
+  if (diff < 60_000) return "lige nu";
+  if (diff < 3_600_000) return `for ${Math.floor(diff / 60_000)} min siden`;
+  const day = localDay(ms);
+  if (day === localDay(now)) return `for ${Math.floor(diff / 3_600_000)} t siden`;
+  const n = new Date(now);
+  // Kalenderdagen før `now` via datodelene (ikke −24 t: sommertidsskift giver 23/25-timers dage).
+  const yesterday = localDay(new Date(n.getFullYear(), n.getMonth(), n.getDate() - 1).getTime());
+  if (day === yesterday) return `i går ${clockText(ms)}`;
+  return formatAt(ms);
 }

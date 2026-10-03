@@ -388,4 +388,295 @@ eq(k.shortCwd(""), "", "shortCwd empty");
 eq(k.reviewRoundText({ reviewRound: 0 }, 5), "Runde 1 af 5", "reviewRoundText workspace max");
 eq(k.reviewRoundText({ reviewRound: 9 }, 5), "Runde 5 af 5", "reviewRoundText capped");
 
+// --- tidslinje (step 6d B6): buildTimeline, timelineText, timelineCount, relativeText ---------
+const T0 = 1_700_000_000_000;
+const hist = (at, from, to, by = "user", note = null) => ({ at, from, to, by, note });
+const noteAt = (at, note, by = "system", state = "backlog") => hist(at, state, state, by, note);
+const report = (id, title, kind, createdAt) => ({
+  id,
+  title,
+  author: { kind, agentId: kind === "agent" ? "A" : null },
+  createdAt,
+  path: `reports/${id}-x.md`,
+  size: 10,
+});
+const full = (over = {}) => ({
+  id: "ab12cd34-0000-4000-8000-000000000000",
+  title: "Titel",
+  state: "backlog",
+  assigneeAgentId: null,
+  queuePosition: null,
+  skipReview: false,
+  source: "user",
+  issue: null,
+  rejectionNote: null,
+  summary: null,
+  createdAt: T0,
+  updatedAt: T0,
+  reviewRound: 0,
+  escalated: false,
+  reviewerAgentId: null,
+  project: null,
+  parentId: null,
+  blockedBy: [],
+  kind: null,
+  playbookStartedAt: null,
+  checks: null,
+  git: null,
+  external: null,
+  body: "HEMMELIG brødtekst",
+  history: [hist(T0, null, "backlog")],
+  reports: [],
+  ...over,
+});
+const kindsOf = (entries) => entries.map((e) => e.kind);
+const textsOf = (entries) => entries.map((e) => e.text);
+
+// Tom ticket: kun oprettelsen.
+eq(k.buildTimeline(full()), [{ at: T0, kind: "created", text: "oprettet i Backlog", by: "dig" }], "timeline empty ticket");
+eq(k.buildTimeline(full({ history: [], reports: [] })), [], "timeline no history at all");
+// Oprettelse fra indbakken beholder noten.
+eq(
+  k.buildTimeline(full({ history: [hist(T0, null, "backlog", "user", "startet fra indbakken: GitHub issue #7 i o/r")] }))[0].text,
+  "oprettet i Backlog — startet fra indbakken: GitHub issue #7 i o/r",
+  "timeline created with note",
+);
+
+// Hel playbook-forælder med børn: historik, vagt-note, forløb, rapport, review.
+const parent = full({
+  kind: "feature",
+  playbookStartedAt: T0 + 2000,
+  history: [
+    hist(T0, null, "backlog"),
+    noteAt(T0 + 1000, "startet af vagten (forløb «feature»)"),
+    hist(T0 + 3000, "backlog", "waiting", "system", "venter på del-tickets (2)"),
+    noteAt(T0 + 9000, "vækket: del-ticket godkendt", "system", "waiting"),
+    hist(T0 + 10_000, "waiting", "review", "system", "forløb afsluttet: alle del-tickets godkendt"),
+  ],
+  reports: [report("01", "Plan", "agent", T0 + 5000)],
+});
+const children = [{ id: "c1", parentId: parent.id }, { id: "c2", parentId: parent.id }];
+const pt = k.buildTimeline(parent, { children });
+eq(kindsOf(pt), ["created", "watch", "playbook", "state", "report", "note", "state"], "timeline parent kinds");
+eq(
+  textsOf(pt),
+  [
+    "oprettet i Backlog",
+    "startet af vagten (forløb «feature»)",
+    "forløb startet (Feature), 2 del-tickets",
+    "Backlog → Venter — venter på del-tickets (2)",
+    "rapport 01: Plan",
+    "vækket: del-ticket godkendt",
+    "Venter → Review — forløb afsluttet: alle del-tickets godkendt",
+  ],
+  "timeline parent texts",
+);
+eq(pt.map((e) => e.by), ["dig", "systemet", "systemet", "systemet", "agenten", "systemet", "systemet"], "timeline parent by");
+eq(pt.map((e) => e.at), [T0, T0 + 1000, T0 + 2000, T0 + 3000, T0 + 5000, T0 + 9000, T0 + 10_000], "timeline parent sorted");
+// Uden children: tekst uden antal; ét barn: ental.
+eq(k.buildTimeline(parent)[2].text, "forløb startet (Feature)", "timeline playbook without children");
+eq(k.buildTimeline(parent, { children: [children[0]] })[2].text, "forløb startet (Feature), 1 del-ticket", "timeline playbook one child");
+eq(k.buildTimeline(full({ kind: "bug", playbookStartedAt: T0 + 1 }), { children: [] })[1].text, "forløb startet (Bug), 0 del-tickets", "timeline playbook bug");
+eq(k.buildTimeline(full({ kind: null, playbookStartedAt: T0 + 1 }))[1].text, "forløb startet (Opgave)", "timeline playbook plain kind");
+
+// Afvist → afvist → godkendt: tre state-linjer med by, noterne bagved; eskalering som note.
+const rr = full({
+  history: [
+    hist(T0, null, "backlog"),
+    hist(T0 + 1, "inProgress", "review", "agent"),
+    hist(T0 + 2, "review", "rejected", "agent", "mangler test"),
+    hist(T0 + 3, "rejected", "review", "agent"),
+    hist(T0 + 4, "review", "rejected", "user", "stadig ikke"),
+    noteAt(T0 + 5, "eskaleret efter 2 runder", "system", "rejected"),
+    hist(T0 + 6, "review", "done", "user"),
+  ],
+});
+const rt = k.buildTimeline(rr);
+eq(kindsOf(rt), ["created", "state", "state", "state", "state", "note", "state"], "timeline review rounds kinds");
+eq(rt[2], { at: T0 + 2, kind: "state", text: "Review → Afvist — mangler test", by: "agenten" }, "timeline rejected by agent");
+eq(rt[4], { at: T0 + 4, kind: "state", text: "Review → Afvist — stadig ikke", by: "dig" }, "timeline rejected by user");
+eq(rt[6].text, "Review → Done", "timeline approved");
+
+// Tjek fejlet → afvist af appen: Tjek-rapporten og afvisningen er `checks`; "tjek kører" forsvinder.
+const checksTicket = full({
+  checks: { state: "pending", failed: null, round: 0, startedAt: T0 + 10 },
+  history: [hist(T0, null, "backlog"), hist(T0 + 5, "inProgress", "review", "agent")],
+});
+eq(kindsOf(k.buildTimeline(checksTicket)), ["created", "state", "checks"], "timeline checks running kinds");
+eq(k.buildTimeline(checksTicket)[2], { at: T0 + 10, kind: "checks", text: "tjek kører", by: "systemet" }, "timeline checks running");
+const checksDone = full({
+  checks: { state: "failed", failed: "build", round: 0, startedAt: T0 + 10 },
+  history: [
+    hist(T0, null, "backlog"),
+    hist(T0 + 5, "inProgress", "review", "agent"),
+    hist(T0 + 30, "review", "rejected", "system", "afvist af appen: Tjek fejlede: build (exit 1). Se rapport 01."),
+  ],
+  reports: [report("01", "Tjek: 1 fejlede", "system", T0 + 20)],
+});
+const ct = k.buildTimeline(checksDone);
+eq(kindsOf(ct), ["created", "state", "checks", "checks"], "timeline checks failed kinds");
+eq(ct[2], { at: T0 + 20, kind: "checks", text: "rapport 01: Tjek: 1 fejlede", by: "appen" }, "timeline checks report");
+eq(ct[3].text, "Review → Afvist — afvist af appen: Tjek fejlede: build (exit 1). Se rapport 01.", "timeline checks rejection text");
+// Tjek-rapport efter starten fjerner "tjek kører" selv om tilstanden stadig er pending.
+eq(
+  kindsOf(k.buildTimeline(full({ ...checksTicket, reports: [report("01", "Tjek: alle bestået", "system", T0 + 20)] }))),
+  ["created", "state", "checks"],
+  "timeline checks report removes running line",
+);
+// En ældre Tjek-rapport (før startedAt) fjerner den ikke.
+eq(
+  kindsOf(k.buildTimeline(full({ ...checksTicket, reports: [report("01", "Tjek: alle bestået", "system", T0 + 1)] }))),
+  ["created", "checks", "state", "checks"],
+  "timeline older checks report keeps running line",
+);
+// Skipped checks: ingen "tjek kører".
+eq(kindsOf(k.buildTimeline(full({ checks: { state: "skipped", failed: null, round: 0, startedAt: T0 + 10 } }))), ["created"], "timeline checks skipped");
+
+// Vækning: note → state; app-genstart og agent-noter er `note`.
+const woke = full({
+  history: [
+    hist(T0, null, "backlog"),
+    noteAt(T0 + 1, "vækket: del-ticket godkendt", "system", "waiting"),
+    hist(T0 + 2, "waiting", "inProgress", "system"),
+    noteAt(T0 + 3, "app genstartet"),
+    noteAt(T0 + 4, "agent afsluttet"),
+  ],
+});
+eq(kindsOf(k.buildTimeline(woke)), ["created", "note", "state", "note", "note"], "timeline wake kinds");
+eq(k.buildTimeline(woke)[2].text, "Venter → I gang", "timeline wake state");
+
+// Skriv-tilbage fejlet → prøv igen → meldt tilbage, issue lukket, resultat skrevet, afbrudt.
+const wb = full({
+  history: [
+    hist(T0, null, "backlog"),
+    noteAt(T0 + 1, "kunne ikke melde tilbage: 502", "system", "done"),
+    noteAt(T0 + 2, "meldt tilbage til GitHub #7", "system", "done"),
+    noteAt(T0 + 3, "issue #7 lukket på GitHub", "system", "done"),
+    noteAt(T0 + 4, "resultat skrevet til inbox/done/x.result.md", "system", "done"),
+    noteAt(T0 + 5, "tilbagemelding afbrudt af genstart", "system", "done"),
+  ],
+});
+eq(kindsOf(k.buildTimeline(wb)), ["created", "writeBack", "writeBack", "writeBack", "writeBack", "writeBack"], "timeline write-back kinds");
+
+// Vagt, worktree, ny session, session fortsat, vagt-fejl, ny session fejlet.
+const sys = full({
+  history: [
+    hist(T0, null, "backlog"),
+    noteAt(T0 + 1, "startet af vagten (forløb «bug»)"),
+    noteAt(T0 + 2, "worktree oprettet: ticket/ab12cd34"),
+    noteAt(T0 + 3, "ny session til ticketen"),
+    noteAt(T0 + 4, "session fortsat i ny mappe"),
+    noteAt(T0 + 5, "vagt: forløbet kunne ikke startes: ingen agent"),
+    noteAt(T0 + 6, "ny session kunne ikke startes (x); ticketen leveres i agentens nuværende session"),
+    noteAt(T0 + 7, "tjek afbrudt af genstart"),
+    noteAt(T0 + 8, "Tjek fejlede: build (exit 1). Se rapport 01."),
+  ],
+});
+eq(
+  kindsOf(k.buildTimeline(sys)),
+  ["created", "watch", "git", "session", "session", "watch", "session", "checks", "checks"],
+  "timeline system note kinds",
+);
+eq(k.buildTimeline(sys)[2], { at: T0 + 2, kind: "git", text: "worktree oprettet: ticket/ab12cd34", by: "systemet" }, "timeline worktree note");
+// git uden "worktree oprettet"-note udelades (ingen tid at opfinde).
+eq(
+  kindsOf(k.buildTimeline(full({ git: { mode: "worktree", branch: "ticket/ab12cd34", base: "main", repo: "/r", worktree: "/w" } }))),
+  ["created"],
+  "timeline git without note is omitted",
+);
+// writeBack-tilstand uden noter giver ingen linje (inflight er forbigående).
+eq(
+  kindsOf(
+    k.buildTimeline(
+      full({
+        external: {
+          kind: "github", externalId: "7", repo: "o/r", number: 7, path: null, url: null, title: "x", labels: [], author: null, notes: [],
+          inboxItemId: "i", importedAt: T0, inherited: false, project: null, skipReview: false,
+          writeBack: { comment: "inflight", close: "none", commentUrl: null, commentedAt: null, closedAt: null, attempts: 1, lastError: null, lastBody: "BODY" },
+        },
+      }),
+    ),
+  ),
+  ["created"],
+  "timeline write-back inflight is omitted",
+);
+
+// Rapporter: forfatter-etiketter; «Ændringer» fra appen er `git`; en agent-rapport "Tjek…" er en almindelig rapport.
+const reps = full({
+  reports: [
+    report("01", "Plan", "agent", T0 + 1),
+    report("02", "Note fra mig", "user", T0 + 2),
+    report("03", "Ændringer", "system", T0 + 3),
+    report("04", "Tjek af noget", "agent", T0 + 4),
+  ],
+});
+const rp = k.buildTimeline(reps);
+eq(kindsOf(rp), ["created", "report", "report", "git", "report"], "timeline report kinds");
+eq(rp.slice(1).map((e) => e.by), ["agenten", "dig", "appen", "agenten"], "timeline report by");
+eq(rp[3].text, "rapport 03: Ændringer", "timeline changes report text");
+
+// Samme `at`: kilde-rækkefølgen holder (historik, rapporter, afledte), og historikken holder sin rækkefølge.
+const same = full({
+  playbookStartedAt: T0,
+  history: [hist(T0, null, "backlog"), noteAt(T0, "startet af vagten (forløb «bug»)"), hist(T0, "backlog", "assigned", "system")],
+  reports: [report("01", "Plan", "agent", T0)],
+});
+eq(kindsOf(k.buildTimeline(same, { children: [] })), ["created", "watch", "state", "report", "playbook"], "timeline same at keeps source order");
+// Dublet: en afledt linje med samme `at` og tekst som en note fjernes.
+eq(
+  kindsOf(k.buildTimeline(full({ checks: { state: "pending", failed: null, round: 0, startedAt: T0 + 1 }, history: [hist(T0, null, "backlog"), noteAt(T0 + 1, "tjek kører")] }))),
+  ["created", "checks"],
+  "timeline derived duplicate removed",
+);
+// Tom note bliver "(note)" i stedet for en tom linje.
+eq(k.buildTimeline(full({ history: [noteAt(T0, "")] }))[0], { at: T0, kind: "note", text: "(note)", by: "systemet" }, "timeline empty note");
+
+// Ingen eksterne brødtekster: hverken body, lastBody eller rapporttekster når tidslinjen.
+const leaky = full({
+  body: "LEAK-BODY",
+  external: {
+    kind: "github", externalId: "7", repo: "o/r", number: 7, path: null, url: null, title: "LEAK-TITLE", labels: [], author: "LEAK-AUTHOR", notes: ["LEAK-NOTE"],
+    inboxItemId: "i", importedAt: T0, inherited: false, project: null, skipReview: false,
+    writeBack: { comment: "failed", close: "none", commentUrl: null, commentedAt: null, closedAt: null, attempts: 1, lastError: "LEAK-ERR", lastBody: "LEAK-LASTBODY" },
+  },
+  reports: [report("01", "Plan", "agent", T0 + 1)],
+});
+const leakText = k.timelineText(k.buildTimeline(leaky, { children: [] }), leaky);
+eq(/LEAK-/.test(leakText), false, "timeline has no external body texts");
+eq(/HEMMELIG/.test(k.timelineText(k.buildTimeline(full()), full())), false, "timeline has no ticket body");
+
+// timelineText: overskrift + "{formatAt} · {text} ({by})" pr. linje.
+const tl = k.buildTimeline(full({ history: [hist(T0, null, "backlog"), hist(T0 + 60_000, "backlog", "assigned", "user")] }));
+eq(
+  k.timelineText(tl, full()),
+  [`ab12cd34 Titel`, `${k.formatAt(T0)} · oprettet i Backlog (dig)`, `${k.formatAt(T0 + 60_000)} · Backlog → I kø (dig)`].join("\n"),
+  "timelineText format",
+);
+eq(k.timelineText([], full()), "ab12cd34 Titel", "timelineText empty");
+
+// timelineCount
+eq(k.timelineCount({ historyLen: 1, reportCount: 0, playbookStartedAt: null }), 1, "timelineCount plain");
+eq(k.timelineCount({ historyLen: 4, reportCount: 2, playbookStartedAt: T0 }), 7, "timelineCount playbook");
+
+// relativeText: grænserne (lokal middag, så "i dag"/"i går" ikke afhænger af tidszonen).
+const noon = new Date(2026, 9, 3, 12, 0, 0).getTime();
+const clock = (ms) => new Date(ms).toLocaleTimeString("da-DK", { hour: "2-digit", minute: "2-digit" });
+for (const [ms, want, msg] of [
+  [noon, "lige nu", "0"],
+  [noon + 5000, "lige nu", "future (clock went back)"],
+  [noon - 59_000, "lige nu", "59 s"],
+  [noon - 60_000, "for 1 min siden", "60 s"],
+  [noon - 3 * 60_000, "for 3 min siden", "3 min"],
+  [noon - 59 * 60_000 - 59_000, "for 59 min siden", "59 min 59 s"],
+  [noon - 60 * 60_000, "for 1 t siden", "60 min"],
+  [noon - 2 * 3_600_000, "for 2 t siden", "2 t"],
+  [noon - 11 * 3_600_000, "for 11 t siden", "11 t (same day)"],
+  [noon - 13 * 3_600_000, `i går ${clock(noon - 13 * 3_600_000)}`, "13 t (yesterday 23)"],
+  [noon - 20 * 3_600_000, `i går ${clock(noon - 20 * 3_600_000)}`, "20 t (yesterday)"],
+  [noon - 35 * 3_600_000, `i går ${clock(noon - 35 * 3_600_000)}`, "35 t (yesterday morning)"],
+  [noon - 37 * 3_600_000, k.formatAt(noon - 37 * 3_600_000), "37 t (two days ago)"],
+  [noon - 3 * 86_400_000, k.formatAt(noon - 3 * 86_400_000), "3 days"],
+])
+  eq(k.relativeText(ms, noon), want, `relativeText ${msg}`);
+
 console.log(`tickets.ts: ${n} cases ok`);

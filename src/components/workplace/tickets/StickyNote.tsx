@@ -28,10 +28,12 @@ import {
 import { isExited } from "../../../lib/status";
 import {
   ACTOR_LABEL,
+  buildTimeline,
   canDelete,
   canStartPlaybook,
   canReturnWaiting,
   checksBadge,
+  childrenOf,
   gitBadge,
   kindLabel,
   canDrag,
@@ -44,11 +46,15 @@ import {
   ISSUE_LABEL,
   parentOf,
   progressOf,
+  relativeText,
   shortId,
   STATE_BADGE_CLASS,
   STATE_LABEL,
   ticketDragId,
+  timelineCount,
+  timelineText,
   WAITING_HINT,
+  type TimelineEntry,
 } from "../../../lib/tickets";
 import type { AgentInfo, TicketHistoryEntry, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
@@ -336,6 +342,7 @@ function NoteFrame(props: FrameProps) {
           <NoteActions ticket={t} agent={agent} onNotice={props.onNotice} />
           {/* The review card shows the reports unfolded itself. */}
           {t.state !== "review" && <ReportsSection ticket={t} />}
+          <TimelineFold ticket={t} />
           <HistoryFold ticket={t} />
         </div>
       )}
@@ -582,6 +589,130 @@ function HistoryFold({ ticket: t }: { ticket: TicketSummary }) {
                 </li>
               ))}
             </ol>
+          )}
+    </details>
+  );
+}
+
+/** Kopiér til udklipsholderen; `false` når API'et mangler eller nægter (så viser folden en tekst). */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard !== undefined) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // falder tilbage til execCommand nedenfor
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Tidslinje (step 6d): historik, rapporter og afledte linjer i én kronologisk liste
+ * (`buildTimeline`), hentet med `getTicket` mens folden er åben, som `HistoryFold`. Overskriften
+ * viser `timelineCount` før hentningen og det reelle antal efter. Hver linje: relativ tid (title =
+ * klokkeslæt), tekst og hvem. "Kopiér" lægger `timelineText` i udklipsholderen.
+ */
+function TimelineFold({ ticket: t }: { ticket: TicketSummary }) {
+  const { state } = useStore();
+  const [open, setOpen] = useState(false);
+  const [entries, setEntries] = useState<TimelineEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<"ok" | "failed" | null>(null);
+  const children = childrenOf(t.id, state.tickets);
+  const childCount = children.length;
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    getTicket(t.id)
+      .then((full) => {
+        if (!alive) return;
+        setEntries(buildTimeline(full, { children: childrenOf(full.id, state.tickets) }));
+        setError(null);
+      })
+      .catch((e: unknown) => {
+        if (alive) setError(errorMessage(e));
+      });
+    return () => {
+      alive = false;
+    };
+    // Refetch when the ticket (or the number of its children) changes while unfolded.
+  }, [open, t.id, t.historyLen, t.reportCount, t.updatedAt, childCount]);
+
+  useEffect(() => {
+    if (copied === null) return;
+    const timer = window.setTimeout(() => setCopied(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const now = Date.now();
+  const count = entries === null ? timelineCount(t) : entries.length;
+
+  return (
+    <details className="mt-1.5" onToggle={(e) => setOpen(e.currentTarget.open)}>
+      <summary className="cursor-pointer select-none text-[11px] opacity-70 hover:opacity-100">
+        Tidslinje ({count})
+      </summary>
+      {error !== null && (
+        <p className="mt-1 text-[11px] text-rose-600 dark:text-rose-300" role="alert">
+          {error}
+        </p>
+      )}
+      {entries === null
+        ? error === null && <p className="mt-1 text-[11px] opacity-70">Henter…</p>
+        : (
+            <>
+              <div className="mt-1 flex items-center gap-2 text-[11px]">
+                <button
+                  type="button"
+                  className={smallBtn}
+                  onClick={() => {
+                    void copyText(timelineText(entries, t)).then((ok) => setCopied(ok ? "ok" : "failed"));
+                  }}
+                  disabled={entries.length === 0}
+                >
+                  Kopiér
+                </button>
+                {copied === "ok" && (
+                  <span className="opacity-70" role="status">
+                    Kopieret
+                  </span>
+                )}
+                {copied === "failed" && (
+                  <span className="text-rose-600 dark:text-rose-300" role="status">
+                    Kunne ikke kopiere
+                  </span>
+                )}
+              </div>
+              {entries.length === 0 ? (
+                <p className="mt-1 text-[11px] opacity-70">(ingen hændelser)</p>
+              ) : (
+                <ol className="mt-1 space-y-0.5 text-[11px]">
+                  {entries.map((e, i) => (
+                    <li key={`${e.at}-${e.kind}-${i}`} className="break-words">
+                      <span className="font-mono opacity-70" title={formatAt(e.at)}>
+                        {relativeText(e.at, now)}
+                      </span>{" "}
+                      {e.text} <span className="opacity-70">({e.by})</span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </>
           )}
     </details>
   );
