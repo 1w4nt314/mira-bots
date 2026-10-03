@@ -11,25 +11,34 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   errorMessage,
   getAppInfo,
+  getInbox,
+  getWatch,
   listAgents,
+  listNotices,
   listPendingPermissions,
   listProfiles,
   listProjects,
   listTickets,
   onAgentsChanged,
+  onInboxChanged,
+  onNoticesChanged,
   onPermissionRequest,
   onPermissionResolved,
   onProfilesChanged,
   onTicketsChanged,
+  onWatchChanged,
   uiReady,
 } from "../lib/ipc";
 import type {
   AgentInfo,
   AgentProfile,
   AppInfo,
+  InboxPayload,
+  NoticesPayload,
   PermissionRequestInfo,
   Project,
   TicketSummary,
+  WatchView,
 } from "../lib/types";
 
 export interface State {
@@ -45,6 +54,18 @@ export interface State {
   profiles: AgentProfile[];
   /** The project folders under the projects root (`listProjects`; refreshed on demand). */
   projects: Project[];
+  /**
+   * The inbox (step 6c): items without body and the status per source. null until the first
+   * answer. Both windows load it; only the workplace polls (`useInboxPolling`).
+   */
+  inbox: InboxPayload | null;
+  /**
+   * The watch (step 6d): active projects, budgets and parked inbox items. null until the first
+   * answer. Pushed by `watch-changed` (the backend's timer); neither window polls it.
+   */
+  watch: WatchView | null;
+  /** The notice queue (step 6d), newest first; pushed by `notices-changed`. null until loaded. */
+  notices: NoticesPayload | null;
 }
 
 export type Action =
@@ -57,7 +78,10 @@ export type Action =
   | { type: "appInfo/set"; appInfo: AppInfo }
   | { type: "tickets/set"; tickets: TicketSummary[] }
   | { type: "profiles/set"; profiles: AgentProfile[] }
-  | { type: "projects/set"; projects: Project[] };
+  | { type: "projects/set"; projects: Project[] }
+  | { type: "inbox/set"; inbox: InboxPayload }
+  | { type: "watch/set"; watch: WatchView }
+  | { type: "notices/set"; notices: NoticesPayload };
 
 export const initialState: State = {
   agents: [],
@@ -68,6 +92,9 @@ export const initialState: State = {
   tickets: [],
   profiles: [],
   projects: [],
+  inbox: null,
+  watch: null,
+  notices: null,
 };
 
 export function reducer(state: State, action: Action): State {
@@ -93,6 +120,12 @@ export function reducer(state: State, action: Action): State {
       return { ...state, profiles: action.profiles };
     case "projects/set":
       return { ...state, projects: action.projects };
+    case "inbox/set":
+      return { ...state, inbox: action.inbox };
+    case "watch/set":
+      return { ...state, watch: action.watch };
+    case "notices/set":
+      return { ...state, notices: action.notices };
   }
 }
 
@@ -116,6 +149,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // A `tickets-changed` that arrives before the initial `listTickets()` answer is newer.
     let ticketsFromEvent = false;
     let profilesFromEvent = false;
+    let inboxFromEvent = false;
+    let watchFromEvent = false;
+    let noticesFromEvent = false;
 
     // W4: the limits and reviewByDefault come from the workspace file, which may change while
     // the app runs (no file watcher). Fetch the app info again after agent/ticket changes and
@@ -166,6 +202,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             profilesFromEvent = true;
             dispatch({ type: "profiles/set", profiles });
           }),
+          onInboxChanged((inbox) => {
+            inboxFromEvent = true;
+            dispatch({ type: "inbox/set", inbox });
+          }),
+          // Step 6d: both windows listen; the backend's timer pushes, nothing polls here.
+          onWatchChanged((watch) => {
+            watchFromEvent = true;
+            dispatch({ type: "watch/set", watch });
+          }),
+          onNoticesChanged((notices) => {
+            noticesFromEvent = true;
+            dispatch({ type: "notices/set", notices });
+          }),
         ]);
         if (cancelled) {
           for (const u of subs) u();
@@ -177,14 +226,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // Both windows load the tickets; the island only uses the review count.
         // Profiles feed the spawn dialog and the "Agenter" tab (both windows keep them current).
         // Projects are optional for the start: a failure gives an empty list, no error.
-        const [agents, pending, appInfo, tickets, profiles, projects] = await Promise.all([
-          listAgents(),
-          listPendingPermissions(),
-          getAppInfo(),
-          listTickets(),
-          listProfiles(),
-          listProjects().catch(() => [] as Project[]),
-        ]);
+        // The inbox is optional too: a failure leaves it null (the next `inbox-changed` fills it).
+        // So are the watch and the notices (step 6d): the next event fills them.
+        const [agents, pending, appInfo, tickets, profiles, projects, inbox, watch, notices] =
+          await Promise.all([
+            listAgents(),
+            listPendingPermissions(),
+            getAppInfo(),
+            listTickets(),
+            listProfiles(),
+            listProjects().catch(() => [] as Project[]),
+            getInbox().catch(() => null),
+            getWatch().catch(() => null),
+            listNotices().catch(() => null),
+          ]);
         if (cancelled) return;
         dispatch({ type: "agents/set", agents });
         if (!ticketsFromEvent) dispatch({ type: "tickets/set", tickets });
@@ -192,6 +247,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         for (const request of pending) dispatch({ type: "permission/add", request });
         dispatch({ type: "appInfo/set", appInfo });
         dispatch({ type: "projects/set", projects });
+        if (!inboxFromEvent && inbox !== null) dispatch({ type: "inbox/set", inbox });
+        if (!watchFromEvent && watch !== null) dispatch({ type: "watch/set", watch });
+        if (!noticesFromEvent && notices !== null) dispatch({ type: "notices/set", notices });
       } catch (e) {
         if (!cancelled) dispatch({ type: "error/set", error: errorMessage(e) });
       }

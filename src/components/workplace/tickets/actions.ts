@@ -1,7 +1,8 @@
 // Workplace-level callbacks the ticket components need (selection and the spawn dialog live in
 // Workplace). A context instead of threading them through Sidebar -> TicketsPanel -> StickyNote.
 import { createContext, useCallback, useContext } from "react";
-import { errorMessage } from "../../../lib/ipc";
+import { errorMessage, startPlaybook } from "../../../lib/ipc";
+import { playbookStartedText } from "../../../lib/tickets";
 import type { AgentInfo, SeatKind, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 
@@ -18,6 +19,15 @@ export interface TicketActions {
    * "Flyt agenten til «p»".
    */
   assignTo: (ticket: TicketSummary, agent: AgentInfo) => void;
+  /** "Opdatér" in the inbox (step 6c): a manual fetch with a 5 s floor (Workplace's polling hook). */
+  refreshInbox: () => void;
+  /**
+   * Step 6d: shows a ticket on the Tickets tab (a click on a notice or the island's badge). The
+   * panel lifts its project filter when it hides the ticket, scrolls to the note and rings it.
+   */
+  selectTicket: (ticketId: string) => void;
+  /** The latest `selectTicket` (full id); a new nonce re-applies the same ticket. */
+  selectedTicket: { id: string; nonce: number } | null;
 }
 
 const noop = () => {};
@@ -31,6 +41,9 @@ export const TicketActionsContext = createContext<TicketActions>({
   spawnWithTicket: noop,
   spawnBlocked: { work: null, staff: null },
   assignTo: noop,
+  refreshInbox: noop,
+  selectTicket: noop,
+  selectedTicket: null,
 });
 
 export function useTicketActions(): TicketActions {
@@ -54,5 +67,30 @@ export function useRun(): (action: () => Promise<unknown>) => Promise<boolean> {
       }
     },
     [dispatch],
+  );
+}
+
+/**
+ * "Start forløb" (step 6b): asks the backend to create the playbook's child tickets. Only ever
+ * called from a click. On success `onNotice` gets "Forløb startet: n del-tickets" plus the
+ * backend's notes (what could not be assigned); a failure goes to the store's error line.
+ */
+export function useStartPlaybook(): (
+  ticket: TicketSummary,
+  onNotice?: (text: string) => void,
+) => Promise<boolean> {
+  const run = useRun();
+  return useCallback(
+    async (ticket: TicketSummary, onNotice?: (text: string) => void) => {
+      const box: { result: Awaited<ReturnType<typeof startPlaybook>> | null } = { result: null };
+      const ok = await run(async () => {
+        box.result = await startPlaybook(ticket.id);
+      });
+      const result = box.result;
+      if (!ok || result === null) return false;
+      onNotice?.(playbookStartedText(result.children.length, result.notes));
+      return true;
+    },
+    [run],
   );
 }

@@ -20,6 +20,7 @@ import {
   errorMessage,
   onWorkplaceSelect,
   quitApp,
+  setWatch,
   takeWorkplaceSelection,
 } from "../../lib/ipc";
 import {
@@ -38,9 +39,10 @@ import {
   type OfficeDetail,
   type TermMode,
 } from "../../lib/office";
+import { canDragInbox, draggedInboxId, inboxDragTitle } from "../../lib/inbox";
 import { readLocal, writeLocal } from "../../lib/persist";
 import { isMacShortcut } from "../../lib/platform";
-import { assignmentIssue, coordinatorHint, projectIdOf } from "../../lib/projects";
+import { assignmentIssue, backlogHint, coordinatorHint, projectIdOf, type SeatHint } from "../../lib/projects";
 import { assignSeats, STAFF_SEATS, WORK_SEATS } from "../../lib/seats";
 import { isExited } from "../../lib/status";
 import {
@@ -52,12 +54,14 @@ import {
 } from "../../lib/tickets";
 import type {
   AgentInfo,
+  InboxItemSummary,
   ProjectRef,
   SeatKind,
   TicketSummary,
   WorkplaceSelection,
   WorkplaceTab,
 } from "../../lib/types";
+import { showResumeWatch, showStopWatch, watchChipText } from "../../lib/watch";
 import { useRefreshProjects, useStore } from "../../state/store";
 import MoveAgentDialog from "./MoveAgentDialog";
 import OfficeDefs from "./office/OfficeDefs";
@@ -67,8 +71,12 @@ import SeatGrid, { SeatOverflow } from "./SeatGrid";
 import Sidebar from "./Sidebar";
 import SpawnDialog from "./SpawnDialog";
 import TerminalPanel from "./TerminalPanel";
-import { TicketActionsContext, type TicketActions } from "./tickets/actions";
+import { TicketActionsContext, useRun, type TicketActions } from "./tickets/actions";
+import InboxCard from "./tickets/InboxCard";
+import NoticesMenu from "./tickets/NoticesMenu";
+import StartInboxDialog, { type StartInboxTarget } from "./tickets/StartInboxDialog";
 import StickyNote from "./tickets/StickyNote";
+import { useInboxPolling } from "./tickets/useInboxPolling";
 
 /** The pointer decides the target; keyboard drags have no pointer, so the nearest seat wins. */
 const collision: CollisionDetection = (args) =>
@@ -77,6 +85,8 @@ const collision: CollisionDetection = (args) =>
 export default function Workplace() {
   const { state, dispatch } = useStore();
   const { agents, appInfo, error, tickets } = state;
+  // Step 6c: the inbox polling lives here and nowhere else (never in the island).
+  const { refreshNow: refreshInbox } = useInboxPolling();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [spawnFor, setSpawnFor] = useState<{
     seatKind: SeatKind;
@@ -85,7 +95,18 @@ export default function Workplace() {
   const [requestedTab, setRequestedTab] = useState<{ tab: WorkplaceTab; nonce: number } | null>(
     null,
   );
+  // Step 6d: the ticket a notice or the island asked for; TicketsPanel acts on it (filter,
+  // scroll, ring). A new nonce re-applies the same ticket.
+  const [selectedTicket, setSelectedTicket] = useState<{ id: string; nonce: number } | null>(null);
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
+  // Step 6c B5: an inbox card being dragged, and the Start dialog its drop opens (with the seat
+  // as target). Nothing starts before the dialog's button is clicked.
+  const [activeInboxId, setActiveInboxId] = useState<string | null>(null);
+  const [startFor, setStartFor] = useState<{ item: InboxItemSummary; target: StartInboxTarget } | null>(
+    null,
+  );
+  // "Startet som ticket {short}" after a drop-started item (the panel shows its own for clicks).
+  const [notice, setNotice] = useState<string | null>(null);
   // Step 4b: an assignment that needs a project ("Hvilket projekt?") or meets another project
   // (explanation + "Flyt agenten til «p»"); opened after a drop or from "Tildel…", never during
   // the drag itself.
@@ -126,6 +147,17 @@ export default function Workplace() {
     () => new Map<string, TicketSummary>(tickets.map((t) => [t.id, t])),
     [tickets],
   );
+
+  const inboxById = useMemo(
+    () => new Map<string, InboxItemSummary>((state.inbox?.items ?? []).map((i) => [i.id, i])),
+    [state.inbox],
+  );
+
+  useEffect(() => {
+    if (notice === null) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
 
   useEffect(() => writeLocal(STORAGE_KEYS.detail, detail), [detail]);
   useEffect(() => writeLocal(STORAGE_KEYS.termMode, termMode), [termMode]);
@@ -178,6 +210,12 @@ export default function Workplace() {
     setTermMode((m) => (m === "min" ? "normal" : m));
   }, []);
 
+  // Step 6d: show a ticket (full id) on the Tickets tab; the panel does the rest.
+  const selectTicket = useCallback((id: string) => {
+    setRequestedTab((prev) => ({ tab: "tickets", nonce: (prev?.nonce ?? 0) + 1 }));
+    setSelectedTicket((prev) => ({ id, nonce: (prev?.nonce ?? 0) + 1 }));
+  }, []);
+
   // Latest spawn blocks, read by `apply` below (its effect must not re-run when they change).
   const spawnBlockedRef = useRef<{ work: string | null; staff: string | null }>({
     work: null,
@@ -217,6 +255,9 @@ export default function Workplace() {
       }
       const tab = parseWorkplaceTab(sel.tab);
       if (tab !== null) setRequestedTab((prev) => ({ tab, nonce: (prev?.nonce ?? 0) + 1 }));
+      // Step 6d: the backend resolved `ticketId` to a full id (`check_ticket`); older payloads
+      // have no field at all.
+      if (typeof sel.ticketId === "string" && sel.ticketId !== "") selectTicket(sel.ticketId);
     };
     takeWorkplaceSelection()
       .then((sel) => {
@@ -242,7 +283,7 @@ export default function Workplace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [dispatch, selectAgent, openSpawn]);
+  }, [dispatch, selectAgent, selectTicket, openSpawn]);
 
   // Cmd+Q / Cmd+W on macOS only (the app runs as an Accessory app without a menu bar, so the
   // keys are handled here; isMacShortcut is false on every other platform). Cmd+Q quits at once,
@@ -317,15 +358,36 @@ export default function Workplace() {
       spawnWithTicket: (seatKind, ticket) => setSpawnFor({ seatKind, ticket }),
       spawnBlocked: { work: spawnBlockedWork, staff: spawnBlockedStaff },
       assignTo,
+      refreshInbox,
+      selectTicket,
+      selectedTicket,
     }),
-    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo],
+    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo, refreshInbox, selectTicket, selectedTicket],
   );
-  // "n agenter, ingen koordinator" per work agent's project (the Seat badge).
-  const hintFor = useCallback(
-    (a: AgentInfo) =>
-      a.seatKind === "work" && a.project !== null ? coordinatorHint(agents, a.project) : null,
-    [agents],
-  );
+  // Office hints per work agent (step 6a): "n agenter, ingen koordinator" for the project, plus
+  // the backlog hint ("coder-01 er ledig: n tickets uden ejer") on the one idle agent it names.
+  // Computed once per project; the button that acts on it lives in the Tickets panel.
+  const hintsByAgent = useMemo(() => {
+    const out = new Map<string, SeatHint>();
+    const idleByProject = new Map<string, { id: string; text: string } | null>();
+    for (const a of agents) {
+      if (a.seatKind !== "work" || a.project === null) continue;
+      const key = a.project.toLowerCase();
+      let idle = idleByProject.get(key);
+      if (idle === undefined) {
+        const h = backlogHint(agents, tickets, a.project);
+        idle = h === null ? null : { id: h.agent.id, text: h.text };
+        idleByProject.set(key, idle);
+      }
+      const hint: SeatHint = {
+        coordinator: coordinatorHint(agents, a.project),
+        idle: idle !== null && idle.id === a.id ? idle.text : null,
+      };
+      if (hint.coordinator !== null || hint.idle !== null) out.set(a.id, hint);
+    }
+    return out;
+  }, [agents, tickets]);
+  const hintFor = useCallback((a: AgentInfo): SeatHint | null => hintsByAgent.get(a.id) ?? null, [hintsByAgent]);
 
   // --- drag-and-drop: backlog notes (sidebar) onto seats ---------------------------------------
   // TODO(windows-verify): PointerSensor in WebView2 — dragging a note from the sidebar to a seat
@@ -339,11 +401,13 @@ export default function Workplace() {
 
   const titleOf = useCallback(
     (id: string | number) => {
+      const iid = draggedInboxId(String(id));
+      if (iid !== null) return inboxDragTitle(inboxById.get(iid));
       const tid = draggedTicketId(String(id));
       const t = tid === null ? undefined : ticketsById.get(tid);
       return t === undefined ? "ticketen" : `ticket ${t.shortId}`;
     },
-    [ticketsById],
+    [ticketsById, inboxById],
   );
   const seatOf = useCallback(
     (id: string | number) => {
@@ -372,12 +436,34 @@ export default function Workplace() {
       "Tryk mellemrum eller Enter for at tage ticketen. Flyt med piletasterne, slip med mellemrum eller Enter, annuller med Escape. Eller brug knappen Tildel.",
   };
 
-  const onDragStart = (e: DragStartEvent) => setActiveTicketId(draggedTicketId(String(e.active.id)));
+  const onDragStart = (e: DragStartEvent) => {
+    setActiveTicketId(draggedTicketId(String(e.active.id)));
+    setActiveInboxId(draggedInboxId(e.active.id));
+  };
+  const clearDrag = () => {
+    setActiveTicketId(null);
+    setActiveInboxId(null);
+  };
 
   const onDragEnd = (e: DragEndEvent) => {
-    setActiveTicketId(null);
-    const ticketId = draggedTicketId(String(e.active.id));
+    clearDrag();
     const target = e.over ? dropTarget(String(e.over.id)) : null;
+    // Step 6c B5: an inbox item opens the Start dialog with the seat as target (agent → "Start
+    // og tildel til {agent}", project locked to the agent's; empty seat → the spawn dialog after
+    // the ticket is created). Only new items; the dialog's click is the confirmation.
+    const inboxId = draggedInboxId(e.active.id);
+    if (inboxId !== null) {
+      const item = inboxById.get(inboxId);
+      if (target === null || item === undefined || !canDragInbox(item)) return;
+      if (target.kind === "agent") {
+        const agent = agents.find((a) => a.id === target.agentId);
+        if (agent !== undefined) setStartFor({ item, target: { kind: "agent", agent } });
+      } else {
+        setStartFor({ item, target: { kind: "empty", seatKind: target.seatKind } });
+      }
+      return;
+    }
+    const ticketId = draggedTicketId(String(e.active.id));
     if (ticketId === null || target === null) return;
     const ticket = ticketsById.get(ticketId);
     if (ticket === undefined || !canDrag(ticket)) return;
@@ -392,6 +478,7 @@ export default function Workplace() {
   };
 
   const activeTicket = activeTicketId === null ? null : (ticketsById.get(activeTicketId) ?? null);
+  const activeInbox = activeInboxId === null ? null : (inboxById.get(activeInboxId) ?? null);
 
   // Height for the floor and the terminal in normal mode: the column minus the splitter and the
   // overflow list. Before the first measurement it is NaN: clampFloorHeight then skips the upper
@@ -452,11 +539,20 @@ export default function Workplace() {
           >
             Kontor: {detail === "more" ? "Lidt mere" : "Diskret"}
           </button>
-          {error !== null && (
-            <span className="ml-auto truncate text-xs text-rose-500" role="alert" title={error}>
-              {error}
-            </span>
-          )}
+          <div className="ml-auto flex min-w-0 items-center gap-3">
+            {notice !== null && (
+              <span className="truncate text-xs text-emerald-700 dark:text-emerald-300" role="status">
+                {notice}
+              </span>
+            )}
+            {error !== null && (
+              <span className="truncate text-xs text-rose-500" role="alert" title={error}>
+                {error}
+              </span>
+            )}
+            <WatchSwitch />
+            <NoticesMenu />
+          </div>
         </header>
         <DndContext
           sensors={sensors}
@@ -464,7 +560,7 @@ export default function Workplace() {
           accessibility={{ announcements, screenReaderInstructions }}
           onDragStart={onDragStart}
           onDragEnd={onDragEnd}
-          onDragCancel={() => setActiveTicketId(null)}
+          onDragCancel={clearDrag}
         >
           <main className="grid min-h-0 flex-1 grid-cols-[1fr_340px]">
             <section ref={sectionRef} className="relative flex min-h-0 min-w-0 flex-col">
@@ -484,7 +580,7 @@ export default function Workplace() {
                   spawnDisabled={spawnDisabled}
                   limits={{ work: liveWork >= maxWork, staff: liveStaff >= maxStaff }}
                   tickets={ticketsById}
-                  dragging={activeTicket !== null}
+                  dragging={activeTicket !== null || activeInbox !== null}
                   draggedTicket={activeTicket}
                   hintFor={hintFor}
                   onSelect={selectAgent}
@@ -529,6 +625,7 @@ export default function Workplace() {
             {activeTicket !== null && (
               <StickyNote ticket={activeTicket} agent={null} draggable={false} compact interactive={false} />
             )}
+            {activeInbox !== null && <InboxCard item={activeInbox} compact />}
           </DragOverlay>
         </DndContext>
         {spawnFor !== null && (
@@ -542,6 +639,17 @@ export default function Workplace() {
               setSpawnFor(null);
               selectAgent(id);
               void refreshProjects();
+            }}
+          />
+        )}
+        {startFor !== null && (
+          <StartInboxDialog
+            item={startFor.item}
+            target={startFor.target}
+            onClose={() => setStartFor(null)}
+            onStarted={(t) => {
+              setStartFor(null);
+              setNotice(`Startet som ticket ${t.shortId}`);
             }}
           />
         )}
@@ -609,5 +717,57 @@ export default function Workplace() {
           })()}
       </div>
     </TicketActionsContext.Provider>
+  );
+}
+
+/**
+ * Step 6d: "Vagt: n projekter" + "Stop vagten" (or "Vagt: pause" + "Start vagten igen") in the
+ * header, like the island's chips. The master pause lives in the app's settings; nothing here
+ * touches `project.json`.
+ */
+function WatchSwitch() {
+  const { state, dispatch } = useStore();
+  const run = useRun();
+  const chip = watchChipText(state.watch);
+  const stop = showStopWatch(state.watch);
+  const resume = showResumeWatch(state.watch);
+  if (chip === null && !stop && !resume) return null;
+  const toggle = (on: boolean) =>
+    void run(async () => {
+      dispatch({ type: "watch/set", watch: await setWatch(null, on) });
+    });
+  const btn =
+    "shrink-0 rounded-md border border-[var(--border)] px-2 py-0.5 text-[11px] hover:border-[var(--accent)]";
+  return (
+    <span className="flex shrink-0 items-center gap-2 text-xs">
+      {chip !== null && (
+        <span
+          className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[11px] text-sky-800 dark:text-sky-200"
+          title="Vagten holder øje med indbakken — se Diagnostik → Projekter"
+        >
+          {chip}
+        </span>
+      )}
+      {stop && (
+        <button
+          type="button"
+          onClick={() => toggle(false)}
+          title="Sæt vagten på pause for alle projekter (gemmes i appens indstillinger, ikke i project.json)"
+          className={btn}
+        >
+          Stop vagten
+        </button>
+      )}
+      {resume && (
+        <button
+          type="button"
+          onClick={() => toggle(true)}
+          title="Start vagten igen for de projekter der tillader den"
+          className={btn}
+        >
+          Start vagten igen
+        </button>
+      )}
+    </span>
   );
 }

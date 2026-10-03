@@ -205,6 +205,8 @@ pub struct AgentManager {
     by_session: HashMap<String, AgentId>,
     max_work: usize,
     max_staff: usize,
+    /// Step 6d (A.11): set by [`AgentManager::kill_all`]; `spawn`/`restart` refuse afterwards.
+    closing: bool,
 }
 
 fn is_exited(s: &AgentStatus) -> bool {
@@ -418,7 +420,13 @@ impl AgentManager {
             by_session: HashMap::new(),
             max_work,
             max_staff,
+            closing: false,
         }
+    }
+
+    /// `true` after [`Self::kill_all`]: no new children are started (step 6d A.11).
+    pub fn is_closing(&self) -> bool {
+        self.closing
     }
 
     /// Agents that have not exited, all seat kinds.
@@ -452,6 +460,16 @@ impl AgentManager {
     /// anything (a project folder, a ticket file; plan4b C4b.4).
     pub fn can_spawn(&self, seat: SeatKind) -> Result<(), AgentError> {
         self.check_limit(seat)
+    }
+
+    /// Frie pladser af den slags (loftet minus levende agenter; trin 6d A.5: vagtens
+    /// forhåndstjek tæller én pr. manglende rolle).
+    pub fn free_seats(&self, seat: SeatKind) -> usize {
+        let max = match seat {
+            SeatKind::Work => self.max_work,
+            SeatKind::Staff => self.max_staff,
+        };
+        max.saturating_sub(self.running_in(seat))
     }
 
     /// Changes the seat limits (from the workspace rules, plan4b A.4); running agents are never
@@ -509,14 +527,17 @@ impl AgentManager {
             .any(|a| !is_exited(&a.info.status) && a.info.roles.contains(&Role::Coordinator))
     }
 
-    /// Starts `claude` in `req.cwd`. Checks, in order: seat limit, prompt does not start with
-    /// `-`, cwd is a directory, claude binary exists.
+    /// Starts `claude` in `req.cwd`. Checks, in order: the app is not closing, seat limit, prompt
+    /// does not start with `-`, cwd is a directory, claude binary exists.
     pub fn spawn(
         &mut self,
         req: SpawnRequest,
         ctx: &SpawnContext,
         sink: EventSink,
     ) -> Result<AgentInfo, AgentError> {
+        if self.closing {
+            return Err(AgentError::Closing);
+        }
         self.check_limit(req.seat_kind)?;
         if prompt_looks_like_flag(req.prompt.as_deref()) {
             return Err(AgentError::InvalidPrompt);
@@ -540,12 +561,17 @@ impl AgentManager {
     }
 
     /// Spawns an arbitrary [`SpawnSpec`] as an agent (used by `spawn`, and directly by tests).
+    /// Refused once the app is closing (review6d N3: the check lives here too, so no caller can
+    /// go around it).
     pub(crate) fn spawn_spec(
         &mut self,
         spec: SpawnSpec,
         meta: AgentMeta,
         sink: EventSink,
     ) -> Result<AgentInfo, AgentError> {
+        if self.closing {
+            return Err(AgentError::Closing);
+        }
         self.check_limit(meta.seat_kind)?;
         let AgentMeta {
             id,
@@ -610,6 +636,9 @@ impl AgentManager {
         effort: Option<String>,
         sink: EventSink,
     ) -> (Result<AgentInfo, AgentError>, Option<PtyHandle>) {
+        if self.closing {
+            return (Err(AgentError::Closing), None);
+        }
         let Some(agent) = self.agents.get_mut(id) else {
             return (Err(AgentError::NotFound), None);
         };
@@ -619,7 +648,8 @@ impl AgentManager {
         let gen = agent.pty_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let mut old = agent.pty.take();
         if let Some(pty) = old.as_mut() {
-            if let Err(e) = pty.kill() {
+            // Windows: the whole tree (node, mira-mcp), not only claude.exe (step 6b, plan A.7).
+            if let Err(e) = pty.kill_tree() {
                 log::debug!("restart: kill agent {id}: {e}");
             }
         }
@@ -667,11 +697,12 @@ impl AgentManager {
     }
 
     /// How a restart of agent `id` continues its session (review5 N1): `--resume` only when the
-    /// session has had a turn, otherwise a fresh session with a new uuid. `None` for unknown
-    /// agents.
-    pub fn restart_session(&self, id: &str) -> Option<RestartSession> {
+    /// session has had a turn, otherwise a fresh session with a new uuid. `force_fresh` (a fresh
+    /// session per ticket, step 6b plan A.7) always gives a fresh session, never `--resume`.
+    /// `None` for unknown agents.
+    pub fn restart_session(&self, id: &str, force_fresh: bool) -> Option<RestartSession> {
         let a = self.agents.get(id)?;
-        Some(if a.has_conversation {
+        Some(if a.has_conversation && !force_fresh {
             RestartSession::Resume(a.info.session_id.clone())
         } else {
             RestartSession::Fresh(uuid::Uuid::new_v4().to_string())
@@ -845,8 +876,10 @@ impl AgentManager {
     /// Kills every child (app exit / `quit_app`). Idempotent; errors are only logged.
     /// Blocks at most [`QUIT_KILL_BUDGET`] on unix (waits for the process groups, then SIGKILL);
     /// returns at once on Windows. Safe under the manager lock: the waiter threads set the exit
-    /// flags before they report (and need this lock).
+    /// flags before they report (and need this lock). Sets `closing` first (step 6d A.11), so a
+    /// `spawn`/`restart` that arrives afterwards (e.g. from the watch) starts nothing.
     pub fn kill_all(&mut self) {
+        self.closing = true;
         let mut children = Vec::new();
         for (id, agent) in &mut self.agents {
             if let Some(pty) = agent.pty.as_mut() {
@@ -1673,7 +1706,7 @@ mod tests {
             ),
             (
                 AgentError::QueueNotEmpty(2),
-                "Agenten har 2 tickets i kø — flyt dem først, eller bekræft at de lægges i Backlog",
+                "Agenten har 2 tickets i kø eller i Venter — flyt dem først, eller bekræft at de lægges i Backlog",
             ),
             (
                 AgentError::ProjectLimit {
@@ -1863,6 +1896,107 @@ mod tests {
         let mut c = m.cwds();
         c.sort();
         assert_eq!(c, [PathBuf::from("/w/bot-01"), PathBuf::from("/w/bot-02")]);
+    }
+
+    #[test]
+    fn free_seats_count_live_agents_of_the_seat_kind() {
+        let mut m = AgentManager::with_limits(3, 2);
+        assert_eq!(m.free_seats(SeatKind::Work), 3);
+        m.insert_fake("s1", "/w/a");
+        let gone = m.insert_fake("s2", "/w/b");
+        assert_eq!(m.free_seats(SeatKind::Work), 1);
+        m.stop(&gone).unwrap();
+        assert_eq!(
+            m.free_seats(SeatKind::Work),
+            2,
+            "an exited agent frees its seat"
+        );
+        assert_eq!(m.free_seats(SeatKind::Staff), 2);
+        m.set_limits(1, 2);
+        m.insert_fake("s3", "/w/c");
+        assert_eq!(m.free_seats(SeatKind::Work), 0, "never below zero");
+    }
+
+    #[test]
+    fn spawn_after_kill_all_is_refused() {
+        // Step 6d A.11: `kill_all` sets `closing`; a spawn afterwards is refused before every
+        // other check (here the seat limit would pass and the cwd check fail).
+        let mut m = AgentManager::new(5);
+        assert!(!m.is_closing());
+        let c = ctx(PathBuf::from("/nope/claude"));
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Work), &c, null_sink()),
+            Err(AgentError::InvalidCwd)
+        ));
+        m.kill_all();
+        assert!(m.is_closing());
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Work), &c, null_sink()),
+            Err(AgentError::Closing)
+        ));
+        assert!(matches!(
+            m.spawn(doomed(SeatKind::Staff), &c, null_sink()),
+            Err(AgentError::Closing)
+        ));
+        // Review6d N3: `spawn_spec` (the path under `spawn`) refuses too, before starting
+        // anything.
+        let spec = SpawnSpec {
+            program: PathBuf::from("/nope/claude"),
+            args: vec![],
+            cwd: PathBuf::from("/definitely/not/a/dir"),
+            env: vec![],
+            cols: PTY_COLS,
+            rows: PTY_ROWS,
+        };
+        let meta = AgentMeta {
+            id: "a1".into(),
+            session_id: "s1".into(),
+            profile: ProfileSnapshot::default(),
+            seat_kind: SeatKind::Work,
+            name: "bot-01".into(),
+            project: None,
+        };
+        assert!(matches!(
+            m.spawn_spec(spec, meta, null_sink()),
+            Err(AgentError::Closing)
+        ));
+        assert!(m.list().is_empty());
+        // Idempotent; the text is the user-facing one.
+        m.kill_all();
+        assert!(m.is_closing());
+        assert_eq!(
+            AgentError::Closing.to_string(),
+            "Appen lukker — ingen nye agenter"
+        );
+    }
+
+    #[test]
+    fn restart_after_kill_all_is_refused() {
+        let mut m = AgentManager::new(5);
+        let a = m.insert_fake("s1", "/w/a");
+        let spec = SpawnSpec {
+            program: PathBuf::from("/nope/claude"),
+            args: Vec::new(),
+            cwd: PathBuf::from("/w/a"),
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+        };
+        m.kill_all();
+        // Refused before the agent lookup: an unknown id gives Closing too, nothing is killed.
+        let (res, old) = m.restart(
+            &a,
+            spec,
+            &RestartSession::Fresh("s2".into()),
+            None,
+            None,
+            null_sink(),
+        );
+        assert!(matches!(res, Err(AgentError::Closing)));
+        assert!(old.is_none());
+        let info = m.get(&a).unwrap();
+        assert_eq!(info.session_id, "s1");
+        assert!(!matches!(info.status, AgentStatus::Exited { .. }));
     }
 
     #[test]
@@ -2111,28 +2245,47 @@ mod tests {
         assert_eq!(m.get(&id).unwrap().detail, None);
     }
 
+    /// Step 6b (plan A.7): a fresh session per ticket never resumes, even after a turn.
+    #[test]
+    fn restart_session_forced_fresh_even_with_conversation() {
+        let mut m = AgentManager::new(5);
+        let id = m.insert_fake("sess-1", "/w/a");
+        m.mark_conversation(&id);
+        assert!(m.restart_session("nope", true).is_none());
+        let Some(RestartSession::Fresh(new_id)) = m.restart_session(&id, true) else {
+            panic!("forced: fresh session");
+        };
+        assert_ne!(new_id, "sess-1");
+        assert!(uuid::Uuid::parse_str(&new_id).is_ok());
+        // Without force the same agent resumes.
+        assert_eq!(
+            m.restart_session(&id, false),
+            Some(RestartSession::Resume("sess-1".into()))
+        );
+    }
+
     /// review5 N1: `--resume` only after a turn (UserPromptSubmit/Stop) of the current session;
     /// a new session id (`/clear`) starts over.
     #[test]
     fn restart_session_resumes_only_after_a_turn() {
         let mut m = AgentManager::new(5);
         let id = m.insert_fake("sess-1", "/w/a");
-        assert!(m.restart_session("nope").is_none());
-        let RestartSession::Fresh(new_id) = m.restart_session(&id).unwrap() else {
+        assert!(m.restart_session("nope", false).is_none());
+        let RestartSession::Fresh(new_id) = m.restart_session(&id, false).unwrap() else {
             panic!("no turn yet: fresh session");
         };
         assert_ne!(new_id, "sess-1");
         assert!(uuid::Uuid::parse_str(&new_id).is_ok());
         m.mark_conversation(&id);
         assert_eq!(
-            m.restart_session(&id),
+            m.restart_session(&id, false),
             Some(RestartSession::Resume("sess-1".into()))
         );
         // `/clear`: the frame rebinds the agent to a new session without a transcript.
         m.match_frame(Some(&id), "sess-2").unwrap();
         assert!(!m.has_conversation(&id));
         assert!(matches!(
-            m.restart_session(&id),
+            m.restart_session(&id, false),
             Some(RestartSession::Fresh(_))
         ));
         // A frame of the same session does not reset it.
@@ -2514,6 +2667,54 @@ mod tests {
             let _ = std::fs::remove_dir_all(&moved);
         }
 
+        /// Step 6b (plan A.7): a forced fresh restart in the ticket's worktree gets a new
+        /// session id (session map follows), the new cwd and no conversation; id and ring
+        /// buffer stay.
+        #[test]
+        fn forced_fresh_restart_changes_session_and_cwd() {
+            let mut m = AgentManager::new(5);
+            let (sink, events) = collecting_sink();
+            let info = m
+                .spawn_spec(
+                    sh("echo before; sleep 30", vec![]),
+                    meta("sess-f"),
+                    sink.clone(),
+                )
+                .unwrap();
+            assert!(wait_for_output(&events, "before").contains("before"));
+            m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
+            m.mark_conversation(&info.id);
+            let session = m.restart_session(&info.id, true).unwrap();
+            let RestartSession::Fresh(new_id) = session.clone() else {
+                panic!("forced: fresh session");
+            };
+            let wt = std::env::temp_dir().join(format!("mira-fresh-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut spec = sh("echo after; sleep 30", vec![]);
+            spec.cwd = wt.clone();
+            let (res, old) = m.restart(&info.id, spec, &session, None, None, sink.clone());
+            drop(old);
+            let after = res.unwrap();
+            assert_eq!(after.id, info.id);
+            assert_eq!(after.session_id, new_id);
+            assert_ne!(after.session_id, "sess-f");
+            assert_eq!(after.cwd, wt.to_string_lossy());
+            assert!(!m.has_conversation(&info.id));
+            assert_eq!(m.agent_id_for_session(&new_id), Some(info.id.clone()));
+            assert_eq!(m.agent_id_for_session("sess-f"), None);
+            // The next restart of the new session (no turn yet) is fresh again, never --resume.
+            assert!(matches!(
+                m.restart_session(&info.id, false),
+                Some(RestartSession::Fresh(_))
+            ));
+            wait_for_output(&events, "after");
+            let (_, bytes) = m.output_snapshot(&info.id).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("before") && text.contains("after"), "{text}");
+            m.stop(&info.id).unwrap();
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+
         /// The exit code of generation `gen` (waits up to 10 s).
         fn wait_for_gen_exit(events: &Arc<Mutex<Vec<SinkEvent>>>, want: u64) -> Option<i32> {
             let t = Instant::now();
@@ -2562,7 +2763,7 @@ mod tests {
             // The session had a turn → --resume; the resumed child exits 1 right away.
             m.mark_conversation(&info.id);
             m.set_status(&info.id, AgentStatus::Idle, None).unwrap();
-            let resume = m.restart_session(&info.id).unwrap();
+            let resume = m.restart_session(&info.id, false).unwrap();
             assert_eq!(resume, RestartSession::Resume("sess-new".into()));
             let (res, old) = m.restart(
                 &info.id,

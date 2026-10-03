@@ -114,6 +114,58 @@ check(
 check(p.coordinatorHint(two, "q"), null, "another project");
 check(p.hasLiveCoordinator([agent("w", "work", "p", ["coder", "coordinator"])]), true, "coordinator on a work seat");
 
+// backlogHint (step 6a)
+const wa = (id, project, over = {}) => ({ ...agent(id, "work", project), name: id, currentTicketId: null, queueLength: 0, ...over });
+const bt = (id, over = {}) => ({
+  id,
+  state: "backlog",
+  assigneeAgentId: null,
+  project: "p",
+  createdAt: 0,
+  blockedBy: [],
+  ...over,
+});
+{
+  const h = p.backlogHint([wa("coder-01", "p")], [bt("b", { createdAt: 5 }), bt("a", { createdAt: 1 })], "p");
+  check(h.text, "coder-01 er ledig: 2 tickets uden ejer", "backlogHint text (plural)");
+  check(h.next.id, "a", "backlogHint next is the oldest");
+  check(h.waiting.map((t) => t.id), ["a", "b"], "backlogHint waiting oldest first");
+  check(h.agent.id, "coder-01", "backlogHint agent");
+}
+check(p.backlogHint([wa("c", "p")], [bt("a")], "p").text, "c er ledig: 1 ticket uden ejer", "backlogHint singular");
+check(p.backlogHint([wa("c", "P")], [bt("a", { project: "p" })], "p")?.next.id, "a", "backlogHint folds project case");
+check(p.backlogHint([wa("c", "p")], [bt("a", { project: { new: "p" } })], "p")?.next.id, "a", "backlogHint {new} = agent's project");
+check(p.backlogHint([wa("c", "p")], [bt("a", { state: "rejected" })], "p")?.next.id, "a", "backlogHint rejected without assignee");
+{
+  const blocked = bt("x", { blockedBy: ["open"], createdAt: 0 });
+  const open = bt("open", { state: "review", assigneeAgentId: "z", createdAt: 1 });
+  const h = p.backlogHint([wa("c", "p")], [blocked, open, bt("y", { createdAt: 2 })], "p");
+  check(h.waiting.map((t) => t.id), ["y"], "backlogHint skips a blocked ticket");
+  check(h.next.id, "y", "backlogHint next skips a blocked ticket");
+  check(p.backlogHint([wa("c", "p")], [blocked, open], "p"), null, "only a blocked ticket -> null");
+}
+check(
+  p.backlogHint([wa("c", "p")], [bt("x", { blockedBy: ["d", "gone"] }), bt("d", { state: "done" })], "p")?.next.id,
+  "x",
+  "a done or deleted blocker does not block",
+);
+check(p.backlogHint([wa("c", "p", { queueLength: 1 })], [bt("a")], "p"), null, "agent with a queue -> null");
+check(p.backlogHint([wa("c", "p", { currentTicketId: "t" })], [bt("a")], "p"), null, "agent with a current ticket -> null");
+check(p.backlogHint([wa("c", "p", { status: { kind: "thinking" } })], [bt("a")], "p"), null, "busy agent -> null");
+check(p.backlogHint([wa("c", "p", { status: { kind: "exited", code: 0 } })], [bt("a")], "p"), null, "exited agent -> null");
+check(p.backlogHint([agent("s", "staff", "p")], [bt("a")], "p"), null, "staff agent does not count");
+check(p.backlogHint([wa("c", "p")], [bt("a", { project: null })], "p"), null, "ticket without a project does not count");
+check(p.backlogHint([wa("c", "p")], [bt("a", { project: "q" })], "p"), null, "another project -> null");
+check(p.backlogHint([wa("c", "q")], [bt("a")], "p"), null, "agent in another project -> null");
+check(p.backlogHint([wa("c", "p")], [bt("a", { state: "done" }), bt("b", { state: "review", assigneeAgentId: "z" })], "p"), null, "no backlog tickets -> null");
+check(p.backlogHint([wa("c", "p")], [bt("a", { assigneeAgentId: "z", state: "assigned" })], "p"), null, "owned ticket does not count");
+check(p.backlogHint([], [bt("a")], "p"), null, "no agents -> null");
+check(
+  p.backlogHint([wa("busy", "p", { queueLength: 2 }), wa("free", "p")], [bt("a")], "p")?.agent.id,
+  "free",
+  "picks the first free agent",
+);
+
 // countsByProject
 const tickets = [{ project: "p" }, { project: "P" }, { project: { new: "p" } }, { project: null }, { project: "q" }];
 const counts = p.countsByProject([...two, agent("3", "work", "q", ["coder"], "exited"), agent("s", "staff", null)], tickets);

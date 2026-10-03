@@ -24,3 +24,4 @@ src-tauri/resources/mira-mcp
 
 # macOS smoke test output (scripts/mac-smoke.sh)
 smoke/
+tsconfig.tsbuildinfo

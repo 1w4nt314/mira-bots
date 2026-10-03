@@ -1,7 +1,8 @@
 //! Ending an agent's child and giving it a terminal environment. Unix: the child is a
 //! session/process-group leader (portable-pty calls setsid), so SIGTERM goes to the whole
 //! group and SIGKILL follows after a grace period. Windows: portable-pty's killer
-//! (TerminateProcess) as before; a Job Object for the tree is backlog.
+//! (TerminateProcess) as before; a restart kills the tree with `taskkill /T`
+//! ([`terminate_tree`], step 6b); a Job Object for the tree is backlog.
 //!
 //! PID reuse: signals go to the group only while it still has members (`group_alive`, i.e.
 //! `kill(-pgid, 0)` succeeds). POSIX does not reuse a process group id while the group has a
@@ -79,6 +80,52 @@ pub fn terminate(
     #[cfg(windows)]
     {
         let _ = (pid, exited, grace);
+        killer.kill()?;
+        Ok(())
+    }
+}
+
+/// [`terminate`] for a restart (step 6b, plan A.7). Unix: identical (SIGTERM to the group,
+/// SIGKILL after `grace`). Windows: while the child has not been reaped, a detached thread
+/// `pty-taskkill-<pid>` runs `taskkill /PID <pid> /T /F` ([`crate::proc::kill_process_tree`];
+/// it must run while claude.exe still lives, because `/T` walks the tree from it) and then
+/// portable-pty's killer as a fallback; the caller (under the manager lock) does not wait.
+/// Without a pid, after the reap or when no thread can be started: `killer.kill()` as in
+/// [`terminate`].
+pub fn terminate_tree(
+    pid: Option<u32>,
+    exited: &Arc<AtomicBool>,
+    killer: &mut (dyn ChildKiller + Send + Sync),
+    grace: Duration,
+) -> Result<(), AgentError> {
+    #[cfg(unix)]
+    {
+        terminate(pid, exited, killer, grace)
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering;
+        let _ = grace;
+        if let Some(pid) = pid.filter(|_| !exited.load(Ordering::SeqCst)) {
+            let mut fallback = killer.clone_killer();
+            let flag = Arc::clone(exited);
+            let spawned = std::thread::Builder::new()
+                .name(format!("pty-taskkill-{pid}"))
+                .spawn(move || {
+                    if !flag.load(Ordering::SeqCst) {
+                        crate::proc::kill_process_tree(pid);
+                    }
+                    if !flag.load(Ordering::SeqCst) {
+                        if let Err(e) = fallback.kill() {
+                            log::debug!("restart: kill {pid} after taskkill: {e}");
+                        }
+                    }
+                });
+            match spawned {
+                Ok(_) => return Ok(()),
+                Err(e) => log::debug!("restart: no taskkill thread for {pid}: {e}"),
+            }
+        }
         killer.kill()?;
         Ok(())
     }

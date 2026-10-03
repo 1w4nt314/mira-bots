@@ -98,6 +98,8 @@ export type ProjectRef = string | { new: string };
 export interface Project {
   id: string;
   path: string;
+  /** The folder has `.git` (step 6b); false for a project that was just created. */
+  isGitRepo: boolean;
 }
 
 export interface PermissionRequestInfo {
@@ -128,6 +130,8 @@ export interface AppInfo {
   projectsRoot: string;
   /** The effective workspace rules (`mira-bots.workspace.json` over the defaults). */
   rules: WorkspaceRules;
+  /** Playbook names, sorted (built-in `bug`/`feature` plus the workspace file's; step 6b). */
+  playbookKinds: string[];
 }
 
 /** The rules of the workspace (defaults overridden by `mira-bots.workspace.json`). */
@@ -144,7 +148,18 @@ export interface WorkspaceRules {
   userInputGraceMs: number;
   agentsMayCreateProjects: boolean;
   maxAgentsPerProject: number;
+  // step 6b
+  /** How a work ticket gets its own branch. */
+  git: GitMode;
+  /** A failed project check rejects the ticket before review. */
+  checksGate: boolean;
+  autoSpawnForPlaybook: boolean;
+  freshSessionPerTicket: boolean;
+  cleanupWorktreesOnDone: boolean;
 }
+
+/** Workspace rule `git` (step 6b). */
+export type GitMode = "off" | "branch" | "worktree";
 
 /** The last tool call from an agent's MCP server (mira-mcp); arguments are never included. */
 export interface LastToolCall {
@@ -217,7 +232,7 @@ export interface Diagnostics {
   profilesWarning: string | null;
   /** Open review assignments. */
   reviewAssignmentsOpen: number;
-  /** Tickets escalated after `MAX_REVIEW_ROUNDS` rejections. */
+  /** Tickets escalated after the workspace's `maxReviewRounds` rejections. */
   ticketsEscalated: number;
   reportsTotal: number;
   /** `<projectsRoot>/mira-bots.workspace.json`. */
@@ -229,6 +244,50 @@ export interface Diagnostics {
   projectsTotal: number;
   /** Profiles copied from the old agents folder at this start. */
   profilesMigrated: number;
+  /** Set when `inbox.json` could not be read (renamed as broken; the inbox starts empty). */
+  inboxWarning: string | null;
+  /** The found `gh` executable; null = not found (step 6c). */
+  ghPath: string | null;
+  /** `gh --version`, e.g. "2.102.0". */
+  ghVersion: string | null;
+  /** "ikke fundet" | "kører stadig" | "ældre end 2.40.0 — ikke afprøvet" | a probe error. */
+  ghVersionNote: string | null;
+  /** `<app data>/inbox.json`. */
+  inboxPath: string;
+  /** Items in state `new`. */
+  inboxNew: number;
+  /** One row per source and project. */
+  inboxSources: InboxSourceDiag[];
+  // step 6d: the watch
+  /** "Stop vagten" (`watchPaused` in `app-settings.json`). */
+  watchPaused: boolean;
+  /** Active watch projects at the latest tick/view. */
+  watchActive: number;
+  /** `<app_data_dir>/watch-state.json`. */
+  watchStatePath: string;
+  /** Set when `watch-state.json` could not be read at startup (renamed; conservative start). */
+  watchWarning: string | null;
+  /** Opted-out notice kinds (`notifyOff` in `app-settings.json`, camelCase kind names). */
+  notifyOff: string[];
+}
+
+/** One inbox source of one project in Diagnostik (`Diagnostics.inboxSources`). */
+export interface InboxSourceDiag {
+  /** null = the projects root's `inbox/`. */
+  project: string | null;
+  kind: ExternalKind;
+  label: string;
+  /** Milliseconds since the Unix epoch of the last successful fetch. */
+  lastFetchAt: number | null;
+  /** The last fetch's error, or why `project.json`'s `github` is ignored. */
+  error: string | null;
+  items: number;
+}
+
+/** Result of `check_gh_auth` (never contains a token). */
+export interface GhAuthResult {
+  ok: boolean;
+  text: string;
 }
 
 export interface AgentOutputPayload {
@@ -258,7 +317,14 @@ export interface HookEventPayload {
 
 // --- tickets (C3.1) ---------------------------------------------------------------------------
 
-export type TicketState = "backlog" | "assigned" | "inProgress" | "review" | "done" | "rejected";
+export type TicketState =
+  | "backlog"
+  | "assigned"
+  | "inProgress"
+  | "waiting"
+  | "review"
+  | "done"
+  | "rejected";
 export type TicketActor = "user" | "system" | "agent";
 /** Who created the ticket: the user (UI) or an agent (`mira_create_ticket`). */
 export type TicketSource = "user" | "agent";
@@ -275,6 +341,32 @@ export interface TicketHistoryEntry {
   to: TicketState;
   by: TicketActor;
   note: string | null;
+}
+
+/** State of a ticket's project checks (step 6b). `skipped`: nothing ran (no file or no checks). */
+export type ChecksState = "pending" | "passed" | "failed" | "skipped";
+
+/** The project checks of the ticket's current review entry (step 6b); reset on submit. */
+export interface TicketChecks {
+  state: ChecksState;
+  /** Name of the first failed check. */
+  failed: string | null;
+  /** The ticket's `reviewRound` when the checks started. */
+  round: number;
+  /** Milliseconds since the Unix epoch. */
+  startedAt: number;
+}
+
+/** The ticket's git branch, prepared by the app at delivery (step 6b). */
+export interface TicketGit {
+  mode: "branch" | "worktree";
+  /** `ticket/<shortId>`. */
+  branch: string;
+  base: string;
+  /** The project's repository folder. */
+  repo: string;
+  /** The worktree folder (`worktree` mode only). */
+  worktree: string | null;
 }
 
 /** A ticket without its history and body (`list_tickets`, `tickets-changed`); `getTicket` has both. */
@@ -306,11 +398,164 @@ export interface TicketSummary {
   reportCount: number;
   /** The ticket's project; null = none yet (it must get one before a work agent takes it). */
   project: ProjectRef | null;
+  /** The parent ticket's full id (step 6a); null when none or when the parent was deleted. */
+  parentId: string | null;
+  /** Full ids of the tickets that must be done before this one is delivered (step 6a). */
+  blockedBy: string[];
+  /** The ticket type (step 6b): `feature`, `bug`, a playbook name; null = plain task ("Opgave"). */
+  kind: string | null;
+  /** Milliseconds since the Unix epoch; set when "Start forløb" created the children. */
+  playbookStartedAt: number | null;
+  /** Project checks of the current review entry; null before/without a review. */
+  checks: TicketChecks | null;
+  /** The ticket's branch/worktree; null when `git` is off or not prepared yet. */
+  git: TicketGit | null;
+  /** Where the ticket came from (step 6c: an inbox item); null for tickets made in the app. */
+  external: ExternalRef | null;
 }
 
-/** Who wrote a report: an agent (`agentId`) or the user. */
+/** Where an inbox item came from: a file in an `inbox/` folder or a GitHub issue. */
+export type ExternalKind = "folder" | "github";
+/** State of one write-back step (comment / close). */
+export type WriteBackState = "none" | "inflight" | "done" | "failed";
+
+/** The write-back to the source when the ticket reaches Done (step 6c). */
+export interface WriteBack {
+  comment: WriteBackState;
+  close: WriteBackState;
+  commentUrl: string | null;
+  commentedAt: number | null;
+  closedAt: number | null;
+  attempts: number;
+  lastError: string | null;
+  lastBody: string | null;
+}
+
+/** The inbox item a ticket was started from; every text is cleaned by the backend. */
+export interface ExternalRef {
+  kind: ExternalKind;
+  externalId: string;
+  repo: string | null;
+  number: number | null;
+  path: string | null;
+  url: string | null;
+  title: string;
+  labels: string[];
+  author: string | null;
+  notes: string[];
+  inboxItemId: string;
+  /** Milliseconds since the Unix epoch. */
+  importedAt: number;
+  writeBack: WriteBack;
+  /** A playbook child of an external ticket: shows the source, never writes back. */
+  inherited: boolean;
+}
+
+export type InboxState = "new" | "started" | "dismissed";
+
+/** An inbox item as listed (`get_inbox`, `inbox-changed`): without its body. */
+export interface InboxItemSummary {
+  id: string;
+  /** The source type. */
+  kind: ExternalKind;
+  externalId: string;
+  sourceId: string;
+  title: string;
+  hasBody: boolean;
+  labels: string[];
+  url: string | null;
+  number: number | null;
+  repo: string | null;
+  path: string | null;
+  author: string | null;
+  /** The project the item belongs to; null = unknown (see `candidates`). */
+  project: string | null;
+  /** Projects sharing the item's repo and labels when `project` is null. */
+  candidates: string[];
+  updatedAt: string | null;
+  /** Milliseconds since the Unix epoch. */
+  seenAt: number;
+  state: InboxState;
+  ticketId: string | null;
+  notes: string[];
+  /** The ticket type from a file's `kind:` (`feature`, `bug`, a playbook); null = plain task. */
+  ticketKind: string | null;
+  /** An open ticket with the same title in the item's project. */
+  duplicateOf: { shortId: string; title: string } | null;
+}
+
+/** `get_inbox_item`: the summary fields plus the body (null for GitHub items before Start). */
+export interface InboxItem extends Omit<InboxItemSummary, "hasBody" | "duplicateOf"> {
+  body: string | null;
+  fingerprint: string | null;
+  gone: boolean;
+  /** Folder items: whether the file was moved to `started/` (null = not started). */
+  moved: boolean | null;
+}
+
+export type InboxErrorKind =
+  | "folder"
+  | "ghMissing"
+  | "notLoggedIn"
+  | "badCredentials"
+  | "repoNotFound"
+  | "rateLimited"
+  | "issuesDisabled"
+  | "network"
+  | "timeout"
+  | "tooLarge"
+  | "badJson"
+  | "other"
+  | "internal";
+
+export interface InboxSourceStatus {
+  /** `folder:…`, `github:owner/name` or `github:owner/name[a,b]` (with labels, sorted). */
+  id: string;
+  kind: ExternalKind;
+  label: string;
+  project: string | null;
+  /** Milliseconds since the Unix epoch of the last successful fetch. */
+  lastFetchAt: number | null;
+  ok: boolean;
+  /** The backend's Danish text (with the retry time for a rate limit); shown as it is. */
+  error: string | null;
+  errorKind: InboxErrorKind | null;
+  nextRetryAt: number | null;
+  items: number;
+  /** More issues exist than were fetched (the limit is 100 per repo). */
+  capped: boolean;
+  /** Notes of the latest fetch (files skipped, …). */
+  notes: string[];
+}
+
+export interface InboxStatus {
+  refreshing: boolean;
+  /** Milliseconds since the Unix epoch. */
+  lastRefreshAt: number | null;
+  sources: InboxSourceStatus[];
+}
+
+/** `get_inbox` and the `inbox-changed` event. */
+export interface InboxPayload {
+  items: InboxItemSummary[];
+  status: InboxStatus;
+}
+
+export type InboxRefreshReason = "startup" | "timer" | "focus" | "manual";
+
+/** The argument of `start_inbox_item`. */
+export interface StartInboxRequest {
+  itemId: string;
+  /** The ticket type; null = plain task. */
+  kind: string | null;
+  /** null = the item's own project (the backend asks for one when it has none). */
+  project: ProjectRef | null;
+  skipReview: boolean;
+}
+
+/** Who wrote a report: an agent (`agentId`), the user or the app itself (`system`, step 6b). */
 export interface ReportAuthor {
-  kind: "agent" | "user";
+  kind: "agent" | "user" | "system";
   agentId: string | null;
 }
 
@@ -365,6 +610,24 @@ export interface TicketPatch {
   project?: ProjectRef | null;
 }
 
+/** One child created by "Start forløb" and whom it went to. */
+export interface StartedChild {
+  ticket: TicketSummary;
+  role: Role;
+  /** The agent it was assigned to; null = it waits in the backlog. */
+  assignee: string | null;
+}
+
+/** `ticket_start_playbook` result (step 6b). */
+export interface PlaybookStarted {
+  parent: TicketSummary;
+  children: StartedChild[];
+  /** Ids of agents started for the playbook (`autoSpawnForPlaybook`). */
+  spawned: string[];
+  /** What could not be done (no agent, refused assignment, failed spawn); Danish. */
+  notes: string[];
+}
+
 /** Sidebar tabs `openWorkplace` may select. */
 export type WorkplaceTab = "permissions" | "diagnostics" | "tickets" | "agents";
 
@@ -374,4 +637,107 @@ export interface WorkplaceSelection {
   tab: string | null;
   /** "work" | "staff": open the "Ny agent" dialog for that seat kind. */
   spawn: string | null;
+  /** Step 6d: the ticket to select on the Tickets tab (full id); absent in older payloads. */
+  ticketId?: string | null;
+}
+
+// --- watch and notices (step 6d, C6d.2 / C6d.6; keys as in the Rust structs) -----------------
+
+/** The eight notice kinds (`notices.rs::NoticeKind`, camelCase on the wire and in `notifyOff`). */
+export type NoticeKind =
+  | "escalated"
+  | "flowReview"
+  | "permissionWaiting"
+  | "trustWaiting"
+  | "writeBackFailed"
+  | "budgetReached"
+  | "watchTripped"
+  | "agentExited";
+
+/** One notice (`list_notices`, `notices-changed`); texts are the backend's Danish, never a body. */
+export interface Notice {
+  /** uuid */
+  id: string;
+  kind: NoticeKind;
+  /** Milliseconds since the Unix epoch. */
+  at: number;
+  title: string;
+  text: string;
+  /** Full ticket id (click → the ticket). */
+  ticketId: string | null;
+  agentId: string | null;
+  project: string | null;
+  seen: boolean;
+}
+
+/** `list_notices`, `mark_notices_seen`, `set_notify_pref` and the `notices-changed` event. */
+export interface NoticesPayload {
+  unread: number;
+  /** Newest first, at most 100. */
+  items: Notice[];
+}
+
+/** Why the watch parked an inbox item (`engine.rs::WaitReason`). */
+export type WaitReason = "budget" | "seat" | "planner" | "duplicate" | "playbook" | "failed";
+
+/** A parked inbox item (`WatchView.waiting[itemId]`). */
+export interface WaitingInfo {
+  reason: WaitReason;
+  /** The badge text as the backend wrote it (C6d.5). */
+  text: string;
+  /** Budget: when it is free at the earliest (ms since the Unix epoch). */
+  nextAt: number | null;
+  project: string;
+}
+
+/** Used/cap of one budget window pair (`engine.rs::BudgetView`). */
+export interface WatchBudgetView {
+  usedHour: number;
+  capHour: number;
+  usedDay: number;
+  capDay: number;
+}
+
+/** One project in the watch view: every project with a `project.json` `watch` or in `watchOff`. */
+export interface WatchProjectView {
+  id: string;
+  /** `project.json` has `watch.enabled: true` ("Hold vagt" can be switched). */
+  enabled: boolean;
+  /** In `watchOff` ("Hold vagt" off). */
+  paused: boolean;
+  active: boolean;
+  /** Why the project is not active (C6d.5 texts); null when it is. */
+  reason: string | null;
+  tripped: boolean;
+  trippedAt: number | null;
+  trippedReason: string | null;
+  usedHour: number;
+  capHour: number;
+  usedDay: number;
+  capDay: number;
+  /** Live agents the watch itself started in the project. */
+  agents: number;
+  maxAgents: number;
+  /** When the budget is free at the earliest, while it waits now. */
+  nextFreeAt: number | null;
+  /** `quietHours` as written ("23-07"). */
+  quiet: string | null;
+  inQuiet: boolean;
+  /** Short description of the rule (`bug`, `byLabel (2) → task`); null = no playbook. */
+  playbook: string | null;
+  notes: string[];
+}
+
+/** `get_watch`, `set_watch`, `restart_watch` and the `watch-changed` event. */
+export interface WatchView {
+  /** "Stop vagten" (`watchPaused`). */
+  paused: boolean;
+  /** Number of active watch projects. */
+  active: number;
+  lastTickAt: number | null;
+  /** The sum over all projects against the workspace caps. */
+  global: WatchBudgetView;
+  projects: WatchProjectView[];
+  /** Inbox item id → why it waits. */
+  waiting: Record<string, WaitingInfo>;
 }

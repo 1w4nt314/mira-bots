@@ -9,25 +9,58 @@ import {
   type SyntheticEvent,
 } from "react";
 import { useTheme } from "../../../lib/bots";
-import { deleteTicket, errorMessage, getTicket } from "../../../lib/ipc";
+import {
+  canRetryWriteBack,
+  inboxLabel,
+  opensIssue,
+  showsWriteBack,
+  writeBackBadge,
+  writeBackFailureText,
+} from "../../../lib/inbox";
+import {
+  deleteTicket,
+  errorMessage,
+  getTicket,
+  openInboxUrl,
+  retryWriteBack,
+  unassignTicket,
+} from "../../../lib/ipc";
 import { isExited } from "../../../lib/status";
 import {
   ACTOR_LABEL,
+  buildTimeline,
   canDelete,
+  canStartPlaybook,
+  canReturnWaiting,
+  checksBadge,
+  childrenOf,
+  gitBadge,
+  kindLabel,
   canDrag,
   canHandOver,
+  BLOCKED_HINT,
+  blockersOf,
   formatAt,
   isCoordinationTask,
   ISSUE_HINT,
   ISSUE_LABEL,
+  parentOf,
+  progressOf,
+  relativeText,
+  shortId,
   STATE_BADGE_CLASS,
   STATE_LABEL,
   ticketDragId,
+  timelineCount,
+  timelineText,
+  WAITING_HINT,
+  type TimelineEntry,
 } from "../../../lib/tickets";
 import type { AgentInfo, TicketHistoryEntry, TicketSummary } from "../../../lib/types";
+import { useStore } from "../../../state/store";
 import BotFigure from "../../BotFigure";
 import Markdown from "../../Markdown";
-import { smallBtn, useRun } from "./actions";
+import { smallBtn, useRun, useStartPlaybook } from "./actions";
 import AssignMenu from "./AssignMenu";
 import ReportsSection from "./ReportsSection";
 import ReviewActions from "./ReviewActions";
@@ -44,6 +77,8 @@ interface Props {
   interactive?: boolean;
   /** Short confirmation shown by the panel (e.g. after a rejection). */
   onNotice?: (text: string) => void;
+  /** Step 6d: a ring for a moment after the note was selected from a notice (TicketsPanel). */
+  highlight?: boolean;
 }
 
 /** Stops the note's drag sensors for events inside its buttons, menus and text fields. */
@@ -97,16 +132,36 @@ interface FrameProps extends Props {
 function NoteFrame(props: FrameProps) {
   const { ticket: t, agent, compact = false, interactive = true, rootRef, rootProps, dimmed, grab } =
     props;
+  const { highlight = false } = props;
   const theme = useTheme();
+  const { state } = useStore();
   const showActions = interactive && !compact;
+  const run = useRun();
+  // Relations are looked up in the whole list (not the filtered one), see tickets.ts.
+  const all = state.tickets;
+  const parent = t.parentId === null ? null : parentOf(t, all);
+  const progress = progressOf(t.id, all);
+  const blockers = t.state === "done" ? [] : blockersOf(t, all);
+  const checks = checksBadge(t);
+  const branch = gitBadge(t);
+  const childrenDone =
+    t.state === "backlog" && t.assigneeAgentId === null && progress.total > 0 && progress.done === progress.total;
+  // Step 6c: the source of a ticket started from the inbox ("GitHub #n" opens the issue).
+  const source = inboxLabel(t.external);
 
   return (
     <div
       ref={rootRef}
       {...rootProps}
+      // Only the panel's notes carry the id (`selectTicket` scrolls to it); overlay and dialog
+      // copies of the same ticket must not duplicate it.
+      id={showActions ? `ticket-${t.id}` : undefined}
+      data-highlight={highlight ? "true" : undefined}
       className={`office-note rounded-lg border border-[var(--note-border)] bg-[var(--note-bg)] p-2 text-xs text-[var(--note-fg)] shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
         grab ? "cursor-grab touch-none active:cursor-grabbing" : ""
-      } ${dimmed ? "opacity-40" : ""} ${compact && !interactive ? "w-[260px] shadow-lg" : ""}`}
+      } ${dimmed ? "opacity-40" : ""} ${compact && !interactive ? "w-[260px] shadow-lg" : ""} ${
+        highlight ? "ring-2 ring-[var(--accent)]" : ""
+      }`}
     >
       <div className="flex items-center gap-1.5">
         <span className={`rounded px-1.5 text-[10px] font-medium leading-4 ${STATE_BADGE_CLASS[t.state]}`}>
@@ -132,11 +187,93 @@ function NoteFrame(props: FrameProps) {
             </span>
           )
         )}
+        {t.kind !== null && (
+          <span
+            className="rounded bg-indigo-500/15 px-1 text-[10px] text-indigo-800 dark:text-indigo-200"
+            title={`Type: ${kindLabel(t.kind)}`}
+          >
+            {kindLabel(t.kind)}
+          </span>
+        )}
+        {t.playbookStartedAt !== null && (
+          <span
+            className="rounded bg-indigo-500/15 px-1 text-[10px] text-indigo-800 dark:text-indigo-200"
+            title="Forløbet er startet"
+          >
+            forløb
+          </span>
+        )}
+        {checks !== null && (
+          <span className={`max-w-[45%] truncate rounded px-1 text-[10px] ${checks.cls}`} title={checks.title}>
+            {checks.text}
+          </span>
+        )}
+        {branch !== null && (
+          <span
+            className="max-w-[45%] truncate rounded bg-neutral-500/15 px-1 font-mono text-[10px]"
+            title={branch.title}
+          >
+            {branch.text}
+          </span>
+        )}
+        {t.parentId !== null && (
+          <span
+            className="rounded bg-teal-500/15 px-1 text-[10px] text-teal-800 dark:text-teal-200"
+            title={parent !== null ? `Del-ticket af ${parent.title}` : "Del-ticket"}
+          >
+            del af {parent !== null ? parent.shortId : shortId(t.parentId)}
+          </span>
+        )}
+        {progress.total > 0 && (
+          <span className="rounded bg-teal-500/15 px-1 text-[10px] text-teal-800 dark:text-teal-200" title="Del-tickets færdige">
+            {progress.done}/{progress.total} del-tickets
+          </span>
+        )}
+        {childrenDone && (
+          <span
+            className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-800 dark:text-amber-200"
+            title="Alle del-tickets er godkendt; ticketen har ingen ejer"
+          >
+            del-tickets færdige
+          </span>
+        )}
+        {blockers.length > 0 && (
+          <span
+            className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-800 dark:text-amber-200"
+            title={BLOCKED_HINT}
+          >
+            Venter på {blockers.map((b) => b.shortId).join(", ")}
+          </span>
+        )}
         {t.skipReview && (
           <span className="text-[10px] opacity-70" title="Går direkte til Done uden review">
             uden review
           </span>
         )}
+        {source !== null &&
+          (opensIssue(t.external) && showActions ? (
+            <button
+              type="button"
+              onClick={() => void run(() => openInboxUrl(t.id))}
+              onPointerDown={stop}
+              onKeyDown={stop}
+              title="Startet fra indbakken — åbn issuen i browseren"
+              className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 underline decoration-dotted hover:text-[var(--accent)] dark:text-sky-200"
+            >
+              {source}
+            </button>
+          ) : (
+            <span
+              className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 dark:text-sky-200"
+              title={
+                t.external?.kind === "folder"
+                  ? `Startet fra indbakke-mappen${t.external.path !== null ? `: ${t.external.path}` : ""}`
+                  : "Startet fra indbakken"
+              }
+            >
+              {source}
+            </span>
+          ))}
         {t.source === "agent" && (
           <span
             className="rounded bg-sky-500/15 px-1 text-[10px] text-sky-800 dark:text-sky-200"
@@ -204,6 +341,8 @@ function NoteFrame(props: FrameProps) {
               )}
             </div>
           )}
+          {t.state === "waiting" && <div className="mt-1 text-[11px] opacity-80">{WAITING_HINT}</div>}
+          {showsWriteBack(t) && <WriteBackRow ticket={t} interactive={interactive} />}
         </>
       )}
 
@@ -212,8 +351,57 @@ function NoteFrame(props: FrameProps) {
           <NoteActions ticket={t} agent={agent} onNotice={props.onNotice} />
           {/* The review card shows the reports unfolded itself. */}
           {t.state !== "review" && <ReportsSection ticket={t} />}
+          <TimelineFold ticket={t} />
           <HistoryFold ticket={t} />
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Write-back status of a Done ticket from the inbox (step 6c): "meldt tilbage ✓" (title = the
+ * comment's address), "melder tilbage…", "ikke meldt tilbage" with the error as a line below
+ * and "Prøv igen" (`retry_write_back`; the backend's text, e.g. "Allerede meldt tilbage", goes to
+ * the error line). The history notes are shown by the history fold as usual.
+ */
+function WriteBackRow({ ticket: t, interactive }: { ticket: TicketSummary; interactive: boolean }) {
+  const run = useRun();
+  const [busy, setBusy] = useState(false);
+  if (t.external === null) return null;
+  const badge = writeBackBadge(t.external);
+  if (badge === null) return null;
+  const failure = writeBackFailureText(t.external);
+  const retry = async () => {
+    setBusy(true);
+    try {
+      await run(() => retryWriteBack(t.id));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div onPointerDown={stop} onKeyDown={stop} className="mt-1 cursor-auto text-[11px]">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className={`rounded px-1 text-[10px] ${badge.cls}`} title={badge.title}>
+          {badge.text}
+        </span>
+        {interactive && canRetryWriteBack(t.external) && (
+          <button
+            type="button"
+            onClick={() => void retry()}
+            disabled={busy || t.external.writeBack.comment === "inflight"}
+            title="Prøv tilbagemeldingen igen (der postes aldrig to gange)"
+            className={smallBtn}
+          >
+            Prøv igen
+          </button>
+        )}
+      </div>
+      {failure !== null && (
+        <p className="mt-0.5 break-words text-rose-700 dark:text-rose-300" role="status">
+          {failure}
+        </p>
       )}
     </div>
   );
@@ -229,7 +417,11 @@ function NoteActions({
   onNotice?: (text: string) => void;
 }) {
   const run = useRun();
+  const startPlaybook = useStartPlaybook();
+  const { state } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const canStart = canStartPlaybook(t, state.tickets, state.appInfo?.playbookKinds ?? []);
 
   useEffect(() => {
     if (!confirmDelete) return;
@@ -246,8 +438,45 @@ function NoteActions({
     void run(() => deleteTicket(t.id));
   };
 
+  const start = async () => {
+    setStarting(true);
+    try {
+      await startPlaybook(t, onNotice);
+    } finally {
+      setStarting(false);
+    }
+  };
+
   const buttons: ReactNode[] = [];
-  if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} />);
+  if (canStart) {
+    buttons.push(
+      <button
+        key="start"
+        type="button"
+        onClick={() => void start()}
+        disabled={starting}
+        title={`Opretter del-ticketsene for ${kindLabel(t.kind)} og giver dem til agenter med den rette rolle`}
+        className={`${smallBtn} font-medium`}
+      >
+        {starting ? "Starter…" : "Start forløb"}
+      </button>,
+    );
+  }
+  if (canDrag(t) || canHandOver(t)) buttons.push(<AssignMenu key="assign" ticket={t} onNotice={onNotice} />);
+  if (canReturnWaiting(t)) {
+    // Review 6a N3: the user frees a waiting parent (its children stay where they are).
+    buttons.push(
+      <button
+        key="return"
+        type="button"
+        onClick={() => void run(() => unassignTicket(t.id))}
+        title="Tag forælderen fra agenten og læg den i Backlog; del-tickets bliver, hvor de er"
+        className={smallBtn}
+      >
+        Læg tilbage
+      </button>,
+    );
+  }
   if (canDelete(t)) {
     buttons.push(
       <button
@@ -369,6 +598,130 @@ function HistoryFold({ ticket: t }: { ticket: TicketSummary }) {
                 </li>
               ))}
             </ol>
+          )}
+    </details>
+  );
+}
+
+/** Kopiér til udklipsholderen; `false` når API'et mangler eller nægter (så viser folden en tekst). */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard !== undefined) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // falder tilbage til execCommand nedenfor
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Tidslinje (step 6d): historik, rapporter og afledte linjer i én kronologisk liste
+ * (`buildTimeline`), hentet med `getTicket` mens folden er åben, som `HistoryFold`. Overskriften
+ * viser `timelineCount` før hentningen og det reelle antal efter. Hver linje: relativ tid (title =
+ * klokkeslæt), tekst og hvem. "Kopiér" lægger `timelineText` i udklipsholderen.
+ */
+function TimelineFold({ ticket: t }: { ticket: TicketSummary }) {
+  const { state } = useStore();
+  const [open, setOpen] = useState(false);
+  const [entries, setEntries] = useState<TimelineEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<"ok" | "failed" | null>(null);
+  const children = childrenOf(t.id, state.tickets);
+  const childCount = children.length;
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    getTicket(t.id)
+      .then((full) => {
+        if (!alive) return;
+        setEntries(buildTimeline(full, { children: childrenOf(full.id, state.tickets) }));
+        setError(null);
+      })
+      .catch((e: unknown) => {
+        if (alive) setError(errorMessage(e));
+      });
+    return () => {
+      alive = false;
+    };
+    // Refetch when the ticket (or the number of its children) changes while unfolded.
+  }, [open, t.id, t.historyLen, t.reportCount, t.updatedAt, childCount]);
+
+  useEffect(() => {
+    if (copied === null) return;
+    const timer = window.setTimeout(() => setCopied(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const now = Date.now();
+  const count = entries === null ? timelineCount(t) : entries.length;
+
+  return (
+    <details className="mt-1.5" onToggle={(e) => setOpen(e.currentTarget.open)}>
+      <summary className="cursor-pointer select-none text-[11px] opacity-70 hover:opacity-100">
+        Tidslinje ({count})
+      </summary>
+      {error !== null && (
+        <p className="mt-1 text-[11px] text-rose-600 dark:text-rose-300" role="alert">
+          {error}
+        </p>
+      )}
+      {entries === null
+        ? error === null && <p className="mt-1 text-[11px] opacity-70">Henter…</p>
+        : (
+            <>
+              <div className="mt-1 flex items-center gap-2 text-[11px]">
+                <button
+                  type="button"
+                  className={smallBtn}
+                  onClick={() => {
+                    void copyText(timelineText(entries, t)).then((ok) => setCopied(ok ? "ok" : "failed"));
+                  }}
+                  disabled={entries.length === 0}
+                >
+                  Kopiér
+                </button>
+                {copied === "ok" && (
+                  <span className="opacity-70" role="status">
+                    Kopieret
+                  </span>
+                )}
+                {copied === "failed" && (
+                  <span className="text-rose-600 dark:text-rose-300" role="status">
+                    Kunne ikke kopiere
+                  </span>
+                )}
+              </div>
+              {entries.length === 0 ? (
+                <p className="mt-1 text-[11px] opacity-70">(ingen hændelser)</p>
+              ) : (
+                <ol className="mt-1 space-y-0.5 text-[11px]">
+                  {entries.map((e, i) => (
+                    <li key={`${e.at}-${e.kind}-${i}`} className="break-words">
+                      <span className="font-mono opacity-70" title={formatAt(e.at)}>
+                        {relativeText(e.at, now)}
+                      </span>{" "}
+                      {e.text} <span className="opacity-70">({e.by})</span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </>
           )}
     </details>
   );

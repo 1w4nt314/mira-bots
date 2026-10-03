@@ -59,8 +59,9 @@ pub enum AgentError {
     #[error("I/O-fejl: {0}")]
     Io(#[from] std::io::Error),
     // ---- step 4b (C4b.3) ----
-    /// "Flyt til projekt…" while the agent still has queued tickets (without `force`).
-    #[error("Agenten har {0} tickets i kø — flyt dem først, eller bekræft at de lægges i Backlog")]
+    /// "Flyt til projekt…" while the agent still has queued tickets or waiting parents (without
+    /// `force`; review 6a W2).
+    #[error("Agenten har {0} tickets i kø eller i Venter — flyt dem først, eller bekræft at de lægges i Backlog")]
     QueueNotEmpty(usize),
     /// `maxAgentsPerProject` live work agents already run in the project.
     #[error("Loft på {max} agenter i projektet «{project}» nået")]
@@ -70,6 +71,11 @@ pub enum AgentError {
     SameProject(String),
     #[error("Stabsagenter står i projektroden og kan ikke flyttes")]
     StaffHasNoProject,
+    // ---- step 6d (A.11) ----
+    /// `spawn`/`restart` after `kill_all()`: the app is closing, no new children (the watch's
+    /// timer may still be running).
+    #[error("Appen lukker — ingen nye agenter")]
+    Closing,
 }
 
 impl From<AgentError> for String {

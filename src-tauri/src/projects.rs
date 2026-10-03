@@ -44,6 +44,8 @@ impl ProjectRef {
 pub struct Project {
     pub id: ProjectId,
     pub path: String,
+    /// The folder has `.git` (a folder or a worktree's file; step 6b, `git::is_git_repo`).
+    pub is_git_repo: bool,
 }
 
 /// Project errors; the messages are user-facing (Danish).
@@ -85,6 +87,7 @@ const EDGE_SPACE: &str = "må ikke begynde eller slutte med mellemrum";
 const TRAILING_DOT: &str = "må ikke slutte med punktum";
 const RESERVED: &str = "er et reserveret navn i Windows";
 const ONLY_DOTS: &str = "må ikke kun bestå af punktummer";
+const RESERVED_INBOX: &str = "er reserveret til indbakken";
 
 /// Device names Windows reserves in every folder, also with an extension (`NUL.txt`).
 pub const RESERVED_STEMS: [&str; 28] = [
@@ -134,6 +137,10 @@ pub fn validate_project_id(raw: &str) -> Result<ProjectId, ProjectError> {
     if RESERVED_STEMS.contains(&stem.as_str()) {
         return bad(RESERVED);
     }
+    // `<root>/inbox/` is the root inbox folder (step 6c), never a project.
+    if raw.to_lowercase() == crate::config::INBOX_DIR {
+        return bad(RESERVED_INBOX);
+    }
     Ok(raw.to_string())
 }
 
@@ -148,10 +155,19 @@ pub fn project_dir(root: &Path, id: &str) -> PathBuf {
     root.join(id)
 }
 
+/// `<root>/<id>/.mira-bots/project.json` (step 6b; the checks are always read from the project
+/// folder, never from a worktree's copy).
+pub fn project_file(root: &Path, id: &str) -> PathBuf {
+    crate::config::PROJECT_FILE
+        .split('/')
+        .fold(project_dir(root, id), |p, part| p.join(part))
+}
+
 /// The project folders directly under `root`, sorted case-insensitively. Hidden folders (`.`
-/// prefix, e.g. `.mira-bots`), files and folders whose names are not valid project ids are
-/// skipped. A missing root gives an empty list.
+/// prefix, e.g. `.mira-bots`), the root inbox folder `inbox` (step 6c), files and folders whose
+/// names are not valid project ids are skipped. A missing root gives an empty list.
 pub fn list_projects(root: &Path) -> Vec<Project> {
+    crate::tickets::assert_not_under_inbox_lock("the projects folder");
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(e) => {
@@ -173,8 +189,10 @@ pub fn list_projects(root: &Path) -> Vec<Project> {
                 log::debug!("projects: skipping folder: {err}");
                 return None;
             }
+            let dir = project_dir(root, &name);
             Some(Project {
-                path: project_dir(root, &name).to_string_lossy().into_owned(),
+                path: dir.to_string_lossy().into_owned(),
+                is_git_repo: crate::git::is_git_repo(&dir),
                 id: name,
             })
         })
@@ -185,6 +203,7 @@ pub fn list_projects(root: &Path) -> Vec<Project> {
 
 /// The project named `name` (case-insensitive), with the name as it is on disk.
 pub fn find_project(root: &Path, name: &str) -> Option<Project> {
+    crate::tickets::assert_not_under_inbox_lock("the projects folder");
     list_projects(root)
         .into_iter()
         .find(|p| same_id(&p.id, name))
@@ -209,6 +228,7 @@ pub fn create_project(root: &Path, name: &str) -> Result<Project, ProjectError> 
         Ok(()) => Ok(Project {
             id,
             path: dir.to_string_lossy().into_owned(),
+            is_git_repo: false,
         }),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(ProjectError::Exists(id)),
         Err(e) => Err(ProjectError::Io(e.to_string())),
@@ -350,6 +370,10 @@ mod tests {
         for (name, want) in table {
             assert_eq!(reason(name), want, "{name:?}");
         }
+        for name in ["inbox", "INBOX", "Inbox"] {
+            assert_eq!(reason(name), RESERVED_INBOX, "{name:?}");
+        }
+        assert!(validate_project_id("inbox-2").is_ok());
         for name in [
             "con",
             "prn",
@@ -444,8 +468,14 @@ mod tests {
         std::fs::write(root.join("f.txt"), "x").unwrap();
         std::fs::create_dir(root.join("CON")).unwrap();
         std::fs::create_dir(root.join("Beta")).unwrap();
+        std::fs::create_dir(root.join("inbox")).unwrap();
         let ids: Vec<_> = list_projects(&root).into_iter().map(|p| p.id).collect();
-        assert_eq!(ids, ["a", "Beta"]);
+        assert_eq!(ids, ["a", "Beta"], "the root inbox folder is no project");
+        assert_eq!(find_project(&root, "inbox"), None);
+        assert!(matches!(
+            create_project(&root, "Inbox"),
+            Err(ProjectError::InvalidName(_, RESERVED_INBOX))
+        ));
 
         assert_eq!(
             create_project(&root, "A"),
@@ -459,6 +489,33 @@ mod tests {
         assert_eq!(find_project(&root, "beta").unwrap().id, "Beta");
         assert_eq!(find_project(&root, "nope"), None);
         assert_eq!(find_project(&root, "f.txt"), None, "files are not projects");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn projects_know_whether_they_are_git_repos() {
+        let root = temp_root();
+        let a = create_project(&root, "a").unwrap();
+        assert!(!a.is_git_repo);
+        create_project(&root, "b").unwrap();
+        std::fs::create_dir(root.join("a").join(".git")).unwrap();
+        // A worktree or submodule has a `.git` file.
+        std::fs::write(root.join("b").join(".git"), "gitdir: /x/.git/worktrees/b\n").unwrap();
+        create_project(&root, "c").unwrap();
+        let flags: Vec<_> = list_projects(&root)
+            .into_iter()
+            .map(|p| (p.id, p.is_git_repo))
+            .collect();
+        assert_eq!(
+            flags,
+            [("a".into(), true), ("b".into(), true), ("c".into(), false)]
+        );
+        assert_eq!(
+            project_file(&root, "a"),
+            root.join("a").join(".mira-bots").join("project.json")
+        );
+        let wire = serde_json::to_value(find_project(&root, "a").unwrap()).unwrap();
+        assert_eq!(wire["isGitRepo"], serde_json::json!(true));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

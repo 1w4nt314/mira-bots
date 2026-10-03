@@ -10,8 +10,16 @@ import type {
   AppInfo,
   Diagnostics,
   Effort,
+  GhAuthResult,
   HookEventPayload,
+  InboxItem,
+  InboxItemSummary,
+  InboxPayload,
+  InboxRefreshReason,
+  NoticeKind,
+  NoticesPayload,
   PermissionRequestInfo,
+  PlaybookStarted,
   PermissionResolvedPayload,
   Project,
   ProjectRef,
@@ -19,11 +27,14 @@ import type {
   ReviewAssignment,
   SeatKind,
   SpawnOverrides,
+  StartInboxRequest,
   Ticket,
   TicketPatch,
   TicketReport,
   TicketState,
   TicketSummary,
+  WatchView,
+  WriteBack,
   WorkplaceSelection,
   WorkplaceTab,
 } from "./types";
@@ -51,6 +62,7 @@ export const COMMANDS = {
   listTickets: "list_tickets",
   getTicket: "get_ticket",
   createTicket: "create_ticket",
+  startTicketPlaybook: "ticket_start_playbook",
   updateTicket: "update_ticket",
   deleteTicket: "delete_ticket",
   assignTicket: "assign_ticket",
@@ -79,6 +91,22 @@ export const COMMANDS = {
   openProjectFolder: "open_project_folder",
   setProjectsRoot: "set_projects_root",
   moveAgentToProject: "move_agent_to_project",
+  getInbox: "get_inbox",
+  getInboxItem: "get_inbox_item",
+  refreshInbox: "refresh_inbox",
+  startInboxItem: "start_inbox_item",
+  dismissInboxItem: "dismiss_inbox_item",
+  undismissInboxItem: "undismiss_inbox_item",
+  retryWriteBack: "retry_write_back",
+  openInboxUrl: "open_inbox_url",
+  checkGhAuth: "check_gh_auth",
+  // step 6d
+  getWatch: "get_watch",
+  setWatch: "set_watch",
+  restartWatch: "restart_watch",
+  listNotices: "list_notices",
+  markNoticesSeen: "mark_notices_seen",
+  setNotifyPref: "set_notify_pref",
 } as const;
 
 export const EVENTS = {
@@ -90,6 +118,9 @@ export const EVENTS = {
   workplaceSelect: "workplace-select",
   ticketsChanged: "tickets-changed",
   profilesChanged: "profiles-changed",
+  inboxChanged: "inbox-changed",
+  watchChanged: "watch-changed",
+  noticesChanged: "notices-changed",
 } as const;
 
 /** Commands reject with the Rust error string (Danish, user-facing). */
@@ -133,12 +164,16 @@ export const resizeIsland = (width: number, height: number) =>
   invoke<void>(COMMANDS.resizeIsland, { width: Math.round(width), height: Math.round(height) });
 export const quitApp = () => invoke<void>(COMMANDS.quitApp);
 export const getDiagnostics = () => invoke<Diagnostics>(COMMANDS.getDiagnostics);
-/** Opens or focuses the workplace window and selects `agentId` and/or the sidebar `tab` there. */
+/**
+ * Opens or focuses the workplace window and selects `agentId` and/or the sidebar `tab` there;
+ * `ticketId` (step 6d) selects that ticket on the Tickets tab.
+ */
 export const openWorkplace = (
   agentId: string | null,
   tab: WorkplaceTab | null = null,
   spawn: SeatKind | null = null,
-) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn });
+  ticketId: string | null = null,
+) => invoke<void>(COMMANDS.openWorkplace, { agentId, tab, spawn, ticketId });
 /** Closes the workplace window (Cmd+W on macOS); `true` when a window was open. */
 export const closeWorkplace = () => invoke<boolean>(COMMANDS.closeWorkplace);
 /** Takes the selection stored by `openWorkplace` for a newly created window (once). */
@@ -158,7 +193,15 @@ export const createTicket = (
   body: string,
   skipReview: boolean,
   project: ProjectRef | null = null,
-) => invoke<TicketSummary>(COMMANDS.createTicket, { title, body, skipReview, project });
+  /** The ticket type (step 6b); null = plain task. */
+  kind: string | null = null,
+) => invoke<TicketSummary>(COMMANDS.createTicket, { title, body, skipReview, project, kind });
+/**
+ * "Start forløb" (step 6b): creates the playbook's child tickets and assigns them by role. Only
+ * a Backlog ticket whose `kind` has a playbook; `notes` says what could not be done.
+ */
+export const startPlaybook = (ticketId: string) =>
+  invoke<PlaybookStarted>(COMMANDS.startTicketPlaybook, { ticketId });
 export const updateTicket = (id: string, patch: TicketPatch) =>
   invoke<TicketSummary>(COMMANDS.updateTicket, { id, patch });
 /** Only backlog/done tickets and rejected ones without an agent. */
@@ -253,6 +296,55 @@ export const setProjectsRoot = (path: string) =>
 export const moveAgentToProject = (agentId: string, project: ProjectRef, force: boolean) =>
   invoke<AgentInfo>(COMMANDS.moveAgentToProject, { agentId, project, force });
 
+// inbox (step 6c)
+/** The listed items (without body) and the status per source. */
+export const getInbox = () => invoke<InboxPayload>(COMMANDS.getInbox);
+/** One item with its body (GitHub items have none before Start). */
+export const getInboxItem = (id: string) => invoke<InboxItem>(COMMANDS.getInboxItem, { id });
+/**
+ * Asks the backend to refresh the sources on its own thread; `false` when a refresh is already
+ * running. Only `manual` overrides the per-source minimum interval and back-off.
+ */
+export const refreshInbox = (reason: InboxRefreshReason) =>
+  invoke<boolean>(COMMANDS.refreshInbox, { reason });
+/** "Start": the item becomes a backlog ticket (GitHub: fetches the issue first). */
+export const startInboxItem = (req: StartInboxRequest) =>
+  invoke<TicketSummary>(COMMANDS.startInboxItem, { req });
+/** "Afvis". */
+export const dismissInboxItem = (id: string) =>
+  invoke<InboxItemSummary>(COMMANDS.dismissInboxItem, { id });
+/** "Fortryd" on a dismissed item. */
+export const undismissInboxItem = (id: string) =>
+  invoke<InboxItemSummary>(COMMANDS.undismissInboxItem, { id });
+/** "Prøv igen": the write-back of a Done ticket from the inbox, once more (only from a click). */
+export const retryWriteBack = (ticketId: string) =>
+  invoke<WriteBack>(COMMANDS.retryWriteBack, { ticketId });
+/** Opens the GitHub issue in the browser; `id` is an inbox item id or a ticket id. */
+export const openInboxUrl = (id: string) => invoke<void>(COMMANDS.openInboxUrl, { id });
+/** "Tjek gh-login" (Diagnostik): `gh auth status`, never automatic. */
+export const checkGhAuth = () => invoke<GhAuthResult>(COMMANDS.checkGhAuth);
+
+// watch and notices (step 6d)
+/** The watch view (cached from the latest tick, else computed now). */
+export const getWatch = () => invoke<WatchView>(COMMANDS.getWatch);
+/**
+ * `project` null: "Stop vagten"/"Start vagten igen" (`watchPaused = !on`); a project id: "Hold
+ * vagt" for that project (`watchOff`). Only app settings change, never `project.json`.
+ */
+export const setWatch = (project: string | null, on: boolean) =>
+  invoke<WatchView>(COMMANDS.setWatch, { project, on });
+/** "Genstart vagt": clears the project's trip (three failures in a row). */
+export const restartWatch = (project: string) =>
+  invoke<WatchView>(COMMANDS.restartWatch, { project });
+/** The notice queue (newest first) and the unread count. */
+export const listNotices = () => invoke<NoticesPayload>(COMMANDS.listNotices);
+/** Marks these notices as read (`null`: all of them). */
+export const markNoticesSeen = (ids: string[] | null) =>
+  invoke<NoticesPayload>(COMMANDS.markNoticesSeen, { ids });
+/** "Giv besked ved: …": switches a notice kind on or off (`notifyOff`). */
+export const setNotifyPref = (kind: NoticeKind, on: boolean) =>
+  invoke<NoticesPayload>(COMMANDS.setNotifyPref, { kind, on });
+
 // --- events (each returns the unlisten function) ----------------------------------------------
 
 export const onAgentsChanged = (cb: (agents: AgentInfo[]) => void): Promise<UnlistenFn> =>
@@ -278,6 +370,15 @@ export const onTicketsChanged = (cb: (tickets: TicketSummary[]) => void): Promis
 /** Full profile list after a profile was saved, deleted or reset. */
 export const onProfilesChanged = (cb: (profiles: AgentProfile[]) => void): Promise<UnlistenFn> =>
   listen<AgentProfile[]>(EVENTS.profilesChanged, (e) => cb(e.payload));
+/** Items and source status after any inbox change (also when a refresh starts and ends). */
+export const onInboxChanged = (cb: (inbox: InboxPayload) => void): Promise<UnlistenFn> =>
+  listen<InboxPayload>(EVENTS.inboxChanged, (e) => cb(e.payload));
+/** The full watch view after a tick, "Stop vagten", "Hold vagt" or "Genstart vagt" (step 6d). */
+export const onWatchChanged = (cb: (v: WatchView) => void): Promise<UnlistenFn> =>
+  listen<WatchView>(EVENTS.watchChanged, (e) => cb(e.payload));
+/** The full notice queue after a notice came in, was marked read or a kind was switched off. */
+export const onNoticesChanged = (cb: (p: NoticesPayload) => void): Promise<UnlistenFn> =>
+  listen<NoticesPayload>(EVENTS.noticesChanged, (e) => cb(e.payload));
 
 // --- dialog -----------------------------------------------------------------------------------
 

@@ -3,7 +3,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::{
-    AGENTS_MAY_CREATE_PROJECTS, AUTO_REVIEW_ON_STOP, CREATE_TICKET_RATE_LIMIT,
+    AGENTS_MAY_CREATE_PROJECTS, AUTO_REVIEW_ON_STOP, AUTO_SPAWN_FOR_PLAYBOOK, CHECKS_GATE,
+    CLEANUP_WORKTREES_ON_DONE, CREATE_TICKET_RATE_LIMIT, FRESH_SESSION_PER_TICKET, GIT_DEFAULT,
     MAX_AGENTS_PER_PROJECT, MAX_REVIEW_ROUNDS, MAX_STAFF_AGENTS, MAX_WORK_AGENTS,
     REPORTS_PER_TICKET_MAX, REPORT_BODY_MAX_CHARS, REVIEW_BY_DEFAULT, TICKETS_SCHEMA_VERSION,
     TICKET_BODY_MAX_CHARS, TICKET_SHORT_ID_LEN, USER_INPUT_GRACE_MS,
@@ -22,16 +23,20 @@ pub enum TicketState {
     Review,
     Done,
     Rejected,
+    /// A parent whose assignee submitted it while children were still open (step 6a): it keeps
+    /// its assignee but is not "current"; it is woken when a child is done.
+    Waiting,
 }
 
 impl TicketState {
-    pub const ALL: [TicketState; 6] = [
+    pub const ALL: [TicketState; 7] = [
         TicketState::Backlog,
         TicketState::Assigned,
         TicketState::InProgress,
         TicketState::Review,
         TicketState::Done,
         TicketState::Rejected,
+        TicketState::Waiting,
     ];
 
     /// Danish UI label (same as `STATE_LABEL` in the frontend).
@@ -43,6 +48,7 @@ impl TicketState {
             TicketState::Review => "Review",
             TicketState::Done => "Done",
             TicketState::Rejected => "Afvist",
+            TicketState::Waiting => "Venter",
         }
     }
 
@@ -55,6 +61,7 @@ impl TicketState {
             TicketState::Review => "review",
             TicketState::Done => "done",
             TicketState::Rejected => "rejected",
+            TicketState::Waiting => "waiting",
         }
     }
 }
@@ -86,6 +93,201 @@ pub enum TicketIssue {
     TurnFailed,
     /// The turn ended (Stop) without `mira_submit_for_review`; the ticket stays in progress.
     NotSubmitted,
+}
+
+/// How the app gives a work ticket its own git branch (step 6b, workspace rule `git`).
+/// Wire: `"off"|"branch"|"worktree"`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitMode {
+    #[default]
+    Off,
+    /// `git switch ticket/<short>` in the project folder.
+    Branch,
+    /// A worktree `<project>/.mira-bots/wt/<short>` on branch `ticket/<short>`.
+    Worktree,
+}
+
+impl GitMode {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitMode::Off => "off",
+            GitMode::Branch => "branch",
+            GitMode::Worktree => "worktree",
+        }
+    }
+
+    /// Wire name → mode, ASCII-case-insensitive and trimmed (the workspace file).
+    pub fn parse(s: &str) -> Option<GitMode> {
+        let s = s.trim();
+        [GitMode::Off, GitMode::Branch, GitMode::Worktree]
+            .into_iter()
+            .find(|m| m.as_str().eq_ignore_ascii_case(s))
+    }
+}
+
+/// State of a ticket's project checks (step 6b).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ChecksState {
+    Pending,
+    Passed,
+    Failed,
+    /// No project file, no checks or an unreadable file: nothing ran.
+    Skipped,
+}
+
+/// The project checks of the ticket's current review entry (step 6b); reset on Submit.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketChecks {
+    pub state: ChecksState,
+    /// Name of the first failed check.
+    pub failed: Option<String>,
+    /// The ticket's `review_round` when the checks started.
+    pub round: u32,
+    /// Unix ms.
+    pub started_at: u64,
+}
+
+/// The ticket's git branch, prepared by the app at delivery (step 6b). Kept on the ticket so the
+/// review file and the checks do not depend on the sender's cwd.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketGit {
+    pub mode: GitMode,
+    /// `ticket/<short id>`.
+    pub branch: String,
+    pub base: String,
+    /// The project's repository folder.
+    pub repo: String,
+    /// The worktree folder (`worktree` mode only).
+    pub worktree: Option<String>,
+}
+
+/// Where an external ticket came from (step 6c). Wire: `"folder"|"github"`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum ExternalKind {
+    Folder,
+    Github,
+}
+
+impl ExternalKind {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExternalKind::Folder => "folder",
+            ExternalKind::Github => "github",
+        }
+    }
+}
+
+/// State of one write-back step (step 6c, plan A.7). Wire: `"none"|"inflight"|"done"|"failed"`.
+/// `inflight` is saved before the call; at startup it becomes `failed` (the call may or may not
+/// have reached the source, so only a click tries again, with the marker check first).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteBackState {
+    #[default]
+    None,
+    Inflight,
+    Done,
+    Failed,
+}
+
+/// The report back to the source when the ticket is Done (step 6c, C6c.2). Every field has a
+/// default, so an older or partial object still reads.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WriteBack {
+    /// The comment (GitHub) or the `.result.md` (folder).
+    pub comment: WriteBackState,
+    /// Closing the issue (GitHub only, after a `done` comment).
+    pub close: WriteBackState,
+    pub comment_url: Option<String>,
+    /// Unix ms.
+    pub commented_at: Option<u64>,
+    /// Unix ms.
+    pub closed_at: Option<u64>,
+    /// Write attempts so far (> 0: look for the marker before posting again).
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    /// The text of the last attempt (kept, not shown in 6c).
+    pub last_body: Option<String>,
+}
+
+/// The external source of a ticket started from the inbox (step 6c, C6c.2). Set by the app,
+/// never from the external text; `TicketSource` stays `user` (the user clicked Start).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalRef {
+    pub kind: ExternalKind,
+    /// `github:owner/name#123` or `folder:<project|_rod>:<relative path>`.
+    pub external_id: String,
+    /// `owner/name` (GitHub).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Issue number (GitHub).
+    #[serde(default)]
+    pub number: Option<u64>,
+    /// Path relative to the inbox folder (folder).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Issue URL (GitHub).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The cleaned external title (only in the ticket file, never in a typed line).
+    pub title: String,
+    /// Cleaned labels (B1 addition to C6c.2: the ticket file's "labels" line).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Cleaned author login (B1 addition to C6c.2: the ticket file's "oprindelig forfatter").
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Sanitising notes ("2 HTML-kommentar(er) fjernet", …), cleaned by the inbox; the ticket
+    /// file shows only their number (review6c C2).
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// The inbox item this ticket was started from.
+    pub inbox_item_id: String,
+    /// Unix ms.
+    pub imported_at: u64,
+    #[serde(default)]
+    pub write_back: WriteBack,
+    /// A playbook child of an external ticket (review6c C1): it carries the parent's source, so
+    /// its typed line shows the fixed label and its file the fenced text, but it never writes
+    /// back (only the parent does) and never counts as "the ticket of" the item.
+    #[serde(default)]
+    pub inherited: bool,
+}
+
+impl ExternalRef {
+    /// The parent's source for a playbook child (review6c C1): `inherited`, no write-back state.
+    pub fn inherited_copy(&self) -> ExternalRef {
+        ExternalRef {
+            write_back: WriteBack::default(),
+            inherited: true,
+            ..self.clone()
+        }
+    }
+
+    /// The `{kilde}` of C6c.4/C6c.5: `GitHub issue #{n} i {repo}` or `filen {path} i indbakken`
+    /// (repo and path sanitised like a title: one line, no invisible chars).
+    pub fn source_label(&self) -> String {
+        use super::prompt::sanitize_title;
+        match self.kind {
+            ExternalKind::Github => match (self.number, self.repo.as_deref()) {
+                (Some(n), Some(r)) => format!("GitHub issue #{n} i {}", sanitize_title(r)),
+                _ => "GitHub issue".to_string(),
+            },
+            ExternalKind::Folder => match self.path.as_deref() {
+                Some(p) => format!("filen {} i indbakken", sanitize_title(p)),
+                None => "en fil i indbakken".to_string(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -125,7 +327,8 @@ pub struct Ticket {
     /// Review rejections so far (plan5 A.6); reset when the ticket goes back to the backlog.
     #[serde(default)]
     pub review_round: u32,
-    /// Reached [`MAX_REVIEW_ROUNDS`] on entering review: no automatic routing, the user decides.
+    /// Reached the workspace's `maxReviewRounds` on entering review: no automatic routing, the
+    /// user decides.
     #[serde(default)]
     pub escalated: bool,
     /// The reviewer agent while in review (kept after approval for display).
@@ -137,6 +340,30 @@ pub struct Ticket {
     /// The project the ticket belongs to (plan4b A.2); absent in step 1–5 files.
     #[serde(default)]
     pub project: Option<ProjectRef>,
+    /// The parent ticket (step 6a): this ticket is one of its children. Absent before 6a.
+    #[serde(default)]
+    pub parent_id: Option<TicketId>,
+    /// Tickets that must be Done before this one is delivered (step 6a). A missing id (deleted
+    /// ticket) does not block. Absent before 6a.
+    #[serde(default)]
+    pub blocked_by: Vec<TicketId>,
+    /// Ticket type (step 6b): `None` = a plain task, otherwise a playbook name (`feature`, `bug`
+    /// or one from the workspace file). Absent before 6b.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Unix ms when the playbook was rolled out on this ticket (the "forløb" marker). Absent
+    /// before 6b.
+    #[serde(default)]
+    pub playbook_started_at: Option<u64>,
+    /// Project checks of the current review entry (step 6b). Absent before 6b.
+    #[serde(default)]
+    pub checks: Option<TicketChecks>,
+    /// The ticket's git branch/worktree (step 6b). Absent before 6b.
+    #[serde(default)]
+    pub git: Option<TicketGit>,
+    /// The external source (step 6c: started from the inbox). Absent before 6c.
+    #[serde(default)]
+    pub external: Option<ExternalRef>,
 }
 
 impl Ticket {
@@ -172,6 +399,17 @@ pub struct TicketSummary {
     pub report_count: usize,
     /// Copy of `Ticket.project` (badge and filter without `get_ticket`).
     pub project: Option<ProjectRef>,
+    /// Copy of `Ticket.parent_id` (step 6a; child counts are derived in the UI).
+    pub parent_id: Option<TicketId>,
+    /// Copy of `Ticket.blocked_by` (step 6a).
+    pub blocked_by: Vec<TicketId>,
+    /// Copies of the step 6b fields.
+    pub kind: Option<String>,
+    pub playbook_started_at: Option<u64>,
+    pub checks: Option<TicketChecks>,
+    pub git: Option<TicketGit>,
+    /// Copy of `Ticket.external` (step 6c; badge and write-back state without `get_ticket`).
+    pub external: Option<ExternalRef>,
 }
 
 impl From<&Ticket> for TicketSummary {
@@ -196,6 +434,13 @@ impl From<&Ticket> for TicketSummary {
             reviewer_agent_id: t.reviewer_agent_id.clone(),
             report_count: t.reports.len(),
             project: t.project.clone(),
+            parent_id: t.parent_id.clone(),
+            blocked_by: t.blocked_by.clone(),
+            kind: t.kind.clone(),
+            playbook_started_at: t.playbook_started_at,
+            checks: t.checks.clone(),
+            git: t.git.clone(),
+            external: t.external.clone(),
         }
     }
 }
@@ -223,12 +468,15 @@ where
     Option::<ProjectRef>::deserialize(d).map(Some)
 }
 
-/// Who wrote a report: an agent (`agentId`) or the user.
+/// Who wrote a report: an agent (`agentId`), the user or the app itself (step 6b: the
+/// «Tjek»/«Ændringer» reports; shown as "appen"). An older build does not know `system` and
+/// would quarantine a `tickets.json` containing it (same class as `waiting` in 6a).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ReportAuthorKind {
     Agent,
     User,
+    System,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -250,6 +498,14 @@ impl ReportAuthor {
         ReportAuthor {
             kind: ReportAuthorKind::Agent,
             agent_id: Some(agent_id.to_string()),
+        }
+    }
+
+    /// The app itself (step 6b).
+    pub fn system() -> Self {
+        ReportAuthor {
+            kind: ReportAuthorKind::System,
+            agent_id: None,
         }
     }
 }
@@ -391,6 +647,37 @@ pub enum TicketError {
     },
     #[error("Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent")]
     ProjectChangeNotAllowed,
+    // ---- step 6a (forløb) ----
+    #[error("Forælderen findes ikke")]
+    ParentNotFound,
+    #[error("Forælderen er allerede færdig (Done)")]
+    ParentDone,
+    #[error("Del-ticketen hører til «{child}», men forælderen til «{parent}»")]
+    ParentProjectMismatch { parent: String, child: String },
+    #[error("Blokeringen {0} findes ikke")]
+    BlockerNotFound(String),
+    #[error("En ticket kan ikke blokeres af sin egen forælder")]
+    BlockedByAncestor,
+    #[error("Relationen ville danne en cyklus")]
+    Cycle,
+    /// The ticket has open blockers (short ids, comma-separated).
+    #[error("Ticketen venter på {0}")]
+    Blocked(String),
+    #[error("Højst 10 blokeringer pr. ticket")]
+    TooManyBlockers,
+    // ---- step 6b (playbooks) ----
+    #[error("Ingen playbook for «{0}»")]
+    NoPlaybook(String),
+    #[error("Forløbet er allerede startet (ticketen har del-tickets)")]
+    PlaybookAlreadyStarted,
+    #[error("kind skal være task, feature, bug eller et playbook-navn fra workspace-filen")]
+    InvalidKind,
+    #[error("Playbooken kan ikke udrulles: {0}")]
+    PlaybookStepsInvalid(String),
+    // ---- step 6c (inbox) ----
+    /// Start of an inbox item that already has a ticket (short id).
+    #[error("Issue/filen er allerede startet som ticket {0}")]
+    ExternalAlreadyStarted(String),
 }
 
 /// The rules of this workspace (plan5 C5.1): the "Regler" section of every profile's system
@@ -413,6 +700,13 @@ pub struct WorkspaceRules {
     pub agents_may_create_projects: bool,
     /// 0 = unlimited.
     pub max_agents_per_project: usize,
+    // step 6b (the playbooks map and `gitBase` are in `workspace::WorkspaceConfig`, so the rules
+    // stay `Copy`)
+    pub git: GitMode,
+    pub checks_gate: bool,
+    pub auto_spawn_for_playbook: bool,
+    pub fresh_session_per_ticket: bool,
+    pub cleanup_worktrees_on_done: bool,
 }
 
 impl WorkspaceRules {
@@ -431,6 +725,11 @@ impl WorkspaceRules {
             user_input_grace_ms: USER_INPUT_GRACE_MS,
             agents_may_create_projects: AGENTS_MAY_CREATE_PROJECTS,
             max_agents_per_project: MAX_AGENTS_PER_PROJECT,
+            git: GIT_DEFAULT,
+            checks_gate: CHECKS_GATE,
+            auto_spawn_for_playbook: AUTO_SPAWN_FOR_PLAYBOOK,
+            fresh_session_per_ticket: FRESH_SESSION_PER_TICKET,
+            cleanup_worktrees_on_done: CLEANUP_WORKTREES_ON_DONE,
         }
     }
 }
@@ -473,6 +772,33 @@ pub(crate) mod test_support {
             reviewer_agent_id: None,
             reports: Vec::new(),
             project: None,
+            parent_id: None,
+            blocked_by: Vec::new(),
+            kind: None,
+            playbook_started_at: None,
+            checks: None,
+            git: None,
+            external: None,
+        }
+    }
+
+    /// A GitHub [`ExternalRef`] for issue `#n` in `o/r` (step 6c tests).
+    pub fn github_ref(n: u64) -> ExternalRef {
+        ExternalRef {
+            kind: ExternalKind::Github,
+            external_id: format!("github:o/r#{n}"),
+            repo: Some("o/r".into()),
+            number: Some(n),
+            path: None,
+            url: Some(format!("https://github.com/o/r/issues/{n}")),
+            title: "Crash ved start".into(),
+            labels: vec!["bug".into()],
+            author: Some("alice".into()),
+            notes: Vec::new(),
+            inbox_item_id: "item-1".into(),
+            imported_at: 5,
+            write_back: WriteBack::default(),
+            inherited: false,
         }
     }
 }
@@ -497,8 +823,15 @@ mod tests {
                 json!("inProgress"),
                 json!("review"),
                 json!("done"),
-                json!("rejected")
+                json!("rejected"),
+                json!("waiting")
             ]
+        );
+        assert_eq!(TicketState::ALL.len(), 7);
+        assert_eq!(TicketState::Waiting.label_da(), "Venter");
+        assert_eq!(
+            serde_json::from_value::<TicketState>(json!("waiting")).unwrap(),
+            TicketState::Waiting
         );
         for s in TicketState::ALL {
             assert_eq!(serde_json::to_value(s).unwrap(), json!(s.as_str()));
@@ -543,6 +876,31 @@ mod tests {
             serde_json::to_value(None::<TicketIssue>).unwrap(),
             json!(null)
         );
+        // step 6b
+        for (m, wire) in [
+            (GitMode::Off, "off"),
+            (GitMode::Branch, "branch"),
+            (GitMode::Worktree, "worktree"),
+        ] {
+            assert_eq!(serde_json::to_value(m).unwrap(), json!(wire));
+            assert_eq!(serde_json::from_value::<GitMode>(json!(wire)).unwrap(), m);
+            assert_eq!(m.as_str(), wire);
+            assert_eq!(GitMode::parse(&wire.to_uppercase()), Some(m));
+        }
+        assert_eq!(GitMode::default(), GitMode::Off);
+        assert_eq!(GitMode::parse("foo"), None);
+        for (c, wire) in [
+            (ChecksState::Pending, "pending"),
+            (ChecksState::Passed, "passed"),
+            (ChecksState::Failed, "failed"),
+            (ChecksState::Skipped, "skipped"),
+        ] {
+            assert_eq!(serde_json::to_value(c).unwrap(), json!(wire));
+        }
+        assert_eq!(
+            serde_json::to_value(ReportAuthor::system()).unwrap(),
+            json!({"kind":"system","agentId":null})
+        );
     }
 
     #[test]
@@ -570,6 +928,13 @@ mod tests {
             "createdAt",
             "updatedAt",
             "history",
+            "parentId",
+            "blockedBy",
+            "kind",
+            "playbookStartedAt",
+            "checks",
+            "git",
+            "external",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
         }
@@ -614,6 +979,162 @@ mod tests {
                 t.project
             );
         }
+
+        // step 6a: relations in both.
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(v["parentId"], json!(null));
+        assert_eq!(v["blockedBy"], json!([]));
+        assert_eq!(s["parentId"], json!(null));
+        assert_eq!(s["blockedBy"], json!([]));
+        t.parent_id = Some("p1".into());
+        t.blocked_by = vec!["b1".into(), "b2".into()];
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["parentId"], json!("p1"));
+        assert_eq!(v["blockedBy"], json!(["b1", "b2"]));
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(s["parentId"], json!("p1"));
+        assert_eq!(s["blockedBy"], json!(["b1", "b2"]));
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+
+        // step 6b: kind, playbook marker, checks and git in both (C6b.2).
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        for k in ["kind", "playbookStartedAt", "checks", "git"] {
+            assert_eq!(v[k], json!(null), "{k}");
+            assert_eq!(s[k], json!(null), "{k}");
+        }
+        t.kind = Some("feature".into());
+        t.playbook_started_at = Some(1_700_000_000_000);
+        t.checks = Some(TicketChecks {
+            state: ChecksState::Pending,
+            failed: None,
+            round: 0,
+            started_at: 5,
+        });
+        t.git = Some(TicketGit {
+            mode: GitMode::Worktree,
+            branch: "ticket/ab12cd34".into(),
+            base: "main".into(),
+            repo: "/p".into(),
+            worktree: Some("/p/.mira-bots/wt/ab12cd34".into()),
+        });
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        for x in [&v, &s] {
+            assert_eq!(x["kind"], json!("feature"));
+            assert_eq!(x["playbookStartedAt"], json!(1_700_000_000_000u64));
+            assert_eq!(
+                x["checks"],
+                json!({"state":"pending","failed":null,"round":0,"startedAt":5})
+            );
+            assert_eq!(
+                x["git"],
+                json!({"mode":"worktree","branch":"ticket/ab12cd34","base":"main","repo":"/p",
+                       "worktree":"/p/.mira-bots/wt/ab12cd34"})
+            );
+        }
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+        let back = serde_json::from_value::<TicketSummary>(s).unwrap();
+        assert_eq!((back.kind, back.git), (t.kind.clone(), t.git.clone()));
+
+        // step 6c: external in both (C6c.2).
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        assert_eq!(v["external"], json!(null));
+        assert_eq!(s["external"], json!(null));
+        t.external = Some(test_support::github_ref(123));
+        let v = serde_json::to_value(&t).unwrap();
+        let s = serde_json::to_value(TicketSummary::from(&t)).unwrap();
+        let want = json!({"kind":"github","externalId":"github:o/r#123","repo":"o/r","number":123,
+            "path":null,"url":"https://github.com/o/r/issues/123","title":"Crash ved start",
+            "labels":["bug"],"author":"alice","notes":[],"inboxItemId":"item-1","importedAt":5,
+            "writeBack":{"comment":"none","close":"none","commentUrl":null,"commentedAt":null,
+                "closedAt":null,"attempts":0,"lastError":null,"lastBody":null},
+            "inherited":false});
+        assert_eq!(v["external"], want);
+        assert_eq!(s["external"], want);
+        assert_eq!(serde_json::from_value::<Ticket>(v).unwrap(), t);
+        assert_eq!(
+            serde_json::from_value::<TicketSummary>(s).unwrap().external,
+            t.external
+        );
+    }
+
+    #[test]
+    fn external_ref_round_trips_and_defaults() {
+        for (st, wire) in [
+            (WriteBackState::None, "none"),
+            (WriteBackState::Inflight, "inflight"),
+            (WriteBackState::Done, "done"),
+            (WriteBackState::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(st).unwrap(), json!(wire));
+        }
+        assert_eq!(
+            serde_json::to_value(ExternalKind::Folder).unwrap(),
+            json!("folder")
+        );
+        assert_eq!(ExternalKind::Github.as_str(), "github");
+        let mut e = test_support::github_ref(7);
+        e.write_back = WriteBack {
+            comment: WriteBackState::Done,
+            close: WriteBackState::Failed,
+            comment_url: Some("https://github.com/o/r/issues/7#issuecomment-1".into()),
+            commented_at: Some(9),
+            closed_at: None,
+            attempts: 2,
+            last_error: Some("x".into()),
+            last_body: Some("y".into()),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(serde_json::from_value::<ExternalRef>(v).unwrap(), e);
+        // Only the required fields: the rest defaults (a folder ref without GitHub data).
+        let min = json!({"kind":"folder","externalId":"folder:web:fejl-1.md","title":"T",
+            "inboxItemId":"i","importedAt":1});
+        let e: ExternalRef = serde_json::from_value(min).unwrap();
+        assert_eq!(e.kind, ExternalKind::Folder);
+        assert_eq!((e.repo, e.number, e.path, e.url), (None, None, None, None));
+        assert!(e.labels.is_empty() && e.notes.is_empty() && e.author.is_none());
+        assert_eq!(e.write_back, WriteBack::default());
+        // A partial write-back object reads with defaults.
+        let wb: WriteBack = serde_json::from_value(json!({"comment":"inflight"})).unwrap();
+        assert_eq!(wb.comment, WriteBackState::Inflight);
+        assert_eq!((wb.close, wb.attempts), (WriteBackState::None, 0));
+    }
+
+    #[test]
+    fn old_ticket_without_external_loads() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Done)).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("external").is_some());
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!(t.external, None);
+        assert_eq!(t, ticket("t1", TicketState::Done));
+    }
+
+    #[test]
+    fn file_without_6b_fields_loads_with_defaults() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Review)).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in ["kind", "playbookStartedAt", "checks", "git"] {
+            assert!(o.remove(k).is_some(), "{k}");
+        }
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!((t.kind.as_deref(), t.playbook_started_at), (None, None));
+        assert_eq!((t.checks.as_ref(), t.git.as_ref()), (None, None));
+        assert_eq!(t, ticket("t1", TicketState::Review));
+    }
+
+    #[test]
+    fn file_without_relations_loads_with_defaults() {
+        let mut v = serde_json::to_value(ticket("t1", TicketState::Assigned)).unwrap();
+        let o = v.as_object_mut().unwrap();
+        assert!(o.remove("parentId").is_some());
+        assert!(o.remove("blockedBy").is_some());
+        let t: Ticket = serde_json::from_value(v).unwrap();
+        assert_eq!(t.parent_id, None);
+        assert!(t.blocked_by.is_empty());
+        assert_eq!(t, ticket("t1", TicketState::Assigned));
     }
 
     #[test]
@@ -658,7 +1179,7 @@ mod tests {
     fn workspace_rules_defaults_wire_format() {
         assert_eq!(
             serde_json::to_string(&WorkspaceRules::defaults()).unwrap(),
-            r#"{"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0}"#
+            r#"{"maxWorkAgents":5,"maxStaffAgents":3,"maxReviewRounds":3,"autoReviewOnStop":false,"createTicketRateLimit":20,"ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,"reportsPerTicketMax":20,"reviewByDefault":true,"userInputGraceMs":5000,"agentsMayCreateProjects":false,"maxAgentsPerProject":0,"git":"off","checksGate":true,"autoSpawnForPlaybook":false,"freshSessionPerTicket":true,"cleanupWorktreesOnDone":false}"#
         );
     }
 
@@ -684,6 +1205,14 @@ mod tests {
             }
             .to_string(),
             "Kan ikke flytte en ticket fra Done til I gang"
+        );
+        assert_eq!(
+            TicketError::IllegalTransition {
+                from: TicketState::Waiting,
+                to: TicketState::Review
+            }
+            .to_string(),
+            "Kan ikke flytte en ticket fra Venter til Review"
         );
         assert_eq!(
             TicketError::Validation("Titel må ikke være tom".into()).to_string(),
@@ -730,6 +1259,62 @@ mod tests {
             TicketError::ProjectChangeNotAllowed.to_string(),
             "Projektet kan kun ændres, mens ticketen ligger i Backlog eller er afvist uden agent"
         );
+        // step 6a
+        let table = [
+            (TicketError::ParentNotFound, "Forælderen findes ikke"),
+            (
+                TicketError::ParentDone,
+                "Forælderen er allerede færdig (Done)",
+            ),
+            (
+                TicketError::ParentProjectMismatch {
+                    parent: "a".into(),
+                    child: "b".into(),
+                },
+                "Del-ticketen hører til «b», men forælderen til «a»",
+            ),
+            (
+                TicketError::BlockerNotFound("abc".into()),
+                "Blokeringen abc findes ikke",
+            ),
+            (
+                TicketError::BlockedByAncestor,
+                "En ticket kan ikke blokeres af sin egen forælder",
+            ),
+            (TicketError::Cycle, "Relationen ville danne en cyklus"),
+            (
+                TicketError::Blocked("a1b2c3d4, e5f6a7b8".into()),
+                "Ticketen venter på a1b2c3d4, e5f6a7b8",
+            ),
+            (
+                TicketError::TooManyBlockers,
+                "Højst 10 blokeringer pr. ticket",
+            ),
+            // step 6b
+            (
+                TicketError::NoPlaybook("docs".into()),
+                "Ingen playbook for «docs»",
+            ),
+            (
+                TicketError::PlaybookAlreadyStarted,
+                "Forløbet er allerede startet (ticketen har del-tickets)",
+            ),
+            (
+                TicketError::InvalidKind,
+                "kind skal være task, feature, bug eller et playbook-navn fra workspace-filen",
+            ),
+            (
+                TicketError::PlaybookStepsInvalid("trin 1 mangler titel".into()),
+                "Playbooken kan ikke udrulles: trin 1 mangler titel",
+            ),
+            (
+                TicketError::ExternalAlreadyStarted("ab12cd34".into()),
+                "Issue/filen er allerede startet som ticket ab12cd34",
+            ),
+        ];
+        for (e, text) in table {
+            assert_eq!(e.to_string(), text);
+        }
     }
 
     #[test]

@@ -277,6 +277,7 @@ mod tests {
             ("mira_add_report", "Skriver rapport"),
             ("mira_get_report", "Læser rapport"),
             ("mira_handoff_ticket", "Giver ticket videre"),
+            ("mira_start_playbook", "Starter forløb"),
         ];
         for (tool, label) in table {
             let name = format!("mcp__mira-bots__{tool}");

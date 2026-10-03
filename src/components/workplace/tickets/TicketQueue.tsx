@@ -8,6 +8,8 @@ import {
 } from "../../../lib/ipc";
 import { isExited } from "../../../lib/status";
 import {
+  BLOCKED_HINT,
+  blockersOf,
   canRedispatch,
   canReopen,
   canRequestSubmission,
@@ -18,10 +20,14 @@ import {
   ISSUE_LABEL,
   moveUp,
   NOT_SUBMITTED_TEXT,
+  progressOf,
   queueFor,
   STATE_BADGE_CLASS,
   STATE_LABEL,
+  SUBMIT_PARENT_HINT,
   TURN_FAILED_TEXT,
+  WAITING_TITLE,
+  WAKE_UNCONFIRMED_TEXT,
 } from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
@@ -47,6 +53,19 @@ function IssueBadge({ t }: { t: TicketSummary }) {
   );
 }
 
+function BlockedBadge({ t, all }: { t: TicketSummary; all: readonly TicketSummary[] }) {
+  const blockers = blockersOf(t, all);
+  if (blockers.length === 0) return null;
+  return (
+    <span
+      className="shrink-0 rounded bg-amber-400/30 px-1.5 text-[10px] leading-4 text-amber-900 dark:text-amber-100"
+      title={BLOCKED_HINT}
+    >
+      Venter på {blockers.map((b) => b.shortId).join(", ")}
+    </span>
+  );
+}
+
 function Title({ t }: { t: TicketSummary }) {
   return (
     <span className="min-w-0 flex-1 truncate" title={`${t.title} (${t.shortId})`}>
@@ -66,12 +85,15 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
   const run = useRun();
   const exited = isExited(agent);
 
-  const { current, queue, review } = useMemo(() => {
+  const { current, queue, review, waiting } = useMemo(() => {
     const mine = state.tickets.filter((t) => t.assigneeAgentId === agent.id);
     return {
       current: mine.find((t) => t.state === "inProgress") ?? null,
       queue: queueFor(mine, agent.id),
       review: mine.filter((t) => t.state === "review"),
+      // Parents waiting for their children, oldest first (the app wakes the agent; a button only
+      // after an unconfirmed wake, review 6a W1).
+      waiting: mine.filter((t) => t.state === "waiting").sort((a, b) => a.updatedAt - b.updatedAt),
     };
   }, [state.tickets, agent.id]);
 
@@ -85,7 +107,8 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
   const hintText =
     agent.detail === DELIVERY_FAILED_TEXT ||
     agent.detail === TURN_FAILED_TEXT ||
-    agent.detail === NOT_SUBMITTED_TEXT
+    agent.detail === NOT_SUBMITTED_TEXT ||
+    agent.detail === WAKE_UNCONFIRMED_TEXT
       ? agent.detail
       : null;
   // The hint row carries the notSubmitted buttons when the agent's detail shows the hint; the
@@ -138,15 +161,15 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
     </button>
   );
 
-  const total = (current === null ? 0 : 1) + queue.length + review.length;
+  const total = (current === null ? 0 : 1) + queue.length + review.length + waiting.length;
   // Tickets on a staff agent (coordinator, reviewer) are coordination tasks (plan5 A.7).
   const heading = isCoordinationTask(agent) ? "Koordineringsopgaver" : "Tickets";
   const summary =
     total === 0
       ? `${heading}: ingen`
-      : `${heading}: ${current === null ? "ingen i gang" : "1 i gang"} · ${queue.length} i kø${
-          review.length > 0 ? ` · ${review.length} i review` : ""
-        }`;
+      : `${heading}: ${current === null ? "ingen i gang" : "1 i gang"}${
+          waiting.length > 0 ? ` · ${waiting.length} venter` : ""
+        } · ${queue.length} i kø${review.length > 0 ? ` · ${review.length} i review` : ""}`;
 
   return (
     <details open className="mx-3 mb-2 shrink-0 rounded-lg border border-[var(--border)] text-xs">
@@ -177,9 +200,11 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
                 type="button"
                 onClick={() => void run(() => setTicketState(current.id, "review", null))}
                 title={
-                  current.skipReview
-                    ? "Marker som færdig (ticketen springer review over og går til Done)"
-                    : "Agenten er færdig (fx efter Esc): flyt ticketen til Review"
+                  progressOf(current.id, state.tickets).done < progressOf(current.id, state.tickets).total
+                    ? SUBMIT_PARENT_HINT
+                    : current.skipReview
+                      ? "Marker som færdig (ticketen springer review over og går til Done)"
+                      : "Agenten er færdig (fx efter Esc): flyt ticketen til Review"
                 }
                 className={smallBtn}
               >
@@ -197,6 +222,39 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
           </div>
         )}
 
+        {waiting.map((t) => {
+          const p = progressOf(t.id, state.tickets);
+          return (
+            <div key={t.id} className="flex items-center gap-1.5">
+              <span className="shrink-0 text-[var(--muted)]">{WAITING_TITLE}:</span>
+              <Title t={t} />
+              <Badge t={t} />
+              {p.total > 0 && (
+                <span className="shrink-0 text-[10px] text-[var(--muted)]" title="Del-tickets færdige">
+                  {p.done}/{p.total}
+                </span>
+              )}
+              {/* Review 6a W1/R2-2: always offered (the detail text is overwritten by the next
+                  hook event); harmless when no wake is due, types the wake line again otherwise. */}
+              <button
+                type="button"
+                onClick={() => void run(() => requestSubmission(t.id))}
+                disabled={!canRequestSubmission(t, agent)}
+                title={
+                  !canRequestSubmission(t, agent)
+                    ? "Virker når agenten er Klar"
+                    : hintText === WAKE_UNCONFIRMED_TEXT
+                      ? "Vækningen blev ikke bekræftet: taster beskeden om de godkendte del-tickets igen"
+                      : "Taster beskeden om de godkendte del-tickets i terminalen igen, hvis vækningen udeblev"
+                }
+                className={smallBtn}
+              >
+                Bed om aflevering
+              </button>
+            </div>
+          );
+        })}
+
         {queue.length > 0 && (
           <ol className="space-y-1">
             {queue.map((t, i) => (
@@ -204,6 +262,7 @@ export default function TicketQueue({ agent }: { agent: AgentInfo }) {
                 <span className="w-5 shrink-0 text-right font-mono text-[var(--muted)]">{i + 1}.</span>
                 <Title t={t} />
                 <IssueBadge t={t} />
+                <BlockedBadge t={t} all={state.tickets} />
                 {i === 0 && hasRedispatchIssue(t) && hintText === null && resend(t)}
                 <button
                   type="button"

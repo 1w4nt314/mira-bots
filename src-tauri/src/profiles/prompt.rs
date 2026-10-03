@@ -19,7 +19,8 @@ Regler:
 - Opdager du opfølgende arbejde, så opret en ny ticket med mira_create_ticket i stedet for at udvide opgaven.
 - Er din igangværende ticket ikke til dig, så giv den videre med mira_handoff_ticket (med agentId til en anden agent; uden agentId tilbage i backlog) og afslut dit svar.
 - mira_list_tickets og mira_get_ticket viser dine og andre tickets; mira_update_status sætter en kort statuslinje; mira_add_report lægger en rapport (markdown) på ticketen, så brugeren og revieweren kan se hvad du har lavet — gør det ved større opgaver, gerne som `report` i mira_submit_for_review; mira_get_workspace_rules viser reglerne; mira_list_projects viser projekterne (mapperne under projektroden).
-- Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den.
+- Rør ikke mappen .mira-bots/ manuelt (ingen filer, ingen redigering); appen ejer den. Undtagelsen er din egen worktree under .mira-bots/wt/, når din ticket peger dertil.
+- Filerne mira-bots.workspace.json (projektroden) og .mira-bots/project.json (projektet) er brugerens; de er låst for dig — bed brugeren om ændringer i stedet for at forsøge at redigere dem.
 ";
 
 /// The role texts (C5.7), verbatim.
@@ -27,9 +28,9 @@ pub fn role_text(role: Role) -> &'static str {
     match role {
         Role::Coder => "Du er koder: du implementerer tickets i din arbejdsmappe, kører tests og afleverer med en rapport der beskriver ændringerne.",
         Role::Researcher => "Du er researcher: du undersøger og dokumenterer; dine afleveringer er tekst (rapport), ikke kodeændringer, medmindre ticketen siger andet.",
-        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets. Læs review-filen, afsenderens rapport og ændringerne (brug `git -C <mappe> diff`/`log`/`status`/`show`; du må ikke committe eller pushe). Kald mira_approve_ticket eller mira_reject_ticket med en konkret note; læg gerne en review-rapport med mira_add_report.",
-        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Hver ticket skal have et projekt (`project`: et id fra mira_list_projects); en arbejdsagent kan kun få tickets fra sit eget projekt, så vælg agent efter projekt eller start en ny i det rigtige projekt (mira_spawn_agent med project). Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op.",
-        Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede tickets med klare acceptkriterier (mira_create_ticket), men tildeler dem ikke.",
+        Role::Reviewer => "Du er reviewer: appen beder dig reviewe andres tickets som kritisk modpart. Læs review-filen, rapporterne («Ændringer», «Tjek», afsenderens rapport) og selve diffen (`git -C <mappe> diff <base>...<branch>`; du må ikke committe eller pushe). Rapportér fund som CRITICAL / WARNING / NICE-TO-HAVE med fil:linje, scenarie og rettelse; mindst ét CRITICAL eller WARNING betyder mira_reject_ticket med listen som note (læg den fulde liste som rapport først), ellers mira_approve_ticket med én linje om hvad du tjekkede. Vurdér aldrig på afsenderens opsummering alene. Reviewer du en forældre-ticket, er del-ticketsene allerede reviewet; vurdér helheden.",
+        Role::Coordinator => "Du er koordinator: du splitter opgaver i tickets (mira_create_ticket, gerne med assignTo), tildeler og fjerner tildelinger (mira_assign_ticket/mira_unassign_ticket), starter agenter fra profiler når der mangler kapacitet (mira_list_profiles, mira_spawn_agent; lofterne gælder) og holder øje med fremdrift (mira_list_agents, mira_list_tickets all). Hver ticket skal have et projekt (`project`: et id fra mira_list_projects); en arbejdsagent kan kun få tickets fra sit eget projekt, så vælg agent efter projekt eller start en ny i det rigtige projekt (mira_spawn_agent med project). Del-tickets opretter du med `parentId` (standard: din igangværende ticket) og `blockedBy` for rækkefølge; afleverer du en ticket med åbne del-tickets, venter den automatisk, og du får besked i terminalen, når en del-ticket er godkendt. Du godkender ikke tickets selv; det gør reviewere eller brugeren. En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op. Har ticketen en type med et forløb (fx feature eller bug), kan du i stedet starte forløbet med mira_start_playbook: appen opretter del-ticketsene i rækkefølge og tildeler dem efter rolle.",
+        Role::Planner => "Du er planlægger: du nedbryder større mål i små, ordnede del-opgaver med klare acceptkriterier. Er der en koordinator i staben, afleverer du planen som rapport (mira_add_report) og opretter ikke tickets selv; ellers opretter du del-ticketsene med mira_create_ticket (med parentId), men tildeler dem ikke.",
         Role::Debugger => "Du er debugger: du reproducerer fejl, finder årsagen og retter eller dokumenterer den; skriv altid reproduktion og årsag i rapporten.",
     }
 }
@@ -310,5 +311,58 @@ mod tests {
             render_profile_prompt(&p, &rules())
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- step 6a (C6.3) ----
+
+    #[test]
+    fn common_prompt_mentions_locked_files() {
+        let last = COMMON_PROMPT.trim_end().lines().last().unwrap();
+        assert_eq!(
+            last,
+            "- Filerne mira-bots.workspace.json (projektroden) og .mira-bots/project.json (projektet) er brugerens; de er låst for dig — bed brugeren om ændringer i stedet for at forsøge at redigere dem."
+        );
+        for id in ["coder", "reviewer", "specialist"] {
+            let p = crate::profiles::model::builtin_profile(id).unwrap();
+            let text = render_profile_prompt(&p, &rules());
+            assert_eq!(text.matches(last).count(), 1, "{id}");
+        }
+    }
+
+    #[test]
+    fn planner_text_mentions_report_and_parent_id() {
+        assert_eq!(
+            role_text(Role::Planner),
+            "Du er planlægger: du nedbryder større mål i små, ordnede del-opgaver med klare acceptkriterier. Er der en koordinator i staben, afleverer du planen som rapport (mira_add_report) og opretter ikke tickets selv; ellers opretter du del-ticketsene med mira_create_ticket (med parentId), men tildeler dem ikke."
+        );
+        let coord = role_text(Role::Coordinator);
+        let added = "Del-tickets opretter du med `parentId` (standard: din igangværende ticket) og `blockedBy` for rækkefølge; afleverer du en ticket med åbne del-tickets, venter den automatisk, og du får besked i terminalen, når en del-ticket er godkendt. ";
+        let at = coord.find(added).expect("coordinator sentence");
+        assert_eq!(
+            at + added.len(),
+            coord.find("Du godkender ikke tickets selv").unwrap()
+        );
+        assert!(coord.find("Hver ticket skal have et projekt").unwrap() < at);
+        assert!(coord.ends_with(
+            "En ticket du får som koordineringsopgave, giver du videre med mira_assign_ticket eller deler op. Har ticketen en type med et forløb (fx feature eller bug), kan du i stedet starte forløbet med mira_start_playbook: appen opretter del-ticketsene i rækkefølge og tildeler dem efter rolle."
+        ));
+    }
+
+    // ---- step 6b (C6b.5) ----
+
+    #[test]
+    fn reviewer_text_mentions_critical_warning_and_reject() {
+        assert_eq!(
+            role_text(Role::Reviewer),
+            "Du er reviewer: appen beder dig reviewe andres tickets som kritisk modpart. Læs review-filen, rapporterne («Ændringer», «Tjek», afsenderens rapport) og selve diffen (`git -C <mappe> diff <base>...<branch>`; du må ikke committe eller pushe). Rapportér fund som CRITICAL / WARNING / NICE-TO-HAVE med fil:linje, scenarie og rettelse; mindst ét CRITICAL eller WARNING betyder mira_reject_ticket med listen som note (læg den fulde liste som rapport først), ellers mira_approve_ticket med én linje om hvad du tjekkede. Vurdér aldrig på afsenderens opsummering alene. Reviewer du en forældre-ticket, er del-ticketsene allerede reviewet; vurdér helheden."
+        );
+        // Only the coordinator is told about mira_start_playbook (its tool, plan6b C6b.3).
+        for role in Role::ALL {
+            assert_eq!(
+                role_text(role).contains("mira_start_playbook"),
+                role == Role::Coordinator,
+                "{role:?}"
+            );
+        }
     }
 }

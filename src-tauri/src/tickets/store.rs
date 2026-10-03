@@ -74,7 +74,7 @@ impl JsonFileStore {
 }
 
 /// `path` with `suffix` appended to its file name (`tickets.json` → `tickets.json.tmp`).
-fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
@@ -257,7 +257,9 @@ impl TicketStore for MemoryStore {
 mod tests {
     use super::*;
     use crate::tickets::model::test_support::ticket;
-    use crate::tickets::model::TicketState;
+    use crate::tickets::model::{
+        ChecksState, GitMode, ReportAuthor, TicketChecks, TicketGit, TicketReport, TicketState,
+    };
     use serde_json::json;
 
     struct TempDir(PathBuf);
@@ -286,11 +288,50 @@ mod tests {
     }
 
     fn sample_doc() -> TicketDoc {
+        // Step 6a: a child of the first ticket, blocked by the second.
+        let mut child = ticket("33333333-0000-4000-8000-000000000000", TicketState::Backlog);
+        child.parent_id = Some("11111111-0000-4000-8000-000000000000".into());
+        child.blocked_by = vec!["22222222-0000-4000-8000-000000000000".into()];
+        // Step 6b: a feature ticket in review with failed checks, a worktree and an app report.
+        let mut feature = ticket("44444444-0000-4000-8000-000000000000", TicketState::Review);
+        feature.assignee_agent_id = Some("a1".into());
+        feature.kind = Some("feature".into());
+        feature.playbook_started_at = Some(1_700_000_000_000);
+        feature.checks = Some(TicketChecks {
+            state: ChecksState::Failed,
+            failed: Some("tests".into()),
+            round: 1,
+            started_at: 2_000,
+        });
+        feature.git = Some(TicketGit {
+            mode: GitMode::Worktree,
+            branch: "ticket/44444444".into(),
+            base: "main".into(),
+            repo: "/p".into(),
+            worktree: Some("/p/.mira-bots/wt/44444444".into()),
+        });
+        feature.reports.push(TicketReport {
+            id: "01".into(),
+            title: "Tjek: FEJL (tests)".into(),
+            author: ReportAuthor::system(),
+            created_at: 2_500,
+            path: "reports/01-tjek-fejl-tests.md".into(),
+            size: 12,
+        });
+        // Step 6c: a done ticket started from a GitHub issue, written back.
+        let mut external = ticket("55555555-0000-4000-8000-000000000000", TicketState::Done);
+        let mut e = crate::tickets::model::test_support::github_ref(7);
+        e.write_back.comment = crate::tickets::model::WriteBackState::Done;
+        e.write_back.attempts = 1;
+        external.external = Some(e);
         TicketDoc {
             schema_version: 1,
             tickets: vec![
                 ticket("11111111-0000-4000-8000-000000000000", TicketState::Backlog),
                 ticket("22222222-0000-4000-8000-000000000000", TicketState::Done),
+                child,
+                feature,
+                external,
             ],
             review_assignments: Vec::new(),
         }
@@ -387,6 +428,104 @@ mod tests {
         assert!(!doc.tickets.is_empty());
         assert!(doc.tickets.iter().all(|t| t.project.is_none()));
         assert_eq!(doc, sample_doc());
+    }
+
+    #[test]
+    fn version_1_file_without_relations_loads() {
+        // A step 1–5 `tickets.json`: no `parentId`/`blockedBy` on any ticket (plan6a punkt 4).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        for t in v["tickets"].as_array_mut().unwrap() {
+            let o = t.as_object_mut().unwrap();
+            assert!(o.remove("parentId").is_some());
+            assert!(o.remove("blockedBy").is_some());
+        }
+        let dir = TempDir::new();
+        let path = dir.0.join("tickets.json");
+        fs::write(&path, v.to_string()).unwrap();
+        let r = JsonFileStore::new(path).load().unwrap();
+        assert_eq!(r.warning, None);
+        assert_eq!(r.doc.schema_version, 1);
+        assert!(r
+            .doc
+            .tickets
+            .iter()
+            .all(|t| t.parent_id.is_none() && t.blocked_by.is_empty()));
+        let mut want = sample_doc();
+        for t in want.tickets.iter_mut() {
+            t.parent_id = None;
+            t.blocked_by.clear();
+        }
+        assert_eq!(r.doc, want);
+        // The relations and a waiting ticket survive a save in this build (schema stays 1).
+        let mut doc = sample_doc();
+        doc.tickets[0].state = TicketState::Waiting;
+        doc.tickets[0].assignee_agent_id = Some("k".into());
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["schemaVersion"], json!(1));
+        assert_eq!(v["tickets"][0]["state"], json!("waiting"));
+        assert_eq!(v["tickets"][2]["parentId"], json!(doc.tickets[0].id));
+        assert_eq!(migrate(v).unwrap(), doc);
+    }
+
+    #[test]
+    fn version_1_file_without_6b_fields_loads() {
+        // A step 1–6a `tickets.json`: no kind/playbookStartedAt/checks/git (plan6b punkt 1).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        assert_eq!(
+            v["tickets"][3]["reports"][0]["author"]["kind"],
+            json!("system")
+        );
+        for t in v["tickets"].as_array_mut().unwrap() {
+            let o = t.as_object_mut().unwrap();
+            for k in ["kind", "playbookStartedAt", "checks", "git"] {
+                assert!(o.remove(k).is_some(), "{k}");
+            }
+        }
+        let doc = migrate(v).unwrap();
+        assert_eq!(doc.schema_version, 1);
+        let mut want = sample_doc();
+        for t in want.tickets.iter_mut() {
+            t.kind = None;
+            t.playbook_started_at = None;
+            t.checks = None;
+            t.git = None;
+        }
+        assert_eq!(doc, want);
+        // The 6b fields survive a save in this build (schema stays 1).
+        let doc = sample_doc();
+        assert_eq!(migrate(serde_json::to_value(&doc).unwrap()).unwrap(), doc);
+    }
+
+    #[test]
+    fn version_1_file_without_6c_fields_loads() {
+        // A step 1–6b `tickets.json`: no `external` on any ticket (plan6c punkt 2).
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        assert_eq!(
+            v["tickets"][4]["external"]["writeBack"]["comment"],
+            json!("done")
+        );
+        for t in v["tickets"].as_array_mut().unwrap() {
+            assert!(t.as_object_mut().unwrap().remove("external").is_some());
+        }
+        let dir = TempDir::new();
+        let path = dir.0.join("tickets.json");
+        fs::write(&path, v.to_string()).unwrap();
+        let r = JsonFileStore::new(path).load().unwrap();
+        assert_eq!(r.warning, None);
+        let mut want = sample_doc();
+        for t in want.tickets.iter_mut() {
+            t.external = None;
+        }
+        assert_eq!(r.doc, want);
+        // The 6c field survives a save in this build (schema stays 1).
+        let doc = sample_doc();
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["schemaVersion"], json!(1));
+        assert_eq!(migrate(v).unwrap(), doc);
+        // An unknown write-back state quarantines the file like an unknown ticket state.
+        let mut v = serde_json::to_value(sample_doc()).unwrap();
+        v["tickets"][4]["external"]["writeBack"]["comment"] = json!("queued");
+        assert_quarantined(&v.to_string());
     }
 
     #[test]

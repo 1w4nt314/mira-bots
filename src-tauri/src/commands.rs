@@ -23,15 +23,18 @@ use crate::agent::{
 };
 use crate::app_settings::{self, AppSettings};
 use crate::config::{
-    moving_text, DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER,
+    fresh_text, moving_text, DEFAULT_PROFILE_ID, MOVED_NOTE, SETTINGS_FILE, STARTING_HINT_AFTER,
     SYSTEM_PROMPT_FILE,
 };
 use crate::diagnostics::{version_fields, Diagnostics, HookStats, VersionProbe};
 use crate::events::{AgentOutputPayload, WorkplaceSelection, AGENTS_CHANGED, WORKPLACE_SELECT};
+use crate::gh::{GhAuthResult, GhProbe};
 use crate::hooks::settings::write_profile_settings;
 use crate::hooks::status::AgentStatus;
+use crate::inbox::{InboxItem, InboxItemSummary, InboxPayload, RefreshReason, StartRequest};
 use crate::island::{self, IslandState};
 use crate::mcp;
+use crate::notices::{NoticeKind, NoticesCtx, NoticesPayload};
 use crate::permissions::{Decision, PendingPermissions, PermissionRequestInfo};
 use crate::profiles::model::{
     model_is_valid, new_custom_id, validate_overrides, AgentProfile, Effort, ProfileError,
@@ -40,13 +43,17 @@ use crate::profiles::model::{
 use crate::profiles::prompt::{profile_files_dir, write_profile_prompt};
 use crate::profiles::ProfilesCtx;
 use crate::projects::{self, AssignmentProject, Project, ProjectError, ProjectId, ProjectRef};
-use crate::tickets::dispatcher::DispatchMsg;
+use crate::tickets::dispatcher::{DispatchMsg, RestartForTicket, RestartPort};
+use crate::tickets::model::WriteBack;
 use crate::tickets::model::{
     ReportAuthor, ReviewAssignment, Ticket, TicketError, TicketPatch, TicketReport, TicketState,
     TicketSummary, WorkspaceRules,
 };
-use crate::tickets::tools::{ticket_has_project, SpawnByProfile, SPAWN_UNAVAILABLE};
+use crate::tickets::playbook::{self, PlaybookStarted, StartedBy};
+use crate::tickets::service::validate_kind;
+use crate::tickets::tools::{ticket_has_project, SpawnByProfile, SpawnPort, SPAWN_UNAVAILABLE};
 use crate::tickets::{prompt, ReportContent, TicketsCtx, AGENT_EXITED_NOTE, AGENT_STOPPED_NOTE};
+use crate::watch::{WatchRuntime, WatchView};
 use crate::workplace;
 use crate::workspace::WorkspaceReader;
 
@@ -107,6 +114,9 @@ pub struct AppState {
     pub hook_stats: Arc<HookStats>,
     /// Result of the one-shot background `claude --version` probe.
     pub claude_version: Arc<Mutex<VersionProbe>>,
+    /// Result of the background `gh --version` probe (step 6c; started again by Diagnostik
+    /// while gh is missing and the lookup may run again).
+    pub gh_probe: Arc<Mutex<GhProbe>>,
     /// Agent/tab to select when a newly created workplace window asks
     /// (`take_workplace_selection`).
     pub workplace_select: Mutex<Option<WorkplaceSelection>>,
@@ -114,12 +124,21 @@ pub struct AppState {
     pub tickets: Arc<TicketsCtx>,
     /// Warning from loading `tickets.json` (corrupt file renamed etc.), for Diagnostics.
     pub tickets_warning: Option<String>,
+    /// Warning from loading `inbox.json` (corrupt file renamed etc.), for Diagnostics (step 6c).
+    pub inbox_warning: Option<String>,
     /// Agent profiles (store + `profiles-changed`).
     pub profiles: Arc<ProfilesCtx>,
     /// `<projects_root>/mira-bots.workspace.json`, read on demand (shared with `TicketsCtx`).
     pub workspace: Arc<WorkspaceReader>,
     /// Profiles copied from the step 1–5 agents root at this start (Diagnostik).
     pub profiles_migrated: usize,
+    /// `app-settings.json` as loaded at start (step 6d A.7). Changed only through
+    /// [`AppState::update_settings`] (read-modify-write + save), never by a struct literal.
+    pub settings: Mutex<AppSettings>,
+    /// Beskedkøen (trin 6d, plan A.8): samme `Arc` som `tickets.notices`.
+    pub notices: Arc<NoticesCtx>,
+    /// Vagten (trin 6d, plan punkt 17): `watch-state.json`, timer-tasken, hukommelse og view.
+    pub watch: WatchRuntime,
 }
 
 /// `AppInfo` (C.1), camelCase.
@@ -141,6 +160,8 @@ pub struct AppInfo {
     pub projects_root: String,
     /// The effective workspace rules (plan4b A.4).
     pub rules: WorkspaceRules,
+    /// The playbook names, sorted (step 6b): the kind dropdown and "Start forløb".
+    pub playbook_kinds: Vec<String>,
 }
 
 /// `get_agent_output` result: same shape as the `agent-output` event payload.
@@ -155,9 +176,76 @@ fn path_string(p: &Option<PathBuf>) -> Option<String> {
 }
 
 impl AppState {
+    /// The only write path for `app-settings.json` (6d A.7): `f` changes a copy of the current
+    /// settings under the lock, the file is written, and only then does the copy become the
+    /// live settings (a failed write changes nothing in memory). Returns the new settings.
+    pub fn update_settings(&self, f: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
+        update_settings_in(&self.paths.data_dir, &self.settings, f)
+    }
+
+    /// "Giv besked ved: …" (trin 6d, plan punkt 15): `notifyOff` læses, ændres og skrives
+    /// (typen ud, og ind igen når `on` er falsk), derefter får køen den nye liste. En fejlet
+    /// gemning ændrer intet.
+    pub fn set_notify_pref(&self, kind: NoticeKind, on: bool) -> Result<NoticesPayload, String> {
+        let name = kind.as_str();
+        let next = self.update_settings(|s| {
+            s.notify_off.retain(|k| k != name);
+            if !on {
+                s.notify_off.push(name.to_string());
+            }
+        })?;
+        log::info!("notices: {name} {}", if on { "on" } else { "off" });
+        Ok(self.notices.set_off(&next.notify_off))
+    }
+
+    /// "Stop vagten"/"Start vagten igen" (`project: None` → `watchPaused`) og "Hold vagt" pr.
+    /// projekt (`watchOff`); læs-ændr-skriv af `app-settings.json`, aldrig `project.json`.
+    pub fn set_watch(&self, project: Option<&str>, on: bool) -> Result<(), String> {
+        let word = if on { "resumed" } else { "paused" };
+        match project.map(str::trim) {
+            None => {
+                self.update_settings(|s| s.watch_paused = !on)?;
+                log::info!("watch: master {word}");
+            }
+            Some("") => return Err("Vælg et projekt".into()),
+            Some(p) => {
+                if !on
+                    && !projects::list_projects(&self.paths.projects_root)
+                        .iter()
+                        .any(|x| projects::same_id(&x.id, p))
+                {
+                    return Err(ProjectError::NotFound(p.to_string()).to_string());
+                }
+                self.update_settings(|s| {
+                    s.watch_off.retain(|x| !projects::same_id(x, p));
+                    if !on {
+                        s.watch_off.push(p.to_string());
+                    }
+                })?;
+                log::info!("watch: {p} {word}");
+            }
+        }
+        Ok(())
+    }
+
+    /// "Genstart vagt": nulstiller fejl og stop for projektet i `watch-state.json`.
+    pub fn restart_watch(&self, project: &str) -> Result<(), String> {
+        let project = project.trim();
+        if project.is_empty() {
+            return Err("Vælg et projekt".into());
+        }
+        let was = self.watch.reset_trip(project);
+        log::info!(
+            "watch: {project} genstartet{}",
+            if was { "" } else { " (var ikke stoppet)" }
+        );
+        Ok(())
+    }
+
     /// Recomputes the `claude` lookup on every call.
     pub fn app_info(&self) -> AppInfo {
-        let rules = self.workspace.snapshot().rules;
+        let snap = self.workspace.snapshot();
+        let rules = snap.rules;
         AppInfo {
             claude_path: path_string(&find_claude()),
             hook_exe: path_string(&self.paths.hook_exe),
@@ -169,17 +257,25 @@ impl AppState {
             max_staff_agents: rules.max_staff_agents,
             projects_root: self.paths.projects_root.to_string_lossy().into_owned(),
             rules,
+            playbook_kinds: snap.config.playbook_kinds(),
         }
     }
 
     /// Everything the Diagnostics panel shows (C2.3). Recomputes the `claude` lookup.
     pub fn diagnostics(&self) -> Diagnostics {
+        let settings = lock(&self.settings).clone();
         let (
             claude_version,
             claude_version_note,
             claude_code_args_supported,
             claude_code_mcp_supported,
         ) = version_fields(&lock(&self.claude_version));
+        // gh missing: look again (on the gh-version thread) once the cached miss expired, so
+        // a gh installed while the app runs shows up here.
+        if *lock(&self.gh_probe) == VersionProbe::NotFound && crate::gh::gh_lookup_due() {
+            crate::gh::start_gh_probe(Arc::clone(&self.gh_probe));
+        }
+        let (gh_version, gh_version_note) = crate::gh::version_fields(&lock(&self.gh_probe));
         let ws = self.workspace.snapshot();
         Diagnostics {
             claude_path: path_string(&find_claude()),
@@ -224,6 +320,23 @@ impl AppState {
             workspace_warning: ws.warning,
             projects_total: crate::projects::list_projects(&self.paths.projects_root).len(),
             profiles_migrated: self.profiles_migrated,
+            inbox_warning: self.inbox_warning.clone(),
+            gh_path: path_string(&crate::gh::known_gh()),
+            gh_version,
+            gh_version_note,
+            inbox_path: self
+                .paths
+                .data_dir
+                .join(crate::config::INBOX_FILE)
+                .to_string_lossy()
+                .into_owned(),
+            inbox_new: self.tickets.inbox_read(|i| i.new_count()),
+            inbox_sources: self.tickets.inbox_sources_diag(),
+            watch_paused: settings.watch_paused,
+            watch_active: self.watch.active(),
+            watch_state_path: self.watch.state_path().to_string_lossy().into_owned(),
+            watch_warning: self.watch.warning().map(str::to_string),
+            notify_off: settings.notify_off,
         }
     }
 
@@ -337,6 +450,21 @@ pub fn check_spawn(spawn: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// `open_workplace`'s `ticket_id` (step 6d A.9): `None`, or a ticket that exists (full or short
+/// id) → its full id for the payload.
+pub fn check_ticket(
+    ticket_id: Option<&str>,
+    tickets: &TicketsCtx,
+) -> Result<Option<String>, String> {
+    match ticket_id {
+        None => Ok(None),
+        Some(id) => tickets
+            .read(|s| s.get_by_any_id(id))
+            .map(|t| Some(t.id))
+            .ok_or_else(|| "Ukendt ticket".to_string()),
+    }
+}
+
 /// Diagnostik's `pipeNote`. Unix: the server's error (`error`, e.g. "Socket-mappen … er ikke
 /// privat"), else the too-long-socket-path text, plus a note when the `/tmp` fallback is in use
 /// (joined with "; "). Windows: `None`.
@@ -429,8 +557,23 @@ pub fn ticket_create(
     skip_review: bool,
     project: Option<ProjectRef>,
 ) -> Result<TicketSummary, String> {
+    ticket_create_kind(t, title, body, skip_review, project, None)
+}
+
+/// [`ticket_create`] with a `kind` (step 6b): task, feature, bug or a playbook name of the
+/// workspace file (absent/`task` = a plain ticket), checked with [`validate_kind`] against the
+/// workspace's playbooks.
+pub fn ticket_create_kind(
+    t: &TicketsCtx,
+    title: &str,
+    body: &str,
+    skip_review: bool,
+    project: Option<ProjectRef>,
+    kind: Option<&str>,
+) -> Result<TicketSummary, String> {
+    let kind = validate_kind(kind, &t.workspace.config().playbook_kinds())?;
     let now = now_ms();
-    t.mutate(|s| s.create_in(title, body, skip_review, project, now))
+    t.mutate(|s| s.create_in(title, body, skip_review, project, kind, now))
         .map(|tk| TicketSummary::from(&tk))
 }
 
@@ -606,12 +749,12 @@ pub fn ticket_redispatch(t: &TicketsCtx, id: &str) -> Result<(), String> {
     }
 }
 
-/// "Bed om aflevering": the ticket must be in progress with a live agent; the dispatcher then
-/// types the nudge line (C4.7) once the agent is idle and no delivery runs (otherwise it only
-/// logs).
+/// "Bed om aflevering": the ticket must be in progress (or a waiting parent, whose wake line is
+/// then typed again; review 6a R2-1) with a live agent; the dispatcher types the line once the
+/// agent is idle and no delivery runs (otherwise it only logs).
 pub fn ticket_request_submission(t: &TicketsCtx, id: &str) -> Result<(), String> {
     let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
-    if tk.state != TicketState::InProgress {
+    if !matches!(tk.state, TicketState::InProgress | TicketState::Waiting) {
         return Err(TicketError::NotInProgress.into());
     }
     let live = tk
@@ -630,17 +773,26 @@ pub fn ticket_request_submission(t: &TicketsCtx, id: &str) -> Result<(), String>
     }
 }
 
-/// Only backlog tickets and rejected tickets without an agent can start a new agent.
+/// Only backlog tickets and rejected tickets without an agent can start a new agent, and only
+/// when no blocker is open (step 6a: "Ticketen venter på …").
+// TODO(windows-verify): "Ny agent med ticket" on a blocked ticket is refused with "Ticketen
+// venter på …" (plan6a D.95).
 pub fn ticket_for_spawn(t: &TicketsCtx, id: &str) -> Result<Ticket, String> {
     let tk = t.read(|s| s.get(id)).ok_or(TicketError::NotFound)?;
     match (tk.state, &tk.assignee_agent_id) {
-        (TicketState::Backlog, _) | (TicketState::Rejected, None) => Ok(tk),
-        (from, _) => Err(TicketError::IllegalTransition {
-            from,
-            to: TicketState::Assigned,
+        (TicketState::Backlog, _) | (TicketState::Rejected, None) => {}
+        (from, _) => {
+            return Err(TicketError::IllegalTransition {
+                from,
+                to: TicketState::Assigned,
+            }
+            .into())
         }
-        .into()),
     }
+    if let Some(blockers) = t.read(|s| s.blocked_text(&tk.id)) {
+        return Err(TicketError::Blocked(blockers).into());
+    }
+    Ok(tk)
 }
 
 /// After a spawn with the ticket line as positional prompt: the dispatcher waits for the session
@@ -721,7 +873,8 @@ pub fn spawn_request(
 }
 
 /// Writes the profile's `settings.json` and `system-prompt.md` under `<data_dir>/profiles/<id>/`
-/// (the hook exe placeholder when it was not found). Returns both paths.
+/// (the hook exe placeholder when it was not found; the deny rules lock the user's files under
+/// the projects root, step 6b). Returns both paths.
 pub fn write_profile_files(
     paths: &AppPaths,
     profile: &AgentProfile,
@@ -731,7 +884,8 @@ pub fn write_profile_files(
         .hook_exe
         .clone()
         .unwrap_or_else(|| PathBuf::from("mira-hook-not-found"));
-    let settings = write_profile_settings(&paths.data_dir, &hook, profile)?;
+    let settings =
+        write_profile_settings(&paths.data_dir, &hook, profile, Some(&paths.projects_root))?;
     let prompt = write_profile_prompt(&paths.data_dir, profile, rules)?;
     Ok((settings, prompt))
 }
@@ -755,8 +909,13 @@ pub fn spawn_context(
     let io = |e: std::io::Error| String::from(AgentError::Io(e));
     let (settings_json, prompt_file) = match profile {
         Some(p) => {
-            let settings =
-                write_profile_settings(&state.paths.data_dir, hook_exe, p).map_err(io)?;
+            let settings = write_profile_settings(
+                &state.paths.data_dir,
+                hook_exe,
+                p,
+                Some(&state.paths.projects_root),
+            )
+            .map_err(io)?;
             let rules = state.workspace.rules();
             let prompt = write_profile_prompt(&state.paths.data_dir, p, &rules).map_err(io)?;
             (settings, prompt)
@@ -998,6 +1157,32 @@ pub fn first_delivery(
     }
 }
 
+/// Step 6a: the first delivery's `## Del-tickets` and, for a planning task, whether a coordinator
+/// runs (a live agent with the role, or the ticket's parent belongs to one) — as the
+/// dispatcher's `delivery_for`. Takes the service lock and the manager lock one after the other.
+fn relation_delivery(
+    state: &AppState,
+    ticket: &Ticket,
+    delivery: prompt::TicketDelivery,
+) -> prompt::TicketDelivery {
+    let children = state.tickets.read(|s| s.child_lines(&ticket.id));
+    let delivery = delivery.with_children(children);
+    if delivery.coordination != Some(prompt::CoordinationKind::Plan) {
+        return delivery;
+    }
+    let parent_assignee = ticket
+        .parent_id
+        .as_deref()
+        .and_then(|p| state.tickets.read(|s| s.get(p)))
+        .and_then(|p| p.assignee_agent_id);
+    let m = lock(&state.manager);
+    let available = m.has_live_coordinator()
+        || parent_assignee
+            .and_then(|a| m.get(&a))
+            .is_some_and(|a| a.roles.contains(&crate::agent::Role::Coordinator));
+    delivery.with_coordinator(available)
+}
+
 /// The shared core of `spawn_agent_with_ticket` and `mira_spawn_agent` with `firstTicketId`.
 /// A ticket without a project (or with `{"new": …}`) gets the agent's project before the file
 /// is written; if the spawn then fails the project stays (an empty folder may remain; plan4b
@@ -1020,7 +1205,7 @@ pub fn spawn_with_ticket_core(
     profile.check_seat(seat)?;
     let may_create = spawn_may_create(&ticket, may_create);
     let project = spawn_project(&ticket, seat, project)?;
-    let (ctx, placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
+    let (ctx, mut placement) = prepare_spawn(state, &profile, seat, project.as_ref(), may_create)?;
     ticket = ticket_in_placement(&state.tickets, ticket, &placement)?;
     let rules = state.workspace.rules();
     // On a staff seat the first ticket is a coordination task (5c C.1).
@@ -1031,6 +1216,27 @@ pub fn spawn_with_ticket_core(
         placement.project.as_deref(),
         &rules,
     );
+    let mut delivery = relation_delivery(state, &ticket, delivery);
+    // Step 6b (plan A.4): a work delivery gets the ticket's git branch; with a worktree the agent
+    // starts in it, so the ticket file lands in `<worktree>/.mira-bots/tickets/`. A failure is a
+    // history note and the spawn continues without git.
+    if delivery.is_work() {
+        if let Some(git) = state.tickets.prepare_ticket_git(&ticket) {
+            if let Some(wt) = git.worktree.as_deref().map(PathBuf::from) {
+                if wt.is_dir() {
+                    placement.cwd = wt;
+                } else {
+                    log::warn!(
+                        "git: worktree {} of ticket {} is missing; the agent starts in the project",
+                        wt.display(),
+                        ticket.short_id()
+                    );
+                }
+            }
+            ticket.git = Some(git.clone());
+            delivery = delivery.with_git(Some(git));
+        }
+    }
     let file = prompt::write_ticket_file(&placement.cwd, &ticket, now_ms(), &delivery)
         .map_err(|e| format!("Kunne ikke skrive ticket-fil: {e}"))?;
     let line = prompt::line_for(&ticket, &delivery);
@@ -1170,32 +1376,41 @@ fn restart_agent(
     model: Option<Option<String>>,
     effort: Option<Effort>,
 ) -> Result<AgentInfo, String> {
-    restart_with(app, state, agent_id, model, effort, None)
+    restart_with(app, state, agent_id, model, effort, None, false, None)
 }
 
-/// [`restart_agent`], optionally in another folder and project (`moved`; plan4b A.3).
+/// [`restart_agent`], optionally in another folder (`moved`: the cwd and, for "Flyt til
+/// projekt", the new project; `None` keeps the agent's project; plan4b A.3). `force_fresh`
+/// starts a new session even after a turn (never `--resume`; a fresh session per ticket, step
+/// 6b plan A.7). `start_text` replaces the restart text while the agent starts (default: the
+/// move text for a new project, else [`crate::config::RESTARTING_TEXT`]).
+#[allow(clippy::too_many_arguments)]
 fn restart_with(
     app: &AppHandle,
     state: &AppState,
     agent_id: &str,
     model: Option<Option<String>>,
     effort: Option<Effort>,
-    moved: Option<(PathBuf, String)>,
+    moved: Option<(PathBuf, Option<String>)>,
+    force_fresh: bool,
+    start_text: Option<String>,
 ) -> Result<AgentInfo, String> {
     let info = check_restartable(lock(&state.manager).get(agent_id).as_ref())?;
     let (model, effort) = restart_values(&info, model, effort);
     let profile = state.profiles.get(&info.profile_id);
     let ctx = spawn_context(state, &info.profile_id, profile.as_ref())?;
+    let new_project = moved.as_ref().and_then(|(_, p)| p.clone());
     let req = match &moved {
         Some((cwd, project)) => restart_request_in(
             &info,
             model.clone(),
             effort,
             cwd.clone(),
-            Some(project.clone()),
+            project.clone().or_else(|| info.project.clone()),
         ),
         None => restart_request(&info, model.clone(), effort),
     };
+    let start_text = start_text.or_else(|| new_project.as_deref().map(moving_text));
     lock(&state.pending).remove_for_agent(agent_id);
     let (result, old_pty, resumed) = {
         let mut m = lock(&state.manager);
@@ -1204,7 +1419,9 @@ fn restart_with(
             return Err(e.into());
         }
         // Decided under the same lock as the restart (a turn may have ended meanwhile).
-        let session = m.restart_session(agent_id).ok_or(AgentError::NotRunning)?;
+        let session = m
+            .restart_session(agent_id, force_fresh)
+            .ok_or(AgentError::NotRunning)?;
         let resumed = matches!(session, RestartSession::Resume(_));
         let spec = build_restart_spec(&req, &ctx, &session, agent_id);
         let (result, old_pty) = m.restart(
@@ -1215,9 +1432,9 @@ fn restart_with(
             effort.map(|e| e.as_str().to_string()),
             Arc::clone(&state.sink),
         );
-        if let (Ok(_), Some((_, project))) = (&result, &moved) {
-            // W2: say where it goes instead of "nye indstillinger".
-            m.set_start_text(agent_id, moving_text(project));
+        if let (Ok(_), Some(text)) = (&result, start_text) {
+            // W2: say where it goes (or which ticket it starts) instead of "nye indstillinger".
+            m.set_start_text(agent_id, text);
         }
         (result, old_pty, resumed)
     };
@@ -1234,8 +1451,8 @@ fn restart_with(
                 model.as_deref().unwrap_or("default"),
                 effort.map_or("-", Effort::as_str)
             );
-            let info = match &moved {
-                Some((_, project)) => {
+            let info = match &new_project {
+                Some(project) => {
                     let mut m = lock(&state.manager);
                     m.set_project(agent_id, Some(project.clone()));
                     log::info!("agent {agent_id} moved to project {project}");
@@ -1243,7 +1460,8 @@ fn restart_with(
                 }
                 None => info,
             };
-            // W2: a move into a git project shows the trust dialog; the hint points at it.
+            // W2: a move into a git project shows the trust dialog; the hint points at it (also
+            // after a restart into a ticket's worktree, step 6b; research6b §1.7).
             schedule_starting_hint(
                 app.clone(),
                 Arc::clone(&state.manager),
@@ -1254,8 +1472,15 @@ fn restart_with(
         }
         Err(e) => {
             log::warn!("restart of agent {agent_id} failed: {e}");
-            if let Err(e) = state.tickets.release_agent(agent_id, AGENT_EXITED_NOTE) {
-                log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+            match state.tickets.release_agent(agent_id, AGENT_EXITED_NOTE) {
+                Ok(released) => {
+                    // Trin 6d (plan A.8 b): den mislykkede genstart afsluttede agenten.
+                    let info = lock(&state.manager).get(agent_id);
+                    if let Some(info) = info {
+                        state.tickets.notice_exit(&info, released);
+                    }
+                }
+                Err(e) => log::warn!("releasing the tickets of agent {agent_id} failed: {e}"),
             }
             state.emit_agents(app);
             Err(e.into())
@@ -1296,25 +1521,80 @@ pub fn set_agent_effort(
     restart_agent(&app, &state, &agent_id, None, Some(effort))
 }
 
+// ---- fresh session per ticket (step 6b, plan A.7) ----
+
+/// The dispatcher's restart before a ticket delivery ([`RestartPort`], plan A.7): the agent's
+/// model/effort and project stay; `req.cwd` (the ticket's worktree) becomes the cwd when given;
+/// `force_fresh` starts a new session (never `--resume`), otherwise the session continues
+/// (`--resume` when it had a turn). The gate (Idle, no ticket in progress) is the same as for a
+/// model change and is checked again under the manager lock; the restart sends
+/// `AgentRestarting`, which keeps the dispatcher's `AwaitingRestart`. The agent shows
+/// [`fresh_text`] while it starts (the 15 s hint follows if no hook event comes). A restart is
+/// not user input (the grace period is untouched).
+// TODO(windows-verify): two tickets in a row give a new session id (Diagnostik/statuslinje), the
+// terminal is not mixed up, and no node/mira-mcp of the old session is left (plan6b D.101).
+pub fn restart_for_ticket(
+    app: &AppHandle,
+    state: &AppState,
+    req: RestartForTicket,
+) -> Result<(), String> {
+    restart_with(
+        app,
+        state,
+        &req.agent_id,
+        None,
+        None,
+        req.cwd.map(|cwd| (cwd, None)),
+        req.force_fresh,
+        Some(fresh_text(&req.ticket_short)),
+    )
+    .map(|_| ())
+}
+
+/// The [`RestartPort`] of the dispatcher's `ManagerPort` (set in `lib.rs` like the tools'
+/// `SpawnPort`): looks the state up per call, so a restart before `manage` is refused.
+pub fn restart_port(app: AppHandle) -> RestartPort {
+    Arc::new(move |req: RestartForTicket| {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| RESTART_UNAVAILABLE.to_string())?;
+        restart_for_ticket(&app, &state, req)
+    })
+}
+
+/// [`restart_port`] before the app state is managed.
+pub const RESTART_UNAVAILABLE: &str = "Appen er ved at starte; genstart er ikke tilgængelig endnu";
+
 // ---- projects (plan4b C4b.4) ----
 
 /// The gate of `move_agent_to_project`, in the order of C4b.4 (without the restart, so it is
-/// unit tested): running, idle, no ticket in progress → work seat → empty queue (or `force`) →
-/// the project exists (a `New` is created: the user may) → not the agent's own → the
-/// `maxAgentsPerProject` limit (the agent itself not counted). Returns the agent and the
-/// project.
+/// unit tested): running, idle, no ticket in progress → work seat → no queued or waiting tickets
+/// (or `force`) → the project exists (a `New` is created: the user may) → not the agent's own →
+/// the `maxAgentsPerProject` limit (the agent itself not counted). Returns the agent, the
+/// project and how many of its tickets go to the backlog (queued + waiting parents).
+///
+/// Review 6a W2: a waiting parent (step 6a) counts like a queued ticket. Left in the old project
+/// it would be woken, and resumed, with the agent in the new one; so the move needs the
+/// confirmation, and [`TicketsCtx::release_queue`] puts it in the backlog with [`MOVED_NOTE`].
 pub fn move_gate(
     state: &AppState,
     agent_id: &str,
     project: &ProjectRef,
     force: bool,
-) -> Result<(AgentInfo, Project), String> {
+) -> Result<(AgentInfo, Project, usize), String> {
     let info = check_restartable(lock(&state.manager).get(agent_id).as_ref())?;
     if info.seat_kind != SeatKind::Work {
         return Err(AgentError::StaffHasNoProject.into());
     }
-    if info.queue_length > 0 && !force {
-        return Err(AgentError::QueueNotEmpty(info.queue_length).into());
+    let waiting = state.tickets.read(|s| {
+        s.list_for_agent(agent_id)
+            .iter()
+            .filter(|t| t.state == TicketState::Waiting)
+            .count()
+    });
+    let pending = info.queue_length + waiting;
+    if pending > 0 && !force {
+        return Err(AgentError::QueueNotEmpty(pending).into());
     }
     let p = projects::realize(&state.paths.projects_root, project, true)?;
     if info
@@ -1326,13 +1606,13 @@ pub fn move_gate(
     }
     let max = state.workspace.rules().max_agents_per_project;
     check_project_limit(&state.manager, &p.id, max, Some(agent_id))?;
-    Ok((info, p))
+    Ok((info, p, pending))
 }
 
 /// "Flyt til projekt…" (plan4b A.3): restarts the agent with `--resume` in the project's
 /// folder (the conversation is kept, research4b §2). Only on a work seat, idle without a ticket
-/// in progress; queued tickets go to the backlog with [`MOVED_NOTE`] when `force`, otherwise the
-/// move is refused.
+/// in progress; queued tickets and waiting parents go to the backlog with [`MOVED_NOTE`] when
+/// `force`, otherwise the move is refused.
 // TODO(windows-verify): the agent restarts with --resume in the new folder, the conversation is
 // kept, the trust dialog comes for a git project, and the next ticket file lands in the new
 // folder (plan4b D.81).
@@ -1347,8 +1627,8 @@ pub fn move_agent_to_project(
     project: ProjectRef,
     force: bool,
 ) -> Result<AgentInfo, String> {
-    let (info, p) = move_gate(&state, &agent_id, &project, force)?;
-    if info.queue_length > 0 {
+    let (_, p, pending) = move_gate(&state, &agent_id, &project, force)?;
+    if pending > 0 {
         state.tickets.release_queue(&agent_id, MOVED_NOTE)?;
     }
     restart_with(
@@ -1357,7 +1637,9 @@ pub fn move_agent_to_project(
         &agent_id,
         None,
         None,
-        Some((PathBuf::from(&p.path), p.id)),
+        Some((PathBuf::from(&p.path), Some(p.id))),
+        false,
+        None,
     )
 }
 
@@ -1405,9 +1687,30 @@ pub fn open_project_folder(
 /// [`store_projects_root`] with a relative path.
 pub const PROJECTS_ROOT_NOT_ABSOLUTE: &str = "Projektroden skal være en absolut sti";
 
+/// [`AppState::update_settings`] without the state: lock → `f` on a copy → `app_settings::save`
+/// → the copy becomes the live settings. The error text is the user-facing one.
+pub fn update_settings_in(
+    data_dir: &std::path::Path,
+    settings: &Mutex<AppSettings>,
+    f: impl FnOnce(&mut AppSettings),
+) -> Result<AppSettings, String> {
+    let mut live = lock(settings);
+    let mut next = live.clone();
+    f(&mut next);
+    app_settings::save(data_dir, &next)
+        .map_err(|e| format!("Indstillingen kunne ikke gemmes: {e}"))?;
+    *live = next.clone();
+    Ok(next)
+}
+
 /// Stores a new projects root in `app-settings.json` (created if missing). It applies after a
-/// restart of mira-bots (plan4b A.1); returns the stored path.
-pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<String, String> {
+/// restart of mira-bots (plan4b A.1); returns the stored path. The other settings (watch and
+/// notice preferences, 6d A.7) are kept: read-modify-write through [`update_settings_in`].
+pub fn store_projects_root(
+    data_dir: &std::path::Path,
+    settings: &Mutex<AppSettings>,
+    path: &str,
+) -> Result<String, String> {
     let path = path.trim();
     if path.is_empty() {
         return Err("Vælg en mappe til projektroden".into());
@@ -1420,11 +1723,9 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir).map_err(|e| format!("Mappen kunne ikke oprettes: {e}"))?;
     }
-    let settings = AppSettings {
-        projects_root: Some(path.to_string()),
-    };
-    app_settings::save(data_dir, &settings)
-        .map_err(|e| format!("Indstillingen kunne ikke gemmes: {e}"))?;
+    update_settings_in(data_dir, settings, |s| {
+        s.projects_root = Some(path.to_string());
+    })?;
     Ok(path.to_string())
 }
 
@@ -1435,7 +1736,7 @@ pub fn store_projects_root(data_dir: &std::path::Path, path: &str) -> Result<Str
 // (plan7 M.16).
 #[tauri::command]
 pub fn set_projects_root(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    let stored = store_projects_root(&state.paths.data_dir, &path)?;
+    let stored = store_projects_root(&state.paths.data_dir, &state.settings, &path)?;
     log::info!("projects root set to {stored} (applies after a restart)");
     Ok(stored)
 }
@@ -1647,8 +1948,9 @@ pub fn resize_island(
 
 /// Opens (or focuses) the workplace window and selects `agent_id` and/or the sidebar `tab`
 /// ("permissions" | "diagnostics" | "tickets") in it; `spawn` ("work" | "staff") makes it open the
-/// "Ny agent" dialog for that seat kind (the island's "+ Ny agent"). Async on purpose: creating a window from a
-/// synchronous command deadlocks on Windows (research2 §5).
+/// "Ny agent" dialog for that seat kind (the island's "+ Ny agent"); `ticket_id` (step 6d A.9,
+/// full or short id of an existing ticket) selects that ticket on the Tickets tab. Async on
+/// purpose: creating a window from a synchronous command deadlocks on Windows (research2 §5).
 // TODO(windows-verify): the "n i review" chip in the non-focusable island opens the workplace on
 // the Tickets tab, both when the window is created and when it is already open (plan D.36).
 #[tauri::command]
@@ -1658,26 +1960,36 @@ pub async fn open_workplace(
     agent_id: Option<String>,
     tab: Option<String>,
     spawn: Option<String>,
+    ticket_id: Option<String>,
 ) -> Result<(), String> {
     check_tab(tab.as_deref())?;
     check_spawn(spawn.as_deref())?;
+    let ticket_id = check_ticket(ticket_id.as_deref(), &state.tickets)?;
     let selection = WorkplaceSelection {
         agent_id,
         tab,
         spawn,
+        ticket_id,
     };
     *lock(&state.workplace_select) = Some(selection.clone());
     let created =
         workplace::open_or_focus(&app).map_err(|e| format!("Kunne ikke åbne Workplace: {e}"))?;
     log::info!(
-        "workplace {} (select {:?}, tab {:?}, spawn {:?})",
+        "workplace {} (select {:?}, tab {:?}, spawn {:?}, ticket {:?})",
         if created { "created" } else { "focused" },
         selection.agent_id,
         selection.tab,
-        selection.spawn
+        selection.spawn,
+        selection
+            .ticket_id
+            .as_deref()
+            .map(crate::tickets::model::short_id)
     );
     if !created
-        && (selection.agent_id.is_some() || selection.tab.is_some() || selection.spawn.is_some())
+        && (selection.agent_id.is_some()
+            || selection.tab.is_some()
+            || selection.spawn.is_some()
+            || selection.ticket_id.is_some())
     {
         // A new window fetches the selection itself via take_workplace_selection. The slot is
         // kept here too, in case the existing window is still loading and misses the event.
@@ -1746,6 +2058,175 @@ pub fn open_log_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
         .map_err(|e| format!("Kunne ikke åbne mappen: {e}"))
 }
 
+// ---- inbox commands (step 6c, plan punkt 11; cores on `TicketsCtx`, `inbox::ipc`) ----
+
+/// The inbox: items without bodies and the status per source (also the `inbox-changed`
+/// payload).
+#[tauri::command]
+pub fn get_inbox(state: State<'_, AppState>) -> Result<InboxPayload, String> {
+    Ok(state.tickets.inbox_payload())
+}
+
+/// One inbox item with its body (the Start dialog).
+#[tauri::command]
+pub fn get_inbox_item(state: State<'_, AppState>, id: String) -> Result<InboxItem, String> {
+    state.tickets.inbox_item(&id)
+}
+
+/// Refreshes the inbox on its own thread; `false` when a refresh is already running. Only
+/// `manual` overrides the per-source minimum interval and back-off.
+#[tauri::command]
+pub async fn refresh_inbox(
+    state: State<'_, AppState>,
+    reason: RefreshReason,
+) -> Result<bool, String> {
+    state.tickets.inbox_refresh(reason)
+}
+
+/// "Start": the item becomes a ticket (blocking work — file moves, B3: `gh` — runs in
+/// `spawn_blocking`).
+// TODO(windows-verify): Start of `.mira-bots\inbox\fejl.md` creates the ticket and moves the
+// file to `started\` (plan D.111).
+#[tauri::command]
+pub async fn start_inbox_item(
+    state: State<'_, AppState>,
+    req: StartRequest,
+) -> Result<TicketSummary, String> {
+    let ctx = Arc::clone(&state.tickets);
+    tauri::async_runtime::spawn_blocking(move || ctx.inbox_start(req))
+        .await
+        .map_err(|e| format!("Start mislykkedes: {e}"))?
+}
+
+/// "Afvis".
+#[tauri::command]
+pub fn dismiss_inbox_item(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<InboxItemSummary, String> {
+    state.tickets.inbox_dismiss(&id)
+}
+
+/// "Fortryd" on a dismissed item.
+#[tauri::command]
+pub fn undismiss_inbox_item(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<InboxItemSummary, String> {
+    state.tickets.inbox_undismiss(&id)
+}
+
+/// "Prøv igen" on a Done ticket from the inbox: the write back again (GitHub: a marker check
+/// first, so a comment is never posted twice). Blocking work in `spawn_blocking`.
+// TODO(windows-verify): network off at Done → "ikke meldt tilbage"; on again → "Prøv igen"
+// posts exactly one comment, also after a restart mid-attempt (plan6c D.113).
+#[tauri::command]
+pub async fn retry_write_back(
+    state: State<'_, AppState>,
+    ticket_id: String,
+) -> Result<WriteBack, String> {
+    let ctx = Arc::clone(&state.tickets);
+    tauri::async_runtime::spawn_blocking(move || ctx.inbox_retry_write_back(&ticket_id))
+        .await
+        .map_err(|e| format!("Tilbagemelding mislykkedes: {e}"))?
+}
+
+/// Opens the GitHub address of an inbox item or of a ticket from the inbox (`id`: either) in
+/// the default browser — only an `https://github.com/<repo>/issues/<n>` address looked up in the
+/// stored data, never one from the caller.
+// TODO(macos-verify): the "#n" button opens the default browser (plan6c D.macOS 24).
+#[tauri::command]
+pub fn open_inbox_url(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let url = state.tickets.inbox_url(&id)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("Kunne ikke åbne adressen: {e}"))
+}
+
+/// "Tjek gh-login" (Diagnostik; only on a click): `gh auth status --hostname github.com`
+/// without token lines.
+#[tauri::command]
+pub async fn check_gh_auth(state: State<'_, AppState>) -> Result<GhAuthResult, String> {
+    let ctx = Arc::clone(&state.tickets);
+    tauri::async_runtime::spawn_blocking(move || ctx.inbox_check_gh_auth())
+        .await
+        .map_err(|e| format!("gh-login kunne ikke tjekkes: {e}"))
+}
+
+// ---- beskeder (trin 6d, plan punkt 15) ----
+
+/// Beskedkøen (nyeste først) og antallet af ulæste.
+#[tauri::command]
+pub fn list_notices(state: State<'_, AppState>) -> NoticesPayload {
+    state.notices.payload()
+}
+
+/// Markerer beskederne med disse id'er som læst (`null`: dem alle).
+#[tauri::command]
+pub fn mark_notices_seen(state: State<'_, AppState>, ids: Option<Vec<String>>) -> NoticesPayload {
+    state.notices.mark_seen(ids.as_deref())
+}
+
+/// Slår en beskedtype til eller fra (`notifyOff` i `app-settings.json`).
+#[tauri::command]
+pub fn set_notify_pref(
+    state: State<'_, AppState>,
+    kind: NoticeKind,
+    on: bool,
+) -> Result<NoticesPayload, String> {
+    state.set_notify_pref(kind, on)
+}
+
+// ---- vagt (trin 6d, plan punkt 18) ----
+
+/// Vagtens status: det senest publicerede view, eller (før første tick) et beregnet uden sweep.
+#[tauri::command]
+pub async fn get_watch(app: AppHandle) -> Result<WatchView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cached = app.try_state::<AppState>().and_then(|s| s.watch.view());
+        cached.unwrap_or_else(|| crate::watch::runtime::refresh_view(&app))
+    })
+    .await
+    .map_err(|e| format!("Vagten kunne ikke læses: {e}"))
+}
+
+/// "Stop vagten"/"Start vagten igen" (`project: null`) eller "Hold vagt" for ét projekt; svarer
+/// med det nye view (og sender `watch-changed`).
+#[tauri::command]
+pub async fn set_watch(
+    app: AppHandle,
+    project: Option<String>,
+    on: bool,
+) -> Result<WatchView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "Appen er ikke klar".to_string())?;
+        state.set_watch(project.as_deref(), on)?;
+        Ok(crate::watch::runtime::refresh_view(&app))
+    })
+    .await
+    .map_err(|e| format!("Vagten kunne ikke ændres: {e}"))?
+}
+
+/// "Genstart vagt" for et projekt der stoppede efter tre fejl i træk.
+#[tauri::command]
+pub async fn restart_watch(app: AppHandle, project: String) -> Result<WatchView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "Appen er ikke klar".to_string())?;
+        state.restart_watch(&project)?;
+        Ok(crate::watch::runtime::refresh_view(&app))
+    })
+    .await
+    .map_err(|e| format!("Vagten kunne ikke genstartes: {e}"))?
+}
+
 // ---- ticket commands (C3.2) ----
 
 #[tauri::command]
@@ -1768,8 +2249,32 @@ pub fn create_ticket(
     body: String,
     skip_review: bool,
     project: Option<ProjectRef>,
+    kind: Option<String>,
 ) -> Result<TicketSummary, String> {
-    ticket_create(&state.tickets, &title, &body, skip_review, project)
+    ticket_create_kind(
+        &state.tickets,
+        &title,
+        &body,
+        skip_review,
+        project,
+        kind.as_deref(),
+    )
+}
+
+/// "Start forløb" (step 6b, plan punkt 6): rolls out the playbook of the ticket's kind as the
+/// user ([`playbook::start_playbook`]); with `autoSpawnForPlaybook` agents are started through
+/// the same path as `mira_spawn_agent`.
+// TODO(windows-verify): "Start forløb" on a feature ticket creates "Plan: …" and "Byg: …" as
+// children, the second blocked by the first, each assigned to a running agent with the role
+// (plan6b D.103).
+#[tauri::command]
+pub fn ticket_start_playbook(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ticket_id: String,
+) -> Result<PlaybookStarted, String> {
+    let port: SpawnPort = Arc::new(move |req| spawn_for_tool(&app, req));
+    playbook::start_playbook(&state.tickets, &ticket_id, StartedBy::User, Some(&port))
 }
 
 #[tauri::command]
@@ -1917,6 +2422,8 @@ pub fn list_review_assignments(
 
 #[tauri::command]
 pub fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Trin 6d (A.11): vagten før agenterne, som i exit-handleren.
+    state.watch.shutdown();
     lock(&state.manager).kill_all();
     app.exit(0);
     Ok(())
@@ -2035,6 +2542,7 @@ mod tests {
             max_staff_agents: 3,
             projects_root: "/h/mira-bots/projects".into(),
             rules: WorkspaceRules::defaults(),
+            playbook_kinds: vec!["bug".into(), "feature".into()],
         };
         assert_eq!(
             serde_json::to_value(&info).unwrap(),
@@ -2046,7 +2554,10 @@ mod tests {
                             "ticketBodyMaxChars":20000,"reportBodyMaxChars":20000,
                             "reportsPerTicketMax":20,"reviewByDefault":true,
                             "userInputGraceMs":5000,"agentsMayCreateProjects":false,
-                            "maxAgentsPerProject":0}})
+                            "maxAgentsPerProject":0,"git":"off","checksGate":true,
+                            "autoSpawnForPlaybook":false,"freshSessionPerTicket":true,
+                            "cleanupWorktreesOnDone":false},
+                   "playbookKinds":["bug","feature"]})
         );
     }
 
@@ -2059,6 +2570,7 @@ mod tests {
         let t = test_ctx(Arc::clone(&manager));
         t.ctx.mutate(|s| s.create("a", "", false, 1)).unwrap();
         t.ctx.mutate(|s| s.create("b", "", false, 1)).unwrap();
+        let notices = Arc::clone(&t.ctx.notices);
         AppState {
             manager,
             pending: Arc::new(Mutex::new(PendingPermissions::new())),
@@ -2083,9 +2595,13 @@ mod tests {
             sink: Arc::new(|_| {}),
             hook_stats: Arc::new(HookStats::default()),
             claude_version: Arc::new(Mutex::new(VersionProbe::Ok("2.1.286 (Claude Code)".into()))),
+            gh_probe: Arc::new(Mutex::new(VersionProbe::Ok(
+                "gh version 2.39.0 (2026-01-01)".into(),
+            ))),
             workplace_select: Mutex::new(None),
             tickets: t.ctx,
             tickets_warning: Some("tickets.json kunne ikke læses".into()),
+            inbox_warning: Some("inbox.json kunne ikke læses".into()),
             profiles: Arc::new(ProfilesCtx::new(
                 ProfileStore::load(profiles_dir(&dir.join("projects")), 1),
                 Arc::new(|_, _| {}),
@@ -2094,7 +2610,82 @@ mod tests {
                 dir.join("projects").join(crate::config::WORKSPACE_FILE),
             )),
             profiles_migrated: 0,
+            settings: Mutex::new(app_settings::load(dir)),
+            notices,
+            watch: WatchRuntime::new(crate::watch::WatchStateFile::load(dir).0, None),
         }
+    }
+
+    #[test]
+    fn watch_settings_view_and_restart() {
+        let dir = std::env::temp_dir().join(format!("mira-watch-cmd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = app_state(&dir);
+        let web = dir.join("projects").join("web");
+        let pj = crate::checks::project_file_path(&web);
+        std::fs::create_dir_all(pj.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pj,
+            r#"{"watch": {"enabled": true, "playbook": "bug", "maxPerHour": 90}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("projects").join("api")).unwrap();
+        let view = crate::watch::runtime::compute_view(&state);
+        assert_eq!(view.projects.len(), 1, "only projects with watch are shown");
+        let p = &view.projects[0];
+        assert_eq!((p.id.as_str(), p.enabled, p.active), ("web", true, false));
+        // Ingen hook-exe i testen: agenter kan ikke startes.
+        assert_eq!(
+            p.reason.as_deref(),
+            Some(crate::config::WATCH_REASON_CANNOT_SPAWN)
+        );
+        assert_eq!((p.cap_hour, p.playbook.as_deref()), (6, Some("bug")));
+        assert_eq!(
+            p.notes,
+            ["project.json: watch.maxPerHour 90 er sat ned til 60 (1–60)"]
+        );
+        // "Hold vagt" fra for web: kun app-settings.json ændres.
+        let before = std::fs::read_to_string(&pj).unwrap();
+        state.set_watch(Some("web"), false).unwrap();
+        assert_eq!(lock(&state.settings).watch_off, ["web"]);
+        let p = crate::watch::runtime::compute_view(&state).projects[0].clone();
+        assert!(p.paused);
+        assert_eq!(
+            p.reason.as_deref(),
+            Some(crate::config::WATCH_REASON_PROJECT_PAUSED)
+        );
+        state.set_watch(Some("WEB"), true).unwrap();
+        assert!(lock(&state.settings).watch_off.is_empty());
+        assert_eq!(
+            state.set_watch(Some("nope"), false).unwrap_err(),
+            "Projektet «nope» findes ikke"
+        );
+        // "Stop vagten".
+        state.set_watch(None, false).unwrap();
+        let v = crate::watch::runtime::compute_view(&state);
+        assert!(v.paused && state.diagnostics().watch_paused);
+        assert_eq!(
+            v.projects[0].reason.as_deref(),
+            Some(crate::config::WATCH_REASON_PAUSED)
+        );
+        state.set_watch(None, true).unwrap();
+        assert!(!app_settings::load(&dir).watch_paused);
+        assert_eq!(std::fs::read_to_string(&pj).unwrap(), before);
+        // Stoppet efter tre fejl → "Genstart vagt".
+        state.watch.state.with(|s| {
+            for _ in 0..3 {
+                s.record_failure("web", "fejl", 5);
+            }
+        });
+        assert!(crate::watch::runtime::compute_view(&state).projects[0].tripped);
+        state.restart_watch("web").unwrap();
+        let p = crate::watch::runtime::compute_view(&state).projects[0].clone();
+        assert!(!p.tripped && p.tripped_at.is_none());
+        assert!(state.restart_watch(" ").is_err());
+        let d = state.diagnostics();
+        assert!(d.watch_state_path.ends_with("watch-state.json"));
+        assert_eq!((d.watch_active, d.watch_warning), (0, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2147,6 +2738,15 @@ mod tests {
             d.tickets_warning.as_deref(),
             Some("tickets.json kunne ikke læses")
         );
+        assert_eq!(
+            d.inbox_warning.as_deref(),
+            Some("inbox.json kunne ikke læses")
+        );
+        assert_eq!(d.gh_version.as_deref(), Some("2.39.0"));
+        assert_eq!(d.gh_version_note.as_deref(), Some(crate::gh::GH_OLD_NOTE));
+        assert!(d.inbox_path.ends_with("inbox.json"));
+        assert_eq!(d.inbox_new, 0);
+        assert!(d.inbox_sources.is_empty(), "no projects, no root inbox");
         std::fs::write(dir.join("settings.json"), "{}").unwrap();
         std::fs::write(dir.join("mcp.json"), "{}").unwrap();
         state
@@ -2170,17 +2770,22 @@ mod tests {
         assert_eq!(info.max_staff_agents, 3);
         assert_eq!(info.projects_root, d.projects_root);
         assert_eq!(info.rules, WorkspaceRules::defaults());
+        assert_eq!(info.playbook_kinds, ["bug", "feature"]);
 
         // The workspace file decides the limits and the auto review; projects are counted.
         std::fs::write(
             dir.join("projects").join(crate::config::WORKSPACE_FILE),
-            r#"{"maxWorkAgents": 2, "maxStaffAgents": 1, "autoReviewOnStop": true}"#,
+            r#"{"maxWorkAgents": 2, "maxStaffAgents": 1, "autoReviewOnStop": true,
+                "maxReviewRounds": 2, "playbooks": {"docs": {"steps": [
+                    {"role": "researcher", "title": "Skriv: {title}"}]}}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("projects").join("demo")).unwrap();
         let info = state.app_info();
         assert_eq!((info.max_agents, info.max_staff_agents), (2, 1));
         assert_eq!(info.rules.max_work_agents, 2);
+        assert_eq!(info.rules.max_review_rounds, 2);
+        assert_eq!(info.playbook_kinds, ["bug", "docs", "feature"]);
         let d = state.diagnostics();
         assert!(d.workspace_file_exists && d.auto_review_on_stop);
         assert_eq!(d.projects_total, 1);
@@ -2201,10 +2806,37 @@ mod tests {
             agent_id: Some("a1".into()),
             tab: Some("tickets".into()),
             spawn: Some("work".into()),
+            ticket_id: None,
         };
         let slot = Mutex::new(Some(sel.clone()));
         assert_eq!(take_selection(&slot), Some(sel));
         assert_eq!(take_selection(&slot), None);
+    }
+
+    #[test]
+    fn open_workplace_rejects_unknown_ticket() {
+        // Step 6d A.9: `check_ticket` is the pure part of `open_workplace`: None passes, a
+        // short or full id of an existing ticket becomes the full id, anything else is refused.
+        let (state, dir) = temp_state();
+        assert_eq!(check_ticket(None, &state.tickets), Ok(None));
+        let t = state
+            .tickets
+            .mutate(|s| s.create("Ret login", "", false, 1))
+            .unwrap();
+        assert_eq!(
+            check_ticket(Some(&t.short_id()), &state.tickets),
+            Ok(Some(t.id.clone()))
+        );
+        assert_eq!(check_ticket(Some(&t.id), &state.tickets), Ok(Some(t.id)));
+        assert_eq!(
+            check_ticket(Some("nope"), &state.tickets),
+            Err("Ukendt ticket".to_string())
+        );
+        assert_eq!(
+            check_ticket(Some(""), &state.tickets),
+            Err("Ukendt ticket".to_string())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2407,6 +3039,12 @@ mod tests {
             v["statusLine"]["command"], "mira-hook-not-found",
             "placeholder without a hook exe"
         );
+        // Step 6b: the user's files are locked under the projects root; push is denied.
+        let root = crate::profiles::model::permission_path(&state.paths.projects_root);
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert!(deny.contains(&json!(format!("Edit({root}/mira-bots.workspace.json)"))));
+        assert!(deny.contains(&json!("Bash(git push *)")));
+        assert!(deny.contains(&json!("Bash(git -C * push)")));
         let bad = AgentProfile {
             name: " ".into(),
             ..saved
@@ -2556,6 +3194,23 @@ mod tests {
         DispatchMsg::QueueChanged {
             agent_id: id.to_string(),
         }
+    }
+
+    #[test]
+    fn create_with_kind_is_validated_against_the_playbooks() {
+        let (t, _, _) = tickets_setup();
+        let f = ticket_create_kind(&t.ctx, "Login", "", false, p(), Some(" Feature ")).unwrap();
+        assert_eq!(f.kind.as_deref(), Some("feature"));
+        let plain = ticket_create_kind(&t.ctx, "x", "", false, p(), Some("task")).unwrap();
+        assert_eq!(plain.kind, None);
+        assert_eq!(
+            ticket_create(&t.ctx, "y", "", false, p()).unwrap().kind,
+            None
+        );
+        assert_eq!(
+            ticket_create_kind(&t.ctx, "z", "", false, p(), Some("docs")).unwrap_err(),
+            String::from(TicketError::InvalidKind)
+        );
     }
 
     #[test]
@@ -2908,6 +3563,42 @@ mod tests {
         assert_eq!(ticket_for_spawn(&t.ctx, &fresh.id).unwrap().id, fresh.id);
     }
 
+    // Step 6a (plan A.4): "Ny agent med ticket" refuses a blocked ticket.
+    #[test]
+    fn spawn_with_blocked_ticket_is_refused() {
+        let (t, _, _) = tickets_setup();
+        let blocker = ticket_create(&t.ctx, "Plan", "", false, p()).unwrap();
+        let blocked = t
+            .ctx
+            .mutate(|s| {
+                s.create_by_agent_related(
+                    "Byg",
+                    "",
+                    false,
+                    None,
+                    p(),
+                    None,
+                    vec![blocker.id.clone()],
+                    None,
+                    2,
+                )
+            })
+            .unwrap();
+        let short = crate::tickets::model::short_id(&blocker.id);
+        assert_eq!(
+            ticket_for_spawn(&t.ctx, &blocked.id).unwrap_err(),
+            format!("Ticketen venter på {short}")
+        );
+        // The blocker deleted: it no longer blocks.
+        t.ctx.delete_ticket(&blocker.id).unwrap();
+        assert_eq!(
+            ticket_for_spawn(&t.ctx, &blocked.id).unwrap().id,
+            blocked.id
+        );
+        // The state rule still comes first.
+        assert!(ticket_for_spawn(&t.ctx, "nope").is_err());
+    }
+
     #[test]
     fn a_spawned_ticket_waits_for_the_session_and_heads_the_queue() {
         let (mut t, live, _) = tickets_setup();
@@ -2925,6 +3616,52 @@ mod tests {
         assert_eq!(got.state, TicketState::Assigned);
         assert_eq!(got.queue_position, Some(0));
         assert_eq!(lock(&t.ctx.manager).get(&live).unwrap().queue_length, 1);
+    }
+
+    #[test]
+    fn request_submission_accepts_a_waiting_parent() {
+        // Review 6a R2-1: "Bed om aflevering" on a waiting parent types the wake line again.
+        let (mut t, live, _dead) = tickets_setup();
+        let parent = ticket_create(&t.ctx, "forælder", "", false, p()).unwrap();
+        t.ctx
+            .mutate(|s| {
+                s.assign(&parent.id, &live, 2)?;
+                s.mark_dispatched(&parent.id, "bot", 3)
+            })
+            .unwrap();
+        t.ctx
+            .mutate(|s| {
+                s.create_by_agent_related(
+                    "barn",
+                    "",
+                    false,
+                    None,
+                    None,
+                    Some(parent.id.clone()),
+                    vec![],
+                    None,
+                    4,
+                )
+            })
+            .unwrap();
+        let waiting = t
+            .ctx
+            .mutate(|s| s.submit_by_agent(&live, None, "fordelt", 5))
+            .unwrap();
+        assert_eq!(waiting.state, TicketState::Waiting);
+        t.sent();
+        ticket_request_submission(&t.ctx, &parent.id).unwrap();
+        assert_eq!(
+            t.sent(),
+            vec![DispatchMsg::RequestSubmission {
+                ticket_id: parent.id.clone()
+            }]
+        );
+        // Still waiting: the command only asks the dispatcher.
+        assert_eq!(
+            t.ctx.read(|s| s.get(&parent.id)).unwrap().state,
+            TicketState::Waiting
+        );
     }
 
     #[test]
@@ -3360,8 +4097,9 @@ mod tests {
             move_gate(&state, &work, &ProjectRef::Existing("P".into()), true).unwrap_err(),
             AgentError::SameProject("p".into()).to_string()
         );
-        let (info, proj) = move_gate(&state, &work, &q, true).unwrap();
+        let (info, proj, pending) = move_gate(&state, &work, &q, true).unwrap();
         assert_eq!((info.id.as_str(), proj.id.as_str()), (work.as_str(), "q"));
+        assert_eq!(pending, 1);
         // With force the queue goes to the backlog with the move note.
         assert_eq!(state.tickets.release_queue(&work, MOVED_NOTE).unwrap(), 1);
         let back = state.tickets.read(|s| s.get(&tk.id)).unwrap();
@@ -3381,9 +4119,77 @@ mod tests {
             move_gate(&state, &work, &q, false).unwrap_err(),
             "Loft på 1 agenter i projektet «q» nået"
         );
-        let (_, n) =
+        let (_, n, _) =
             move_gate(&state, &work, &ProjectRef::New { new: "ny".into() }, false).unwrap();
         assert!(PathBuf::from(&n.path).is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review 6a W2: a waiting parent counts like a queued ticket: the move needs the
+    /// confirmation, and with it the parent goes to the backlog with the move note.
+    #[test]
+    fn move_gate_counts_waiting_parents() {
+        let (state, dir) = temp_state();
+        let root = state.paths.projects_root.clone();
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        let work = {
+            let mut m = lock(&state.manager);
+            let w = m.insert_fake_in("mw", "/w/p", &[Role::Coder], SeatKind::Work, Some("p"));
+            m.set_status(&w, AgentStatus::Idle, None).unwrap();
+            w
+        };
+        let parent = ticket_create(&state.tickets, "forælder", "", false, p()).unwrap();
+        ticket_assign(&state.tickets, &parent.id, &work).unwrap();
+        let child = state
+            .tickets
+            .mutate(|s| {
+                s.mark_dispatched(&parent.id, "mw", 1)?;
+                let c = s.create_by_agent_related(
+                    "del",
+                    "",
+                    false,
+                    None,
+                    None,
+                    Some(parent.id.clone()),
+                    vec![],
+                    None,
+                    2,
+                )?;
+                s.submit_by_agent(&work, None, "fordelt", 3)?;
+                Ok(c)
+            })
+            .unwrap();
+        assert_eq!(
+            state.tickets.read(|s| s.get(&parent.id)).unwrap().state,
+            TicketState::Waiting
+        );
+        // Idle, nothing in progress, an empty queue, but a waiting parent: refused without force.
+        let q = ProjectRef::Existing("q".into());
+        assert_eq!(
+            move_gate(&state, &work, &q, false).unwrap_err(),
+            AgentError::QueueNotEmpty(1).to_string()
+        );
+        // A queued ticket as well: both counted.
+        let tk = ticket_create(&state.tickets, "x", "", false, p()).unwrap();
+        ticket_assign(&state.tickets, &tk.id, &work).unwrap();
+        assert_eq!(
+            move_gate(&state, &work, &q, false).unwrap_err(),
+            AgentError::QueueNotEmpty(2).to_string()
+        );
+        let (_, _, pending) = move_gate(&state, &work, &q, true).unwrap();
+        assert_eq!(pending, 2);
+        // Confirmed: both go to the backlog with the move note; the child is untouched.
+        assert_eq!(state.tickets.release_queue(&work, MOVED_NOTE).unwrap(), 2);
+        for id in [&parent.id, &tk.id] {
+            let t = state.tickets.read(|s| s.get(id)).unwrap();
+            assert_eq!((t.state, t.assignee_agent_id), (TicketState::Backlog, None));
+            assert_eq!(t.history.last().unwrap().note.as_deref(), Some(MOVED_NOTE));
+        }
+        let c = state.tickets.read(|s| s.get(&child.id)).unwrap();
+        assert_eq!(c.parent_id.as_deref(), Some(parent.id.as_str()));
+        let (_, _, pending) = move_gate(&state, &work, &q, false).unwrap();
+        assert_eq!(pending, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3399,22 +4205,138 @@ mod tests {
         std::fs::create_dir_all(root.join("X")).unwrap();
         assert_eq!(project_folder(&root, Some("x")).unwrap(), root.join("X"));
         assert_eq!(
-            store_projects_root(&dir, "  ").unwrap_err(),
+            store_projects_root(&dir, &state.settings, "  ").unwrap_err(),
             "Vælg en mappe til projektroden"
         );
         // N5: relative paths are refused; nothing is created or stored.
         for rel in ["x", "andet/rod", "./x"] {
             assert_eq!(
-                store_projects_root(&dir, rel).unwrap_err(),
+                store_projects_root(&dir, &state.settings, rel).unwrap_err(),
                 PROJECTS_ROOT_NOT_ABSOLUTE
             );
         }
         assert_eq!(app_settings::load(&dir).projects_root(), None);
         let other = dir.join("andet").join("rod");
-        let stored = store_projects_root(&dir, &format!(" {} ", other.display())).unwrap();
+        let stored =
+            store_projects_root(&dir, &state.settings, &format!(" {} ", other.display())).unwrap();
         assert_eq!(stored, other.to_string_lossy());
         assert!(other.is_dir());
-        assert_eq!(app_settings::load(&dir).projects_root(), Some(other));
+        assert_eq!(
+            app_settings::load(&dir).projects_root(),
+            Some(other.clone())
+        );
+        // The live settings follow the file.
+        assert_eq!(lock(&state.settings).projects_root(), Some(other));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_projects_root_keeps_watch_fields() {
+        // 6d A.7 (handoff "Øvrigt"): "Vælg projektrod…" used to write a struct literal and would
+        // have reset the watch/notice fields; now it is a read-modify-write.
+        let (state, dir) = temp_state();
+        state
+            .update_settings(|s| {
+                s.watch_paused = true;
+                s.watch_off = vec!["shop".into()];
+                s.notify_off = vec!["escalated".into()];
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(app_settings::settings_path(&dir)).unwrap();
+        assert!(text.contains("\"watchPaused\": true"), "{text}");
+        let root = dir.join("ny").join("rod");
+        store_projects_root(&dir, &state.settings, &root.to_string_lossy()).unwrap();
+        let on_disk = app_settings::load(&dir);
+        assert_eq!(
+            on_disk,
+            AppSettings {
+                projects_root: Some(root.to_string_lossy().into_owned()),
+                watch_paused: true,
+                watch_off: vec!["shop".into()],
+                notify_off: vec!["escalated".into()],
+            }
+        );
+        assert_eq!(*lock(&state.settings), on_disk);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Trin 6d (plan punkt 15): `set_notify_pref` læser, ændrer og skriver `notifyOff` (de øvrige
+    /// indstillinger bliver), køen dropper typen, og "til" igen fjerner den fra listen.
+    #[test]
+    fn set_notify_pref_updates_settings_and_queue() {
+        use crate::notices::{Notice, NoticeKey};
+        let (state, dir) = temp_state();
+        state.update_settings(|s| s.watch_paused = true).unwrap();
+        let n = |kind: NoticeKind, g: u64| {
+            (
+                NoticeKey::new(kind, "x", g),
+                Notice::new(kind, format!("n{g}"), g),
+            )
+        };
+        state.notices.push_all(
+            vec![n(NoticeKind::Escalated, 1), n(NoticeKind::BudgetReached, 2)],
+            3,
+        );
+        let p = state
+            .set_notify_pref(NoticeKind::BudgetReached, false)
+            .unwrap();
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].kind, NoticeKind::Escalated);
+        let p = state
+            .set_notify_pref(NoticeKind::BudgetReached, false)
+            .unwrap();
+        assert_eq!(p.unread, 1, "twice off is still one entry");
+        let saved = app_settings::load(&dir);
+        assert_eq!(saved.notify_off, vec!["budgetReached".to_string()]);
+        assert!(saved.watch_paused, "the other settings stay");
+        assert_eq!(
+            state
+                .notices
+                .push_all(vec![n(NoticeKind::BudgetReached, 4)], 5),
+            0,
+            "off: not created"
+        );
+        state
+            .set_notify_pref(NoticeKind::BudgetReached, true)
+            .unwrap();
+        assert!(app_settings::load(&dir).notify_off.is_empty());
+        assert_eq!(
+            state
+                .notices
+                .push_all(vec![n(NoticeKind::BudgetReached, 6)], 7),
+            1
+        );
+        // Læst: én ad gangen via id, derefter alle.
+        let id = state.notices.payload().items[0].id.clone();
+        assert_eq!(state.notices.mark_seen(Some(&[id])).unread, 1);
+        assert_eq!(state.notices.mark_seen(None).unread, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn update_settings_is_read_modify_write_and_keeps_memory_on_failure() {
+        let (state, dir) = temp_state();
+        let got = state
+            .update_settings(|s| s.watch_off.push("a".into()))
+            .unwrap();
+        assert_eq!(got.watch_off, vec!["a".to_string()]);
+        let got = state
+            .update_settings(|s| s.watch_off.push("b".into()))
+            .unwrap();
+        assert_eq!(got.watch_off, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(app_settings::load(&dir), got);
+        // A write that fails (the settings path is a directory) changes nothing in memory.
+        let path = app_settings::settings_path(&dir);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = state
+            .update_settings(|s| s.watch_paused = true)
+            .unwrap_err();
+        assert!(
+            err.starts_with("Indstillingen kunne ikke gemmes: "),
+            "{err}"
+        );
+        assert_eq!(*lock(&state.settings), got);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

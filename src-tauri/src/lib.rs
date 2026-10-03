@@ -1,18 +1,25 @@
 pub mod agent;
 pub mod app_settings;
+pub mod checks;
 pub mod commands;
 pub mod config;
 pub mod diagnostics;
 pub mod events;
+pub mod gh;
+pub mod git;
 pub mod hooks;
+pub mod inbox;
 pub mod island;
 pub mod mcp;
+pub mod notices;
 pub mod permissions;
 pub mod pipe;
 pub mod platform;
+pub mod proc;
 pub mod profiles;
 pub mod projects;
 pub mod tickets;
+pub mod watch;
 pub mod workplace;
 pub mod workspace;
 
@@ -32,7 +39,7 @@ use agent::{now_ms, AgentManager, EventSink, SinkEvent};
 use app_settings::AppSettings;
 use commands::{AppPaths, AppState};
 use config::{
-    CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
+    CLAUDE_VERSION_TIMEOUT, HOOK_EXE_ENV, INBOX_FILE, LOG_FILE_STEM, LOG_KEEP_FILES, LOG_LEVEL_ENV,
     LOG_MAX_FILE_SIZE, MCP_CONFIG_FILE, MCP_EXE_ENV, PROFILE_FILES_DIR, REPORTS_DIR, SETTINGS_FILE,
     SYSTEM_PROMPT_FILE, TICKETS_FILE, WORKSPACE_FILE,
 };
@@ -165,6 +172,8 @@ pub fn tauri_sink(
                 (m.mark_exited(&agent_id, gen, code), replaced)
             };
             let known = exited.is_some();
+            // Trin 6d (plan A.8 b): den afsluttede agents info til beskeden nedenfor.
+            let info = exited.as_ref().map(|(info, _)| info.clone());
             // Drop the PTY (ConPTY ClosePseudoConsole may block) only after the lock is released.
             drop(exited);
             if replaced {
@@ -175,8 +184,15 @@ pub fn tauri_sink(
             lock(&pending).remove_for_agent(&agent_id);
             if known {
                 log::info!("agent {agent_id} exited (code {code:?})");
-                if let Err(e) = tickets.release_agent(&agent_id, AGENT_EXITED_NOTE) {
-                    log::warn!("releasing the tickets of agent {agent_id} failed: {e}");
+                match tickets.release_agent(&agent_id, AGENT_EXITED_NOTE) {
+                    Ok(released) => {
+                        if let Some(info) = &info {
+                            tickets.notice_exit(info, released);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("releasing the tickets of agent {agent_id} failed: {e}")
+                    }
                 }
                 let list = lock(&manager).list();
                 if let Err(e) = app.emit(AGENTS_CHANGED, &list) {
@@ -358,6 +374,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
     let claude_version = Arc::new(Mutex::new(VersionProbe::Pending));
     start_version_probe(Arc::clone(&claude_version));
+    // Step 6c: `gh --version` on the `gh-version` thread (lookup included; never blocks setup).
+    let gh_probe = Arc::new(Mutex::new(VersionProbe::Pending));
+    gh::start_gh_probe(Arc::clone(&gh_probe));
 
     let log_file = match app.path().app_log_dir() {
         Ok(d) => Some(d.join(format!("{LOG_FILE_STEM}.log"))),
@@ -484,16 +503,31 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let profiles = Arc::new(ProfilesCtx::new(profile_store, Arc::clone(&emit)));
 
     let tickets_file = data_dir.join(TICKETS_FILE);
+    // Logs the warning itself; Diagnostik shows it (`inbox_warning`).
+    let (inbox_service, inbox_warning) = inbox::load_inbox(data_dir.join(INBOX_FILE));
+    let removed = inbox::clean_tmp(&data_dir);
+    if removed > 0 {
+        log::info!("inbox: {removed} leftover write-back file(s) removed");
+    }
     let (service, tickets_warning) = tickets::load_tickets(tickets_file.clone(), now_ms());
     let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMsg>();
-    let tickets = Arc::new(TicketsCtx::new(
+    // `shared`: the project checks run on their own thread with the context (step 6b).
+    let tickets = TicketsCtx::new(
         service,
         Arc::clone(&manager),
         dispatch_tx.clone(),
         Arc::clone(&emit),
         data_dir.join(REPORTS_DIR),
         Arc::clone(&workspace),
-    ));
+        // git is looked up (and probed) on first use, not at startup.
+        Arc::new(git::SystemGit::new()),
+        // Step 6c: the inbox document (refreshed by the Workplace; B4).
+        inbox_service,
+    )
+    .shared();
+    // Trin 6d (plan A.8): beskedtyper som brugeren har fravalgt, oprettes aldrig.
+    tickets.notices.set_off(&settings.notify_off);
+    let notices = Arc::clone(&tickets.notices);
     let sink = tauri_sink(
         handle.clone(),
         Arc::clone(&manager),
@@ -515,7 +549,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         dispatch_rx,
         Dispatcher::new(
             Arc::clone(&tickets),
-            ManagerPort::new(Arc::clone(&manager), Arc::clone(&emit)),
+            // Step 6b: a fresh session per ticket restarts through the UI's restart path; the
+            // closure looks the state up per call (like the tools' SpawnPort below).
+            ManagerPort::new(Arc::clone(&manager), Arc::clone(&emit))
+                .with_restart(commands::restart_port(handle.clone())),
             RealTimers::new(dispatch_tx),
         ),
     ));
@@ -549,6 +586,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&pipe_error),
     );
 
+    // Trin 6d: vagtens budget/fejl-fil. Er den ulæselig, omdøbes den og vagten starter
+    // konservativt (advarslen logges af `load` og vises i Diagnostik).
+    let (watch_state, watch_warning) = watch::WatchStateFile::load(&data_dir);
     let data_dir_for_profiles = data_dir.join(PROFILE_FILES_DIR);
     let app_settings_path = app_settings::settings_path(&data_dir);
     app.manage(AppState {
@@ -575,13 +615,25 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         sink,
         hook_stats,
         claude_version,
+        gh_probe,
         workplace_select: Mutex::new(None),
         tickets,
         tickets_warning,
+        inbox_warning,
         profiles,
         workspace,
         profiles_migrated,
+        settings: Mutex::new(settings),
+        notices,
+        watch: watch::WatchRuntime::new(watch_state, watch_warning),
     });
+
+    // Trin 6d: vagtens timer (efter `manage`: tick'et slår `AppState` op; første tick efter 60 s).
+    if let Some(state) = app.try_state::<AppState>() {
+        state
+            .watch
+            .set_handle(watch::runtime::start(app.handle().clone()));
+    }
 
     // After `manage`: the exit handler's `kill_all` needs `AppState` (review7 W5).
     #[cfg(unix)]
@@ -679,6 +731,22 @@ pub fn run() {
             commands::open_project_folder,
             commands::set_projects_root,
             commands::move_agent_to_project,
+            commands::ticket_start_playbook,
+            commands::get_inbox,
+            commands::get_inbox_item,
+            commands::refresh_inbox,
+            commands::start_inbox_item,
+            commands::dismiss_inbox_item,
+            commands::undismiss_inbox_item,
+            commands::retry_write_back,
+            commands::open_inbox_url,
+            commands::check_gh_auth,
+            commands::list_notices,
+            commands::mark_notices_seen,
+            commands::set_notify_pref,
+            commands::get_watch,
+            commands::set_watch,
+            commands::restart_watch,
         ])
         .build(tauri::generate_context!());
     // Plugin setup (the log plugin creates its directory and installs the global logger) runs
@@ -701,8 +769,13 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(state) = app_handle.try_state::<AppState>() {
+                // Trin 6d (A.11): vagten stoppes først (ingen nye starter/spawns), så agenterne.
+                state.watch.shutdown();
                 lock(&state.manager).kill_all();
             }
+            // Step 6b: git and project-check children still running (with their trees).
+            // TODO(windows-verify): closing the app mid-check leaves no process behind (plan6b D.107).
+            proc::registry().kill_running();
         }
         // The process exits without dropping the pipe server task (and its SocketGuard).
         #[cfg(unix)]
@@ -769,10 +842,12 @@ mod tests {
         }
     }
 
-    /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50). Counted from the
-    /// source so a command added without a handler (or the other way round) is noticed.
+    /// The Tauri command list (plan4b punkt 9: 44 → 49; plan7 punkt 8: → 50; plan6b punkt 6:
+    /// → 51; plan6c punkt 11: → 57; plan6c punkt 15: → 60; plan6d punkt 15: → 63; plan6d punkt
+    /// 18: → 66). Counted
+    /// from the source so a command added without a handler (or the other way round) is noticed.
     #[test]
-    fn generate_handler_lists_50_commands() {
+    fn generate_handler_lists_66_commands() {
         let src = include_str!("lib.rs");
         let start = src.find("generate_handler![").expect("handler list");
         let list = &src[start..start + src[start..].find("])").expect("end of list")];
@@ -781,8 +856,24 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("commands::"))
             .map(|l| l.trim_end_matches(','))
             .collect();
-        assert_eq!(names.len(), 50, "{names:?}");
+        assert_eq!(names.len(), 66, "{names:?}");
         for n in [
+            "get_watch",
+            "set_watch",
+            "restart_watch",
+            "list_notices",
+            "mark_notices_seen",
+            "set_notify_pref",
+            "get_inbox",
+            "get_inbox_item",
+            "refresh_inbox",
+            "start_inbox_item",
+            "dismiss_inbox_item",
+            "undismiss_inbox_item",
+            "retry_write_back",
+            "open_inbox_url",
+            "check_gh_auth",
+            "ticket_start_playbook",
             "close_workplace",
             "list_projects",
             "create_project",

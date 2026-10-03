@@ -382,9 +382,11 @@ mod tests {
         assert!(rev.contains(&"mira_approve_ticket".into()));
         assert!(rev.contains(&"mira_reject_ticket".into()));
         let co = listed(&b, &["coordinator"]);
-        assert_eq!(co.len(), 15);
+        assert_eq!(co.len(), 16);
+        assert!(co.contains(&"mira_start_playbook".into()));
         assert!(!co.contains(&"mira_approve_ticket".into()));
-        assert_eq!(listed(&b, &["reviewer", "coordinator"]).len(), 17);
+        assert!(!rev.contains(&"mira_start_playbook".into()));
+        assert_eq!(listed(&b, &["reviewer", "coordinator"]).len(), 18);
     }
 
     #[test]

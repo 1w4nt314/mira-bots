@@ -1,5 +1,5 @@
-//! The seventeen tools (plan4 C4.3 + plan5 C5.3 + step 5c's handoff + step 4b's project list;
-//! eleven common): `tools/list` definitions, the role matrix and
+//! The eighteen tools (plan4 C4.3 + plan5 C5.3 + step 5c's handoff + step 4b's project list +
+//! step 6b's playbook start; eleven common): `tools/list` definitions, the role matrix and
 //! argument validation before anything is sent to the app. The app validates again (C4.12) and
 //! enforces the role matrix itself (the security boundary); this layer gives the model a quick,
 //! precise error without a pipe round trip and only lists the tools its roles allow.
@@ -27,6 +27,8 @@ pub const GET_REPORT: &str = "mira_get_report";
 pub const HANDOFF_TICKET: &str = "mira_handoff_ticket";
 /// Step 4b: the project folders under the projects root (plan4b C4b.5).
 pub const LIST_PROJECTS: &str = "mira_list_projects";
+/// Step 6b: the coordinator rolls out the playbook of a ticket's kind (plan6b C6b.3).
+pub const START_PLAYBOOK: &str = "mira_start_playbook";
 
 /// Tools every agent has, whatever its roles (plan5 A.2).
 /// `mira_list_agents` is common since step 5c (read-only): any agent handing a ticket on with
@@ -47,21 +49,22 @@ pub const COMMON_TOOLS: [&str; 11] = [
 ];
 
 /// Tools only some roles have (the union of [`ROLE_TOOLS`]).
-pub const ROLE_BOUND_TOOLS: [&str; 6] = [
+pub const ROLE_BOUND_TOOLS: [&str; 7] = [
     APPROVE_TICKET,
     REJECT_TICKET,
     ASSIGN_TICKET,
     UNASSIGN_TICKET,
     SPAWN_AGENT,
     LIST_PROFILES,
+    START_PLAYBOOK,
 ];
 
 /// Every tool name (plan5 C5.8), common ones first; the order of [`definitions`].
-pub const TOOL_NAMES: [&str; 17] = ALL_TOOL_NAMES;
+pub const TOOL_NAMES: [&str; 18] = ALL_TOOL_NAMES;
 
-/// Every tool name of plan5 C5.3 (+ step 5c's handoff, step 4b's project list), common ones
-/// first.
-pub const ALL_TOOL_NAMES: [&str; 17] = [
+/// Every tool name of plan5 C5.3 (+ step 5c's handoff, step 4b's project list, step 6b's
+/// playbook start), common ones first.
+pub const ALL_TOOL_NAMES: [&str; 18] = [
     CREATE_TICKET,
     LIST_TICKETS,
     GET_TICKET,
@@ -79,6 +82,7 @@ pub const ALL_TOOL_NAMES: [&str; 17] = [
     UNASSIGN_TICKET,
     SPAWN_AGENT,
     LIST_PROFILES,
+    START_PLAYBOOK,
 ];
 
 /// The role matrix (plan5 A.2): role wire name → the tools that role adds to [`COMMON_TOOLS`].
@@ -89,7 +93,13 @@ pub const ROLE_TOOLS: &[(&str, &[&str])] = &[
     ("reviewer", &[APPROVE_TICKET, REJECT_TICKET]),
     (
         "coordinator",
-        &[ASSIGN_TICKET, UNASSIGN_TICKET, SPAWN_AGENT, LIST_PROFILES],
+        &[
+            ASSIGN_TICKET,
+            UNASSIGN_TICKET,
+            SPAWN_AGENT,
+            LIST_PROFILES,
+            START_PLAYBOOK,
+        ],
     ),
     ("planner", &[]),
     ("debugger", &[]),
@@ -129,6 +139,16 @@ pub const REPORT_TITLE_MAX: usize = 120;
 pub const REPORT_BODY_MAX: usize = 20_000;
 pub const REPORT_ID_MAX: usize = 8;
 pub const SEAT_KINDS: [&str; 2] = ["work", "staff"];
+/// Most `blockedBy` entries on `mira_create_ticket` (step 6a; the app's `BLOCKED_BY_MAX`).
+pub const BLOCKED_BY_MAX: usize = 10;
+/// Error for a malformed `blockedBy` argument (step 6a).
+pub const BLOCKED_BY_ERROR: &str = "blockedBy skal være en liste af ticket-id'er (højst 10)";
+/// Error for a malformed `parentId` argument (step 6a).
+pub const PARENT_ID_ERROR: &str = "parentId skal være et ticket-id (1–64 tegn) eller \"none\"";
+/// Most chars of `kind` on `mira_create_ticket` (step 6b; a playbook name is `^[a-z0-9_-]{1,32}$`).
+pub const KIND_MAX: usize = 32;
+/// Error for a malformed `kind` argument (step 6b).
+pub const KIND_ERROR: &str = "kind skal være en tekst på 1–32 tegn";
 /// Error for a malformed `project` argument (step 4b).
 pub const PROJECT_ERROR: &str =
     "project skal være et projekt-id (1–64 tegn) eller {\"new\": \"<navn>\"}";
@@ -161,7 +181,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": CREATE_TICKET,
-            "description": "Opretter en ny ticket i mira-bots' backlog (ikke tildelt nogen). Brug den til opfølgende opgaver du opdager undervejs. Returnerer id og kort-id.",
+            "description": "Opretter en ny ticket i mira-bots' backlog (ikke tildelt nogen). Brug den til opfølgende opgaver du opdager undervejs, og til del-tickets (parentId) med afhængigheder (blockedBy). Returnerer id og kort-id; ligner titlen en åben ticket i samme projekt, får du en advarsel (warnings/duplicateOf).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -169,7 +189,13 @@ pub fn definitions() -> Vec<Value> {
                     "body": {"type": "string", "maxLength": BODY_MAX, "description": "Beskrivelse (markdown)"},
                     "skipReview": {"type": "boolean", "description": "true: ticketen går direkte til Done når den afleveres"},
                     "assignTo": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Agent-id (kun koordinator): ticketen sættes bagest i agentens kø"},
-                    "project": project_ref_schema("Projektet ticketen hører til: et projekt-id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} for et nyt projekt (kun hvis workspacet tillader det). Udelades: dit eget projekt (arbejdsagent) eller assignTo-agentens.")
+                    "project": project_ref_schema("Projektet ticketen hører til: et projekt-id fra mira_list_projects, eller {\"new\": \"<mappenavn>\"} for et nyt projekt (kun hvis workspacet tillader det). Udelades: dit eget projekt (arbejdsagent) eller assignTo-agentens."),
+                    "parentId": {"type": "string", "minLength": 1, "maxLength": ID_MAX,
+                        "description": "Forældre-ticket (id eller kort-id): denne ticket bliver en del-ticket af den. Udelades: din igangværende ticket, hvis du er koordinator; ellers ingen. \"none\" = ingen forælder."},
+                    "blockedBy": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": ID_MAX}, "maxItems": BLOCKED_BY_MAX,
+                        "description": "Tickets (id/kort-id) der skal være Done, før denne leveres til sin agent. Den kan tildeles med det samme; køen springer den over indtil da."},
+                    "kind": {"type": "string", "minLength": 1, "maxLength": KIND_MAX,
+                        "description": "Ticket-type: task (standard), feature, bug eller et playbook-navn fra workspace-filen. Styrer hvilket forløb «Start forløb»/mira_start_playbook udruller."}
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -178,7 +204,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": LIST_TICKETS,
-            "description": "Lister tickets uden beskrivelse og historik. filter: \"mine\" (dine i kø og i gang, standard), \"backlog\" (ikke tildelte) eller \"all\".",
+            "description": "Lister tickets uden beskrivelse og historik. filter: \"mine\" (dine i kø og i gang, standard), \"backlog\" (ikke tildelte) eller \"all\". Viser også parentId og blockedBy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -202,7 +228,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": SUBMIT_FOR_REVIEW,
-            "description": "Afleverer den ticket du arbejder på: den går til Review (eller Done hvis den springer review over). KALD DEN når opgaven er færdig, med en kort opsummering af hvad du gjorde. Uden ticketId bruges din igangværende ticket.",
+            "description": "Afleverer den ticket du arbejder på: den går til Review (eller Done hvis den springer review over). KALD DEN når opgaven er færdig, med en kort opsummering af hvad du gjorde. Uden ticketId bruges din igangværende ticket. En ticket med åbne del-tickets går i Venter i stedet for Review; du får besked når de er godkendt.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -363,6 +389,19 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "annotations": annotations(true, true)
         }),
+        json!({
+            "name": START_PLAYBOOK,
+            "description": "Starter forløbet (playbooken) for en ticket med en type (kind) der har en playbook: appen opretter del-ticketsene med parentId, kæder dem med blockedBy og tildeler dem til agenter med den rette rolle i projektet. Kun koordinator. Afvises hvis ticketen allerede har del-tickets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": ID_MAX, "description": "Ticket (id eller kort-id) med en kind der har en playbook; typisk din igangværende ticket"}
+                },
+                "required": ["ticketId"],
+                "additionalProperties": false
+            },
+            "annotations": annotations(false, false)
+        }),
     ]
 }
 
@@ -422,6 +461,40 @@ fn take_project(args: &Map<String, Value>, out: &mut Map<String, Value>) -> Resu
     Ok(())
 }
 
+/// A list of ticket ids (`blockedBy`, step 6a): an array of strings, each trimmed to 1–64 chars,
+/// at most `max` entries, duplicates dropped; `null` counts as absent and an empty list is left
+/// out. Anything else is [`BLOCKED_BY_ERROR`].
+fn take_id_list(
+    args: &Map<String, Value>,
+    out: &mut Map<String, Value>,
+    key: &str,
+    max: usize,
+) -> Result<(), String> {
+    let items = match args.get(key) {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(BLOCKED_BY_ERROR.into()),
+    };
+    if items.len() > max {
+        return Err(BLOCKED_BY_ERROR.into());
+    }
+    let mut ids: Vec<Value> = Vec::new();
+    for v in items {
+        let s = v.as_str().ok_or(BLOCKED_BY_ERROR)?.trim();
+        if s.is_empty() || s.chars().count() > ID_MAX {
+            return Err(BLOCKED_BY_ERROR.into());
+        }
+        let s = Value::String(s.to_string());
+        if !ids.contains(&s) {
+            ids.push(s);
+        }
+    }
+    if !ids.is_empty() {
+        out.insert(key.to_string(), Value::Array(ids));
+    }
+    Ok(())
+}
+
 fn take_str(
     args: &Map<String, Value>,
     out: &mut Map<String, Value>,
@@ -455,6 +528,7 @@ fn id_rule(key: &'static str, required: bool, max: usize) -> StrRule {
         "agentId" => "agentId skal være en tekst på 1–64 tegn",
         "assignTo" => "assignTo skal være en tekst på 1–64 tegn",
         "firstTicketId" => "firstTicketId skal være en tekst på 1–64 tegn",
+        "parentId" => PARENT_ID_ERROR,
         _ => "id skal være en tekst på 1–64 tegn",
     };
     StrRule {
@@ -474,7 +548,16 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         .as_object()
         .ok_or_else(|| "Argumenterne skal være et objekt".to_string())?;
     let allowed: &[&str] = match name {
-        CREATE_TICKET => &["title", "body", "skipReview", "assignTo", "project"],
+        CREATE_TICKET => &[
+            "title",
+            "body",
+            "skipReview",
+            "assignTo",
+            "project",
+            "parentId",
+            "blockedBy",
+            "kind",
+        ],
         LIST_TICKETS => &["filter", "project"],
         GET_TICKET => &["id"],
         SUBMIT_FOR_REVIEW => &["summary", "ticketId", "report"],
@@ -487,6 +570,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
         ADD_REPORT => &["ticketId", "title", "body"],
         GET_REPORT => &["ticketId", "reportId"],
         HANDOFF_TICKET => &["ticketId", "agentId", "project"],
+        START_PLAYBOOK => &["ticketId"],
         other => return Err(format!("Ukendt værktøj: {other}")),
     };
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
@@ -527,6 +611,22 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             }
             take_str(obj, &mut out, &id_rule("assignTo", false, ID_MAX))?;
             take_project(obj, &mut out)?;
+            // Step 6a: "none" (no parent) passes as any other id; the app interprets it.
+            take_str(obj, &mut out, &id_rule("parentId", false, ID_MAX))?;
+            take_id_list(obj, &mut out, "blockedBy", BLOCKED_BY_MAX)?;
+            // Step 6b: the app checks the name against the workspace's playbooks.
+            take_str(
+                obj,
+                &mut out,
+                &StrRule {
+                    key: "kind",
+                    required: false,
+                    min: 1,
+                    max: KIND_MAX,
+                    error: KIND_ERROR,
+                    too_long: None,
+                },
+            )?;
         }
         LIST_TICKETS => {
             if let Some(v) = obj.get("filter") {
@@ -663,6 +763,7 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             take_str(obj, &mut out, &id_rule("agentId", false, ID_MAX))?;
             take_project(obj, &mut out)?;
         }
+        START_PLAYBOOK => take_str(obj, &mut out, &id_rule("ticketId", true, ID_MAX))?,
         _ => take_str(
             obj,
             &mut out,
@@ -691,9 +792,15 @@ mod tests {
             assert_eq!(tools_for_roles(&[role]), COMMON_TOOLS.to_vec(), "{role}");
         }
         assert_eq!(COMMON_TOOLS.len(), 11);
-        assert_eq!(ALL_TOOL_NAMES.len(), 17);
+        assert_eq!(ALL_TOOL_NAMES.len(), 18);
+        assert_eq!(ROLE_BOUND_TOOLS.len(), 7);
         assert_eq!(tools_for_roles(&["reviewer"]).len(), 13);
-        assert_eq!(tools_for_roles(&["coordinator"]).len(), 15);
+        assert_eq!(tools_for_roles(&["coordinator"]).len(), 16);
+        // Step 6b: only the coordinator starts a playbook.
+        assert!(is_allowed(START_PLAYBOOK, &["coordinator"]));
+        for role in ["coder", "researcher", "reviewer", "planner", "debugger"] {
+            assert!(!is_allowed(START_PLAYBOOK, &[role]), "{role}");
+        }
         // Step 4b: every role sees the projects.
         assert!(is_allowed(LIST_PROJECTS, &none));
         assert!(is_allowed(LIST_PROJECTS, &["coder"]));
@@ -753,7 +860,7 @@ mod tests {
     #[test]
     fn definitions_are_well_formed() {
         let defs = definitions();
-        assert_eq!(defs.len(), 17);
+        assert_eq!(defs.len(), 18);
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert_eq!(names, TOOL_NAMES);
         for d in &defs {
@@ -853,6 +960,82 @@ mod tests {
             "Ukendt argument: assignee"
         );
         assert_eq!(err(json!(["x"])), "Argumenterne skal være et objekt");
+
+        // Step 6a: parentId ("none" passes like an id) and blockedBy.
+        assert_eq!(
+            validate_args(
+                CREATE_TICKET,
+                &json!({"title":"x","parentId":" none ","blockedBy":[" a ","a","b"]})
+            ),
+            Ok(json!({"title":"x","parentId":"none","blockedBy":["a","b"]}))
+        );
+        assert_eq!(
+            validate_args(CREATE_TICKET, &json!({"title":"x","parentId":"abcdef01"})),
+            Ok(json!({"title":"x","parentId":"abcdef01"}))
+        );
+        assert_eq!(
+            validate_args(
+                CREATE_TICKET,
+                &json!({"title":"x","blockedBy":[" a ", "a"]})
+            ),
+            Ok(json!({"title":"x","blockedBy":["a"]}))
+        );
+        // null = absent, an empty list is left out.
+        assert_eq!(
+            validate_args(CREATE_TICKET, &json!({"title":"x","blockedBy":null})),
+            Ok(json!({"title":"x"}))
+        );
+        assert_eq!(
+            validate_args(CREATE_TICKET, &json!({"title":"x","blockedBy":[]})),
+            Ok(json!({"title":"x"}))
+        );
+        for bad in [
+            json!(""),
+            json!("  "),
+            json!(null),
+            json!(5),
+            json!("p".repeat(65)),
+        ] {
+            assert_eq!(
+                err(json!({"title":"x","parentId": bad})),
+                PARENT_ID_ERROR,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            PARENT_ID_ERROR,
+            "parentId skal være et ticket-id (1–64 tegn) eller \"none\""
+        );
+        let eleven: Vec<String> = (0..11).map(|i| format!("t{i}")).collect();
+        let ten: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        assert!(validate_args(CREATE_TICKET, &json!({"title":"x","blockedBy": ten})).is_ok());
+        for bad in [
+            json!("x"),
+            json!({"a": 1}),
+            json!([5]),
+            json!([""]),
+            json!(["  "]),
+            json!(["p".repeat(65)]),
+            json!(eleven),
+        ] {
+            assert_eq!(
+                err(json!({"title":"x","blockedBy": bad})),
+                BLOCKED_BY_ERROR,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            BLOCKED_BY_ERROR,
+            "blockedBy skal være en liste af ticket-id'er (højst 10)"
+        );
+        assert_eq!(
+            err(json!({"title":"x","parent":"a"})),
+            "Ukendt argument: parent"
+        );
+        assert_eq!(
+            validate_args(LIST_TICKETS, &json!({"parentId":"a"})).unwrap_err(),
+            "Ukendt argument: parentId"
+        );
     }
 
     #[test]
@@ -957,8 +1140,8 @@ mod tests {
             (&["planner"][..], 11),
             (&["debugger"][..], 11),
             (&["reviewer"][..], 13),
-            (&["coordinator"][..], 15),
-            (&["coder", "reviewer", "coordinator"][..], 17),
+            (&["coordinator"][..], 16),
+            (&["coder", "reviewer", "coordinator"][..], 18),
             (&["nobody"][..], 11),
         ] {
             assert_eq!(names(roles).len(), n, "{roles:?}");
@@ -1259,5 +1442,124 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("projektroden og projektlisten"));
+    }
+
+    // ---- step 6a ----
+
+    #[test]
+    fn step6a_definitions() {
+        let defs = definitions();
+        let create = def(&defs, CREATE_TICKET);
+        assert_eq!(
+            create["description"],
+            "Opretter en ny ticket i mira-bots' backlog (ikke tildelt nogen). Brug den til opfølgende opgaver du opdager undervejs, og til del-tickets (parentId) med afhængigheder (blockedBy). Returnerer id og kort-id; ligner titlen en åben ticket i samme projekt, får du en advarsel (warnings/duplicateOf)."
+        );
+        let props = &create["inputSchema"]["properties"];
+        assert_eq!(
+            props["parentId"],
+            json!({"type": "string", "minLength": 1, "maxLength": 64,
+              "description": "Forældre-ticket (id eller kort-id): denne ticket bliver en del-ticket af den. Udelades: din igangværende ticket, hvis du er koordinator; ellers ingen. \"none\" = ingen forælder."})
+        );
+        assert_eq!(
+            props["blockedBy"],
+            json!({"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 64}, "maxItems": 10,
+              "description": "Tickets (id/kort-id) der skal være Done, før denne leveres til sin agent. Den kan tildeles med det samme; køen springer den over indtil da."})
+        );
+        assert_eq!(create["inputSchema"]["required"], json!(["title"]));
+        assert_eq!(create["inputSchema"]["additionalProperties"], false);
+        // Step 6b: + kind.
+        assert_eq!(props.as_object().unwrap().len(), 8);
+        assert!(def(&defs, SUBMIT_FOR_REVIEW)["description"]
+            .as_str()
+            .unwrap()
+            .ends_with(" En ticket med åbne del-tickets går i Venter i stedet for Review; du får besked når de er godkendt."));
+        assert!(def(&defs, LIST_TICKETS)["description"]
+            .as_str()
+            .unwrap()
+            .ends_with(" Viser også parentId og blockedBy."));
+        // Step 6b added mira_start_playbook (18/11/7).
+        assert_eq!(defs.len(), 18);
+        assert_eq!(ALL_TOOL_NAMES.len(), 18);
+        assert_eq!(COMMON_TOOLS.len(), 11);
+        assert_eq!(BLOCKED_BY_MAX, 10);
+    }
+
+    #[test]
+    fn step6b_definitions() {
+        let defs = definitions();
+        let sp = def(&defs, START_PLAYBOOK);
+        assert_eq!(
+            sp["description"],
+            "Starter forløbet (playbooken) for en ticket med en type (kind) der har en playbook: appen opretter del-ticketsene med parentId, kæder dem med blockedBy og tildeler dem til agenter med den rette rolle i projektet. Kun koordinator. Afvises hvis ticketen allerede har del-tickets."
+        );
+        assert_eq!(
+            sp["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "ticketId": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Ticket (id eller kort-id) med en kind der har en playbook; typisk din igangværende ticket"}
+                },
+                "required": ["ticketId"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(sp["annotations"], annotations(false, false));
+        assert_eq!(
+            def(&defs, CREATE_TICKET)["inputSchema"]["properties"]["kind"],
+            json!({"type": "string", "minLength": 1, "maxLength": 32,
+              "description": "Ticket-type: task (standard), feature, bug eller et playbook-navn fra workspace-filen. Styrer hvilket forløb «Start forløb»/mira_start_playbook udruller."})
+        );
+        // Last in the list, role-bound.
+        assert_eq!(*ALL_TOOL_NAMES.last().unwrap(), START_PLAYBOOK);
+        assert!(ROLE_BOUND_TOOLS.contains(&START_PLAYBOOK));
+        assert!(!COMMON_TOOLS.contains(&START_PLAYBOOK));
+    }
+
+    #[test]
+    fn start_playbook_args() {
+        assert_eq!(
+            validate_args(START_PLAYBOOK, &json!({"ticketId": " ab12cd34 "})),
+            Ok(json!({"ticketId": "ab12cd34"}))
+        );
+        for bad in [json!({}), json!({"ticketId": ""}), json!({"ticketId": 7})] {
+            assert_eq!(
+                validate_args(START_PLAYBOOK, &bad),
+                Err("ticketId skal være en tekst på 1–64 tegn".to_string()),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            validate_args(START_PLAYBOOK, &json!({"ticketId": "x".repeat(65)})),
+            Err("ticketId skal være en tekst på 1–64 tegn".to_string())
+        );
+        assert_eq!(
+            validate_args(START_PLAYBOOK, &json!({"ticketId": "a", "kind": "bug"})),
+            Err("Ukendt argument: kind".to_string())
+        );
+    }
+
+    #[test]
+    fn create_ticket_kind() {
+        assert_eq!(
+            validate_args(CREATE_TICKET, &json!({"title": "t", "kind": " feature "})),
+            Ok(json!({"title": "t", "kind": "feature"}))
+        );
+        for bad in [
+            json!({"title": "t", "kind": ""}),
+            json!({"title": "t", "kind": "  "}),
+            json!({"title": "t", "kind": 3}),
+            json!({"title": "t", "kind": "x".repeat(33)}),
+        ] {
+            assert_eq!(
+                validate_args(CREATE_TICKET, &bad),
+                Err(KIND_ERROR.to_string()),
+                "{bad}"
+            );
+        }
+        // Any name passes here; the app checks it against the workspace's playbooks.
+        assert_eq!(
+            validate_args(CREATE_TICKET, &json!({"title": "t", "kind": "docs"})),
+            Ok(json!({"title": "t", "kind": "docs"}))
+        );
     }
 }

@@ -12,21 +12,25 @@
 //! agents' ticket links and emits).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::model::{
-    ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketIssue, TicketState, WorkspaceRules,
+    ReportAuthor, ReportAuthorKind, Ticket, TicketError, TicketGit, TicketIssue, TicketState,
+    WorkspaceRules,
 };
-use super::prompt::{self, ReviewSender, TicketDelivery};
-use super::service::TicketService;
+use super::prompt::{self, ReviewSender, TicketDelivery, WakeInfo};
+use super::service::{DueWake, TicketService};
+use crate::agent::roles::has_work_role;
 use crate::agent::{now_ms, Role, SeatKind};
 use crate::config::{
-    CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS, ENTER_DELAY_MS,
-    NOT_SUBMITTED_TEXT, RETRY_TIMEOUT_MS, SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT,
+    CHILDREN_DONE_NOTE, CONFIRM_TIMEOUT_MS, DELIVERY_FAILED_TEXT, DISPATCH_DELAY_MS,
+    ENTER_DELAY_MS, NEW_SESSION_NOTE, NOT_SUBMITTED_TEXT, RESTART_TIMEOUT_MS, RETRY_TIMEOUT_MS,
+    SESSION_MOVED_NOTE, SPAWN_CONFIRM_TIMEOUT_MS, TURN_FAILED_TEXT, WAKE_MAX_ATTEMPTS,
+    WAKE_UNCONFIRMED_TEXT, WOKEN_NOTE,
 };
 use crate::events::StatusEvent;
 use crate::hooks::status::AgentStatus;
@@ -41,6 +45,17 @@ pub const TERMINAL_GONE_NOTE: &str = "Terminalen er væk";
 pub const USER_TYPED_NOTE: &str = "brugeren skrev selv i terminalen";
 /// History note after the "Bed om aflevering" line was typed (the ticket is otherwise unchanged).
 pub const SUBMISSION_REQUESTED_NOTE: &str = "bedt om aflevering";
+/// History note (by the app) when the restart before a delivery did not bring the agent back
+/// within [`RESTART_TIMEOUT_MS`] (step 6b, plan A.7): the ticket goes to the agent's session as
+/// it is once it is idle.
+pub const RESTART_TIMEOUT_NOTE: &str =
+    "ny session startede ikke inden for 60 s; ticketen leveres i agentens nuværende session";
+
+/// History note (by the app) when the restart before a delivery was refused (step 6b): the
+/// ticket is typed into the agent's current session.
+pub fn restart_failed_note(err: &str) -> String {
+    format!("ny session kunne ikke startes ({err}); ticketen leveres i agentens nuværende session")
+}
 
 /// No ticket is typed into a terminal the user typed into less than this long ago (their
 /// half-written prompt would be merged with the ticket line); the dispatch waits instead. The
@@ -65,6 +80,82 @@ pub struct AgentSnapshot {
     pub roles: Vec<Role>,
     /// The agent's project (plan4b A.1); `None` on a staff seat.
     pub project: Option<String>,
+    /// The agent's current Claude session id (changes on a fresh restart and after `/clear`):
+    /// the dispatcher's record of the ticket it delivered in a session is only valid for this
+    /// session (review6b W3/W5).
+    pub session_id: String,
+}
+
+/// The restart the dispatcher asks for before a work delivery (step 6b, plan A.7): `cwd` is the
+/// ticket's worktree when the agent must move there, or its project folder when it sits in
+/// another ticket's worktree and this ticket has none (`None` keeps the cwd); `force_fresh`
+/// starts a new session (never `--resume`); otherwise the session continues in the new cwd
+/// (`--resume`, like "Flyt til projekt"). The agent keeps its project, model and effort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartForTicket {
+    pub agent_id: String,
+    pub cwd: Option<PathBuf>,
+    pub force_fresh: bool,
+    pub ticket_short: String,
+}
+
+/// The app's restart path for [`AgentPort::restart_fresh`] (`commands::restart_for_ticket`,
+/// installed in `lib.rs` like the tools' `SpawnPort`).
+pub type RestartPort = Arc<dyn Fn(RestartForTicket) -> Result<(), String> + Send + Sync>;
+
+/// What [`fresh_decision`] says about a work delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FreshDecision {
+    /// Type the ticket into the agent's current session.
+    None,
+    /// Restart first ([`RestartForTicket`]), then deliver at the next Idle.
+    Restart {
+        cwd: Option<PathBuf>,
+        force_fresh: bool,
+    },
+}
+
+/// Step 6b (plan A.7): whether a work delivery of `ticket` to the agent `snap` restarts it first.
+/// Never for a staff seat or an agent without a work role (a coordination task). Otherwise:
+/// - `needs_cwd`: the ticket's worktree (`git.worktree`, an existing folder) is not the agent's
+///   cwd ([`crate::git::same_path`]) → restart in it; without one, an agent that sits in an app
+///   worktree (`<project>/.mira-bots/wt/<short>`, [`crate::git::worktree_project`]) goes back
+///   to the project folder (it must not work on another ticket's branch);
+/// - `needs_fresh`: rule `freshSessionPerTicket`, the app itself delivered a ticket in the
+///   agent's current session (`delivered`: its id, see `Dispatcher::delivered_in_session`) and
+///   that ticket is not this one (review6b W3/W5). So the user's own conversation before the
+///   first ticket survives, a rejected ticket coming back to the same agent and session keeps
+///   its context, and a rejected ticket that comes to another agent (or after another ticket's
+///   session) gets a fresh session. Whether the session has had a turn decides nothing here; it
+///   only picks `--resume` or a new session for a restart without `force_fresh`.
+///
+/// `Restart { cwd, force_fresh: needs_fresh }` when either holds; a ticket that must change
+/// folders without a fresh session continues its session there (`--resume`).
+// TODO(windows-verify): a rejected ticket coming back to the same agent does not restart the
+// session (the conversation continues, round 1) (plan6b D.102).
+pub fn fresh_decision(
+    rules: &WorkspaceRules,
+    snap: &AgentSnapshot,
+    ticket: &Ticket,
+    git: Option<&TicketGit>,
+    delivered: Option<&str>,
+) -> FreshDecision {
+    if snap.seat_kind != SeatKind::Work || !has_work_role(&snap.roles) {
+        return FreshDecision::None;
+    }
+    let cwd = git
+        .and_then(|g| g.worktree.as_deref())
+        .map(PathBuf::from)
+        .filter(|wt| wt.is_dir())
+        .or_else(|| crate::git::worktree_project(&snap.cwd).filter(|p| p.is_dir()))
+        .filter(|want| {
+            !crate::git::same_path(&want.to_string_lossy(), &snap.cwd.to_string_lossy())
+        });
+    let force_fresh = rules.fresh_session_per_ticket && delivered.is_some_and(|d| d != ticket.id);
+    if cwd.is_none() && !force_fresh {
+        return FreshDecision::None;
+    }
+    FreshDecision::Restart { cwd, force_fresh }
 }
 
 /// Access to the agents (implemented by `ManagerPort` over `Arc<Mutex<AgentManager>>`; each call
@@ -80,6 +171,18 @@ pub trait AgentPort: Send {
     fn peers_in_project(&self, _id: &str) -> Vec<String> {
         Vec::new()
     }
+    /// Whether a live agent has the coordinator role (step 6a: the planner's text). `false` by
+    /// default (test ports).
+    fn has_live_coordinator(&self) -> bool {
+        false
+    }
+    /// Step 6b (plan A.7): restarts the idle agent before a work delivery (a fresh session and/or
+    /// the ticket's worktree as cwd). Synchronous; the dispatcher holds no lock while calling
+    /// it. On `Ok` the app sends [`DispatchMsg::AgentRestarting`] and, after the new session's
+    /// SessionStart, [`DispatchMsg::AgentIdle`]. Refused by default (test ports, no app).
+    fn restart_fresh(&self, _req: RestartForTicket) -> Result<(), String> {
+        Err("ingen genstart i denne port".into())
+    }
 }
 
 /// Access to the shared ticket service (implemented for the app's `TicketsCtx`).
@@ -90,6 +193,16 @@ pub trait TicketsHost: Send {
         &self,
         f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
     ) -> Result<T, String>;
+    /// [`Self::mutate`], but the implementation emits only when `changed(&result)` (review6d
+    /// N4: a no-op note stays silent). By default it is `mutate`.
+    fn mutate_if<T>(
+        &self,
+        f: impl FnOnce(&mut TicketService) -> Result<T, TicketError>,
+        changed: impl FnOnce(&T) -> bool,
+    ) -> Result<T, String> {
+        let _ = changed;
+        self.mutate(f)
+    }
     /// Read-only access under the service lock; no emits.
     fn read<T>(&self, f: impl FnOnce(&TicketService) -> T) -> T;
     /// Routes tickets in review without a reviewer (plan5 A.6; `TicketsCtx::route_reviews`).
@@ -103,6 +216,18 @@ pub trait TicketsHost: Send {
     }
     /// The project ids under the projects root (plan4b A.6). Empty by default.
     fn project_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Step 6b (plan A.4): the ticket's git branch for a real work delivery to an agent in
+    /// `cwd` (`TicketsCtx::prepare_git`: an existing `ticket.git` is kept; with `git: worktree`
+    /// the worktree is prepared and saved; any failure is a history note and `None`). Blocks
+    /// for the git commands. `None` by default (git off).
+    fn prepare_git(&self, _ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
+        None
+    }
+    /// Step 6b (plan punkt 16): the project's checks as "name: `run`" lines for the review file
+    /// (`TicketsCtx` reads `<project>/.mira-bots/project.json`). Empty by default.
+    fn project_checks(&self, _project: Option<&str>) -> Vec<String> {
         Vec::new()
     }
 }
@@ -124,6 +249,9 @@ pub enum TimerKind {
     NudgeDelay,
     /// "Bed om aflevering": line typed, Enter pending.
     NudgeEnter,
+    /// Step 6b: the restart before a delivery did not bring the agent back in time
+    /// ([`RESTART_TIMEOUT_MS`]).
+    RestartTimeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,7 +274,9 @@ pub enum DispatchMsg {
     /// The agent stopped/exited/was removed (its tickets are already released).
     AgentGone { agent_id: String },
     /// The agent is restarted with `--resume` (model/effort change, plan5 A.5): any delivery
-    /// state is dropped like for `AgentGone`; its queue continues at the next Idle.
+    /// state is dropped like for `AgentGone`; its queue continues at the next Idle. A
+    /// [`Delivery::AwaitingRestart`] (the dispatcher's own restart, step 6b) and the ticket
+    /// delivered in the session (`delivered_in_session`, review6b W8) are kept.
     AgentRestarting { agent_id: String },
     /// `spawn_agent_with_ticket`: the line went in as the positional prompt.
     SpawnedWithTicket { agent_id: String, ticket_id: String },
@@ -199,18 +329,22 @@ pub fn messages_for(ev: &StatusEvent) -> Vec<DispatchMsg> {
     }
 }
 
-/// What a delivery types: a work ticket ("Ticket …" line) or a review ("Review af ticket …"
-/// line, plan5 C5.12).
+/// What a delivery types: a work ticket ("Ticket …" line), a review ("Review af ticket …"
+/// line, plan5 C5.12) or the wake line of a waiting parent ("Du har fået besked: …", review 6a
+/// W1; the parent resumes only once the line is confirmed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKind {
     Work,
     Review,
+    Wake,
 }
 
 impl DeliveryKind {
     /// Whether the submitted `prompt` is this delivery's line: a ticket goes in as
     /// "Ticket <short>" or, as a coordination task, as "Koordiner ticket <short>" (5c C.1; the
-    /// first word matched tolerantly, review 5c N1); a review as "Review af ticket <short>".
+    /// first word matched tolerantly, review 5c N1); a review as "Review af ticket <short>"; a
+    /// wake as "Du har fået besked: … (ticketId <parent short>)" ([`prompt::is_wake_line_for`]).
+    /// The prefixes exclude each other, so no kind ever confirms another kind's line.
     fn confirms(self, ticket_id: &str, prompt: &str) -> bool {
         let short = super::model::short_id(ticket_id);
         let p = prompt.trim_start();
@@ -220,6 +354,7 @@ impl DeliveryKind {
                     || prompt::is_coordination_line_for(p, &short)
             }
             DeliveryKind::Review => p.starts_with(&format!("Review af ticket {short}")),
+            DeliveryKind::Wake => prompt::is_wake_line_for(p, &short),
         }
     }
 }
@@ -245,7 +380,8 @@ enum Delivery {
         token: u64,
         kind: DeliveryKind,
     },
-    /// Enter sent, waiting for `UserPromptSubmit` or a busy status.
+    /// Enter sent, waiting for `UserPromptSubmit` or a busy status (a wake: only for the
+    /// `UserPromptSubmit` with its line, review 6a W1).
     Waiting {
         ticket_id: String,
         token: u64,
@@ -259,9 +395,17 @@ enum Delivery {
         ticket_id: String,
         token: u64,
     },
-    /// Typing a "Du …" line for `ticket_id`: "Bed om aflevering" (C4.7, the ticket in progress)
-    /// or "stop, it was handed on" (review 5c W4): waiting for the grace period (`NudgeDelay`),
-    /// then for the Enter (`NudgeEnter`). Nothing is confirmed.
+    /// Step 6b (plan A.7): the agent was restarted before `ticket_id` is delivered (a fresh
+    /// session and/or the ticket's worktree); survives `AgentRestarting`, the next Idle (or
+    /// `RestartTimeout`) frees the agent and the queue is considered again.
+    AwaitingRestart {
+        ticket_id: String,
+        token: u64,
+    },
+    /// Typing a "Du …" line for `ticket_id`: "Bed om aflevering" (C4.7, the ticket in progress),
+    /// "stop, it was handed on" (review 5c W4) or the wake line of a waiting parent (step 6a):
+    /// waiting for the grace period (`NudgeDelay`), then for the Enter (`NudgeEnter`). Nothing is
+    /// confirmed.
     Nudging {
         ticket_id: String,
         token: u64,
@@ -276,6 +420,44 @@ enum Nudge {
     Submit,
     /// [`prompt::handed_over_line`]: the ticket left the agent (review 5c W4).
     Stop,
+    /// [`prompt::wake_line`]: `ticket_id` is the agent's waiting parent and a child is done
+    /// (step 6a, plan A.2). After the Enter the dispatcher waits for the confirmation like a
+    /// delivery ([`DeliveryKind::Wake`], review 6a W1); only then the parent goes back in progress.
+    Wake,
+}
+
+/// The wake a [`WakeMiss`] counts: the same parent with the same children done and open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WakeKey {
+    parent_id: String,
+    newly_done: Vec<String>,
+    open_left: usize,
+}
+
+impl WakeKey {
+    fn of(w: &DueWake) -> Self {
+        WakeKey {
+            parent_id: w.parent.id.clone(),
+            newly_done: w.newly_done.iter().map(|c| c.id.clone()).collect(),
+            open_left: w.open_left,
+        }
+    }
+}
+
+/// Unconfirmed attempts at an agent's wake line (review 6a W1). At [`WAKE_MAX_ATTEMPTS`] the
+/// wake is not typed again until it changes (another child done), the user asks ("Bed om
+/// aflevering" on the waiting parent) or the agent restarts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WakeMiss {
+    key: WakeKey,
+    misses: u8,
+}
+
+/// The ticket the app delivered in one session of an agent (review6b W3/W5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionDelivery {
+    ticket_id: String,
+    session_id: String,
 }
 
 /// A pending [`prompt::handed_over_line`] for an agent (review 5c W4).
@@ -293,6 +475,17 @@ pub struct Dispatcher<H, P, T> {
     /// Agents to tell that their ticket in progress was handed on (review 5c W4), typed when
     /// they are idle, before their next delivery.
     stop_notices: HashMap<String, StopNotice>,
+    /// Per agent: unconfirmed wake attempts (review 6a W1).
+    wake_misses: HashMap<String, WakeMiss>,
+    /// Per agent: the ticket it was last restarted for (step 6b). That ticket is never restarted
+    /// for again by the same agent (no loop when the new cwd does not match, a timeout delivers
+    /// as it is); cleared when a ticket is typed or the agent is gone.
+    restarted_for: HashMap<String, String>,
+    /// Per agent: the work ticket the app delivered (confirmed) in the agent's current session
+    /// (review6b W3/W5, [`fresh_decision`]'s `delivered`). Cleared by `AgentGone`; only valid
+    /// while the agent's session id is the recorded one (a fresh restart or `/clear` gives a
+    /// new id; a `--resume` restart keeps it and so keeps the record, review6b W8).
+    delivered_in_session: HashMap<String, SessionDelivery>,
     next_token: u64,
     /// Overrides the workspace rule `autoReviewOnStop` (tests); `None` = [`TicketsHost::rules`].
     auto_review_on_stop: Option<bool>,
@@ -306,6 +499,9 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             timers,
             deliveries: HashMap::new(),
             stop_notices: HashMap::new(),
+            wake_misses: HashMap::new(),
+            restarted_for: HashMap::new(),
+            delivered_in_session: HashMap::new(),
             next_token: 0,
             auto_review_on_stop: None,
         }
@@ -368,9 +564,20 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             DispatchMsg::AgentGone { agent_id } => {
                 self.deliveries.remove(&agent_id);
                 self.stop_notices.remove(&agent_id);
+                self.wake_misses.remove(&agent_id);
+                self.restarted_for.remove(&agent_id);
+                self.delivered_in_session.remove(&agent_id);
             }
             DispatchMsg::AgentRestarting { agent_id } => {
-                self.deliveries.remove(&agent_id);
+                // `delivered_in_session` is kept (review6b W8): a `--resume` restart ("Skift
+                // model", "Flyt til projekt") continues the same session, which still holds the
+                // delivered ticket. A fresh restart or `/clear` changes the session id, which
+                // the lookup filters on; the same ticket is guarded by `restarted_for`.
+                // Our own restart before a delivery announces itself too: keep waiting for it.
+                if !matches!(self.state(&agent_id), Delivery::AwaitingRestart { .. }) {
+                    self.deliveries.remove(&agent_id);
+                }
+                self.wake_misses.remove(&agent_id);
             }
             DispatchMsg::SpawnedWithTicket {
                 agent_id,
@@ -401,13 +608,18 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// Starts a delivery sequence if the agent is free, idle and has a review or a queued ticket.
     // TODO(windows-verify): 750 ms after Stop the input field is ready, and the extra Enter on
     // retry neither sends an empty prompt nor closes a dialog (plan D.29).
-    /// A pending stop notice (review 5c W4) goes first: no delivery until it is typed.
+    /// A pending stop notice (review 5c W4) goes first: no delivery until it is typed. Then a
+    /// due wake line for a waiting parent (step 6a), then reviews and the queue.
     fn consider(&mut self, agent_id: &str) {
         if *self.state(agent_id) != Delivery::Free {
             return;
         }
         if self.stop_notices.contains_key(agent_id) {
             self.start_stop_notice(agent_id);
+            return;
+        }
+        if let Some((snap, _)) = self.due_wake(agent_id) {
+            self.start_wake(agent_id, &snap);
             return;
         }
         let Some((snap, _)) = self.ready_item(agent_id) else {
@@ -429,6 +641,106 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         let grace = self.host.rules().user_input_grace_ms;
         let elapsed = self.timers.now_ms().saturating_sub(at);
         (elapsed < grace).then(|| grace - elapsed)
+    }
+
+    /// The agent's due wake (step 6a, plan A.2): only while it is idle without a ticket in
+    /// progress, and a waiting parent of its own is due ([`TicketService::due_wake_for`]). Not
+    /// once the same wake went unconfirmed [`WAKE_MAX_ATTEMPTS`] times (review 6a W1).
+    fn due_wake(&self, agent_id: &str) -> Option<(AgentSnapshot, DueWake)> {
+        let snap = self.port.snapshot(agent_id)?;
+        if snap.status != AgentStatus::Idle {
+            return None;
+        }
+        if self.host.read(|s| s.current_for_agent(agent_id)).is_some() {
+            return None;
+        }
+        let w = self.host.read(|s| s.due_wake_for(agent_id))?;
+        let given_up = self
+            .wake_misses
+            .get(agent_id)
+            .is_some_and(|m| m.misses >= WAKE_MAX_ATTEMPTS && m.key == WakeKey::of(&w));
+        if given_up {
+            return None;
+        }
+        Some((snap, w))
+    }
+
+    /// Schedules the wake line after the usual delay and the user-input grace (like a stop
+    /// notice). What is typed is decided again when the timer comes due ([`Self::wake_type`]).
+    fn start_wake(&mut self, agent_id: &str, snap: &AgentSnapshot) {
+        let Some(w) = self.host.read(|s| s.due_wake_for(agent_id)) else {
+            return;
+        };
+        let delay = self
+            .user_grace_left(snap)
+            .map_or(DISPATCH_DELAY_MS, |left| left.max(DISPATCH_DELAY_MS));
+        let token = self.token();
+        self.schedule(agent_id, token, TimerKind::NudgeDelay, delay);
+        self.set(
+            agent_id,
+            Delivery::Nudging {
+                ticket_id: w.parent.id,
+                token,
+                nudge: Nudge::Wake,
+            },
+        );
+    }
+
+    /// `NudgeDelay` of a wake came due: type [`prompt::wake_line`] if the agent is still idle
+    /// without a ticket in progress, the user is not typing and the parent is still due; else
+    /// free the agent (and consider it again when the wake is no longer due).
+    // TODO(windows-verify): "Du har fået besked: …" is typed about 1 s after the coordinator is
+    // idle and the parent shows "I gang" with the note "vækket …" (plan6a D.91/92).
+    fn wake_type(&mut self, agent_id: &str, parent_id: &str, token: u64) {
+        let Some(snap) = self.port.snapshot(agent_id) else {
+            self.set(agent_id, Delivery::Free);
+            return;
+        };
+        if let Some(left) = self.user_grace_left(&snap) {
+            log::info!("dispatch {agent_id}: user typed recently; wake line in {left} ms");
+            self.schedule(agent_id, token, TimerKind::NudgeDelay, left);
+            return;
+        }
+        if snap.status != AgentStatus::Idle
+            || self.host.read(|s| s.current_for_agent(agent_id)).is_some()
+        {
+            // Still due: the next Stop/Idle considers it again.
+            log::info!("dispatch {agent_id}: busy again; no wake line now");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        let due = self
+            .host
+            .read(|s| s.due_wake_for(agent_id))
+            .filter(|w| w.parent.id == parent_id);
+        let Some(w) = due else {
+            self.set(agent_id, Delivery::Free);
+            self.consider(agent_id);
+            return;
+        };
+        let info = WakeInfo {
+            parent_short: w.parent.short_id(),
+            newly_done: w
+                .newly_done
+                .iter()
+                // Step 6c: an external child's title never goes into the line.
+                .map(|c| (c.short_id(), prompt::line_title(c)))
+                .collect(),
+            open_left: w.open_left,
+        };
+        let line = prompt::wake_line(&info);
+        if let Err(e) = self.port.write_input(agent_id, line.as_bytes()) {
+            log::warn!("dispatch {agent_id}: typing the wake line failed: {e}");
+            self.set(agent_id, Delivery::Free);
+            return;
+        }
+        log::info!(
+            "dispatch {agent_id}: woke for parent {} ({} children done, {} open)",
+            info.parent_short,
+            w.newly_done.len(),
+            w.open_left
+        );
+        self.schedule(agent_id, token, TimerKind::NudgeEnter, ENTER_DELAY_MS);
     }
 
     /// The agent (idle, not exited) and what it gets next, if a delivery may start now: its
@@ -457,6 +769,16 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 self.host.reroute_reviews();
                 self.consider(agent_id);
             }
+            Delivery::AwaitingRestart { ticket_id, .. } => {
+                // The new session is up (step 6b): deliver as usual; it holds no ticket from the
+                // app and `restarted_for` holds the ticket, so it is not restarted again.
+                log::info!(
+                    "dispatch {agent_id}: restarted for ticket {}; delivering",
+                    super::model::short_id(&ticket_id)
+                );
+                self.set(agent_id, Delivery::Free);
+                self.consider(agent_id);
+            }
             Delivery::AwaitingSession { ticket_id, token } => {
                 // The session is up; the positional prompt should be submitted soon.
                 self.schedule(
@@ -483,6 +805,12 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
 
     fn on_busy(&mut self, agent_id: &str) {
         match self.state(agent_id).clone() {
+            // A wake is confirmed by its line only (review 6a W1): a busy status may belong to
+            // something else, and a wrongly resumed parent is never woken again.
+            Delivery::Waiting {
+                kind: DeliveryKind::Wake,
+                ..
+            } => {}
             Delivery::Waiting {
                 ticket_id, kind, ..
             } => self.confirm(agent_id, &ticket_id, kind),
@@ -504,10 +832,26 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             Delivery::AwaitingSession { ticket_id, .. } => {
                 (ticket_id.clone(), false, DeliveryKind::Work)
             }
+            Delivery::Free
+            | Delivery::Nudging {
+                nudge: Nudge::Wake, ..
+            } => {
+                // A wake line submitted outside its confirm window (late, or Enter pressed before
+                // ours) still counts (review 6a W1).
+                if let Some(p) = prompt {
+                    self.late_wake(agent_id, p);
+                }
+                return;
+            }
             _ => return,
         };
         match prompt {
             Some(p) if kind.confirms(&ticket_id, p) => self.confirm(agent_id, &ticket_id, kind),
+            None if kind == DeliveryKind::Wake => {
+                log::info!(
+                    "dispatch {agent_id}: UserPromptSubmit without prompt; wake not confirmed yet"
+                );
+            }
             Some(_) if typed_by_us => {
                 // Another prompt went in while our line was in the terminal (typically the user's
                 // own text, possibly merged with the line). A busy status that follows belongs
@@ -527,6 +871,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// counts as delivered ("review sendt til <name>").
     fn confirm(&mut self, agent_id: &str, ticket_id: &str, kind: DeliveryKind) {
         self.set(agent_id, Delivery::Free);
+        if kind == DeliveryKind::Wake {
+            self.wake_confirmed(agent_id, ticket_id);
+            return;
+        }
         let snap = self.port.snapshot(agent_id);
         let name = snap
             .as_ref()
@@ -554,9 +902,26 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 .host
                 .mutate(|s| s.mark_review_delivered(ticket_id, &name, now))
                 .map(|_| ()),
+            DeliveryKind::Wake => Ok(()),
         };
-        if let Err(e) = r {
-            log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}");
+        match r {
+            Err(e) => {
+                log::warn!("dispatch {agent_id}: confirming {kind:?} {ticket_id} failed: {e}")
+            }
+            // Recorded even when the ticket changed hands (review6b N18): its line was typed
+            // and submitted in this agent's session all the same.
+            Ok(()) if kind == DeliveryKind::Work => {
+                if let Some(s) = &snap {
+                    self.delivered_in_session.insert(
+                        agent_id.to_string(),
+                        SessionDelivery {
+                            ticket_id: ticket_id.to_string(),
+                            session_id: s.session_id.clone(),
+                        },
+                    );
+                }
+            }
+            Ok(()) => {}
         }
         if snap.is_some_and(|s| {
             matches!(
@@ -576,7 +941,8 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// Otherwise (step 4) a ticket still in progress was not submitted with
     /// `mira_submit_for_review`: it keeps its state with `issue: notSubmitted` and the agent gets
     /// [`NOT_SUBMITTED_TEXT`]; no next ticket is considered. Without a ticket in progress (e.g.
-    /// submitted by the tool in this turn) the queue moves on.
+    /// submitted by the tool in this turn) the queue moves on. Step 6a: a parent with open
+    /// children goes to waiting instead (no hint) and the queue moves on.
     // TODO(windows-verify): Esc mid-turn gives no Stop (the ticket stays in progress); StopFailure
     // shows the "Turn fejlede" hint and "Send igen" works (plan D.33). Stop without
     // `mira_submit_for_review` shows "Ikke afleveret"; with it, the ticket is in review before or
@@ -602,13 +968,26 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 .set_detail(agent_id, Some(TURN_FAILED_TEXT.to_string()));
         } else if self.auto_review() {
             match self.host.mutate(|s| s.complete_turn(agent_id, now)) {
-                Ok(Some(_)) => self.host.reroute_reviews(),
-                Ok(None) => {}
+                Ok(Some(t)) if t.state == TicketState::Waiting => log::info!(
+                    "dispatch {agent_id}: turn ended; parent {} waits for its children",
+                    t.short_id()
+                ),
+                Ok(Some(t)) if t.state == TicketState::Review => self.host.reroute_reviews(),
+                Ok(_) => {}
                 Err(e) => log::warn!("dispatch {agent_id}: completing the turn failed: {e}"),
             }
             self.consider(agent_id);
         } else {
             match self.host.mutate(|s| s.mark_not_submitted(agent_id, now)) {
+                // Step 6a: a parent with open children waits instead ("Ikke afleveret" would be
+                // wrong); the agent is free for its queue.
+                Ok(Some(t)) if t.state == TicketState::Waiting => {
+                    log::info!(
+                        "dispatch {agent_id}: turn ended; parent {} waits for its children",
+                        t.short_id()
+                    );
+                    self.consider(agent_id);
+                }
                 Ok(Some(t)) => {
                     log::info!(
                         "dispatch {agent_id}: turn ended without submitting ticket {}",
@@ -632,6 +1011,18 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         };
         let agent_id = match (&t.state, &t.assignee_agent_id) {
             (TicketState::InProgress, Some(a)) => a.clone(),
+            (TicketState::Waiting, Some(a)) => {
+                // Review 6a W1: on a waiting parent the request types its wake line again, also
+                // after the dispatcher gave up on an unconfirmed one.
+                let a = a.clone();
+                self.wake_misses.remove(&a);
+                log::info!(
+                    "request submission: parent {} waits; its wake is tried again",
+                    t.short_id()
+                );
+                self.consider(&a);
+                return;
+            }
             _ => {
                 log::info!(
                     "request submission: ticket {} is not in progress",
@@ -784,8 +1175,29 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             log::warn!("dispatch {agent_id}: sending Enter after the {nudge:?} line failed: {e}");
             return;
         }
-        if nudge == Nudge::Stop {
-            return;
+        match nudge {
+            Nudge::Stop => return,
+            Nudge::Wake => {
+                // Review 6a W1: the parent stays waiting until the line is confirmed.
+                log::info!(
+                    "dispatch {agent_id}: wake line for parent {} entered; waiting for confirmation",
+                    super::model::short_id(ticket_id)
+                );
+                let token = self.token();
+                self.schedule(agent_id, token, TimerKind::Confirm, CONFIRM_TIMEOUT_MS);
+                self.set(
+                    agent_id,
+                    Delivery::Waiting {
+                        ticket_id: ticket_id.to_string(),
+                        token,
+                        retried: true,
+                        from_spawn: false,
+                        kind: DeliveryKind::Wake,
+                    },
+                );
+                return;
+            }
+            Nudge::Submit => {}
         }
         let still_ours = self
             .host
@@ -810,13 +1222,116 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         }
     }
 
+    /// The wake line was confirmed (step 6a, plan P2; review 6a W1: its `UserPromptSubmit`):
+    /// the parent goes waiting → in progress with [`WOKEN_NOTE`] ([`CHILDREN_DONE_NOTE`] when no
+    /// child is open any more). Nothing happens when it is no longer the agent's waiting parent
+    /// or the agent has another ticket in progress (`Ok(None)`). The attempts are forgotten and a
+    /// [`WAKE_UNCONFIRMED_TEXT`] detail is cleared.
+    fn wake_confirmed(&mut self, agent_id: &str, parent_id: &str) {
+        self.wake_misses.remove(agent_id);
+        let now = now_ms();
+        let r = self.host.mutate(|s| {
+            let note = if s.open_children_count(parent_id) == 0 {
+                CHILDREN_DONE_NOTE
+            } else {
+                WOKEN_NOTE
+            };
+            s.resume_after_wake(parent_id, agent_id, note, now)
+        });
+        match r {
+            Ok(Some(t)) => log::info!(
+                "dispatch {agent_id}: wake confirmed; parent {} back in progress",
+                t.short_id()
+            ),
+            Ok(None) => log::info!(
+                "dispatch {agent_id}: wake confirmed; parent {} not resumed (no longer waiting or agent busy)",
+                super::model::short_id(parent_id)
+            ),
+            Err(e) => log::warn!("dispatch {agent_id}: resuming the parent failed: {e}"),
+        }
+        let stale = self
+            .port
+            .snapshot(agent_id)
+            .is_some_and(|s| s.detail.as_deref() == Some(WAKE_UNCONFIRMED_TEXT));
+        if stale {
+            self.port.set_detail(agent_id, None);
+        }
+    }
+
+    /// A `UserPromptSubmit` outside a wake's confirm window (review 6a W1): when it is the wake
+    /// line of one of the agent's waiting parents (submitted after the timeout, or the user
+    /// pressed Enter before ours), the parent resumes as if confirmed; a pending Enter for it is
+    /// dropped, so the line is never entered twice.
+    fn late_wake(&mut self, agent_id: &str, prompt: &str) {
+        let parent = self.host.read(|s| {
+            s.list_for_agent(agent_id)
+                .into_iter()
+                .find(|t| {
+                    t.state == TicketState::Waiting && DeliveryKind::Wake.confirms(&t.id, prompt)
+                })
+                .map(|t| t.id)
+        });
+        let Some(parent_id) = parent else {
+            return;
+        };
+        log::info!(
+            "dispatch {agent_id}: wake line for parent {} submitted outside the confirm window",
+            super::model::short_id(&parent_id)
+        );
+        if matches!(self.state(agent_id), Delivery::Nudging { ticket_id, .. } if *ticket_id == parent_id)
+        {
+            self.set(agent_id, Delivery::Free);
+        }
+        self.wake_confirmed(agent_id, &parent_id);
+    }
+
+    /// The wake line was not confirmed in [`CONFIRM_TIMEOUT_MS`] after its Enter, or another
+    /// prompt went in (review 6a W1): the agent is free, the parent stays waiting and
+    /// [`TicketService::due_wake_for`] finds it again at the next idle — once; after
+    /// [`WAKE_MAX_ATTEMPTS`] unconfirmed attempts of the same wake the agent shows
+    /// [`WAKE_UNCONFIRMED_TEXT`] and the user asks again ("Bed om aflevering").
+    fn wake_unconfirmed(&mut self, agent_id: &str, parent_id: &str, why: &str) {
+        self.set(agent_id, Delivery::Free);
+        let short = super::model::short_id(parent_id);
+        let due = self
+            .host
+            .read(|s| s.due_wake_for(agent_id))
+            .filter(|w| w.parent.id == parent_id);
+        let Some(w) = due else {
+            log::info!(
+                "dispatch {agent_id}: wake for parent {short} not confirmed ({why}); no longer due"
+            );
+            self.wake_misses.remove(agent_id);
+            return;
+        };
+        let key = WakeKey::of(&w);
+        let misses = match self.wake_misses.get(agent_id) {
+            Some(m) if m.key == key => m.misses.saturating_add(1),
+            _ => 1,
+        };
+        self.wake_misses
+            .insert(agent_id.to_string(), WakeMiss { key, misses });
+        if misses >= WAKE_MAX_ATTEMPTS {
+            log::warn!(
+                "dispatch {agent_id}: wake for parent {short} not confirmed ({why}) after {misses} attempts; not typed again until the user asks"
+            );
+            self.port
+                .set_detail(agent_id, Some(WAKE_UNCONFIRMED_TEXT.to_string()));
+        } else {
+            log::info!(
+                "dispatch {agent_id}: wake for parent {short} not confirmed ({why}); typed again at the next idle"
+            );
+        }
+    }
+
     fn on_timer(&mut self, agent_id: &str, token: u64, kind: TimerKind) {
         let state = self.state(agent_id).clone();
         match (state, kind) {
             (Delivery::Delaying { token: t }, TimerKind::DispatchDelay) if t == token => {
                 self.set(agent_id, Delivery::Free);
-                if self.stop_notices.contains_key(agent_id) {
-                    // A stop notice arrived during the delay: it goes first (review 5c W4).
+                if self.stop_notices.contains_key(agent_id) || self.due_wake(agent_id).is_some() {
+                    // A stop notice (review 5c W4) or a wake (step 6a) arrived during the delay:
+                    // it goes first.
                     self.consider(agent_id);
                 } else if let Some((snap, item)) = self.ready_item(agent_id) {
                     if let Some(left) = self.user_grace_left(&snap) {
@@ -826,7 +1341,9 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                         self.set(agent_id, Delivery::Delaying { token });
                     } else {
                         match item {
-                            Item::Work(ticket) => self.type_ticket(agent_id, &snap, &ticket, token),
+                            Item::Work(ticket) => {
+                                self.deliver_work(agent_id, &snap, &ticket, token)
+                            }
                             Item::Review(ticket) => {
                                 self.type_review(agent_id, &snap, &ticket, token)
                             }
@@ -856,6 +1373,15 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                     );
                 }
             }
+            (
+                Delivery::Waiting {
+                    ticket_id,
+                    token: t,
+                    kind: DeliveryKind::Wake,
+                    ..
+                },
+                TimerKind::Confirm,
+            ) if t == token => self.wake_unconfirmed(agent_id, &ticket_id, "timeout"),
             (
                 Delivery::Waiting {
                     ticket_id,
@@ -901,6 +1427,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             ) if t == token => match nudge {
                 Nudge::Submit => self.nudge_type(agent_id, &ticket_id, token),
                 Nudge::Stop => self.stop_notice_type(agent_id, &ticket_id, token),
+                Nudge::Wake => self.wake_type(agent_id, &ticket_id, token),
             },
             (
                 Delivery::Nudging {
@@ -910,15 +1437,51 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                 },
                 TimerKind::NudgeEnter,
             ) if t == token => self.nudge_enter(agent_id, &ticket_id, nudge),
+            (
+                Delivery::AwaitingRestart {
+                    ticket_id,
+                    token: t,
+                },
+                TimerKind::RestartTimeout,
+            ) if t == token => {
+                // Fallback: the ticket goes into whatever session the agent has once it is idle
+                // (`restarted_for` prevents a second restart).
+                log::warn!(
+                    "dispatch {agent_id}: no session {} s after the restart for ticket {}; delivering without it",
+                    RESTART_TIMEOUT_MS / 1000,
+                    super::model::short_id(&ticket_id)
+                );
+                let now = now_ms();
+                if let Err(e) = self
+                    .host
+                    .mutate(|s| s.note_by_system(&ticket_id, RESTART_TIMEOUT_NOTE, now))
+                {
+                    log::warn!("dispatch {agent_id}: noting the restart timeout failed: {e}");
+                }
+                self.set(agent_id, Delivery::Free);
+                self.consider(agent_id);
+            }
             _ => log::debug!("dispatch {agent_id}: ignoring stale {kind:?} timer"),
         }
     }
 
     /// The delivery for the agent (5c C.1) with the step 4b sections: `## Delt projekt` for a
     /// real work delivery when other live work agents share the project (plan4b A.5), the
-    /// project list for a coordination task (A.6).
-    fn delivery_for(&self, agent_id: &str, snap: &AgentSnapshot) -> TicketDelivery {
-        let mut delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles);
+    /// project list for a coordination task (A.6). Step 6a: `## Del-tickets` for a ticket with
+    /// children, and a planning task knows whether a coordinator runs (a live agent with the
+    /// role, or the ticket's parent belongs to one).
+    fn delivery_for(
+        &self,
+        agent_id: &str,
+        snap: &AgentSnapshot,
+        ticket: &Ticket,
+    ) -> TicketDelivery {
+        let mut delivery = TicketDelivery::for_agent(snap.seat_kind, &snap.roles)
+            .with_children(self.host.read(|s| s.child_lines(&ticket.id)));
+        if delivery.coordination == Some(prompt::CoordinationKind::Plan) {
+            let available = self.port.has_live_coordinator() || self.parent_is_coordinators(ticket);
+            delivery = delivery.with_coordinator(available);
+        }
         if let (Some(p), SeatKind::Work, true) = (&snap.project, snap.seat_kind, delivery.is_work())
         {
             let others = self.port.peers_in_project(agent_id);
@@ -933,11 +1496,145 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         delivery
     }
 
+    /// Whether `ticket`'s parent has an assignee with the coordinator role (step 6a).
+    fn parent_is_coordinators(&self, ticket: &Ticket) -> bool {
+        let Some(parent) = ticket.parent_id.as_deref() else {
+            return false;
+        };
+        self.host
+            .read(|s| s.get(parent))
+            .and_then(|p| p.assignee_agent_id)
+            .and_then(|a| self.port.snapshot(&a))
+            .is_some_and(|a| a.roles.contains(&Role::Coordinator))
+    }
+
+    /// The queue head's delivery after the dispatch delay (step 6b, plan A.7): the ticket's git
+    /// branch first (a real work delivery), then [`fresh_decision`]. A restart that is accepted
+    /// leaves the agent in [`Delivery::AwaitingRestart`] (timer [`TimerKind::RestartTimeout`]);
+    /// the ticket file is written after it, in the new cwd. A refused restart types the ticket
+    /// into the current session with a note, if the agent is still idle with it next.
+    fn deliver_work(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
+        let delivery = self.delivery_for(agent_id, snap, ticket);
+        let git = if delivery.is_work() {
+            self.host.prepare_git(ticket, &snap.cwd)
+        } else {
+            None
+        };
+        let decision = if self.restarted_for.get(agent_id) == Some(&ticket.id) {
+            FreshDecision::None
+        } else {
+            let delivered = self
+                .delivered_in_session
+                .get(agent_id)
+                .filter(|d| d.session_id.eq_ignore_ascii_case(&snap.session_id))
+                .map(|d| d.ticket_id.as_str());
+            fresh_decision(&self.host.rules(), snap, ticket, git.as_ref(), delivered)
+        };
+        let FreshDecision::Restart { cwd, force_fresh } = decision else {
+            self.type_prepared(agent_id, snap, ticket, token, delivery.with_git(git));
+            return;
+        };
+        let short = ticket.short_id();
+        log::info!(
+            "dispatch {agent_id}: fresh session for ticket {short} (cwd {}, {})",
+            if cwd.is_some() { "changed" } else { "same" },
+            if force_fresh {
+                "new session"
+            } else {
+                "session kept"
+            }
+        );
+        self.restarted_for
+            .insert(agent_id.to_string(), ticket.id.clone());
+        let req = RestartForTicket {
+            agent_id: agent_id.to_string(),
+            cwd,
+            force_fresh,
+            ticket_short: short.clone(),
+        };
+        match self.port.restart_fresh(req) {
+            Ok(()) => {
+                // Step 6d (A.10): the timeline's session note (state unchanged).
+                let note = if force_fresh {
+                    NEW_SESSION_NOTE
+                } else {
+                    SESSION_MOVED_NOTE
+                };
+                let now = now_ms();
+                // Review6d N4: no `tickets-changed` when the note is already the last entry.
+                if let Err(e) = self
+                    .host
+                    .mutate_if(|s| s.note_by_system(&ticket.id, note, now), Option::is_some)
+                {
+                    log::warn!("dispatch {agent_id}: noting the restart on {short} failed: {e}");
+                }
+                self.schedule(
+                    agent_id,
+                    token,
+                    TimerKind::RestartTimeout,
+                    RESTART_TIMEOUT_MS,
+                );
+                self.set(
+                    agent_id,
+                    Delivery::AwaitingRestart {
+                        ticket_id: ticket.id.clone(),
+                        token,
+                    },
+                );
+            }
+            Err(e) => {
+                log::warn!("dispatch {agent_id}: restart for ticket {short} failed: {e}");
+                // The agent may have exited (its tickets released) or started working: only a
+                // still idle agent with the same queue head gets it now.
+                match self.ready_item(agent_id) {
+                    Some((snap, Item::Work(t))) if t.id == ticket.id => {
+                        let now = now_ms();
+                        let note = restart_failed_note(&e);
+                        if let Err(e) = self.host.mutate(|s| s.note_by_system(&t.id, &note, now)) {
+                            log::warn!(
+                                "dispatch {agent_id}: noting the restart failure failed: {e}"
+                            );
+                        }
+                        let t = self.host.read(|s| s.get(&t.id)).unwrap_or(t);
+                        let delivery = self.delivery_for(agent_id, &snap, &t).with_git(git);
+                        self.type_prepared(agent_id, &snap, &t, token, delivery);
+                    }
+                    _ => {
+                        self.set(agent_id, Delivery::Free);
+                        self.consider(agent_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Writes the ticket file and types the line (a coordination task on a staff seat, 5c C.1);
-    /// Enter follows after `ENTER_DELAY_MS`.
+    /// Enter follows after `ENTER_DELAY_MS`. Step 6b: a real work delivery asks the host for the
+    /// ticket's git branch first (`## Git` in the file). The file is written in the agent's cwd:
+    /// the ticket's worktree after the restart of [`Self::deliver_work`] or for an agent
+    /// spawned with the ticket; otherwise the section names the worktree folder.
     fn type_ticket(&mut self, agent_id: &str, snap: &AgentSnapshot, ticket: &Ticket, token: u64) {
+        let delivery = self.delivery_for(agent_id, snap, ticket);
+        let delivery = if delivery.is_work() {
+            let git = self.host.prepare_git(ticket, &snap.cwd);
+            delivery.with_git(git)
+        } else {
+            delivery
+        };
+        self.type_prepared(agent_id, snap, ticket, token, delivery);
+    }
+
+    /// [`Self::type_ticket`] with the delivery (and its git branch) already decided.
+    fn type_prepared(
+        &mut self,
+        agent_id: &str,
+        snap: &AgentSnapshot,
+        ticket: &Ticket,
+        token: u64,
+        delivery: TicketDelivery,
+    ) {
         let now = now_ms();
-        let delivery = self.delivery_for(agent_id, snap);
+        self.restarted_for.remove(agent_id);
         if let Err(e) = prompt::write_ticket_file(&snap.cwd, ticket, now, &delivery) {
             log::warn!("dispatch {agent_id}: writing the ticket file failed: {e}");
             self.send_to_backlog(
@@ -969,9 +1666,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         );
     }
 
-    /// A report author as a display name: "brugeren", the agent's name, or its id when gone.
+    /// A report author as a display name: "brugeren", "appen" (step 6b), the agent's name, or
+    /// its id when gone.
     fn author_name(&self, a: &ReportAuthor) -> String {
         match (a.kind, &a.agent_id) {
+            (ReportAuthorKind::System, _) => "appen".to_string(),
             (ReportAuthorKind::User, _) | (_, None) => "brugeren".to_string(),
             (ReportAuthorKind::Agent, Some(id)) => self
                 .port
@@ -993,10 +1692,29 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
             .and_then(|a| self.port.snapshot(a))
             .map(|s| ReviewSender {
                 name: s.name,
-                cwd: s.cwd.to_string_lossy().into_owned(),
+                // Step 6b: the ticket's worktree (or repository) is where the work is, not the
+                // sender's current folder.
+                cwd: match &ticket.git {
+                    Some(g) => g.worktree.clone().unwrap_or_else(|| g.repo.clone()),
+                    None => s.cwd.to_string_lossy().into_owned(),
+                },
             });
         let author = |a: &ReportAuthor| self.author_name(a);
-        if let Err(e) = prompt::write_review_file(&snap.cwd, ticket, sender.as_ref(), &author) {
+        // Step 6a: a parent's review file lists its children (already reviewed).
+        let children = self.host.read(|s| s.child_reviews(&ticket.id));
+        let max = self.host.rules().max_review_rounds;
+        let checks = self
+            .host
+            .project_checks(ticket.project.as_ref().and_then(|p| p.id()));
+        if let Err(e) = prompt::write_review_file(
+            &snap.cwd,
+            ticket,
+            sender.as_ref(),
+            &author,
+            &children,
+            max,
+            &checks,
+        ) {
             log::warn!("dispatch {agent_id}: writing the review file failed: {e}");
             self.review_failed(agent_id, &ticket.id);
             return;
@@ -1056,6 +1774,7 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
                         self.send_to_backlog(agent_id, ticket_id, TERMINAL_GONE_NOTE)
                     }
                     DeliveryKind::Review => self.review_failed(agent_id, ticket_id),
+                    DeliveryKind::Wake => self.set(agent_id, Delivery::Free),
                 }
                 false
             }
@@ -1073,6 +1792,10 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
     /// No confirmation after the retry, or another prompt went in: the ticket stays first in
     /// the queue with an issue and `note` in its history (a review: see [`Self::review_failed`]).
     fn delivery_failed(&mut self, agent_id: &str, ticket_id: &str, note: &str, kind: DeliveryKind) {
+        if kind == DeliveryKind::Wake {
+            self.wake_unconfirmed(agent_id, ticket_id, note);
+            return;
+        }
         if kind == DeliveryKind::Review {
             log::info!("dispatch {agent_id}: review delivery of {ticket_id} failed ({note})");
             self.review_failed(agent_id, ticket_id);
@@ -1131,7 +1854,11 @@ impl<H: TicketsHost, P: AgentPort, T: Timers> Dispatcher<H, P, T> {
         let snap = self.port.snapshot(&agent_id);
         let idle = snap.as_ref().is_some_and(|s| s.status == AgentStatus::Idle);
         if !eligible || !idle || *self.state(&agent_id) != Delivery::Free {
-            log::info!("redispatch: ticket {} is not deliverable now", t.short_id());
+            match self.host.read(|s| s.blocked_text(&t.id)) {
+                // Step 6a: a blocked ticket is skipped by `next_for_agent` and never re-sent.
+                Some(b) => log::info!("redispatch: ticket {} waits for {b}", t.short_id()),
+                None => log::info!("redispatch: ticket {} is not deliverable now", t.short_id()),
+            }
             return;
         }
         let now = now_ms();
@@ -1285,6 +2012,9 @@ mod tests {
         svc: Arc<Mutex<TicketService>>,
         mutations: Arc<AtomicUsize>,
         rules: WorkspaceRules,
+        /// Step 6b: what `prepare_git` prepares for a ticket without git (saved like the app).
+        git: Arc<Mutex<Option<TicketGit>>>,
+        git_calls: Arc<AtomicUsize>,
     }
 
     impl TicketsHost for TestHost {
@@ -1299,12 +2029,36 @@ mod tests {
             r
         }
 
+        fn mutate_if<R>(
+            &self,
+            f: impl FnOnce(&mut TicketService) -> Result<R, TicketError>,
+            changed: impl FnOnce(&R) -> bool,
+        ) -> Result<R, String> {
+            let r = f(&mut lock(&self.svc)).map_err(String::from);
+            if r.as_ref().is_ok_and(changed) {
+                self.mutations.fetch_add(1, Ordering::SeqCst);
+            }
+            r
+        }
+
         fn read<R>(&self, f: impl FnOnce(&TicketService) -> R) -> R {
             f(&lock(&self.svc))
         }
 
         fn rules(&self) -> WorkspaceRules {
             self.rules
+        }
+
+        fn prepare_git(&self, ticket: &Ticket, _cwd: &Path) -> Option<TicketGit> {
+            self.git_calls.fetch_add(1, Ordering::SeqCst);
+            if ticket.git.is_some() {
+                return ticket.git.clone();
+            }
+            let git = lock(&self.git).clone()?;
+            lock(&self.svc)
+                .set_git(&ticket.id, Some(git.clone()), 5)
+                .unwrap();
+            Some(git)
         }
     }
 
@@ -1313,12 +2067,51 @@ mod tests {
         snapshots: HashMap<String, AgentSnapshot>,
         writes: Vec<(String, Vec<u8>)>,
         fail_writes: bool,
+        /// `has_live_coordinator` (step 6a).
+        coordinator_live: bool,
+        /// Step 6b: every `restart_fresh` request; `Some(err)` refuses them.
+        restarts: Vec<RestartForTicket>,
+        fail_restart: Option<String>,
+        /// The failed restart leaves the agent exited (the new child could not start).
+        exit_on_failed_restart: bool,
     }
 
     #[derive(Clone, Default)]
     struct FakePort(Arc<Mutex<PortState>>);
 
     impl AgentPort for FakePort {
+        fn has_live_coordinator(&self) -> bool {
+            lock(&self.0).coordinator_live
+        }
+
+        /// Like the app: the agent starts again (a new session id when fresh, the new cwd); the
+        /// test sends
+        /// `AgentRestarting` and the Idle of the new session itself.
+        fn restart_fresh(&self, req: RestartForTicket) -> Result<(), String> {
+            let mut s = lock(&self.0);
+            s.restarts.push(req.clone());
+            if let Some(e) = s.fail_restart.clone() {
+                if s.exit_on_failed_restart {
+                    if let Some(snap) = s.snapshots.get_mut(&req.agent_id) {
+                        snap.status = AgentStatus::Exited { code: None };
+                    }
+                }
+                return Err(e);
+            }
+            let snap = s
+                .snapshots
+                .get_mut(&req.agent_id)
+                .ok_or("Agenten kører ikke")?;
+            snap.status = AgentStatus::Starting;
+            if req.force_fresh {
+                snap.session_id = uuid::Uuid::new_v4().to_string();
+            }
+            if let Some(cwd) = req.cwd {
+                snap.cwd = cwd;
+            }
+            Ok(())
+        }
+
         fn snapshot(&self, id: &str) -> Option<AgentSnapshot> {
             lock(&self.0).snapshots.get(id).cloned()
         }
@@ -1368,6 +2161,9 @@ mod tests {
     struct Harness {
         d: Dispatcher<TestHost, FakePort, FakeTimers>,
         svc: Arc<Mutex<TicketService>>,
+        /// The host's `prepare_git` answer and call count (step 6b).
+        git: Arc<Mutex<Option<TicketGit>>>,
+        git_calls: Arc<AtomicUsize>,
         port: FakePort,
         timers: FakeTimers,
         root: PathBuf,
@@ -1389,17 +2185,28 @@ mod tests {
                 svc: svc.clone(),
                 mutations: Arc::default(),
                 rules: WorkspaceRules::defaults(),
+                git: Arc::default(),
+                git_calls: Arc::default(),
             };
+            let (git, git_calls) = (host.git.clone(), host.git_calls.clone());
             let port = FakePort::default();
             let timers = FakeTimers::new();
             let root = std::env::temp_dir().join(format!("mira-dispatch-{}", uuid::Uuid::new_v4()));
             Harness {
                 d: Dispatcher::new(host, port.clone(), timers.clone()),
                 svc,
+                git,
+                git_calls,
                 port,
                 timers,
                 root,
             }
+        }
+
+        /// Turns `freshSessionPerTicket` off: for tests that deliver several tickets into one
+        /// session (since review6b W3/W5 the next ticket after a confirmed one restarts).
+        fn one_session(&mut self) {
+            self.d.host.rules.fresh_session_per_ticket = false;
         }
 
         /// A live agent with its own cwd (work seat, coder: gets the plain work delivery; review
@@ -1423,6 +2230,7 @@ mod tests {
                     seat_kind,
                     roles: roles.to_vec(),
                     project: None,
+                    session_id: format!("s-{id}"),
                 },
             );
         }
@@ -1795,6 +2603,7 @@ mod tests {
     #[test]
     fn turn_end_moves_the_ticket_to_review_or_done() {
         let mut h = Harness::new();
+        h.one_session();
         h.d.auto_review_on_stop = Some(true);
         h.agent("a1", AgentStatus::Idle);
         let a = h.queued("a1", "A");
@@ -2288,6 +3097,7 @@ mod tests {
             seat_kind: SeatKind::Work,
             roles: vec![],
             project: None,
+            session_id: "s".into(),
         };
         assert_eq!(h.d.user_grace_left(&snap), Some(USER_INPUT_GRACE_MS));
         let mut host = h.d.host.clone();
@@ -2326,6 +3136,7 @@ mod tests {
     #[test]
     fn stop_with_auto_review_moves_on_to_the_next_ticket() {
         let mut h = Harness::new();
+        h.one_session();
         h.d.auto_review_on_stop = Some(true);
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
@@ -2354,6 +3165,7 @@ mod tests {
     #[test]
     fn submit_by_the_tool_before_stop_lets_the_next_ticket_go() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.svc()
             .submit_by_agent("a1", None, "Rettet login", 50)
@@ -2374,6 +3186,7 @@ mod tests {
     #[test]
     fn submit_after_a_not_submitted_stop_clears_it_and_the_queue_moves() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
         assert_eq!(h.ticket(&a.id).issue, Some(TicketIssue::NotSubmitted));
@@ -2498,6 +3311,7 @@ mod tests {
     #[test]
     fn confirm_clears_the_not_submitted_detail() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         stop(&mut h, "a1");
         assert_eq!(h.detail("a1").as_deref(), Some(NOT_SUBMITTED_TEXT));
@@ -2674,6 +3488,8 @@ mod tests {
             svc: h.svc.clone(),
             mutations: Arc::default(),
             rules: WorkspaceRules::defaults(),
+            git: Arc::default(),
+            git_calls: Arc::default(),
         };
         let d = Dispatcher::new(host, h.port.clone(), h.timers.clone());
         tx2.send(DispatchMsg::QueueChanged {
@@ -2684,6 +3500,790 @@ mod tests {
         run(rx2, d).await;
         assert_eq!(h.timers.pending(), 1);
         assert_eq!(h.ticket(&t.id).state, S::Assigned);
+    }
+
+    // ---- step 6b: git in the delivery ----
+
+    fn worktree_git(short: &str) -> TicketGit {
+        TicketGit {
+            mode: crate::tickets::model::GitMode::Worktree,
+            branch: format!("ticket/{short}"),
+            base: "main".into(),
+            repo: "/p/proj".into(),
+            worktree: Some(format!("/p/proj/.mira-bots/wt/{short}")),
+        }
+    }
+
+    #[test]
+    fn work_delivery_asks_host_for_git_and_writes_git_section() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        let g = worktree_git(&t.short_id());
+        *lock(&h.git) = Some(g.clone());
+        deliver_until_enter(&mut h, "a1");
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 1);
+        // The line is unchanged; the file has `## Git` before `## Regler`; the ticket keeps it.
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t)), enter("a1")]);
+        let f = h.ticket_file("a1", &t);
+        let section = format!(
+            "## Git\n- branch: {} (fra main)\n- mappe: {}\n- Commit dine ændringer",
+            g.branch,
+            g.worktree.as_deref().unwrap()
+        );
+        assert!(f.contains(&section), "{f}");
+        assert!(f.find("## Git").unwrap() < f.find("## Regler").unwrap());
+        assert_eq!(h.ticket(&t.id).git, Some(g));
+    }
+
+    #[test]
+    fn delivery_without_git_has_no_git_section() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        deliver_until_enter(&mut h, "a1");
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 1);
+        assert!(!h.ticket_file("a1", &t).contains("## Git"));
+        assert_eq!(h.ticket(&t.id).git, None);
+    }
+
+    #[test]
+    fn rejected_ticket_keeps_its_git_info() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        let first = worktree_git(&t.short_id());
+        h.svc().set_git(&t.id, Some(first.clone()), 3).unwrap();
+        // The host would prepare something else for a ticket without git.
+        *lock(&h.git) = Some(TicketGit {
+            branch: "ticket/other".into(),
+            ..worktree_git("ffffffff")
+        });
+        deliver_until_enter(&mut h, "a1");
+        let f = h.ticket_file("a1", &t);
+        assert!(
+            f.contains(&format!("- branch: {} (fra main)", first.branch)),
+            "{f}"
+        );
+        assert!(!f.contains("ticket/other"));
+        assert_eq!(h.ticket(&t.id).git, Some(first));
+    }
+
+    #[test]
+    fn coordination_task_never_asks_for_git() {
+        let mut h = Harness::new();
+        h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+        let t = h.queued("p1", "Plan noget");
+        *lock(&h.git) = Some(worktree_git(&t.short_id()));
+        deliver_until_enter(&mut h, "p1");
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 0);
+        assert!(!h.ticket_file("p1", &t).contains("## Git"));
+        assert_eq!(h.ticket(&t.id).git, None);
+    }
+
+    // ---- step 6b: fresh session per ticket (plan A.7, punkt 19) ----
+
+    impl Harness {
+        /// The app delivered an earlier ticket in `id`'s current session (review6b W3/W5).
+        fn had_ticket(&mut self, id: &str) {
+            let session_id = lock(&self.port.0).snapshots[id].session_id.clone();
+            self.d.delivered_in_session.insert(
+                id.to_string(),
+                SessionDelivery {
+                    ticket_id: "earlier".into(),
+                    session_id,
+                },
+            );
+        }
+
+        /// The agent's current snapshot (session id, cwd, …) in the fake port.
+        fn snapshot(&self, id: &str) -> AgentSnapshot {
+            lock(&self.port.0).snapshots[id].clone()
+        }
+
+        fn restarts(&self) -> Vec<RestartForTicket> {
+            lock(&self.port.0).restarts.clone()
+        }
+
+        /// A worktree folder for `t` under the harness root (exists) and its git info.
+        fn worktree_for(&self, t: &Ticket) -> (PathBuf, TicketGit) {
+            let wt = self.root.join("proj/.mira-bots/wt").join(t.short_id());
+            fs::create_dir_all(&wt).unwrap();
+            let git = TicketGit {
+                worktree: Some(wt.to_string_lossy().into_owned()),
+                repo: self.root.join("proj").to_string_lossy().into_owned(),
+                ..worktree_git(&t.short_id())
+            };
+            (wt, git)
+        }
+
+        /// The new session of a restarted agent comes up (SessionStart → Idle).
+        fn session_started(&mut self, agent: &str) {
+            self.set_status(agent, AgentStatus::Idle);
+            self.idle(agent);
+        }
+    }
+
+    fn snap_for(seat_kind: SeatKind, roles: &[Role], cwd: &Path) -> AgentSnapshot {
+        AgentSnapshot {
+            name: "a".into(),
+            cwd: cwd.to_path_buf(),
+            status: AgentStatus::Idle,
+            detail: None,
+            last_user_input_at: None,
+            seat_kind,
+            roles: roles.to_vec(),
+            project: Some("proj".into()),
+            session_id: "s".into(),
+        }
+    }
+
+    /// One row of [`fresh_decision_table`]: name, rules, agent, ticket, git, the ticket the app
+    /// delivered in the agent's current session, expected.
+    type Row<'a> = (
+        &'a str,
+        &'a WorkspaceRules,
+        AgentSnapshot,
+        &'a Ticket,
+        Option<&'a TicketGit>,
+        Option<&'a str>,
+        FreshDecision,
+    );
+
+    #[test]
+    fn fresh_decision_table() {
+        let h = Harness::new();
+        let t = h.queued("a1", "A");
+        let (wt, git) = h.worktree_for(&t);
+        let cwd = h.root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let on = WorkspaceRules::defaults();
+        assert!(on.fresh_session_per_ticket);
+        let off = WorkspaceRules {
+            fresh_session_per_ticket: false,
+            ..on
+        };
+        let coder = &[Role::Coder][..];
+        let work = || snap_for(SeatKind::Work, coder, &cwd);
+        let in_wt = || snap_for(SeatKind::Work, coder, &wt);
+        let other_wt = cwd.join(".mira-bots/wt/ffffffff");
+        fs::create_dir_all(&other_wt).unwrap();
+        let in_other = || snap_for(SeatKind::Work, coder, &other_wt);
+        let rejected = Ticket {
+            review_round: 1,
+            ..t.clone()
+        };
+        let noted = Ticket {
+            rejection_note: Some("Mangler test".into()),
+            ..t.clone()
+        };
+        let restart = |cwd: Option<&Path>, force_fresh| FreshDecision::Restart {
+            cwd: cwd.map(Path::to_path_buf),
+            force_fresh,
+        };
+        let missing = TicketGit {
+            worktree: Some(h.root.join("gone").to_string_lossy().into_owned()),
+            ..git.clone()
+        };
+        let trailing = TicketGit {
+            worktree: Some(format!("{}/", wt.to_string_lossy())),
+            ..git.clone()
+        };
+        // `other`: the app delivered another ticket in this session; `same`: this ticket.
+        let (other, same) = (Some("other-ticket"), Some(t.id.as_str()));
+        #[rustfmt::skip]
+        let rows: Vec<Row> = vec![
+            ("normal: new ticket after another one", &on, work(), &t, None, other, restart(None, true)),
+            ("rule off", &off, work(), &t, None, other, FreshDecision::None),
+            ("staff seat", &on, snap_for(SeatKind::Staff, &[Role::Planner], &cwd), &t, Some(&git), other, FreshDecision::None),
+            ("staff seat with a work role", &on, snap_for(SeatKind::Staff, &[Role::Researcher], &cwd), &t, Some(&git), other, FreshDecision::None),
+            ("work seat without a work role", &on, snap_for(SeatKind::Work, &[Role::Reviewer], &cwd), &t, Some(&git), other, FreshDecision::None),
+            ("first ticket (nothing delivered in this session)", &on, work(), &t, None, None, FreshDecision::None),
+            ("first ticket, spawned in its worktree", &on, in_wt(), &t, Some(&git), None, FreshDecision::None),
+            ("first ticket, worktree elsewhere", &on, work(), &t, Some(&git), None, restart(Some(&wt), false)),
+            ("rejected back to the same session (round)", &on, work(), &rejected, None, same, FreshDecision::None),
+            ("rejected back to the same session (note)", &on, work(), &noted, None, same, FreshDecision::None),
+            ("rejected back, already in its worktree", &on, in_wt(), &rejected, Some(&git), same, FreshDecision::None),
+            ("rejected back, worktree elsewhere", &on, work(), &rejected, Some(&git), same, restart(Some(&wt), false)),
+            ("rejected back after another ticket's session", &on, work(), &rejected, None, other, restart(None, true)),
+            ("rejected, to an agent with another ticket, worktree elsewhere", &on, work(), &noted, Some(&git), other, restart(Some(&wt), true)),
+            ("rejected, to an agent with nothing delivered yet", &on, work(), &rejected, None, None, FreshDecision::None),
+            ("rule off, worktree elsewhere", &off, work(), &t, Some(&git), other, restart(Some(&wt), false)),
+            ("normal, worktree elsewhere", &on, work(), &t, Some(&git), other, restart(Some(&wt), true)),
+            ("normal, already in the worktree", &on, in_wt(), &t, Some(&git), other, restart(None, true)),
+            ("same folder written differently", &on, in_wt(), &t, Some(&trailing), None, FreshDecision::None),
+            ("worktree folder missing", &on, work(), &t, Some(&missing), None, FreshDecision::None),
+            ("worktree folder missing after another ticket", &on, work(), &t, Some(&missing), other, restart(None, true)),
+            ("no git, in another ticket's worktree", &on, in_other(), &t, None, None, restart(Some(&cwd), false)),
+            ("no git, in another ticket's worktree after it", &on, in_other(), &t, None, other, restart(Some(&cwd), true)),
+            ("rejected back without git, in another worktree", &on, in_other(), &rejected, None, same, restart(Some(&cwd), false)),
+            ("worktree missing, in another ticket's worktree", &off, in_other(), &t, Some(&missing), other, restart(Some(&cwd), false)),
+            ("own worktree, from another ticket's worktree", &on, in_other(), &t, Some(&git), None, restart(Some(&wt), false)),
+        ];
+        for (name, rules, snap, ticket, git, delivered, want) in rows {
+            assert_eq!(
+                fresh_decision(rules, &snap, ticket, git, delivered),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn work_ticket_restarts_agent_before_delivery_and_delivers_after_idle() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        // Restarted (fresh, same cwd), nothing typed yet.
+        assert_eq!(
+            h.restarts(),
+            vec![RestartForTicket {
+                agent_id: "a1".into(),
+                cwd: None,
+                force_fresh: true,
+                ticket_short: t.short_id(),
+            }]
+        );
+        assert!(h.writes().is_empty());
+        assert!(matches!(
+            h.d.state("a1"),
+            Delivery::AwaitingRestart { ticket_id, .. } if *ticket_id == t.id
+        ));
+        // The restart announces itself; the dispatcher keeps waiting for it.
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        assert!(matches!(h.d.state("a1"), Delivery::AwaitingRestart { .. }));
+        // An Idle of the old session (queued before the restart) types nothing: still Starting.
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes().is_empty());
+        // The new session is up: exactly one delivery, no second restart.
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t)), enter("a1")]);
+        assert_eq!(h.restarts().len(), 1);
+        h.submitted("a1", &line(&t));
+        assert_eq!(h.ticket(&t.id).state, S::InProgress);
+        // The stale restart timeout does nothing.
+        h.advance(RESTART_TIMEOUT_MS);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.restarts().len(), 1);
+        assert!(h.d.restarted_for.is_empty());
+    }
+
+    #[test]
+    fn fresh_session_adds_history_note() {
+        // Step 6d (A.10): an accepted restart notes "ny session til ticketen" (fresh) or
+        // "session fortsat i ny mappe" (only the cwd changed) on the ticket, by the system.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "A");
+        let before = h.ticket(&t.id).history.len();
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.restarts().len(), 1);
+        assert!(h.restarts()[0].force_fresh);
+        let after = h.ticket(&t.id);
+        assert_eq!(after.history.len(), before + 1);
+        let last = after.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some("ny session til ticketen"))
+        );
+        assert_eq!(last.note.as_deref(), Some(NEW_SESSION_NOTE));
+        assert_eq!(after.state, S::Assigned, "state unchanged by the note");
+
+        // First ticket of the session, worktree elsewhere: the session is kept, only the cwd
+        // changes.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let t = h.queued("a1", "Ret login");
+        let (_wt, git) = h.worktree_for(&t);
+        *lock(&h.git) = Some(git);
+        let before = h.ticket(&t.id).history.len();
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].force_fresh);
+        assert!(r[0].cwd.is_some());
+        let after = h.ticket(&t.id);
+        assert_eq!(after.history.len(), before + 1);
+        let last = after.history.last().unwrap();
+        assert_eq!(
+            (last.by, last.note.as_deref()),
+            (TicketActor::System, Some("session fortsat i ny mappe"))
+        );
+        assert_eq!(last.note.as_deref(), Some(SESSION_MOVED_NOTE));
+
+        // A refused restart notes the failure, not a session note.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "B");
+        lock(&h.port.0).fail_restart = Some("nej".into());
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        let notes: Vec<String> = h
+            .ticket(&t.id)
+            .history
+            .iter()
+            .filter_map(|e| e.note.clone())
+            .collect();
+        assert!(!notes.iter().any(|n| n == NEW_SESSION_NOTE), "{notes:?}");
+    }
+
+    #[test]
+    fn repeated_session_note_is_silent() {
+        // Review6d N4: when "ny session til ticketen" is already the last entry, the note is a
+        // no-op and the host is not told about a change (no empty `tickets-changed`).
+        let run = |seed: bool| {
+            let mut h = Harness::new();
+            h.agent("a1", AgentStatus::Idle);
+            h.had_ticket("a1");
+            let t = h.queued("a1", "A");
+            if seed {
+                lock(&h.d.host.svc)
+                    .note_by_system(&t.id, NEW_SESSION_NOTE, 1)
+                    .unwrap();
+            }
+            let len = h.ticket(&t.id).history.len();
+            let before = h.d.host.mutations.load(Ordering::SeqCst);
+            h.idle("a1");
+            h.advance(DISPATCH_DELAY_MS);
+            assert_eq!(h.restarts().len(), 1);
+            let after = h.ticket(&t.id);
+            let notes = after
+                .history
+                .iter()
+                .filter(|e| e.note.as_deref() == Some(NEW_SESSION_NOTE))
+                .count();
+            assert_eq!(notes, 1, "seed {seed}");
+            (
+                h.d.host.mutations.load(Ordering::SeqCst) - before,
+                after.history.len() - len,
+            )
+        };
+        let (fresh, fresh_len) = run(false);
+        let (seeded, seeded_len) = run(true);
+        assert_eq!((fresh_len, seeded_len), (1, 0));
+        assert_eq!(fresh, seeded + 1);
+    }
+
+    #[test]
+    fn restart_moves_agent_into_the_worktree_and_writes_the_file_there() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "Ret login");
+        let (wt, git) = h.worktree_for(&t);
+        *lock(&h.git) = Some(git.clone());
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            (r[0].cwd.as_deref(), r[0].force_fresh),
+            (Some(wt.as_path()), true)
+        );
+        // git was prepared once, before the restart, and saved on the ticket.
+        assert_eq!(h.git_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(h.ticket(&t.id).git, Some(git.clone()));
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        assert_eq!(h.restarts().len(), 1);
+        // The file lands in the worktree (the agent's new cwd), not in the old folder.
+        let file = prompt::ticket_dir(&wt).join(format!("{}.md", t.short_id()));
+        let f = fs::read_to_string(&file).unwrap();
+        assert!(
+            f.contains(&format!("- mappe: {}", wt.to_string_lossy())),
+            "{f}"
+        );
+        assert!(!prompt::ticket_dir(&h.root.join("a1"))
+            .join(format!("{}.md", t.short_id()))
+            .exists());
+    }
+
+    #[test]
+    fn restart_failure_falls_back_to_typing() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        lock(&h.port.0).fail_restart = Some("Agenten arbejder".into());
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.restarts().len(), 1);
+        // Typed into the current session right away, with a note by the app.
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        let now = h.ticket(&t.id);
+        let last = now.history.last().unwrap();
+        assert_eq!(
+            last.note.as_deref(),
+            Some(restart_failed_note("Agenten arbejder").as_str())
+        );
+        assert_eq!(last.by, TicketActor::System);
+        assert!(matches!(h.d.state("a1"), Delivery::Typed { .. }));
+    }
+
+    #[test]
+    fn restart_failure_with_the_agent_gone_types_nothing() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        {
+            let mut p = lock(&h.port.0);
+            p.fail_restart = Some("kunne ikke starte".into());
+            p.exit_on_failed_restart = true;
+        }
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        // The new child could not start: the agent exited (the app releases its tickets).
+        assert_eq!(h.restarts().len(), 1);
+        assert!(h.writes().is_empty());
+        assert_eq!(h.ticket(&t.id).state, S::Assigned);
+        assert!(h.d.deliveries.is_empty());
+    }
+
+    #[test]
+    fn restart_timeout_frees_and_delivers() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        let t = h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        // No SessionStart within the timeout (e.g. a dialog in the terminal).
+        h.advance(RESTART_TIMEOUT_MS);
+        assert!(h.writes().is_empty());
+        assert!(h.d.deliveries.is_empty());
+        assert_eq!(
+            h.ticket(&t.id).history.last().unwrap().note.as_deref(),
+            Some(RESTART_TIMEOUT_NOTE)
+        );
+        // Once idle the ticket is typed as it is: no second restart.
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        assert_eq!(h.restarts().len(), 1);
+
+        // Already idle at the timeout (the Idle got lost): delivered right after it.
+        h.agent("a2", AgentStatus::Idle);
+        h.had_ticket("a2");
+        let t2 = h.queued("a2", "B");
+        h.idle("a2");
+        h.advance(DISPATCH_DELAY_MS);
+        h.set_status("a2", AgentStatus::Idle);
+        h.advance(RESTART_TIMEOUT_MS + DISPATCH_DELAY_MS);
+        assert_eq!(h.writes().last(), Some(&("a2".into(), line(&t2))));
+        assert_eq!(h.restarts().len(), 2);
+    }
+
+    #[test]
+    fn rejected_ticket_back_to_same_agent_does_not_restart() {
+        let mut h = Harness::new();
+        h.d.auto_review_on_stop = Some(true);
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        // First ticket after the spawn: no turn yet, no restart.
+        deliver_until_enter(&mut h, "a1");
+        assert!(h.restarts().is_empty());
+        h.submitted("a1", &line(&a));
+        h.set_status("a1", AgentStatus::Thinking);
+        h.send(DispatchMsg::TurnEnded {
+            agent_id: "a1".into(),
+            failed: false,
+        });
+        assert_eq!(h.ticket(&a.id).state, S::Review);
+        h.svc()
+            .reject(&a.id, "Mangler test", RejectReturn::Sender, 10)
+            .unwrap();
+        h.set_status("a1", AgentStatus::Idle);
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        // Back to the same agent: the session (and its context) continues.
+        assert!(h.restarts().is_empty());
+        let a_now = h.ticket(&a.id);
+        assert_eq!(h.writes().last(), Some(&("a1".into(), line(&a_now))));
+    }
+
+    /// Delivers `t` (queued for `agent`) without a restart, confirms it and submits it.
+    fn deliver_and_submit(h: &mut Harness, agent: &str, t: &Ticket) {
+        deliver_until_enter(h, agent);
+        h.submitted(agent, &line(t));
+        assert_eq!(h.ticket(&t.id).state, S::InProgress);
+        h.svc().submit_by_agent(agent, None, "Lavet", 10).unwrap();
+    }
+
+    #[test]
+    fn fresh_session_only_after_a_ticket_the_app_delivered_in_this_session() {
+        // Review6b W5: the user's own conversation before the first ticket is kept; only a
+        // session the app typed a ticket into is restarted for the next one.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        deliver_and_submit(&mut h, "a1", &a);
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, a.id);
+        let b = h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].force_fresh);
+        // The fresh restart gave a new session id, so the record (kept) no longer applies; the
+        // new session gets B and records it.
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        let old = h.d.delivered_in_session["a1"].clone();
+        assert_eq!(old.ticket_id, a.id);
+        assert_ne!(old.session_id, h.snapshot("a1").session_id);
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        h.submitted("a1", &line(&b));
+        let rec = h.d.delivered_in_session["a1"].clone();
+        assert_eq!(rec.ticket_id, b.id);
+        assert_ne!(rec.session_id, "s-a1");
+        assert_eq!(h.restarts().len(), 1);
+    }
+
+    #[test]
+    fn a_new_session_or_a_gone_agent_forgets_the_delivered_ticket() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let a = h.queued("a1", "A");
+        deliver_and_submit(&mut h, "a1", &a);
+        // `/clear`: the agent's session id changes; the next ticket goes into the new session.
+        lock(&h.port.0).snapshots.get_mut("a1").unwrap().session_id = "cleared".into();
+        let b = h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.writes().last(), Some(&("a1".into(), line(&b))));
+        // AgentGone clears the record.
+        h.had_ticket("a1");
+        h.send(DispatchMsg::AgentGone {
+            agent_id: "a1".into(),
+        });
+        assert!(h.d.delivered_in_session.is_empty());
+        // AgentRestarting keeps it (review6b W8): a `--resume` restart continues the session.
+        h.agent("a2", AgentStatus::Thinking);
+        h.had_ticket("a2");
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a2".into(),
+        });
+        assert_eq!(h.d.delivered_in_session["a2"].ticket_id, "earlier");
+    }
+
+    #[test]
+    fn resumed_session_still_gets_a_fresh_one_before_the_next_ticket() {
+        // Review6b W8: "Skift model"/"Flyt til projekt" restart with `--resume` (same session
+        // id) after ticket X; ticket Y must still get a fresh session.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let x = h.queued("a1", "X");
+        deliver_and_submit(&mut h, "a1", &x);
+        let sid = h.snapshot("a1").session_id;
+        // The user's model change: a resume restart, the session id stays.
+        h.set_status("a1", AgentStatus::Starting);
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        h.session_started("a1");
+        assert_eq!(h.snapshot("a1").session_id, sid);
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, x.id);
+        let y = h.queued("a1", "Y");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a1", true));
+        assert!(!h.writes().iter().any(|(_, w)| *w == line(&y)));
+        // Y goes into the new session.
+        h.send(DispatchMsg::AgentRestarting {
+            agent_id: "a1".into(),
+        });
+        h.session_started("a1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().last(), Some(&enter("a1")));
+        h.submitted("a1", &line(&y));
+        let rec = h.d.delivered_in_session["a1"].clone();
+        assert_eq!(rec.ticket_id, y.id);
+        assert_ne!(rec.session_id, sid);
+        assert_eq!(h.restarts().len(), 1);
+    }
+
+    #[test]
+    fn delivery_is_recorded_even_when_the_ticket_changed_hands_but_not_for_reviews() {
+        // Review6b N18: the line was typed and submitted in a1's session, so the next ticket
+        // for a1 gets a fresh session even though A moved to a2 on the way.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.agent("a2", AgentStatus::Thinking);
+        let a = h.queued("a1", "A");
+        deliver_until_enter(&mut h, "a1");
+        {
+            let mut s = h.svc();
+            s.unassign(&a.id, 10).unwrap();
+            s.assign(&a.id, "a2", 11).unwrap();
+        }
+        h.submitted("a1", &line(&a));
+        assert_eq!(h.ticket(&a.id).state, S::Assigned);
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, a.id);
+        h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a1", true));
+
+        // A confirmed review delivery records nothing.
+        h.agent("rev", AgentStatus::Idle);
+        let t = routed_review(&h, "a2", "rev", "Ret login");
+        assigned(&mut h, "rev");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        h.submitted("rev", &review_line(&h, &t, "a2"));
+        assert!(h
+            .svc()
+            .assignment_for_ticket(&t.id)
+            .unwrap()
+            .delivered_at
+            .is_some());
+        assert!(!h.d.delivered_in_session.contains_key("rev"));
+    }
+
+    #[test]
+    fn second_ticket_after_spawn_with_ticket_gets_a_fresh_session() {
+        // Review6b N19: the first ticket goes in as the positional prompt (AwaitingSession);
+        // its confirmation records it, so ticket 2 in the same session restarts first.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Starting);
+        let a = h.queued("a1", "A");
+        h.send(DispatchMsg::SpawnedWithTicket {
+            agent_id: "a1".into(),
+            ticket_id: a.id.clone(),
+        });
+        h.session_started("a1");
+        h.submitted("a1", &line(&a));
+        assert_eq!(h.ticket(&a.id).state, S::InProgress);
+        assert!(h.writes().is_empty());
+        assert_eq!(h.d.delivered_in_session["a1"].ticket_id, a.id);
+        h.svc().submit_by_agent("a1", None, "Lavet", 10).unwrap();
+        let b = h.queued("a1", "B");
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a1".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a1", true));
+        assert!(h.writes().is_empty());
+        assert!(matches!(
+            h.d.state("a1"),
+            Delivery::AwaitingRestart { ticket_id, .. } if *ticket_id == b.id
+        ));
+    }
+
+    #[test]
+    fn rejected_ticket_to_another_agent_gets_a_fresh_session() {
+        // Review6b W3: a rejected ticket handed to an agent that just did another ticket must
+        // not be typed into that ticket's session.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        let x = h.queued("a1", "X");
+        deliver_and_submit(&mut h, "a1", &x);
+        h.svc()
+            .reject(&x.id, "Mangler test", RejectReturn::Moved, 11)
+            .unwrap();
+        h.agent("a2", AgentStatus::Idle);
+        h.had_ticket("a2");
+        let x = h.svc().assign(&x.id, "a2", 12).unwrap();
+        assert!(x.review_round > 0 || x.rejection_note.is_some());
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: "a2".into(),
+        });
+        h.advance(DISPATCH_DELAY_MS);
+        let r = h.restarts();
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].agent_id.as_str(), r[0].force_fresh), ("a2", true));
+    }
+
+    #[test]
+    fn first_ticket_after_spawn_in_its_worktree_does_not_restart() {
+        // B3: an agent spawned with the ticket starts in the ticket's worktree; when the
+        // positional prompt is not confirmed, the PTY fallback must not restart it.
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Starting);
+        let t = h.queued("a1", "A");
+        let (wt, git) = h.worktree_for(&t);
+        h.svc().set_git(&t.id, Some(git), 3).unwrap();
+        lock(&h.port.0).snapshots.get_mut("a1").unwrap().cwd = wt.clone();
+        h.send(DispatchMsg::SpawnedWithTicket {
+            agent_id: "a1".into(),
+            ticket_id: t.id.clone(),
+        });
+        h.session_started("a1");
+        h.advance(SPAWN_CONFIRM_TIMEOUT_MS + DISPATCH_DELAY_MS);
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.writes(), vec![("a1".into(), line(&t))]);
+        assert!(prompt::ticket_dir(&wt)
+            .join(format!("{}.md", t.short_id()))
+            .exists());
+    }
+
+    #[test]
+    fn staff_agent_is_never_restarted() {
+        let mut h = Harness::new();
+        h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+        h.had_ticket("p1");
+        let t = h.queued("p1", "Plan noget");
+        deliver_until_enter(&mut h, "p1");
+        assert!(h.restarts().is_empty());
+        assert_eq!(h.writes().len(), 2);
+        let _ = t;
+    }
+
+    #[test]
+    fn agent_gone_while_awaiting_restart_clears_everything() {
+        let mut h = Harness::new();
+        h.agent("a1", AgentStatus::Idle);
+        h.had_ticket("a1");
+        h.queued("a1", "A");
+        h.idle("a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(matches!(h.d.state("a1"), Delivery::AwaitingRestart { .. }));
+        h.remove_agent("a1");
+        h.send(DispatchMsg::AgentGone {
+            agent_id: "a1".into(),
+        });
+        assert!(h.d.deliveries.is_empty());
+        assert!(h.d.restarted_for.is_empty());
+        h.advance(RESTART_TIMEOUT_MS);
+        assert!(h.writes().is_empty());
     }
 
     // ---- review deliveries (plan5 punkt 12) ----
@@ -2924,6 +4524,7 @@ mod tests {
     #[test]
     fn user_handoff_mid_turn_tells_the_old_agent_to_stop_before_its_next_ticket() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.agent("w", AgentStatus::Thinking);
         h.set_status("a1", AgentStatus::Thinking);
@@ -3000,6 +4601,7 @@ mod tests {
     #[test]
     fn stop_line_only_for_a_foreign_handoff_and_not_after_it_came_back() {
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.agent("w", AgentStatus::Thinking);
         h.svc()
@@ -3019,6 +4621,7 @@ mod tests {
 
         // Came back: the user hands it over, then straight back before a1 is idle.
         let mut h = Harness::new();
+        h.one_session();
         let (a, b) = a_in_progress(&mut h);
         h.agent("w", AgentStatus::Thinking);
         h.set_status("a1", AgentStatus::Thinking);
@@ -3133,5 +4736,532 @@ mod tests {
         let writes = h.writes();
         let typed = writes.iter().find(|(x, _)| x == "a2").unwrap().1.clone();
         assert_eq!(typed, line(&t2));
+    }
+
+    // ---- step 6a: wake lines, waiting on Stop, blocked tickets ----
+
+    /// A child of `parent`, assigned to and submitted to review by the portless agent "x".
+    fn child_in_review(h: &Harness, parent: &Ticket, title: &str) -> Ticket {
+        let mut s = h.svc();
+        let c = s
+            .create_by_agent_related(
+                title,
+                "",
+                false,
+                None,
+                None,
+                Some(parent.id.clone()),
+                vec![],
+                None,
+                3,
+            )
+            .unwrap();
+        s.assign(&c.id, "x", 4).unwrap();
+        s.mark_dispatched(&c.id, "x", 5).unwrap();
+        s.submit_by_agent("x", None, "HEMMELIG opsummering", 6)
+            .unwrap()
+    }
+
+    /// Coordinator k1 (staff, idle) whose parent waits for `n` children in review.
+    fn waiting_parent(h: &mut Harness, n: usize) -> (Ticket, Vec<Ticket>) {
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        let p = h.queued("k1", "Byg spillet");
+        h.svc().mark_dispatched(&p.id, "k1", 2).unwrap();
+        let kids: Vec<Ticket> = (0..n)
+            .map(|i| child_in_review(h, &p, &format!("Del {i}")))
+            .collect();
+        let p = h.svc().submit_by_agent("k1", None, "fordelt", 7).unwrap();
+        assert_eq!(p.state, S::Waiting);
+        (p, kids)
+    }
+
+    fn queue_changed(h: &mut Harness, agent: &str) {
+        h.send(DispatchMsg::QueueChanged {
+            agent_id: agent.into(),
+        });
+    }
+
+    #[test]
+    fn child_done_wakes_idle_parent_assignee() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        // TicketsCtx's hook sends this for the parent's assignee.
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS - 1);
+        assert!(h.writes().is_empty(), "the usual delay");
+        h.advance(1);
+        let w = h.writes();
+        assert_eq!(w.len(), 1);
+        let l = &w[0].1;
+        assert!(l.starts_with("Du har fået besked"), "{l}");
+        assert!(
+            l.contains(&kids[0].short_id()) && l.contains(&p.short_id()),
+            "{l}"
+        );
+        assert!(l.contains("1 del-ticket(s) mangler stadig"), "{l}");
+        assert!(!l.contains("HEMMELIG"), "no child summary in the terminal");
+        assert!(!l.contains(['\r', '\n']));
+        // P2: the parent waits until the line is entered …
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[1], enter("k1"));
+        // … and (review 6a W1) confirmed by its UserPromptSubmit.
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        h.submitted("k1", l);
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::InProgress);
+        let last = pt.history.last().unwrap();
+        assert_eq!(last.note.as_deref(), Some(WOKEN_NOTE));
+        assert_eq!(last.by, TicketActor::System);
+        // Not due any more: no second line at the next idle.
+        h.idle("k1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+    }
+
+    #[test]
+    fn wake_waits_while_agent_busy_or_working() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 1);
+        // k1 took its next ticket while the parent waits.
+        let other = h.queued("k1", "Næste");
+        h.svc().mark_dispatched(&other.id, "k1", 8).unwrap();
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.idle("k1");
+        h.advance(10_000);
+        assert!(
+            h.writes().is_empty(),
+            "never in the middle of another ticket"
+        );
+        // That ticket is submitted, but the agent is busy: nothing either.
+        h.svc().submit_by_agent("k1", None, "ok", 11).unwrap();
+        h.set_status("k1", AgentStatus::Thinking);
+        queue_changed(&mut h, "k1");
+        h.advance(10_000);
+        assert!(h.writes().is_empty(), "busy");
+        // Idle again, but the user just typed: the grace first.
+        h.set_status("k1", AgentStatus::Idle);
+        h.user_typed("k1");
+        h.idle("k1");
+        h.advance(USER_INPUT_GRACE_MS - 1);
+        assert!(h.writes().is_empty(), "grace");
+        h.advance(1);
+        let w = h.writes();
+        assert_eq!(w.len(), 1);
+        assert!(w[0]
+            .1
+            .starts_with("Du har fået besked: alle del-tickets til ticket"));
+        // The Enter is still pending: the parent waits until then.
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+    }
+
+    #[test]
+    fn wake_is_dropped_when_the_agent_gets_busy_before_typing() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 1);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.set_status("k1", AgentStatus::Thinking);
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes().is_empty());
+        // Still due (derived from the data): typed at the next idle.
+        h.set_status("k1", AgentStatus::Idle);
+        h.idle("k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 2);
+        let l = h.writes()[0].1.clone();
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+    }
+
+    #[test]
+    fn last_child_done_line_asks_for_submission() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 1);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        assert_eq!(
+            l,
+            prompt::wake_line(&WakeInfo {
+                parent_short: p.short_id(),
+                newly_done: vec![(kids[0].short_id(), "Del 0".into())],
+                open_left: 0,
+            })
+        );
+        assert!(l.contains(&format!(
+            "alle del-tickets til ticket {} er afsluttet",
+            p.short_id()
+        )));
+        assert!(l.contains(&format!("(ticketId {})", p.short_id())));
+        h.advance(ENTER_DELAY_MS);
+        h.submitted("k1", &l);
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::InProgress);
+        assert_eq!(
+            pt.history.last().unwrap().note.as_deref(),
+            Some(CHILDREN_DONE_NOTE)
+        );
+        // A Stop without submitting now: nothing open → "Ikke afleveret" as before.
+        stop(&mut h, "k1");
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        assert_eq!(h.ticket(&p.id).issue, Some(TicketIssue::NotSubmitted));
+        assert_eq!(h.detail("k1").as_deref(), Some(NOT_SUBMITTED_TEXT));
+    }
+
+    #[test]
+    fn wake_is_confirmed_only_by_its_own_line() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        for id in [&p.id, &kids[0].id, &kids[1].id] {
+            assert!(!DeliveryKind::Work.confirms(id, &l));
+            assert!(!DeliveryKind::Review.confirms(id, &l));
+        }
+        // Review 6a W1: the wake kind confirms the parent's line only, and never a delivery line.
+        assert!(DeliveryKind::Wake.confirms(&p.id, &l));
+        assert!(!DeliveryKind::Wake.confirms(&kids[0].id, &l));
+        for other in [
+            format!("Ticket {}: x", p.short_id()),
+            format!("Koordiner ticket {}: x", p.short_id()),
+            format!("Review af ticket {}: x", p.short_id()),
+        ] {
+            assert!(!DeliveryKind::Wake.confirms(&p.id, &other), "{other}");
+        }
+        // Enter: a busy status and a prompt without text do not resume the parent.
+        h.advance(ENTER_DELAY_MS);
+        assert_eq!(h.writes()[1], enter("k1"));
+        let before = h.ticket(&p.id);
+        h.send(DispatchMsg::AgentBusy {
+            agent_id: "k1".into(),
+        });
+        h.send(DispatchMsg::PromptSubmitted {
+            agent_id: "k1".into(),
+            prompt: None,
+        });
+        assert_eq!(h.ticket(&p.id), before);
+        assert_eq!(h.ticket(&kids[1].id).state, S::Review);
+        // The line's UserPromptSubmit does.
+        h.submitted("k1", &l);
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::InProgress);
+        assert_eq!(pt.history.last().unwrap().note.as_deref(), Some(WOKEN_NOTE));
+        // The confirm timer is stale now: nothing more happens.
+        h.set_status("k1", AgentStatus::Idle);
+        h.idle("k1");
+        h.advance(CONFIRM_TIMEOUT_MS + 10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.detail("k1"), None);
+    }
+
+    /// Review 6a W1: Esc (or an Enter that sends nothing) after the wake line: no confirmation,
+    /// so the parent stays waiting, the line is typed once more at the next idle, and after that
+    /// the agent shows the hint until the user asks again.
+    #[test]
+    fn unconfirmed_wake_keeps_parent_waiting_and_retries_once() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 2);
+        let l = h.writes()[0].1.clone();
+        // No prompt: still waiting while the confirmation may come …
+        h.advance(CONFIRM_TIMEOUT_MS - 1);
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        // … and after the timeout: no extra Enter, nothing typed until the next idle.
+        h.advance(1);
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+        assert_eq!(h.detail("k1"), None, "the first miss shows nothing");
+        // Next idle: the same line once more (still derived from the data).
+        h.idle("k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let w = h.writes();
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[2].1, l);
+        assert_eq!(w[3], enter("k1"));
+        h.advance(CONFIRM_TIMEOUT_MS);
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        assert_eq!(h.detail("k1").as_deref(), Some(WAKE_UNCONFIRMED_TEXT));
+        // Given up: no more lines at idle or queue changes.
+        h.idle("k1");
+        queue_changed(&mut h, "k1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 4);
+        // "Bed om aflevering" on the waiting parent types it again; confirmed, the hint goes.
+        h.send(DispatchMsg::RequestSubmission {
+            ticket_id: p.id.clone(),
+        });
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 6);
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        assert_eq!(h.detail("k1"), None);
+    }
+
+    /// Review 6a W1: a changed wake (another child done) is typed again after a give-up, and a
+    /// stop/restart forgets the attempts.
+    #[test]
+    fn new_child_done_after_give_up_wakes_again() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 3);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        for _ in 0..WAKE_MAX_ATTEMPTS {
+            h.idle("k1");
+            h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS);
+        }
+        assert_eq!(h.writes().len(), 4);
+        assert_eq!(h.detail("k1").as_deref(), Some(WAKE_UNCONFIRMED_TEXT));
+        h.svc().approve(&kids[1].id, 20).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        assert_eq!(h.writes().len(), 6);
+        let l = h.writes()[4].1.clone();
+        assert!(l.contains(&kids[1].short_id()), "{l}");
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+    }
+
+    /// Review 6a W1: the wake line is never entered twice: not while its confirmation is
+    /// pending, not when it is confirmed late, and not when the user pressed Enter before ours.
+    #[test]
+    fn wake_line_is_never_typed_twice() {
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS + ENTER_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        // Pending confirmation: idle and queue changes start nothing.
+        h.idle("k1");
+        queue_changed(&mut h, "k1");
+        h.advance(CONFIRM_TIMEOUT_MS - 1);
+        assert_eq!(h.writes().len(), 2);
+        // The confirmation arrives after the timeout: still counts, nothing typed again.
+        h.advance(1);
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        h.idle("k1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2);
+
+        // The user pressed Enter on the line before the app did: our Enter is dropped.
+        let mut h = Harness::new();
+        let (p, kids) = waiting_parent(&mut h, 2);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        queue_changed(&mut h, "k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let l = h.writes()[0].1.clone();
+        h.submitted("k1", &l);
+        assert_eq!(h.ticket(&p.id).state, S::InProgress);
+        h.advance(ENTER_DELAY_MS + CONFIRM_TIMEOUT_MS + 10_000);
+        assert_eq!(h.writes().len(), 1, "no Enter after the line went in");
+    }
+
+    #[test]
+    fn stop_without_submit_on_parent_with_open_children_waits_without_hint() {
+        let mut h = Harness::new();
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        let p = h.queued("k1", "Byg spillet");
+        h.svc().mark_dispatched(&p.id, "k1", 2).unwrap();
+        child_in_review(&h, &p, "Del");
+        let next = h.queued("k1", "Næste");
+        stop(&mut h, "k1");
+        let pt = h.ticket(&p.id);
+        assert_eq!(pt.state, S::Waiting);
+        assert_eq!(pt.issue, None);
+        assert_eq!(h.detail("k1"), None, "no NOT_SUBMITTED_TEXT");
+        // The queue moves on.
+        h.advance(DISPATCH_DELAY_MS);
+        assert!(h.writes()[0]
+            .1
+            .starts_with(&format!("Koordiner ticket {}: ", next.short_id())));
+
+        // Also with autoReviewOnStop: waiting, not review.
+        let mut h = Harness::new();
+        h.d.auto_review_on_stop = Some(true);
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        let p = h.queued("k1", "Byg spillet");
+        h.svc().mark_dispatched(&p.id, "k1", 2).unwrap();
+        child_in_review(&h, &p, "Del");
+        stop(&mut h, "k1");
+        assert_eq!(h.ticket(&p.id).state, S::Waiting);
+        assert_eq!(h.detail("k1"), None);
+    }
+
+    #[test]
+    fn blocked_ticket_is_skipped_and_delivered_when_blocker_is_done() {
+        let mut h = Harness::new();
+        h.one_session();
+        h.agent("a1", AgentStatus::Idle);
+        // The blocker: in review with the portless agent "x".
+        let blocker = {
+            let mut s = h.svc();
+            let b = s.create("Plan", "", false, 1).unwrap();
+            s.assign(&b.id, "x", 2).unwrap();
+            s.mark_dispatched(&b.id, "x", 3).unwrap();
+            s.submit_by_agent("x", None, "plan", 4).unwrap()
+        };
+        let first = {
+            let mut s = h.svc();
+            let t = s
+                .create_by_agent_related(
+                    "Byg",
+                    "",
+                    false,
+                    None,
+                    None,
+                    None,
+                    vec![blocker.id.clone()],
+                    None,
+                    5,
+                )
+                .unwrap();
+            s.assign(&t.id, "a1", 6).unwrap()
+        };
+        let second = h.queued("a1", "Andet");
+        assert_eq!(first.queue_position, Some(0));
+        deliver_until_enter(&mut h, "a1");
+        assert_eq!(h.writes()[0], ("a1".into(), line(&second)));
+        h.submitted("a1", &line(&second));
+        assert_eq!(h.ticket(&second.id).state, S::InProgress);
+        // The blocked ticket keeps its place.
+        assert_eq!(h.ticket(&first.id).queue_position, Some(0));
+        assert_eq!(h.ticket(&first.id).state, S::Assigned);
+        // "Send igen" of the blocked ticket does nothing.
+        h.svc().submit_by_agent("a1", None, "ok", 7).unwrap();
+        h.send(DispatchMsg::Redispatch {
+            ticket_id: first.id.clone(),
+        });
+        assert_eq!(h.writes().len(), 2);
+        h.idle("a1");
+        h.advance(10_000);
+        assert_eq!(h.writes().len(), 2, "still blocked");
+        // The blocker is approved: the hook's QueueChanged delivers it.
+        h.svc().approve(&blocker.id, 20).unwrap();
+        queue_changed(&mut h, "a1");
+        h.advance(DISPATCH_DELAY_MS);
+        assert_eq!(h.writes()[2], ("a1".into(), line(&first)));
+    }
+
+    #[test]
+    fn plan_delivery_switches_text_when_coordinator_lives() {
+        use prompt::{COORDINATION_PLAN_TEXT, COORDINATION_PLAN_WITH_COORDINATOR_TEXT};
+        let plan_file = |coordinator_live: bool| {
+            let mut h = Harness::new();
+            lock(&h.port.0).coordinator_live = coordinator_live;
+            h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+            let t = h.queued("p1", "Plan spillet");
+            h.idle("p1");
+            h.advance(DISPATCH_DELAY_MS);
+            assert!(h.writes()[0].1.starts_with("Koordiner ticket "));
+            h.ticket_file("p1", &t)
+        };
+        let f = plan_file(false);
+        assert!(f.contains(COORDINATION_PLAN_TEXT));
+        assert!(!f.contains("Der er en koordinator i staben"));
+        let f = plan_file(true);
+        assert!(f.contains(&format!(
+            "## Koordineringsopgave\n{COORDINATION_PLAN_WITH_COORDINATOR_TEXT}\n"
+        )));
+        assert!(!f.contains(COORDINATION_PLAN_TEXT));
+
+        // No live coordinator per the port, but the ticket's parent belongs to one; the parent's
+        // own file lists its children.
+        let mut h = Harness::new();
+        h.agent_on(
+            "k1",
+            AgentStatus::Idle,
+            SeatKind::Staff,
+            &[Role::Coordinator],
+        );
+        h.agent_on("p1", AgentStatus::Idle, SeatKind::Staff, &[Role::Planner]);
+        let parent = h.queued("k1", "Mål");
+        let child = {
+            let mut s = h.svc();
+            let c = s
+                .create_by_agent_related(
+                    "Plan",
+                    "",
+                    false,
+                    None,
+                    None,
+                    Some(parent.id.clone()),
+                    vec![],
+                    None,
+                    3,
+                )
+                .unwrap();
+            s.assign(&c.id, "p1", 4).unwrap()
+        };
+        h.idle("p1");
+        h.idle("k1");
+        h.advance(DISPATCH_DELAY_MS);
+        let f = h.ticket_file("p1", &child);
+        assert!(f.contains(COORDINATION_PLAN_WITH_COORDINATOR_TEXT), "{f}");
+        let f = h.ticket_file("k1", &parent);
+        assert!(
+            f.contains(&format!(
+                "## Del-tickets\n{}\n- {} Plan — I kø\n",
+                prompt::CHILDREN_INTRO,
+                child.short_id()
+            )),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn review_of_parent_lists_children_and_rule() {
+        let mut h = Harness::new();
+        h.agent_on("rev", AgentStatus::Idle, SeatKind::Staff, &[Role::Reviewer]);
+        let (p, kids) = waiting_parent(&mut h, 1);
+        h.svc().approve(&kids[0].id, 10).unwrap();
+        // The coordinator submits the parent (all children done) → review, routed to "rev".
+        {
+            let mut s = h.svc();
+            s.resume_after_wake(&p.id, "k1", WOKEN_NOTE, 11).unwrap();
+            assert_eq!(
+                s.submit_by_agent("k1", None, "Samlet", 12).unwrap().state,
+                S::Review
+            );
+            s.route_review(&p.id, "rev", "bot-rev", 13).unwrap();
+        }
+        h.idle("rev");
+        h.advance(DISPATCH_DELAY_MS);
+        let f = fs::read_to_string(
+            prompt::review_dir(&h.root.join("rev")).join(format!("{}.md", p.short_id())),
+        )
+        .unwrap();
+        assert!(
+            f.contains(&format!(
+                "## Del-tickets (allerede reviewet)\n- {} Del 0 — Done: HEMMELIG opsummering\n## Opgaven\n",
+                kids[0].short_id()
+            )),
+            "{f}"
+        );
+        assert!(f.ends_with(&format!("{}\n", prompt::PARENT_REVIEW_RULE)));
     }
 }

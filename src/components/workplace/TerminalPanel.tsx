@@ -6,7 +6,7 @@ import { openFolderTitle } from "../../lib/platform";
 import type { TermMode } from "../../lib/office";
 import { rolesText } from "../../lib/roles";
 import { isExited, isStartingHint, statusLabel } from "../../lib/status";
-import { switchBlocked } from "../../lib/tickets";
+import { shortCwd, switchBlocked } from "../../lib/tickets";
 import type { AgentInfo, BotState } from "../../lib/types";
 import { useStore } from "../../state/store";
 import AgentTerminal from "../AgentTerminal";
@@ -194,7 +194,7 @@ export default function TerminalPanel(props: Props) {
               </span>
             </div>
             <div className="truncate font-mono text-[11px] text-[var(--muted)]" title={agent.cwd}>
-              {agent.cwd}
+              {shortCwd(agent.cwd)}
             </div>
           </div>
           {!exited && <AgentSwitch agent={agent} />}

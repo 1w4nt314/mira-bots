@@ -29,6 +29,15 @@ pub const WORKPLACE_SELECT: &str = "workplace-select";
 pub const TICKETS_CHANGED: &str = "tickets-changed";
 /// Full profile list (`AgentProfile[]`) after a profile was saved, deleted or reset.
 pub const PROFILES_CHANGED: &str = "profiles-changed";
+/// The inbox (`InboxPayload`: items without bodies + status per source) after any inbox change
+/// and at the start and end of a refresh (step 6c).
+pub const INBOX_CHANGED: &str = "inbox-changed";
+/// Beskedkøen (`NoticesPayload`: `{unread, items}`, nyeste først) efter at en besked kom ind,
+/// blev markeret læst eller forsvandt fordi dens type blev fravalgt (trin 6d, plan A.8).
+pub const NOTICES_CHANGED: &str = "notices-changed";
+/// Vagtens status (`WatchView`) efter hvert tick og efter "Hold vagt"/"Stop vagten"/"Genstart
+/// vagt" (trin 6d, plan punkt 18).
+pub const WATCH_CHANGED: &str = "watch-changed";
 
 /// Payload of `workplace-select` and the result of `take_workplace_selection`: which agent and/or
 /// sidebar tab the workplace window should show (`tab`: "permissions" | "diagnostics" |
@@ -41,6 +50,10 @@ pub struct WorkplaceSelection {
     pub tab: Option<String>,
     #[serde(default)]
     pub spawn: Option<String>,
+    /// Step 6d (A.9): the ticket to select on the Tickets tab (full id; the UI uses it in
+    /// Batch 5). Last and `default`, so older payloads still parse.
+    #[serde(default)]
+    pub ticket_id: Option<String>,
 }
 
 /// In-process notification (not a Tauri event) from the pipe handler after a hook frame was
@@ -99,6 +112,9 @@ mod tests {
         assert_eq!(WORKPLACE_SELECT, "workplace-select");
         assert_eq!(TICKETS_CHANGED, "tickets-changed");
         assert_eq!(PROFILES_CHANGED, "profiles-changed");
+        assert_eq!(INBOX_CHANGED, "inbox-changed");
+        assert_eq!(NOTICES_CHANGED, "notices-changed");
+        assert_eq!(WATCH_CHANGED, "watch-changed");
     }
 
     #[test]
@@ -107,16 +123,20 @@ mod tests {
             agent_id: Some("a".into()),
             tab: Some("tickets".into()),
             spawn: Some("work".into()),
+            ticket_id: Some("t-1".into()),
         };
         let v = serde_json::to_value(&sel).unwrap();
-        assert_eq!(v, json!({"agentId":"a","tab":"tickets","spawn":"work"}));
+        assert_eq!(
+            v,
+            json!({"agentId":"a","tab":"tickets","spawn":"work","ticketId":"t-1"})
+        );
         assert_eq!(
             serde_json::from_value::<WorkplaceSelection>(v).unwrap(),
             sel
         );
         assert_eq!(
             serde_json::to_value(WorkplaceSelection::default()).unwrap(),
-            json!({"agentId":null,"tab":null,"spawn":null})
+            json!({"agentId":null,"tab":null,"spawn":null,"ticketId":null})
         );
     }
 
@@ -130,6 +150,11 @@ mod tests {
         let new = json!({"agentId":null,"tab":null,"spawn":"staff"});
         let sel = serde_json::from_value::<WorkplaceSelection>(new).unwrap();
         assert_eq!(sel.spawn.as_deref(), Some("staff"));
+        // Step 6d: a payload without `ticketId` (before 6d) parses with `ticket_id` = None.
+        assert_eq!(sel.ticket_id, None);
+        let with = json!({"agentId":null,"tab":"tickets","spawn":null,"ticketId":"t-9"});
+        let sel = serde_json::from_value::<WorkplaceSelection>(with).unwrap();
+        assert_eq!(sel.ticket_id.as_deref(), Some("t-9"));
     }
 
     #[test]

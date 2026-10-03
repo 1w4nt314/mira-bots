@@ -154,6 +154,22 @@ impl PtyHandle {
         self.kill_with_grace(PROCESS_KILL_GRACE)
     }
 
+    /// [`Self::kill`] for a restart (step 6b, plan A.7): Unix the same (the child leads its
+    /// process group). Windows: `taskkill /PID <pid> /T /F` on a helper thread before
+    /// portable-pty's killer, so node/mira-mcp of the old session do not survive it (one
+    /// restart per ticket would leak a set per ticket). Never blocks. See
+    /// [`process::terminate_tree`].
+    // TODO(windows-verify): after a fresh-session restart no node/mira-mcp of the old session is
+    // left in Task Manager (plan6b D.101).
+    pub fn kill_tree(&mut self) -> Result<(), AgentError> {
+        process::terminate_tree(
+            self.pid,
+            &self.exited,
+            self.killer.as_mut(),
+            PROCESS_KILL_GRACE,
+        )
+    }
+
     /// [`Self::kill`] with another grace period (tests).
     pub(crate) fn kill_with_grace(&mut self, grace: std::time::Duration) -> Result<(), AgentError> {
         process::terminate(self.pid, &self.exited, self.killer.as_mut(), grace)

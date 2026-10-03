@@ -3,7 +3,19 @@ import { useTheme } from "../../../lib/bots";
 import { approveTicket, assignReviewer, rejectTicket } from "../../../lib/ipc";
 import { rolesText } from "../../../lib/roles";
 import { isExited } from "../../../lib/status";
-import { reviewerCandidates, reviewRoundText } from "../../../lib/tickets";
+import {
+  checksBadge,
+  checksLineText,
+  childrenOf,
+  gitLineText,
+  isFlowParent,
+  progressOf,
+  reviewerCandidates,
+  reviewerChoiceBlocked,
+  reviewRoundText,
+  shortCwd,
+  STATE_LABEL,
+} from "../../../lib/tickets";
 import type { AgentInfo, TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
 import BotFigure from "../../BotFigure";
@@ -50,6 +62,40 @@ function AgentSummary({ summary }: { summary: string | null }) {
   );
 }
 
+/**
+ * For a parent ticket: the children with their summaries (they were reviewed one by one already;
+ * the reviewer here judges the whole). Nothing is rendered for a ticket without children.
+ */
+function ChildrenSummaries({ ticket }: { ticket: TicketSummary }) {
+  const { state } = useStore();
+  const children = childrenOf(ticket.id, state.tickets);
+  if (children.length === 0) return null;
+  const { done, total } = progressOf(ticket.id, state.tickets);
+  return (
+    <div>
+      <div className="text-[11px] font-medium opacity-80">
+        Del-tickets ({done}/{total}):
+      </div>
+      <ul className="mt-0.5 space-y-0.5 text-[11px]">
+        {children.map((c) => (
+          <li key={c.id} className="break-words">
+            <span>
+              • <span className="font-mono opacity-70">{c.shortId}</span> {c.title} — {STATE_LABEL[c.state]} —{" "}
+            </span>
+            {c.summary === null || c.summary.trim() === "" ? (
+              <span className="italic opacity-70">(ingen opsummering)</span>
+            ) : (
+              <span className="line-clamp-3 whitespace-pre-wrap" title={c.summary}>
+                {c.summary}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /** "Vælg reviewer…": a small menu of the running reviewer agents that may review the ticket. */
 function ReviewerMenu({ ticket }: { ticket: TicketSummary }) {
   const { state } = useStore();
@@ -58,6 +104,7 @@ function ReviewerMenu({ ticket }: { ticket: TicketSummary }) {
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   const candidates = reviewerCandidates(state.agents, ticket);
+  const blocked = reviewerChoiceBlocked(ticket, state.appInfo?.rules.checksGate ?? true);
 
   useEffect(() => {
     if (!open) return;
@@ -73,18 +120,19 @@ function ReviewerMenu({ ticket }: { ticket: TicketSummary }) {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        disabled={candidates.length === 0}
+        disabled={candidates.length === 0 || blocked !== null}
         aria-expanded={open}
         title={
-          candidates.length === 0
+          blocked ??
+          (candidates.length === 0
             ? "Ingen anden kørende agent med reviewer-rollen"
-            : "Vælg hvilken reviewer-agent der skal reviewe ticketen"
+            : "Vælg hvilken reviewer-agent der skal reviewe ticketen")
         }
         className={smallBtn}
       >
         Vælg reviewer…
       </button>
-      {open && (
+      {open && blocked === null && (
         <ul
           role="menu"
           className="absolute left-0 top-full z-30 mt-1 w-[220px] space-y-0.5 rounded-lg border border-[var(--border)] bg-[var(--panel)] p-1 text-[11px] text-[var(--fg)] shadow-lg"
@@ -119,6 +167,7 @@ function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
   const theme = useTheme();
   const reviewer =
     ticket.reviewerAgentId === null ? null : state.agents.find((a) => a.id === ticket.reviewerAgentId);
+  const maxRounds = state.appInfo?.rules.maxReviewRounds ?? 3;
   return (
     <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
       <span className="opacity-80">Reviewer:</span>
@@ -140,13 +189,43 @@ function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
           <span className="truncate font-medium">{reviewer.name}</span>
         </span>
       )}
-      <span className="opacity-70">· {reviewRoundText(ticket)}</span>
+      <span className="opacity-70">· {reviewRoundText(ticket, maxRounds)}</span>
       {ticket.escalated && (
         <span
           className="rounded bg-rose-500/20 px-1 text-[10px] font-medium text-rose-700 dark:text-rose-300"
-          title="3 afvisninger — afgør selv"
+          title={`${maxRounds} afvisninger — afgør selv`}
         >
           Eskaleret til dig
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** The project checks of this review entry (step 6b); nothing when none ran. */
+function ChecksLine({ ticket }: { ticket: TicketSummary }) {
+  const text = checksLineText(ticket);
+  const badge = checksBadge(ticket);
+  if (text === null || badge === null) return null;
+  return (
+    <div className="text-[11px]" title={badge.title}>
+      <span className={`rounded px-1 font-medium ${badge.cls}`}>{text}</span>
+    </div>
+  );
+}
+
+/** The ticket's branch (step 6b): "Branch {branch} fra {base}" and the worktree folder. */
+function GitLine({ ticket }: { ticket: TicketSummary }) {
+  const g = ticket.git;
+  if (g === null) return null;
+  return (
+    <div className="text-[11px]">
+      <span className="font-mono" title={g.repo}>
+        {gitLineText(g)}
+      </span>
+      {g.worktree !== null && (
+        <span className="ml-1 font-mono opacity-70" title={g.worktree}>
+          · {shortCwd(g.worktree)}
         </span>
       )}
     </div>
@@ -159,10 +238,13 @@ function ReviewerLine({ ticket }: { ticket: TicketSummary }) {
  * buttons, "Godkend" (→ Done),
  * "Afvis…" with a required note (the ticket goes back first in the agent's queue, or to the
  * backlog when the agent no longer runs; it leaves the Review list either way), and "Åbn
- * terminal" to look at the agent's work.
+ * terminal" to look at the agent's work. A flow parent (step 6b: `isFlowParent`, no assignee) has
+ * no sender and no reviewer agent: it shows "venter på dig" and neither "Åbn terminal" nor the
+ * reviewer menu.
  */
 export default function ReviewActions({ ticket, agent, onNotice }: Props) {
   const run = useRun();
+  const flowParent = isFlowParent(ticket);
   const { selectAgent } = useTicketActions();
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
@@ -190,14 +272,19 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
     onNotice?.(
       after.state === "assigned"
         ? `Ticket ${ticket.shortId} er afvist og sendt tilbage forrest i køen hos ${agent?.name ?? "agenten"}`
-        : `Ticket ${ticket.shortId} er afvist; agenten kører ikke, så den ligger nu i Backlog`,
+        : flowParent
+          ? `Ticket ${ticket.shortId} er afvist og ligger nu i Backlog`
+          : `Ticket ${ticket.shortId} er afvist; agenten kører ikke, så den ligger nu i Backlog`,
     );
   };
 
   return (
     <div className="mt-1.5 space-y-1.5">
       <ReviewerLine ticket={ticket} />
+      <ChecksLine ticket={ticket} />
+      <GitLine ticket={ticket} />
       <AgentSummary summary={ticket.summary} />
+      <ChildrenSummaries ticket={ticket} />
       <div className="flex flex-wrap gap-1.5">
         <button
           type="button"
@@ -218,17 +305,19 @@ export default function ReviewActions({ ticket, agent, onNotice }: Props) {
         >
           Afvis…
         </button>
-        <button
-          type="button"
-          onClick={() => ticket.assigneeAgentId !== null && selectAgent(ticket.assigneeAgentId)}
-          disabled={agent === null}
-          title={agent === null ? "Agenten findes ikke længere" : `Vis terminalen for ${agent.name}`}
-          className={smallBtn}
-        >
-          Åbn terminal
-        </button>
-        <ReviewerMenu ticket={ticket} />
-        {ticket.reviewerAgentId !== null && (
+        {!flowParent && (
+          <button
+            type="button"
+            onClick={() => ticket.assigneeAgentId !== null && selectAgent(ticket.assigneeAgentId)}
+            disabled={agent === null}
+            title={agent === null ? "Agenten findes ikke længere" : `Vis terminalen for ${agent.name}`}
+            className={smallBtn}
+          >
+            Åbn terminal
+          </button>
+        )}
+        {!flowParent && <ReviewerMenu ticket={ticket} />}
+        {!flowParent && ticket.reviewerAgentId !== null && (
           <button
             type="button"
             onClick={() => void run(() => assignReviewer(ticket.id, null))}

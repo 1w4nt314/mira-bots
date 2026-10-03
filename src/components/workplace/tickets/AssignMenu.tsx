@@ -1,10 +1,10 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { assignmentIssue, wrongProjectText } from "../../../lib/projects";
 import { isExited } from "../../../lib/status";
-import { isCoordinationTask } from "../../../lib/tickets";
+import { canStartPlaybook, isCoordinationTask, kindLabel } from "../../../lib/tickets";
 import type { TicketSummary } from "../../../lib/types";
 import { useStore } from "../../../state/store";
-import { smallBtn, useTicketActions } from "./actions";
+import { smallBtn, useStartPlaybook, useTicketActions } from "./actions";
 
 interface Item {
   key: string;
@@ -20,8 +20,16 @@ interface Item {
  * back to the button. For a ticket in progress (step 5c, `canHandOver`) it hands the ticket over:
  * only the other running agents are offered, no new agent.
  */
-export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
+export default function AssignMenu({
+  ticket,
+  onNotice,
+}: {
+  ticket: TicketSummary;
+  /** Where "Forløb startet: n del-tickets" is shown (the panel's notice line). */
+  onNotice?: (text: string) => void;
+}) {
   const { state } = useStore();
+  const startPlaybook = useStartPlaybook();
   const { spawnBlocked, spawnWithTicket, assignTo } = useTicketActions();
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -29,6 +37,8 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
   const menuId = useId();
 
   const handOver = ticket.state === "inProgress";
+  // Step 6b: "Start forløb ({kind})" comes first; the agents keep their own block below it.
+  const canStart = canStartPlaybook(ticket, state.tickets, state.appInfo?.playbookKinds ?? []);
   const live = state.agents.filter(
     (a) => !isExited(a) && !(handOver && a.id === ticket.assigneeAgentId),
   );
@@ -162,6 +172,21 @@ export default function AssignMenu({ ticket }: { ticket: TicketSummary }) {
           onKeyDown={onMenuKey}
           className="absolute left-0 z-20 mt-1 w-64 rounded-lg border border-[var(--border)] bg-[var(--panel)] py-1 text-xs text-[var(--fg)] shadow-lg"
         >
+          {canStart && (
+            <button
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              title="Opretter del-ticketsene for forløbet og giver dem til agenter med den rette rolle"
+              onClick={() => {
+                close(true);
+                void startPlaybook(ticket, onNotice);
+              }}
+              className="mb-1 block w-full truncate border-b border-[var(--border)] px-3 py-1 pb-1.5 text-left font-medium hover:bg-[var(--accent)]/15 focus:bg-[var(--accent)]/15 focus:outline-none"
+            >
+              Start forløb ({kindLabel(ticket.kind)})
+            </button>
+          )}
           {live.length === 0 && (
             <p className="px-3 py-1 text-[var(--muted)]">
               {handOver ? "Ingen andre kørende agenter" : "Ingen kørende agenter"}

@@ -56,7 +56,7 @@ export default function AgentReviews({ agent }: { agent: AgentInfo }) {
                 <span className="min-w-0 flex-1 truncate" title={`${t.title} (${t.shortId})`}>
                   {t.title} <span className="font-mono text-[10px] text-[var(--muted)]">({t.shortId})</span>
                 </span>
-                <span className="shrink-0 text-[10px] text-[var(--muted)]">{reviewRoundText(t)}</span>
+                <span className="shrink-0 text-[10px] text-[var(--muted)]">{reviewRoundText(t, state.appInfo?.rules.maxReviewRounds ?? 3)}</span>
                 <span className="shrink-0 text-[10px] text-[var(--muted)]">
                   {a === undefined ? "" : a.deliveredAt !== null ? "sendt" : "venter på levering"}
                 </span>

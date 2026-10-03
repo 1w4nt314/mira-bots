@@ -130,10 +130,11 @@ fn tools_list_filtered_by_env() {
             "mira_assign_ticket",
             "mira_unassign_ticket",
             "mira_spawn_agent",
-            "mira_list_profiles"
+            "mira_list_profiles",
+            "mira_start_playbook"
         ])
     );
-    assert_eq!(listed_names(Some("coder,reviewer,coordinator")).len(), 17);
+    assert_eq!(listed_names(Some("coder,reviewer,coordinator")).len(), 18);
     // A hidden tool is refused without contacting the app (no pipe needed).
     let input = format!(
         "{INIT}\n{}\n",
