@@ -263,6 +263,7 @@ impl AppState {
 
     /// Everything the Diagnostics panel shows (C2.3). Recomputes the `claude` lookup.
     pub fn diagnostics(&self) -> Diagnostics {
+        let settings = lock(&self.settings).clone();
         let (
             claude_version,
             claude_version_note,
@@ -331,10 +332,11 @@ impl AppState {
                 .into_owned(),
             inbox_new: self.tickets.inbox_read(|i| i.new_count()),
             inbox_sources: self.tickets.inbox_sources_diag(),
-            watch_paused: lock(&self.settings).watch_paused,
+            watch_paused: settings.watch_paused,
             watch_active: self.watch.active(),
             watch_state_path: self.watch.state_path().to_string_lossy().into_owned(),
             watch_warning: self.watch.warning().map(str::to_string),
+            notify_off: settings.notify_off,
         }
     }
 

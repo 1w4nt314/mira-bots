@@ -21,6 +21,13 @@ export interface TicketActions {
   assignTo: (ticket: TicketSummary, agent: AgentInfo) => void;
   /** "Opdatér" in the inbox (step 6c): a manual fetch with a 5 s floor (Workplace's polling hook). */
   refreshInbox: () => void;
+  /**
+   * Step 6d: shows a ticket on the Tickets tab (a click on a notice or the island's badge). The
+   * panel lifts its project filter when it hides the ticket, scrolls to the note and rings it.
+   */
+  selectTicket: (ticketId: string) => void;
+  /** The latest `selectTicket` (full id); a new nonce re-applies the same ticket. */
+  selectedTicket: { id: string; nonce: number } | null;
 }
 
 const noop = () => {};
@@ -35,6 +42,8 @@ export const TicketActionsContext = createContext<TicketActions>({
   spawnBlocked: { work: null, staff: null },
   assignTo: noop,
   refreshInbox: noop,
+  selectTicket: noop,
+  selectedTicket: null,
 });
 
 export function useTicketActions(): TicketActions {

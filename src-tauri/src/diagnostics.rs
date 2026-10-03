@@ -357,6 +357,8 @@ pub struct Diagnostics {
     pub watch_state_path: String,
     /// Sat når `watch-state.json` ikke kunne læses ved start (omdøbt; konservativ start).
     pub watch_warning: Option<String>,
+    /// Fravalgte beskedtyper (`notifyOff` i `app-settings.json`, camelCase-navne).
+    pub notify_off: Vec<String>,
 }
 
 /// One inbox source of one project in Diagnostik (C6c.2 `inboxSources`).
@@ -608,6 +610,7 @@ mod tests {
             watch_active: 1,
             watch_state_path: "/d/watch-state.json".into(),
             watch_warning: None,
+            notify_off: vec!["budgetReached".into()],
         };
         // Step 7 fields, checked apart (the json! below is at the macro recursion limit),
         // including the serde order: platform after appVersion, pipeNote after pipeReady.
@@ -644,6 +647,7 @@ mod tests {
             "watchActive",
             "watchStatePath",
             "watchWarning",
+            "notifyOff",
         ];
         assert!(watch_keys.windows(2).all(|w| at(w[0]) < at(w[1])));
         let w6d: serde_json::Map<String, Value> = watch_keys[1..]
@@ -656,7 +660,8 @@ mod tests {
                 "watchPaused": true,
                 "watchActive": 1,
                 "watchStatePath": "/d/watch-state.json",
-                "watchWarning": null
+                "watchWarning": null,
+                "notifyOff": ["budgetReached"]
             })
         );
         assert_eq!(

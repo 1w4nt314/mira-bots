@@ -21,6 +21,11 @@ import InboxSection, { DismissedFold } from "./InboxSection";
 import StickyNote from "./StickyNote";
 
 const NOTICE_VISIBLE_MS = 5000;
+/** How long a note selected from a notice keeps its ring (step 6d). */
+const HIGHLIGHT_MS = 2000;
+// The nonce of the last `selectTicket` this window acted on. Module-level on purpose: the panel
+// unmounts with its tab, and a remount must not scroll to an old selection again.
+let handledNonce = 0;
 
 function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
   return (
@@ -45,12 +50,42 @@ function Empty({ text }: { text: string }) {
  */
 export default function TicketsPanel() {
   const { state } = useStore();
-  const { assignTo } = useTicketActions();
+  const { assignTo, selectAgent, selectedTicket } = useTicketActions();
   // Step 4b: the project filter (remembered) applies to Review, Backlog and Done.
   const [filter, setFilter] = useState<ProjectFilter>(() =>
     parseProjectFilter(readLocal(PROJECT_FILTER_KEY)),
   );
   useEffect(() => writeLocal(PROJECT_FILTER_KEY, projectFilterKey(filter)), [filter]);
+  const [doneOpen, setDoneOpen] = useState(false);
+  const [highlight, setHighlight] = useState<{ id: string; nonce: number } | null>(null);
+
+  // Step 6d: a ticket chosen from a notice or the island's badge (`selectTicket`). The filter is
+  // lifted when it hides the ticket, the Done fold opens for a finished one, a ticket that sits at
+  // an agent also selects that agent (its note is under the terminal), and the note gets a ring.
+  useEffect(() => {
+    if (selectedTicket === null || selectedTicket.nonce === handledNonce) return;
+    const t = state.tickets.find((x) => x.id === selectedTicket.id);
+    if (t === undefined) return; // the list may still be loading; tried again when it changes
+    handledNonce = selectedTicket.nonce;
+    if (!matchesFilter(t, filter)) setFilter("all");
+    if (t.state === "done") setDoneOpen(true);
+    const atAgent = t.state === "assigned" || t.state === "inProgress" || t.state === "rejected";
+    if (atAgent && t.assigneeAgentId !== null) selectAgent(t.assigneeAgentId);
+    setHighlight({ id: t.id, nonce: selectedTicket.nonce });
+  }, [selectedTicket, state.tickets, filter, selectAgent]);
+
+  useEffect(() => {
+    if (highlight === null) return;
+    // Next frame: the lifted filter / opened fold has rendered the note by then.
+    const raf = requestAnimationFrame(() => {
+      document.getElementById(`ticket-${highlight.id}`)?.scrollIntoView({ block: "center" });
+    });
+    const t = setTimeout(() => setHighlight(null), HIGHLIGHT_MS);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(t);
+    };
+  }, [highlight]);
   const groups = useMemo(() => groupTickets(state.tickets), [state.tickets]);
   const shown = useMemo(
     () => ({
@@ -132,6 +167,7 @@ export default function TicketsPanel() {
 
   const doneShown = shown.done.slice(0, DONE_VISIBLE);
   const doneHidden = shown.done.length - doneShown.length;
+  const lit = (t: TicketSummary) => highlight !== null && highlight.id === t.id;
 
   return (
     <div className="office-cork space-y-4 p-3">
@@ -173,7 +209,7 @@ export default function TicketsPanel() {
       {shown.review.length > 0 && (
         <Section title="Review" count={shown.review.length}>
           {shown.review.map((t) => (
-            <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} onNotice={setNotice} />
+            <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} onNotice={setNotice} highlight={lit(t)} />
           ))}
         </Section>
       )}
@@ -181,7 +217,7 @@ export default function TicketsPanel() {
       {shown.waiting.length > 0 && (
         <Section title="Venter" count={shown.waiting.length}>
           {shown.waiting.map((t) => (
-            <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} onNotice={setNotice} />
+            <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} onNotice={setNotice} highlight={lit(t)} />
           ))}
         </Section>
       )}
@@ -223,7 +259,7 @@ export default function TicketsPanel() {
               Træk en note til en plads, eller brug Tildel…
             </p>
             {shown.backlog.map((t) => (
-              <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable onNotice={setNotice} />
+              <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable onNotice={setNotice} highlight={lit(t)} />
             ))}
           </>
         )}
@@ -235,7 +271,7 @@ export default function TicketsPanel() {
         )}
       </Section>
 
-      <details className="group">
+      <details className="group" open={doneOpen} onToggle={(e) => setDoneOpen(e.currentTarget.open)}>
         <summary className="cursor-pointer select-none text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)] hover:text-[var(--fg)]">
           Done ({shown.done.length})
         </summary>
@@ -245,7 +281,7 @@ export default function TicketsPanel() {
           ) : (
             <>
               {doneShown.map((t) => (
-                <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} />
+                <StickyNote key={t.id} ticket={t} agent={agentOf(t)} draggable={false} highlight={lit(t)} />
               ))}
               {doneHidden > 0 && (
                 <p className="text-[11px] text-[var(--muted)]">og {doneHidden} flere</p>

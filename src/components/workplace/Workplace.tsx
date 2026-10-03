@@ -20,6 +20,7 @@ import {
   errorMessage,
   onWorkplaceSelect,
   quitApp,
+  setWatch,
   takeWorkplaceSelection,
 } from "../../lib/ipc";
 import {
@@ -60,6 +61,7 @@ import type {
   WorkplaceSelection,
   WorkplaceTab,
 } from "../../lib/types";
+import { showResumeWatch, showStopWatch, watchChipText } from "../../lib/watch";
 import { useRefreshProjects, useStore } from "../../state/store";
 import MoveAgentDialog from "./MoveAgentDialog";
 import OfficeDefs from "./office/OfficeDefs";
@@ -69,8 +71,9 @@ import SeatGrid, { SeatOverflow } from "./SeatGrid";
 import Sidebar from "./Sidebar";
 import SpawnDialog from "./SpawnDialog";
 import TerminalPanel from "./TerminalPanel";
-import { TicketActionsContext, type TicketActions } from "./tickets/actions";
+import { TicketActionsContext, useRun, type TicketActions } from "./tickets/actions";
 import InboxCard from "./tickets/InboxCard";
+import NoticesMenu from "./tickets/NoticesMenu";
 import StartInboxDialog, { type StartInboxTarget } from "./tickets/StartInboxDialog";
 import StickyNote from "./tickets/StickyNote";
 import { useInboxPolling } from "./tickets/useInboxPolling";
@@ -92,6 +95,9 @@ export default function Workplace() {
   const [requestedTab, setRequestedTab] = useState<{ tab: WorkplaceTab; nonce: number } | null>(
     null,
   );
+  // Step 6d: the ticket a notice or the island asked for; TicketsPanel acts on it (filter,
+  // scroll, ring). A new nonce re-applies the same ticket.
+  const [selectedTicket, setSelectedTicket] = useState<{ id: string; nonce: number } | null>(null);
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
   // Step 6c B5: an inbox card being dragged, and the Start dialog its drop opens (with the seat
   // as target). Nothing starts before the dialog's button is clicked.
@@ -204,6 +210,12 @@ export default function Workplace() {
     setTermMode((m) => (m === "min" ? "normal" : m));
   }, []);
 
+  // Step 6d: show a ticket (full id) on the Tickets tab; the panel does the rest.
+  const selectTicket = useCallback((id: string) => {
+    setRequestedTab((prev) => ({ tab: "tickets", nonce: (prev?.nonce ?? 0) + 1 }));
+    setSelectedTicket((prev) => ({ id, nonce: (prev?.nonce ?? 0) + 1 }));
+  }, []);
+
   // Latest spawn blocks, read by `apply` below (its effect must not re-run when they change).
   const spawnBlockedRef = useRef<{ work: string | null; staff: string | null }>({
     work: null,
@@ -243,6 +255,9 @@ export default function Workplace() {
       }
       const tab = parseWorkplaceTab(sel.tab);
       if (tab !== null) setRequestedTab((prev) => ({ tab, nonce: (prev?.nonce ?? 0) + 1 }));
+      // Step 6d: the backend resolved `ticketId` to a full id (`check_ticket`); older payloads
+      // have no field at all.
+      if (typeof sel.ticketId === "string" && sel.ticketId !== "") selectTicket(sel.ticketId);
     };
     takeWorkplaceSelection()
       .then((sel) => {
@@ -268,7 +283,7 @@ export default function Workplace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [dispatch, selectAgent, openSpawn]);
+  }, [dispatch, selectAgent, selectTicket, openSpawn]);
 
   // Cmd+Q / Cmd+W on macOS only (the app runs as an Accessory app without a menu bar, so the
   // keys are handled here; isMacShortcut is false on every other platform). Cmd+Q quits at once,
@@ -344,8 +359,10 @@ export default function Workplace() {
       spawnBlocked: { work: spawnBlockedWork, staff: spawnBlockedStaff },
       assignTo,
       refreshInbox,
+      selectTicket,
+      selectedTicket,
     }),
-    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo, refreshInbox],
+    [selectAgent, spawnBlockedWork, spawnBlockedStaff, assignTo, refreshInbox, selectTicket, selectedTicket],
   );
   // Office hints per work agent (step 6a): "n agenter, ingen koordinator" for the project, plus
   // the backlog hint ("coder-01 er ledig: n tickets uden ejer") on the one idle agent it names.
@@ -522,16 +539,20 @@ export default function Workplace() {
           >
             Kontor: {detail === "more" ? "Lidt mere" : "Diskret"}
           </button>
-          {notice !== null && (
-            <span className="ml-auto truncate text-xs text-emerald-700 dark:text-emerald-300" role="status">
-              {notice}
-            </span>
-          )}
-          {error !== null && (
-            <span className={`${notice === null ? "ml-auto " : ""}truncate text-xs text-rose-500`} role="alert" title={error}>
-              {error}
-            </span>
-          )}
+          <div className="ml-auto flex min-w-0 items-center gap-3">
+            {notice !== null && (
+              <span className="truncate text-xs text-emerald-700 dark:text-emerald-300" role="status">
+                {notice}
+              </span>
+            )}
+            {error !== null && (
+              <span className="truncate text-xs text-rose-500" role="alert" title={error}>
+                {error}
+              </span>
+            )}
+            <WatchSwitch />
+            <NoticesMenu />
+          </div>
         </header>
         <DndContext
           sensors={sensors}
@@ -696,5 +717,57 @@ export default function Workplace() {
           })()}
       </div>
     </TicketActionsContext.Provider>
+  );
+}
+
+/**
+ * Step 6d: "Vagt: n projekter" + "Stop vagten" (or "Vagt: pause" + "Start vagten igen") in the
+ * header, like the island's chips. The master pause lives in the app's settings; nothing here
+ * touches `project.json`.
+ */
+function WatchSwitch() {
+  const { state, dispatch } = useStore();
+  const run = useRun();
+  const chip = watchChipText(state.watch);
+  const stop = showStopWatch(state.watch);
+  const resume = showResumeWatch(state.watch);
+  if (chip === null && !stop && !resume) return null;
+  const toggle = (on: boolean) =>
+    void run(async () => {
+      dispatch({ type: "watch/set", watch: await setWatch(null, on) });
+    });
+  const btn =
+    "shrink-0 rounded-md border border-[var(--border)] px-2 py-0.5 text-[11px] hover:border-[var(--accent)]";
+  return (
+    <span className="flex shrink-0 items-center gap-2 text-xs">
+      {chip !== null && (
+        <span
+          className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[11px] text-sky-800 dark:text-sky-200"
+          title="Vagten holder øje med indbakken — se Diagnostik → Projekter"
+        >
+          {chip}
+        </span>
+      )}
+      {stop && (
+        <button
+          type="button"
+          onClick={() => toggle(false)}
+          title="Sæt vagten på pause for alle projekter (gemmes i appens indstillinger, ikke i project.json)"
+          className={btn}
+        >
+          Stop vagten
+        </button>
+      )}
+      {resume && (
+        <button
+          type="button"
+          onClick={() => toggle(true)}
+          title="Start vagten igen for de projekter der tillader den"
+          className={btn}
+        >
+          Start vagten igen
+        </button>
+      )}
+    </span>
   );
 }

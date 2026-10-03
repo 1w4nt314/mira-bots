@@ -77,6 +77,8 @@ interface Props {
   interactive?: boolean;
   /** Short confirmation shown by the panel (e.g. after a rejection). */
   onNotice?: (text: string) => void;
+  /** Step 6d: a ring for a moment after the note was selected from a notice (TicketsPanel). */
+  highlight?: boolean;
 }
 
 /** Stops the note's drag sensors for events inside its buttons, menus and text fields. */
@@ -130,6 +132,7 @@ interface FrameProps extends Props {
 function NoteFrame(props: FrameProps) {
   const { ticket: t, agent, compact = false, interactive = true, rootRef, rootProps, dimmed, grab } =
     props;
+  const { highlight = false } = props;
   const theme = useTheme();
   const { state } = useStore();
   const showActions = interactive && !compact;
@@ -150,9 +153,15 @@ function NoteFrame(props: FrameProps) {
     <div
       ref={rootRef}
       {...rootProps}
+      // Only the panel's notes carry the id (`selectTicket` scrolls to it); overlay and dialog
+      // copies of the same ticket must not duplicate it.
+      id={showActions ? `ticket-${t.id}` : undefined}
+      data-highlight={highlight ? "true" : undefined}
       className={`office-note rounded-lg border border-[var(--note-border)] bg-[var(--note-bg)] p-2 text-xs text-[var(--note-fg)] shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
         grab ? "cursor-grab touch-none active:cursor-grabbing" : ""
-      } ${dimmed ? "opacity-40" : ""} ${compact && !interactive ? "w-[260px] shadow-lg" : ""}`}
+      } ${dimmed ? "opacity-40" : ""} ${compact && !interactive ? "w-[260px] shadow-lg" : ""} ${
+        highlight ? "ring-2 ring-[var(--accent)]" : ""
+      }`}
     >
       <div className="flex items-center gap-1.5">
         <span className={`rounded px-1.5 text-[10px] font-medium leading-4 ${STATE_BADGE_CLASS[t.state]}`}>

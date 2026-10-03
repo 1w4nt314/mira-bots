@@ -8,7 +8,9 @@ import {
   sourceBadge,
   visibleLabels,
 } from "../../../lib/inbox";
-import type { InboxItemSummary } from "../../../lib/types";
+import type { InboxItemSummary, WaitingInfo } from "../../../lib/types";
+import { waitingBadge } from "../../../lib/watch";
+import { useStore } from "../../../state/store";
 import { smallBtn, useRun } from "./actions";
 
 interface Props {
@@ -81,8 +83,13 @@ function CardFrame(props: FrameProps) {
   const { item, compact = false, onStart, onDismiss, onUndismiss, busy = false } = props;
   const { rootRef, rootProps, dimmed, grab } = props;
   const run = useRun();
+  const { state } = useStore();
   const labels = visibleLabels(item.labels);
   const showButtons = !compact;
+  // Step 6d: why the watch parked this item ("venter på budget (næste: 14:05)", …). The buttons
+  // stay as they are: the user can always start the item by hand.
+  const parked: WaitingInfo | undefined = state.watch?.waiting[item.id];
+  const watchBadge = parked === undefined || compact ? null : waitingBadge(parked, Date.now());
   return (
     <div
       ref={rootRef}
@@ -163,6 +170,16 @@ function CardFrame(props: FrameProps) {
       {item.duplicateOf !== null && !compact && (
         <p className="mt-1 text-[10px] text-amber-700 dark:text-amber-300">
           {duplicateText(item.duplicateOf)}
+        </p>
+      )}
+      {watchBadge !== null && (
+        <p className="mt-1">
+          <span
+            className={`inline-block max-w-full truncate rounded px-1 text-[10px] ${watchBadge.cls}`}
+            title={watchBadge.title}
+          >
+            {watchBadge.text}
+          </span>
         </p>
       )}
       {showButtons && (

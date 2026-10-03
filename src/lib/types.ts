@@ -258,6 +258,17 @@ export interface Diagnostics {
   inboxNew: number;
   /** One row per source and project. */
   inboxSources: InboxSourceDiag[];
+  // step 6d: the watch
+  /** "Stop vagten" (`watchPaused` in `app-settings.json`). */
+  watchPaused: boolean;
+  /** Active watch projects at the latest tick/view. */
+  watchActive: number;
+  /** `<app_data_dir>/watch-state.json`. */
+  watchStatePath: string;
+  /** Set when `watch-state.json` could not be read at startup (renamed; conservative start). */
+  watchWarning: string | null;
+  /** Opted-out notice kinds (`notifyOff` in `app-settings.json`, camelCase kind names). */
+  notifyOff: string[];
 }
 
 /** One inbox source of one project in Diagnostik (`Diagnostics.inboxSources`). */
@@ -628,4 +639,105 @@ export interface WorkplaceSelection {
   spawn: string | null;
   /** Step 6d: the ticket to select on the Tickets tab (full id); absent in older payloads. */
   ticketId?: string | null;
+}
+
+// --- watch and notices (step 6d, C6d.2 / C6d.6; keys as in the Rust structs) -----------------
+
+/** The eight notice kinds (`notices.rs::NoticeKind`, camelCase on the wire and in `notifyOff`). */
+export type NoticeKind =
+  | "escalated"
+  | "flowReview"
+  | "permissionWaiting"
+  | "trustWaiting"
+  | "writeBackFailed"
+  | "budgetReached"
+  | "watchTripped"
+  | "agentExited";
+
+/** One notice (`list_notices`, `notices-changed`); texts are the backend's Danish, never a body. */
+export interface Notice {
+  /** uuid */
+  id: string;
+  kind: NoticeKind;
+  /** Milliseconds since the Unix epoch. */
+  at: number;
+  title: string;
+  text: string;
+  /** Full ticket id (click → the ticket). */
+  ticketId: string | null;
+  agentId: string | null;
+  project: string | null;
+  seen: boolean;
+}
+
+/** `list_notices`, `mark_notices_seen`, `set_notify_pref` and the `notices-changed` event. */
+export interface NoticesPayload {
+  unread: number;
+  /** Newest first, at most 100. */
+  items: Notice[];
+}
+
+/** Why the watch parked an inbox item (`engine.rs::WaitReason`). */
+export type WaitReason = "budget" | "seat" | "planner" | "duplicate" | "playbook" | "failed";
+
+/** A parked inbox item (`WatchView.waiting[itemId]`). */
+export interface WaitingInfo {
+  reason: WaitReason;
+  /** The badge text as the backend wrote it (C6d.5). */
+  text: string;
+  /** Budget: when it is free at the earliest (ms since the Unix epoch). */
+  nextAt: number | null;
+  project: string;
+}
+
+/** Used/cap of one budget window pair (`engine.rs::BudgetView`). */
+export interface WatchBudgetView {
+  usedHour: number;
+  capHour: number;
+  usedDay: number;
+  capDay: number;
+}
+
+/** One project in the watch view: every project with a `project.json` `watch` or in `watchOff`. */
+export interface WatchProjectView {
+  id: string;
+  /** `project.json` has `watch.enabled: true` ("Hold vagt" can be switched). */
+  enabled: boolean;
+  /** In `watchOff` ("Hold vagt" off). */
+  paused: boolean;
+  active: boolean;
+  /** Why the project is not active (C6d.5 texts); null when it is. */
+  reason: string | null;
+  tripped: boolean;
+  trippedAt: number | null;
+  trippedReason: string | null;
+  usedHour: number;
+  capHour: number;
+  usedDay: number;
+  capDay: number;
+  /** Live agents the watch itself started in the project. */
+  agents: number;
+  maxAgents: number;
+  /** When the budget is free at the earliest, while it waits now. */
+  nextFreeAt: number | null;
+  /** `quietHours` as written ("23-07"). */
+  quiet: string | null;
+  inQuiet: boolean;
+  /** Short description of the rule (`bug`, `byLabel (2) → task`); null = no playbook. */
+  playbook: string | null;
+  notes: string[];
+}
+
+/** `get_watch`, `set_watch`, `restart_watch` and the `watch-changed` event. */
+export interface WatchView {
+  /** "Stop vagten" (`watchPaused`). */
+  paused: boolean;
+  /** Number of active watch projects. */
+  active: number;
+  lastTickAt: number | null;
+  /** The sum over all projects against the workspace caps. */
+  global: WatchBudgetView;
+  projects: WatchProjectView[];
+  /** Inbox item id → why it waits. */
+  waiting: Record<string, WaitingInfo>;
 }

@@ -16,6 +16,8 @@ import type {
   InboxItemSummary,
   InboxPayload,
   InboxRefreshReason,
+  NoticeKind,
+  NoticesPayload,
   PermissionRequestInfo,
   PlaybookStarted,
   PermissionResolvedPayload,
@@ -31,6 +33,7 @@ import type {
   TicketReport,
   TicketState,
   TicketSummary,
+  WatchView,
   WriteBack,
   WorkplaceSelection,
   WorkplaceTab,
@@ -97,6 +100,13 @@ export const COMMANDS = {
   retryWriteBack: "retry_write_back",
   openInboxUrl: "open_inbox_url",
   checkGhAuth: "check_gh_auth",
+  // step 6d
+  getWatch: "get_watch",
+  setWatch: "set_watch",
+  restartWatch: "restart_watch",
+  listNotices: "list_notices",
+  markNoticesSeen: "mark_notices_seen",
+  setNotifyPref: "set_notify_pref",
 } as const;
 
 export const EVENTS = {
@@ -109,6 +119,8 @@ export const EVENTS = {
   ticketsChanged: "tickets-changed",
   profilesChanged: "profiles-changed",
   inboxChanged: "inbox-changed",
+  watchChanged: "watch-changed",
+  noticesChanged: "notices-changed",
 } as const;
 
 /** Commands reject with the Rust error string (Danish, user-facing). */
@@ -312,6 +324,27 @@ export const openInboxUrl = (id: string) => invoke<void>(COMMANDS.openInboxUrl, 
 /** "Tjek gh-login" (Diagnostik): `gh auth status`, never automatic. */
 export const checkGhAuth = () => invoke<GhAuthResult>(COMMANDS.checkGhAuth);
 
+// watch and notices (step 6d)
+/** The watch view (cached from the latest tick, else computed now). */
+export const getWatch = () => invoke<WatchView>(COMMANDS.getWatch);
+/**
+ * `project` null: "Stop vagten"/"Start vagten igen" (`watchPaused = !on`); a project id: "Hold
+ * vagt" for that project (`watchOff`). Only app settings change, never `project.json`.
+ */
+export const setWatch = (project: string | null, on: boolean) =>
+  invoke<WatchView>(COMMANDS.setWatch, { project, on });
+/** "Genstart vagt": clears the project's trip (three failures in a row). */
+export const restartWatch = (project: string) =>
+  invoke<WatchView>(COMMANDS.restartWatch, { project });
+/** The notice queue (newest first) and the unread count. */
+export const listNotices = () => invoke<NoticesPayload>(COMMANDS.listNotices);
+/** Marks these notices as read (`null`: all of them). */
+export const markNoticesSeen = (ids: string[] | null) =>
+  invoke<NoticesPayload>(COMMANDS.markNoticesSeen, { ids });
+/** "Giv besked ved: …": switches a notice kind on or off (`notifyOff`). */
+export const setNotifyPref = (kind: NoticeKind, on: boolean) =>
+  invoke<NoticesPayload>(COMMANDS.setNotifyPref, { kind, on });
+
 // --- events (each returns the unlisten function) ----------------------------------------------
 
 export const onAgentsChanged = (cb: (agents: AgentInfo[]) => void): Promise<UnlistenFn> =>
@@ -340,6 +373,12 @@ export const onProfilesChanged = (cb: (profiles: AgentProfile[]) => void): Promi
 /** Items and source status after any inbox change (also when a refresh starts and ends). */
 export const onInboxChanged = (cb: (inbox: InboxPayload) => void): Promise<UnlistenFn> =>
   listen<InboxPayload>(EVENTS.inboxChanged, (e) => cb(e.payload));
+/** The full watch view after a tick, "Stop vagten", "Hold vagt" or "Genstart vagt" (step 6d). */
+export const onWatchChanged = (cb: (v: WatchView) => void): Promise<UnlistenFn> =>
+  listen<WatchView>(EVENTS.watchChanged, (e) => cb(e.payload));
+/** The full notice queue after a notice came in, was marked read or a kind was switched off. */
+export const onNoticesChanged = (cb: (p: NoticesPayload) => void): Promise<UnlistenFn> =>
+  listen<NoticesPayload>(EVENTS.noticesChanged, (e) => cb(e.payload));
 
 // --- dialog -----------------------------------------------------------------------------------
 
