@@ -8,10 +8,12 @@
 //! Pr. tick og pr. aktivt vagt-projekt (i projektlistens rækkefølge) højst ét vellykket start:
 //! kandidaterne (nye emner i projektet, ældste først) gennemgås i rækkefølge — `stopping` →
 //! stop alt; dublet → park; ingen/ukendt playbook → park; bemanding (en levende agent eller
-//! plads til at starte en arbejdsagent; aldrig en stabsagent) → park; budget (reservation under
+//! plads til at starte en arbejdsagent; aldrig en stabsagent) → park; emnets kilde er nede →
+//! park; budget (reservation under
 //! én kort lås) → park + besked og ingen flere reservationer i projektet; ellers start. Et emne
 //! der forsvandt (`Gone`) annullerer reservationen uden fejl; en reel fejl annullerer og tæller
-//! (tre i træk stopper vagten for projektet).
+//! (tre i træk stopper vagten for projektet). Svigter emnets kilde (`gh` logget ud, rate limit,
+//! intet netværk), startes intet fra kilden, og intet tælles som fejl (review6d W3).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -20,11 +22,12 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AgentInfo, Role};
 use crate::app_settings::AppSettings;
 use crate::config::{
-    watch_start_failed_text, watch_tripped_reason, watch_unknown_playbook_text,
-    watch_wait_budget_text, HOUR_MS, WATCH_ERROR_MAX_CHARS, WATCH_GH_ERROR_TEXT,
-    WATCH_REASON_CANNOT_SPAWN, WATCH_REASON_NOT_ENABLED, WATCH_REASON_PAUSED,
-    WATCH_REASON_PROJECT_PAUSED, WATCH_REASON_WS_OFF, WATCH_TRIP_AFTER, WATCH_WAIT_CAP_ZERO,
-    WATCH_WAIT_DUPLICATE, WATCH_WAIT_NO_PLAYBOOK, WATCH_WAIT_PLANNER, WATCH_WAIT_SEAT,
+    watch_source_wait_text, watch_source_when_at, watch_start_failed_text, watch_tripped_reason,
+    watch_unknown_playbook_text, watch_wait_budget_text, HOUR_MS, WATCH_ERROR_MAX_CHARS,
+    WATCH_GH_ERROR_TEXT, WATCH_REASON_CANNOT_SPAWN, WATCH_REASON_NOT_ENABLED, WATCH_REASON_PAUSED,
+    WATCH_REASON_PROJECT_PAUSED, WATCH_REASON_WS_OFF, WATCH_SOURCE_WHEN_MANUAL,
+    WATCH_SOURCE_WHEN_NEXT_FETCH, WATCH_TRIP_AFTER, WATCH_WAIT_CAP_ZERO, WATCH_WAIT_DUPLICATE,
+    WATCH_WAIT_NO_PLAYBOOK, WATCH_WAIT_PLANNER, WATCH_WAIT_SEAT,
 };
 use crate::notices::{budget_notice, clip_line, tripped_notice, Notice, NoticeKey};
 use crate::projects::same_id;
@@ -54,6 +57,58 @@ pub trait InboxPort {
     fn candidates(&self, project: &str) -> Vec<Candidate>;
     /// Ligner `title` en åben ticket i `project` (Start-dialogens "Ligner ticket …")?
     fn is_duplicate(&self, project: &str, title: &str) -> bool;
+    /// Kilden `source_id` som indbakkens status ser den (ingen `gh`-kald; review6d W3).
+    fn source_health(&self, source_id: &str) -> SourceHealth;
+}
+
+/// En kilde set fra vagten (af indbakkens [`crate::inbox::SourceStatus`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceHealth {
+    /// Kildens seneste hentning fejlede med denne tekst (`None`: ok eller ukendt kilde).
+    pub error: Option<String>,
+    /// Fejlen venter på brugeren ("Opdatér"; fx `gh` logget ud), ikke på back-off'en.
+    pub waits_for_user: bool,
+    /// Back-off: hvornår kilden tidligst hentes igen.
+    pub next_retry_at: Option<u64>,
+    /// Seneste vellykkede hentning.
+    pub last_fetch_at: Option<u64>,
+}
+
+/// Et start der fejlede, fordi kilden svigtede ([`StartFailure::Source`]): kilden regnes for
+/// nede, til den er hentet med held efter `at` (højst en time).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceFail {
+    pub text: String,
+    pub at: u64,
+}
+
+/// Er kilden nede for vagten (review6d W3)? `Some((fejl, hvornår, næste))`: kildens hentning
+/// fejler (back-off eller "Opdatér"), eller et start fejlede på kilden (`fail`) og kilden er
+/// ikke hentet med held siden (højst [`HOUR_MS`]). Ren.
+pub fn source_blocked(
+    h: &SourceHealth,
+    fail: Option<&SourceFail>,
+    now: u64,
+    off: i64,
+) -> Option<(String, String, u64)> {
+    if let Some(err) = &h.error {
+        let err = short_error(err);
+        return Some(match h.next_retry_at.filter(|t| *t > now) {
+            Some(t) => (err, watch_source_when_at(&hhmm(t, off)), t),
+            None if h.waits_for_user => (err, WATCH_SOURCE_WHEN_MANUAL.into(), now + HOUR_MS),
+            None => (err, WATCH_SOURCE_WHEN_NEXT_FETCH.into(), now + HOUR_MS),
+        });
+    }
+    let f = fail?;
+    let until = f.at + HOUR_MS;
+    let fetched_since = h.last_fetch_at.is_some_and(|t| t > f.at);
+    (now < until && !fetched_since).then(|| {
+        (
+            f.text.clone(),
+            WATCH_SOURCE_WHEN_NEXT_FETCH.to_string(),
+            until,
+        )
+    })
 }
 
 /// Bemanding og selve startet.
@@ -96,6 +151,9 @@ pub struct Candidate {
     /// Mappe-emnets frontmatter `kind:` (valideret); vinder over `byLabel`.
     pub ticket_kind: Option<String>,
     pub seen_at: u64,
+    /// Indbakke-kilden (`github:o/r`, `folder:web`), så vagten kan holde sig fra en kilde der er
+    /// nede (review6d W3).
+    pub source_id: String,
 }
 
 /// Svar fra [`StarterPort::staffing`].
@@ -135,6 +193,10 @@ pub enum StartFailure {
     Gone,
     /// En reel fejl uden ticket: reservationen annulleres, og fejlen tælles.
     Real(String),
+    /// Kilden svigtede (`gh` logget ud eller afvist, rate limit, intet netværk, timeout): ingen
+    /// ticket, reservationen annulleres, og **intet** tælles (review6d W3); emnets kilde regnes
+    /// for nede til næste vellykkede hentning.
+    Source(String),
     /// Ticketen blev oprettet, men forløbet kunne ikke rulles ud: budgettet er brugt
     /// (reservationen bekræftes), og fejlen tælles.
     AfterTicket { ticket_id: String, error: String },
@@ -280,6 +342,20 @@ pub struct Waiting {
     /// Budget: hvornår det tidligst er frit (UTC-ms).
     pub next_at: Option<u64>,
     pub project: String,
+    /// Parkeret fordi emnets kilde er nede, ikke fordi startet fejlede: tjekkes igen hvert tick
+    /// og tæller aldrig som fejl (review6d W3). Kun i hukommelsen; ikke på tråden.
+    #[serde(skip)]
+    pub by_source: bool,
+}
+
+impl Waiting {
+    /// Et emne hvis start fejlede, og som først prøves igen ved `next_at` (review6d W1). Sådan en
+    /// parkering huskes også, mens projektet er inaktivt (pause/genoptag, review6d N11).
+    pub fn failed_until_later(&self, now: u64) -> bool {
+        self.reason == WaitReason::Failed
+            && !self.by_source
+            && self.next_at.is_some_and(|t| t > now)
+    }
 }
 
 /// Vagtens hukommelse (i runtime; aldrig på disk).
@@ -291,9 +367,18 @@ pub struct WatchMemory {
     /// lever).
     pub agents: BTreeMap<String, String>,
     pub last_tick_at: Option<u64>,
+    /// Kilde-id → et start der fejlede på kilden (review6d W3).
+    pub source_fails: BTreeMap<String, SourceFail>,
 }
 
 impl WatchMemory {
+    /// "Genstart vagt" for `project`: dets fejlede starter prøves igen straks (review6d N11 —
+    /// ellers ventede de deres time, også efter genstarten).
+    pub fn forget_failed(&mut self, project: &str) {
+        self.waiting
+            .retain(|_, w| !(w.reason == WaitReason::Failed && same_id(&w.project, project)));
+    }
+
     /// Levende vagt-agenter i `project` (efter seneste beskæring).
     pub fn agents_in(&self, project: &str) -> usize {
         self.agents.values().filter(|p| same_id(p, project)).count()
@@ -581,9 +666,11 @@ impl<P: WatchPort> WatchEngine<P> {
             let live = self.port.live_of(&ids);
             mem.agents.retain(|id, _| live.contains(id));
         }
-        // Emner i projekter der ikke (længere) er aktive, venter ikke på vagten.
-        mem.waiting
-            .retain(|_, w| plan.projects.iter().any(|p| same_id(&p.id, &w.project)));
+        // Emner i projekter der ikke (længere) er aktive, venter ikke på vagten — undtagen et
+        // fejlet start, hvis time ikke er gået (review6d N11: pause/genoptag nulstiller den ikke).
+        mem.waiting.retain(|_, w| {
+            w.failed_until_later(now) || plan.projects.iter().any(|p| same_id(&p.id, &w.project))
+        });
         for p in &plan.projects {
             if self.port.stopping() || !self.sweep(mem, p, now, off) {
                 log::info!("watch: appen lukker — ingen flere starter i dette tick");
@@ -598,6 +685,12 @@ impl<P: WatchPort> WatchEngine<P> {
     /// [`Self::tick`], men en panik giver `None` (logget som én linje `watch: tick fejlede`),
     /// og `mem` beholder det motoren nåede før panikken — fx agent-id'er fra et start lige før
     /// (review6d N8).
+    ///
+    /// Kun i debug og tests (review6d W4): release-profilen har `panic = "abort"` (rodens
+    /// `Cargo.toml`), så dér ender en panik processen som enhver anden panik i appen, og
+    /// `catch_unwind` fanger intet. Da tick'et kører i `spawn_blocking` på en kopi af `mem`, og
+    /// `watch-state.json` kun skrives atomisk, er hverken hukommelsen eller filen nogensinde halvt
+    /// skrevet.
     pub fn tick_guarded(&self, mem: &mut WatchMemory, plan: &TickPlan) -> Option<WatchView> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick(mem, plan))) {
             Ok(view) => Some(view),
@@ -620,6 +713,7 @@ impl<P: WatchPort> WatchEngine<P> {
             text,
             next_at: None,
             project: p.id.clone(),
+            by_source: false,
         };
         if self.port.is_duplicate(&p.id, &c.title) {
             return Err(wait(WaitReason::Duplicate, WATCH_WAIT_DUPLICATE.into()));
@@ -645,6 +739,21 @@ impl<P: WatchPort> WatchEngine<P> {
             .retain(|id, w| !same_id(&w.project, &p.id) || ids.contains(id.as_str()));
         let watch_free = p.cfg.max_agents.saturating_sub(mem.agents_in(&p.id));
         let caps = caps_of(&p.cfg, &p.ws);
+        // Review6d W3: kilderne der er nede (ét statusopslag pr. kilde; intet `gh`-kald). En
+        // kilde der er kommet op igen, glemmer sit fejlede start.
+        let mut down: BTreeMap<&str, Option<(String, String, u64)>> = BTreeMap::new();
+        for c in &cands {
+            let sid = c.source_id.as_str();
+            if down.contains_key(sid) {
+                continue;
+            }
+            let h = self.port.source_health(sid);
+            let blocked = source_blocked(&h, mem.source_fails.get(sid), now, off);
+            if blocked.is_none() {
+                mem.source_fails.remove(sid);
+            }
+            down.insert(sid, blocked);
+        }
         // Efter et budget-afslag reserveres intet mere i projektet; de øvrige emner får samme
         // ventetekst (efter dublet/playbook/bemanding).
         let mut budget_wait: Option<Waiting> = None;
@@ -654,9 +763,11 @@ impl<P: WatchPort> WatchEngine<P> {
             }
             // Review6d W1: et emne hvis start fejlede, prøves først igen efter en time; det
             // blokerer ikke projektets øvrige emner imens.
-            if mem.waiting.get(&c.item_id).is_some_and(|w| {
-                w.reason == WaitReason::Failed && w.next_at.is_some_and(|t| t > now)
-            }) {
+            if mem
+                .waiting
+                .get(&c.item_id)
+                .is_some_and(|w| w.failed_until_later(now))
+            {
                 continue;
             }
             let pb = match self.precheck(p, c, watch_free) {
@@ -666,6 +777,11 @@ impl<P: WatchPort> WatchEngine<P> {
                     continue;
                 }
             };
+            // Review6d W3: kilden er nede → ingen start, ingen fejl, intet budget.
+            if let Some(Some((err, when, next))) = down.get(c.source_id.as_str()) {
+                park(mem, &c.item_id, source_wait(&p.id, err, when, *next));
+                continue;
+            }
             if let Some(w) = &budget_wait {
                 park(mem, &c.item_id, w.clone());
                 continue;
@@ -689,6 +805,7 @@ impl<P: WatchPort> WatchEngine<P> {
                     text,
                     next_at: next_ms,
                     project: p.id.clone(),
+                    by_source: false,
                 };
                 park(mem, &c.item_id, w.clone());
                 budget_wait = Some(w);
@@ -745,9 +862,25 @@ impl<P: WatchPort> WatchEngine<P> {
                             text: watch_start_failed_text(&e, &hhmm(retry, off)),
                             next_at: Some(retry),
                             project: p.id.clone(),
+                            by_source: false,
                         },
                     );
                     self.after_failure(p, tripped, now);
+                    return true;
+                }
+                Err(StartFailure::Source(e)) => {
+                    // Review6d W3: `gh`/netværket svigter — ikke emnets fejl. Ingen fejltælling;
+                    // kildens øvrige emner prøves ikke, før kilden er hentet med held igen.
+                    let e = short_error(&e);
+                    self.port.with_state(&mut |s| s.cancel(&p.id, now));
+                    log::warn!(
+                        "watch: {}: start af emne {item} fejlede på kilden ({e}); kilden prøves igen efter næste hentning",
+                        p.id
+                    );
+                    let w = source_wait(&p.id, &e, WATCH_SOURCE_WHEN_NEXT_FETCH, now + HOUR_MS);
+                    mem.source_fails
+                        .insert(c.source_id.clone(), SourceFail { text: e, at: now });
+                    park(mem, &c.item_id, w);
                     return true;
                 }
                 Err(StartFailure::AfterTicket { ticket_id, error }) => {
@@ -781,12 +914,27 @@ impl<P: WatchPort> WatchEngine<P> {
     }
 }
 
+/// Parkeringen for et emne hvis kilde er nede (review6d W3): `Failed` med kildens tekst, uden
+/// fejltælling, tjekket igen hvert tick.
+fn source_wait(project: &str, err: &str, when: &str, next: u64) -> Waiting {
+    Waiting {
+        reason: WaitReason::Failed,
+        text: watch_source_wait_text(err, when),
+        next_at: Some(next),
+        project: project.to_string(),
+        by_source: true,
+    }
+}
+
 /// Parkerer et emne; logger kun når årsagen er ny eller skiftede (ingen titler).
 fn park(mem: &mut WatchMemory, item_id: &str, w: Waiting) {
-    let changed = mem
-        .waiting
-        .get(item_id)
-        .is_none_or(|old| old.reason != w.reason || old.next_at != w.next_at);
+    // En kilde-parkering uden back-off-tid flytter `next_at` hvert tick; det er ingen ny årsag.
+    let changed = mem.waiting.get(item_id).is_none_or(|old| {
+        old.reason != w.reason
+            || old.by_source != w.by_source
+            || old.text != w.text
+            || (!w.by_source && old.next_at != w.next_at)
+    });
     if changed {
         log::info!(
             "watch: {}: emne {} parkeret ({})",
@@ -835,6 +983,9 @@ mod tests {
         /// `with_state`-kald indtil nu, og ved hvilket kald porten går i panik (N8).
         state_calls: usize,
         panic_at_state_call: Option<usize>,
+        /// Kilde-id → indbakkens status for kilden (W3); ukendt = ok.
+        sources: BTreeMap<String, SourceHealth>,
+        source_calls: usize,
     }
 
     #[derive(Clone, Default)]
@@ -862,6 +1013,16 @@ mod tests {
             f
         }
         fn add(&self, project: &str, id: &str, labels: &[&str], kind: Option<&str>) {
+            self.add_from(&format!("folder:{project}"), project, id, labels, kind);
+        }
+        fn add_from(
+            &self,
+            source: &str,
+            project: &str,
+            id: &str,
+            labels: &[&str],
+            kind: Option<&str>,
+        ) {
             let n = self.s().candidates.values().map(Vec::len).sum::<usize>() as u64;
             self.s()
                 .candidates
@@ -873,6 +1034,7 @@ mod tests {
                     labels: labels.iter().map(|s| s.to_string()).collect(),
                     ticket_kind: kind.map(str::to_string),
                     seen_at: n,
+                    source_id: source.into(),
                 });
         }
         fn started_items(&self) -> Vec<String> {
@@ -909,6 +1071,11 @@ mod tests {
         fn is_duplicate(&self, _project: &str, title: &str) -> bool {
             self.s().duplicates.contains(title)
         }
+        fn source_health(&self, source_id: &str) -> SourceHealth {
+            let mut s = self.s();
+            s.source_calls += 1;
+            s.sources.get(source_id).cloned().unwrap_or_default()
+        }
     }
     impl StarterPort for Fake {
         fn staffing(&self, project: &str, playbook: &str, watch_free: usize) -> Staffing {
@@ -931,7 +1098,8 @@ mod tests {
                     notes: vec![],
                 })
             });
-            if !matches!(answer, Err(StartFailure::Real(_))) {
+            // Et emne der fejlede (reelt eller på kilden), er stadig nyt i indbakken.
+            if !matches!(answer, Err(StartFailure::Real(_) | StartFailure::Source(_))) {
                 for v in s.candidates.values_mut() {
                     v.retain(|c| c.item_id != req.item_id);
                 }
@@ -1385,8 +1553,11 @@ mod tests {
             v.projects[0].reason.as_deref(),
             Some("stoppet efter 3 fejl — tryk Genstart vagt")
         );
-        // "Genstart vagt" nulstiller; næste tick starter.
+        // De fejlede emner huskes også mens projektet er stoppet (N11)…
+        assert_eq!(mem.waiting.len(), 3);
+        // …men "Genstart vagt" nulstiller og glemmer dem; næste tick starter.
         assert!(f.s().state.reset_trip("web"));
+        mem.forget_failed("web");
         let tripped = f.s().state.tripped();
         let plan5 = active_projects(&ws, &AppSettings::default(), &files, &tripped, true, &names);
         e.tick(&mut mem, &plan5);
@@ -1936,6 +2107,375 @@ mod tests {
         assert_eq!(
             playbook_text(&empty).as_deref(),
             Some(PLAYBOOK_ONLY_KIND_TEXT)
+        );
+    }
+
+    // ---- review6d runde 2: W3 (kilden nede), N11 (pause/genoptag) ----
+
+    const GH: &str = "github:o/r";
+    const LOGGED_OUT: &str = "gh er ikke logget ind — kør gh auth login i en terminal";
+
+    fn plan_paused(paused: bool) -> TickPlan {
+        let files = [ProjectWatchFile {
+            id: "web".into(),
+            cfg: Some(cfg(fixed("bug"))),
+            notes: vec![],
+        }];
+        let settings = AppSettings {
+            watch_paused: paused,
+            ..AppSettings::default()
+        };
+        active_projects(
+            &WorkspaceWatch::default(),
+            &settings,
+            &files,
+            &BTreeSet::new(),
+            true,
+            &["bug".to_string()],
+        )
+    }
+
+    fn set_source(f: &Fake, h: SourceHealth) {
+        f.s().sources.insert(GH.into(), h);
+    }
+
+    #[test]
+    fn gh_logged_out_parks_the_source_without_trip_or_more_calls() {
+        // Review6d W3 / E.123: `gh auth logout` med fire listede issues. Det første start fejler
+        // på kilden; derefter ingen starter (ingen `gh issue view`), ingen fejl, ingen trip.
+        let f = Fake::new();
+        for id in ["i1", "i2", "i3", "i4"] {
+            f.add_from(GH, "web", id, &["bug"], None);
+        }
+        f.s()
+            .answers
+            .push_back(Err(StartFailure::Source(LOGGED_OUT.into())));
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let plan = plan_paused(false);
+        let mut v = e.tick(&mut mem, &plan);
+        for _ in 0..5 {
+            f.advance(MIN);
+            v = e.tick(&mut mem, &plan);
+        }
+        assert_eq!(f.started_items(), ["i1"], "kun ét gh-kald");
+        let ps = f.s().state.projects["web"].clone();
+        assert_eq!(ps.failures, 0);
+        assert!(ps.tripped_at.is_none());
+        assert_eq!(f.notices_of(NoticeKind::WatchTripped), 0);
+        assert_eq!(global_used(&f), 0, "intet budget brugt");
+        let want =
+            format!("vagt: venter på kilden: {LOGGED_OUT} (prøves igen efter næste hentning)");
+        for id in ["i1", "i2", "i3", "i4"] {
+            assert_eq!(v.waiting[id].reason, WaitReason::Failed, "{id}");
+            assert_eq!(v.waiting[id].text, want, "{id}");
+            assert!(mem.waiting[id].by_source, "{id}");
+        }
+        // Ikke på tråden.
+        let json = serde_json::to_string(&v.waiting["i1"]).unwrap();
+        assert!(
+            !json.contains("bySource") && !json.contains("by_source"),
+            "{json}"
+        );
+        // Hentningen fejler også nu: kilden venter på "Opdatér".
+        set_source(
+            &f,
+            SourceHealth {
+                error: Some(LOGGED_OUT.into()),
+                waits_for_user: true,
+                next_retry_at: None,
+                last_fetch_at: Some(T - 10 * MIN),
+            },
+        );
+        f.advance(MIN);
+        let v = e.tick(&mut mem, &plan);
+        assert_eq!(f.s().starts.len(), 1);
+        assert_eq!(
+            v.waiting["i3"].text,
+            format!("vagt: venter på kilden: {LOGGED_OUT} (prøves igen efter Opdatér i indbakken)")
+        );
+        // `gh auth login` + "Opdatér": kilden er ok igen → vagten genoptager selv (ingen
+        // "Genstart vagt"), ét emne pr. tick.
+        let now = f.s().now;
+        set_source(
+            &f,
+            SourceHealth {
+                last_fetch_at: Some(now),
+                ..SourceHealth::default()
+            },
+        );
+        f.advance(MIN);
+        e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["i1", "i1"]);
+        assert!(mem.source_fails.is_empty());
+        f.advance(MIN);
+        e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["i1", "i1", "i2"]);
+        assert_eq!(f.s().state.projects["web"].failures, 0);
+    }
+
+    #[test]
+    fn rate_limited_source_makes_no_call_before_its_retry_time() {
+        let f = Fake::new();
+        for id in ["i1", "i2", "i3"] {
+            f.add_from(GH, "web", id, &["bug"], None);
+        }
+        let retry = T + 15 * MIN;
+        set_source(
+            &f,
+            SourceHealth {
+                error: Some("GitHub: rate limit — prøver igen kl. 12:15".into()),
+                waits_for_user: false,
+                next_retry_at: Some(retry),
+                last_fetch_at: Some(T - 30 * MIN),
+            },
+        );
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let plan = plan_paused(false);
+        let mut v = e.tick(&mut mem, &plan);
+        while f.s().now + MIN < retry {
+            f.advance(MIN);
+            v = e.tick(&mut mem, &plan);
+        }
+        assert!(f.s().starts.is_empty(), "ingen gh-kald før back-off'en");
+        assert_eq!(
+            v.waiting["i1"].text,
+            "vagt: venter på kilden: GitHub: rate limit — prøver igen kl. 12:15 (prøves igen tidligst 12:15)"
+        );
+        assert_eq!(v.waiting["i1"].next_at, Some(retry));
+        assert_eq!(global_used(&f), 0);
+        // Back-off'en er udløbet, men kilden er ikke hentet igen endnu: stadig intet kald.
+        f.advance(2 * MIN);
+        let v = e.tick(&mut mem, &plan);
+        assert!(f.s().starts.is_empty());
+        assert!(v.waiting["i1"]
+            .text
+            .ends_with("(prøves igen efter næste hentning)"));
+        // Hentningen lykkes: vagten genoptager.
+        let now = f.s().now;
+        set_source(
+            &f,
+            SourceHealth {
+                last_fetch_at: Some(now),
+                ..SourceHealth::default()
+            },
+        );
+        f.advance(MIN);
+        e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["i1"]);
+        assert_eq!(f.s().state.projects["web"].failures, 0);
+    }
+
+    #[test]
+    fn source_failures_never_trip_but_real_failures_still_do() {
+        // Fire kilde-fejl (hentningen lykkes imellem, så hver gang prøves et emne): ingen trip.
+        let f = Fake::new();
+        for id in ["a", "b", "c", "d"] {
+            f.add_from(GH, "web", id, &["bug"], None);
+        }
+        for _ in 0..4 {
+            f.s().answers.push_back(Err(StartFailure::Source(
+                "ingen forbindelse til GitHub".into(),
+            )));
+        }
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        let plan = plan_paused(false);
+        for _ in 0..4 {
+            e.tick(&mut mem, &plan);
+            let now = f.s().now;
+            set_source(
+                &f,
+                SourceHealth {
+                    last_fetch_at: Some(now + 1),
+                    ..SourceHealth::default()
+                },
+            );
+            f.advance(3 * MIN);
+        }
+        assert_eq!(f.started_items(), ["a", "a", "a", "a"]);
+        let ps = f.s().state.projects["web"].clone();
+        assert_eq!((ps.failures, ps.tripped_at), (0, None));
+        assert_eq!(f.notices_of(NoticeKind::WatchTripped), 0);
+        // En nede kilde blokerer ikke projektets andre kilder (mappen).
+        let now = f.s().now;
+        set_source(
+            &f,
+            SourceHealth {
+                error: Some("ingen forbindelse til GitHub".into()),
+                next_retry_at: Some(now + 4 * MIN),
+                ..SourceHealth::default()
+            },
+        );
+        f.add("web", "m", &["bug"], None);
+        e.tick(&mut mem, &plan);
+        assert_eq!(f.started_items(), ["a", "a", "a", "a", "m"]);
+        // Reelle fejl tripper stadig (tre forskellige mappe-emner).
+        for id in ["x", "y", "z"] {
+            f.add("web", id, &["bug"], None);
+            f.s().answers.push_back(Err(StartFailure::Real(
+                "forløbet kunne ikke foldes ud".into(),
+            )));
+        }
+        for _ in 0..3 {
+            f.advance(MIN);
+            e.tick(&mut mem, &plan);
+        }
+        assert_eq!(f.s().state.projects["web"].failures, 3);
+        assert!(f.s().state.projects["web"].tripped_at.is_some());
+    }
+
+    #[test]
+    fn source_blocked_table() {
+        let off = CEST;
+        let fail = SourceFail {
+            text: "gh svarede ikke inden for 30 s".into(),
+            at: T,
+        };
+        let ok = SourceHealth::default();
+        assert_eq!(source_blocked(&ok, None, T, off), None);
+        // Et start fejlede på kilden: nede til en vellykket hentning efter fejlen, højst en time.
+        let b = source_blocked(&ok, Some(&fail), T + MIN, off).unwrap();
+        assert_eq!(
+            b,
+            (
+                fail.text.clone(),
+                WATCH_SOURCE_WHEN_NEXT_FETCH.into(),
+                T + HOUR_MS
+            )
+        );
+        let old_fetch = SourceHealth {
+            last_fetch_at: Some(T),
+            ..SourceHealth::default()
+        };
+        assert!(source_blocked(&old_fetch, Some(&fail), T + MIN, off).is_some());
+        let new_fetch = SourceHealth {
+            last_fetch_at: Some(T + 1),
+            ..SourceHealth::default()
+        };
+        assert_eq!(source_blocked(&new_fetch, Some(&fail), T + MIN, off), None);
+        assert_eq!(source_blocked(&ok, Some(&fail), T + HOUR_MS, off), None);
+        // Kildens egen fejl: back-off, "Opdatér", udløbet back-off; teksten renses.
+        let backoff = SourceHealth {
+            error: Some("ingen forbindelse til GitHub".into()),
+            next_retry_at: Some(T + 4 * MIN),
+            ..SourceHealth::default()
+        };
+        assert_eq!(
+            source_blocked(&backoff, None, T, off),
+            Some((
+                "ingen forbindelse til GitHub".into(),
+                "prøves igen tidligst 12:04".into(),
+                T + 4 * MIN
+            ))
+        );
+        assert_eq!(
+            source_blocked(&backoff, None, T + 5 * MIN, off).map(|b| b.1),
+            Some(WATCH_SOURCE_WHEN_NEXT_FETCH.to_string())
+        );
+        let manual = SourceHealth {
+            error: Some("kunne ikke læse C:\\Users\\x\\inbox".into()),
+            waits_for_user: true,
+            ..SourceHealth::default()
+        };
+        assert_eq!(
+            source_blocked(&manual, Some(&fail), T, off),
+            Some((
+                "kunne ikke læse …".into(),
+                WATCH_SOURCE_WHEN_MANUAL.into(),
+                T + HOUR_MS
+            ))
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_keep_a_failed_park() {
+        // Review6d N11 (Refuterens modeksempel): ét giftigt emne + to gange "Stop vagten"/"Start
+        // vagten igen" inden for en time → stadig kun ét forsøg, ingen trip.
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        for _ in 0..3 {
+            f.s().answers.push_back(Err(StartFailure::Real(
+                "forløbet kunne ikke foldes ud".into(),
+            )));
+        }
+        let e = engine(&f);
+        let mut mem = WatchMemory::default();
+        e.tick(&mut mem, &plan_paused(false));
+        assert_eq!(f.s().starts.len(), 1);
+        for _ in 0..2 {
+            f.advance(MIN);
+            let v = e.tick(&mut mem, &plan_paused(true)); // "Stop vagten"
+            assert_eq!(
+                v.waiting["a"].reason,
+                WaitReason::Failed,
+                "parkeringen huskes"
+            );
+            f.advance(MIN);
+            e.tick(&mut mem, &plan_paused(false)); // "Start vagten igen"
+        }
+        assert_eq!(f.started_items(), ["a"]);
+        let ps = f.s().state.projects["web"].clone();
+        assert_eq!(ps.failures, 1);
+        assert!(ps.tripped_at.is_none());
+        // Efter timen prøves det igen.
+        f.advance(HOUR_MS);
+        e.tick(&mut mem, &plan_paused(false));
+        assert_eq!(f.started_items(), ["a", "a"]);
+        // Andre parkeringer glemmes stadig ved pause.
+        f.s().duplicates.insert("titel a".into());
+        f.advance(HOUR_MS + MIN);
+        e.tick(&mut mem, &plan_paused(false));
+        assert_eq!(mem.waiting["a"].reason, WaitReason::Duplicate);
+        let v = e.tick(&mut mem, &plan_paused(true));
+        assert!(v.waiting.is_empty());
+    }
+
+    #[test]
+    fn restart_of_the_app_forgets_a_failed_park() {
+        // Kendt grænse (review6d N11, ikke rettet): parkeringen bor kun i hukommelsen, og
+        // fejltælleren i `watch-state.json`; tre app-genstarter inden for en time med ét giftigt
+        // emne stopper derfor vagten for projektet (fail-closed).
+        let f = Fake::new();
+        f.add("web", "a", &[], None);
+        for _ in 0..3 {
+            f.s().answers.push_back(Err(StartFailure::Real(
+                "forløbet kunne ikke foldes ud".into(),
+            )));
+        }
+        let e = engine(&f);
+        for _ in 0..3 {
+            let mut mem = WatchMemory::default(); // genstart
+            e.tick(&mut mem, &plan_paused(false));
+            f.advance(10 * MIN);
+        }
+        assert_eq!(f.started_items(), ["a", "a", "a"]);
+        assert!(f.s().state.projects["web"].tripped_at.is_some());
+    }
+
+    #[test]
+    fn short_error_edge_cases() {
+        assert_eq!(
+            short_error("repoet «o/r» findes ikke, eller gh har ikke adgang"),
+            "repoet «o/r» findes ikke, eller gh har ikke adgang"
+        );
+        assert_eq!(
+            short_error(r"kunne ikke læse C:\Users\x\.mira-bots\inbox\a.md"),
+            "kunne ikke læse …"
+        );
+        assert_eq!(
+            short_error("se https://github.com/o/r/issues/1 nu"),
+            "se … nu"
+        );
+        assert_eq!(
+            short_error("\u{200b}gh: HTTP 404: Not Found (https://api.github.com/x)"),
+            WATCH_GH_ERROR_TEXT
+        );
+        assert_eq!(short_error(LOGGED_OUT), LOGGED_OUT);
+        assert_eq!(
+            short_error("Playbooken kan ikke udrulles: Ingen playbook for «docs»"),
+            "Playbooken kan ikke udrulles: Ingen playbook for «docs»"
         );
     }
 }

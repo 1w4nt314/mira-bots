@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useBotStates, useTheme } from "../lib/bots";
-import { errorMessage, openWorkplace, quitApp, resizeIsland, setWatch } from "../lib/ipc";
+import { errorMessage, markNoticesSeen, openWorkplace, quitApp, resizeIsland, setWatch } from "../lib/ipc";
 import { DOT_CLASS, worstStatus } from "../lib/status";
 import { reviewCount } from "../lib/tickets";
 import type { WorkplaceTab } from "../lib/types";
@@ -122,6 +122,29 @@ export default function Island() {
     }
   };
 
+  // The notice chip: Workplace on the newest unread notice's ticket. Was the ticket deleted
+  // between render and click (`open_workplace` refuses an unknown ticket, review6d N16), the
+  // notice is marked read and Workplace opens on the Tickets tab without a selection.
+  const openNotice = async () => {
+    const n = newestWithTicket(unseen);
+    if (n === null || n.ticketId === null) {
+      await workplace("tickets");
+      return;
+    }
+    try {
+      await openWorkplace(null, "tickets", null, n.ticketId);
+      return;
+    } catch {
+      // Fall through: the ticket is gone.
+    }
+    try {
+      dispatch({ type: "notices/set", notices: await markNoticesSeen([n.id]) });
+    } catch {
+      // Marking read is a courtesy; opening Workplace matters more.
+    }
+    await workplace("tickets");
+  };
+
   // "Stop vagten" / "Genoptag": the master pause in the app's own settings (never project.json).
   const toggleWatch = async (on: boolean) => {
     try {
@@ -223,7 +246,7 @@ export default function Island() {
           {noticeChip !== "" && (
             <button
               type="button"
-              onClick={() => void workplace("tickets", newestWithTicket(unseen)?.ticketId ?? null)}
+              onClick={() => void openNotice()}
               title="Åbn beskederne i Workplace (eskaleringer, forløb til godkendelse, vagten)"
               className="shrink-0 rounded-full bg-amber-400/25 px-2.5 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-400/35"
             >

@@ -33,7 +33,8 @@ use crate::config::{
 };
 use crate::events::WATCH_CHANGED;
 use crate::hooks::status::AgentStatus;
-use crate::inbox::{InboxItemSummary, InboxState, RefreshReason, StartRequest};
+use crate::inbox::source::{Retry, SourceErrorKind};
+use crate::inbox::{InboxItemSummary, InboxState, InboxStatus, RefreshReason, StartRequest};
 use crate::notices::{derive_waiting_notices, Notice, NoticeKey};
 use crate::projects::{same_id, ProjectRef};
 use crate::tickets::model::{short_id, TicketError};
@@ -42,9 +43,9 @@ use crate::tickets::tools::{SpawnByProfile, SpawnPort};
 use crate::tickets::TicketsCtx;
 use crate::watch::engine::{
     active_projects, build_view, can_start_anything, short_error, staffing_for, AgentsPort,
-    Candidate, Clock, InboxPort, Notifier, ProjectWatchFile, SeatRoom, Staffing, StartFailure,
-    Started, StarterPort, StatePort, TickPlan, WatchEngine, WatchMemory, WatchPort, WatchStart,
-    WatchView,
+    Candidate, Clock, InboxPort, Notifier, ProjectWatchFile, SeatRoom, SourceHealth, Staffing,
+    StartFailure, Started, StarterPort, StatePort, TickPlan, WatchEngine, WatchMemory, WatchPort,
+    WatchStart, WatchView,
 };
 use crate::watch::state::{WatchState, WatchStateFile};
 use crate::workspace::WorkspaceSnapshot;
@@ -133,9 +134,14 @@ impl WatchRuntime {
         self.state.path()
     }
 
-    /// "Genstart vagt": nulstiller fejl og stop for `project`. `true` når det var stoppet.
+    /// "Genstart vagt": nulstiller fejl og stop for `project` og glemmer projektets fejlede
+    /// emner, så de prøves igen ved næste tick (review6d N11). `true` når det var stoppet. Et
+    /// tick der kører netop nu, kan skrive sin kopi af hukommelsen tilbage bagefter; så venter
+    /// emnerne deres time ud (fail-closed).
     pub fn reset_trip(&self, project: &str) -> bool {
-        self.state.with(|s| s.reset_trip(project))
+        let was = self.state.with(|s| s.reset_trip(project));
+        lock(&self.mem).forget_failed(project);
+        was
     }
 
     fn mem_copy(&self) -> WatchMemory {
@@ -201,16 +207,49 @@ pub fn watch_spawn_port(
 
 /// Fejlen fra `inbox_start` → [`StartFailure`]: emnet er væk, allerede startet som ticket,
 /// eller issuen blev lukket mellem hentning og start (review6d W1) → `Gone` (ingen fejl, intet
-/// budget); alt andet er reelt, som én kort linje ([`short_error`], review6d N2).
+/// budget); `gh` eller netværket svigtede (`gh` mangler, er logget ud eller afvist, rate limit,
+/// ingen forbindelse, timeout — [`crate::gh::error_text`]) → `Source` (ingen fejltælling,
+/// review6d W3); alt andet er reelt, som én kort linje ([`short_error`], review6d N2).
 ///
 /// Et lukket issue forbliver `new` i indbakken (der findes ingen vej til at markere ét emne
 /// `gone` uden en komplet hentning); næste komplette hentning markerer det `gone`.
 pub fn classify_start_error(e: &str) -> StartFailure {
+    use crate::gh::{error_text, GhError};
     let started = TicketError::ExternalAlreadyStarted(String::new()).to_string();
     if e == INBOX_ITEM_GONE || e == INBOX_ISSUE_CLOSED || e.starts_with(started.trim_end()) {
-        StartFailure::Gone
+        return StartFailure::Gone;
+    }
+    let source = [
+        GhError::GhMissing,
+        GhError::NotLoggedIn,
+        GhError::BadCredentials,
+        GhError::RateLimited,
+        GhError::Network,
+        GhError::Timeout,
+    ]
+    .iter()
+    .any(|g| e == error_text(g, ""));
+    if source {
+        StartFailure::Source(short_error(e))
     } else {
         StartFailure::Real(short_error(e))
+    }
+}
+
+/// Kilden `source_id` i indbakkens status (review6d W3; ingen `gh`-kald). En ukendt kilde er ok.
+pub fn source_health_of(status: &InboxStatus, source_id: &str) -> SourceHealth {
+    let Some(s) = status.sources.iter().find(|s| s.id == source_id) else {
+        return SourceHealth::default();
+    };
+    SourceHealth {
+        error: (!s.ok).then(|| {
+            s.error
+                .clone()
+                .unwrap_or_else(|| "kilden kunne ikke hentes".to_string())
+        }),
+        waits_for_user: !s.ok && s.error_kind.map(SourceErrorKind::retry) == Some(Retry::Manual),
+        next_retry_at: s.next_retry_at,
+        last_fetch_at: s.last_fetch_at,
     }
 }
 
@@ -234,6 +273,7 @@ pub fn watch_candidates(items: &[InboxItemSummary], project: &str) -> Vec<Candid
             labels: i.labels.clone(),
             ticket_kind: i.ticket_kind.clone(),
             seen_at: i.seen_at,
+            source_id: i.source_id.clone(),
         })
         .collect()
 }
@@ -351,6 +391,9 @@ impl InboxPort for AppPort<'_> {
     }
     fn is_duplicate(&self, project: &str, title: &str) -> bool {
         is_duplicate_in(&self.state.tickets, project, title)
+    }
+    fn source_health(&self, source_id: &str) -> SourceHealth {
+        source_health_of(&self.state.tickets.inbox_rt.status(), source_id)
     }
 }
 
@@ -491,8 +534,9 @@ pub fn compute_view(state: &AppState) -> WatchView {
     let ids: HashSet<String> = mem.agents.keys().cloned().collect();
     let live = live_of(state, &ids);
     mem.agents.retain(|id, _| live.contains(id));
-    mem.waiting
-        .retain(|_, w| plan.projects.iter().any(|p| same_id(&p.id, &w.project)));
+    mem.waiting.retain(|_, w| {
+        w.failed_until_later(now) || plan.projects.iter().any(|p| same_id(&p.id, &w.project))
+    });
     let st = state.watch.state.read(WatchState::clone);
     build_view(&plan, &st, &mem, now, off)
 }
@@ -548,7 +592,10 @@ fn maybe_refresh(state: &AppState, now: u64) {
 }
 
 /// Ét tick (på en blocking-tråd). Højst ét ad gangen (`tick_busy`); en panik logges og
-/// frigiver `tick_busy`.
+/// frigiver `tick_busy` — kun i debug og tests (review6d W4): release har `panic = "abort"`
+/// (rodens `Cargo.toml`), så dér ender en panik processen som enhver anden panik i appen.
+/// Hukommelsen kopieres ud og ind, og `watch-state.json` skrives atomisk, så ingen af dem er
+/// nogensinde halvt skrevet.
 pub fn tick(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
@@ -586,7 +633,8 @@ fn run_tick(app: &AppHandle, state: &AppState) {
         let ids: HashSet<String> = mem.agents.keys().cloned().collect();
         let live = port.live_of(&ids);
         mem.agents.retain(|id, _| live.contains(id));
-        mem.waiting.clear();
+        // Review6d N11: et fejlet start husker sin time også gennem en pause.
+        mem.waiting.retain(|_, w| w.failed_until_later(now));
         mem.last_tick_at = Some(now);
         let st = rt.state.read(WatchState::clone);
         let view = build_view(&plan, &st, &mem, now, off);
@@ -610,7 +658,8 @@ fn run_tick(app: &AppHandle, state: &AppState) {
     // reservationen siger nej). Kun indbakke-dokumentet læses; intet netværk.
     //
     // Review6d N8: en panik i motoren må ikke tabe hukommelsen (fx agent-id'er fra et start
-    // lige før panikken); den gemmes også da, og panikken logges som én linje.
+    // lige før panikken); den gemmes også da, og panikken logges som én linje. Det gælder kun
+    // debug og tests (review6d W4): i release (`panic = "abort"`) ender processen.
     let view = WatchEngine::new(port).tick_guarded(&mut mem, &plan);
     rt.store_mem(mem);
     if let Some(view) = view {
@@ -805,6 +854,79 @@ mod tests {
             classify_start_error("svaret fra gh var for stort"),
             StartFailure::Real("svaret fra gh var for stort".into())
         );
+        // Review6d W3: gh/netværket svigter → kilden, ikke en fejl der tæller.
+        use crate::gh::{error_text, GhError};
+        for g in [
+            GhError::GhMissing,
+            GhError::NotLoggedIn,
+            GhError::BadCredentials,
+            GhError::RateLimited,
+            GhError::Network,
+            GhError::Timeout,
+        ] {
+            let e = error_text(&g, "o/r");
+            assert_eq!(
+                classify_start_error(&e),
+                StartFailure::Source(e.clone()),
+                "{g:?}"
+            );
+        }
+        for g in [
+            GhError::RepoNotFound,
+            GhError::IssuesDisabled,
+            GhError::TooLarge,
+            GhError::BadJson("x".into()),
+            GhError::Other("y".into()),
+        ] {
+            let e = error_text(&g, "o/r");
+            assert!(
+                matches!(classify_start_error(&e), StartFailure::Real(_)),
+                "{g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_health_from_the_inbox_status() {
+        use crate::inbox::source::{SourceError, SourceId, SourceStatus};
+        let gh = SourceId::github("O/R");
+        let mut status = InboxStatus::default();
+        let mut s = SourceStatus::new(&gh, "o/r".into(), Some("web".into()));
+        s.succeeded(1_000, &crate::inbox::source::Fetched::default());
+        status.sources.push(s.clone());
+        // Ok og ukendt kilde: intet blokerer.
+        let h = source_health_of(&status, "github:o/r");
+        assert_eq!(
+            h,
+            SourceHealth {
+                last_fetch_at: Some(1_000),
+                ..SourceHealth::default()
+            }
+        );
+        assert_eq!(
+            source_health_of(&status, "folder:web"),
+            SourceHealth::default()
+        );
+        // Logget ud: venter på "Opdatér".
+        s.failed(
+            2_000,
+            &SourceError::new(SourceErrorKind::NotLoggedIn, "gh er ikke logget ind"),
+        );
+        status.sources[0] = s.clone();
+        let h = source_health_of(&status, "github:o/r");
+        assert_eq!(h.error.as_deref(), Some("gh er ikke logget ind"));
+        assert!(h.waits_for_user);
+        assert_eq!((h.next_retry_at, h.last_fetch_at), (None, Some(1_000)));
+        // Rate limit: back-off med tidspunkt.
+        s.failed(
+            3_000,
+            &SourceError::new(SourceErrorKind::RateLimited, "GitHub: rate limit"),
+        );
+        status.sources[0] = s;
+        let h = source_health_of(&status, "github:o/r");
+        assert!(!h.waits_for_user);
+        assert_eq!(h.next_retry_at, Some(3_000 + 900_000));
+        assert!(h.error.unwrap().starts_with("GitHub: rate limit"));
     }
 
     #[test]

@@ -61,10 +61,15 @@ export function nextFreeText(nextMs: number | null, now: number): string {
 export const BADGE_WAIT = "bg-amber-400/20 text-amber-800 dark:text-amber-200";
 export const BADGE_FAILED = "bg-rose-500/15 text-rose-700 dark:text-rose-300";
 
+/** Rust `WATCH_SOURCE_WAIT_PREFIX`: a `failed` parking because the item's source is down. */
+export const SOURCE_WAIT_PREFIX = "vagt: venter på kilden";
+
 /**
  * The badge of an inbox item the watch parked (C6d.5 texts). The budget text is rebuilt from
  * `nextAt` so "i morgen" shows up; every other text is the backend's. A failed start shows the
- * short text and keeps the error in the title.
+ * short text and keeps the error in the title. A source that is down (`gh` logged out, rate
+ * limit, no network; review6d W3) is no failure of the item: amber "vagt: venter på kilden" with
+ * the source's text in the title.
  */
 export function waitingBadge(w: WaitingInfo, now: number): { text: string; title: string; cls: string } {
   switch (w.reason) {
@@ -101,7 +106,9 @@ export function waitingBadge(w: WaitingInfo, now: number): { text: string; title
         cls: BADGE_WAIT,
       };
     case "failed":
-      return { text: "vagt: start fejlede", title: w.text, cls: BADGE_FAILED };
+      return w.text.startsWith(SOURCE_WAIT_PREFIX)
+        ? { text: SOURCE_WAIT_PREFIX, title: w.text, cls: BADGE_WAIT }
+        : { text: "vagt: start fejlede", title: w.text, cls: BADGE_FAILED };
   }
 }
 

@@ -533,6 +533,22 @@ pub fn watch_unknown_playbook_text(name: &str) -> String {
 pub fn watch_start_failed_text(err: &str, retry_hhmm: &str) -> String {
     format!("vagt: start fejlede: {err} (prøves igen {retry_hhmm})")
 }
+/// Parking text prefix: the item's source (`gh`, the network) fails; the watch does not try it
+/// and counts no failure (review6d W3). The badge shows this prefix in the inbox.
+pub const WATCH_SOURCE_WAIT_PREFIX: &str = "vagt: venter på kilden";
+/// When a source that waits for the user ("gh er ikke logget ind" and the like) is tried again.
+pub const WATCH_SOURCE_WHEN_MANUAL: &str = "prøves igen efter Opdatér i indbakken";
+/// When a source whose start just failed is tried again: after the next successful fetch.
+pub const WATCH_SOURCE_WHEN_NEXT_FETCH: &str = "prøves igen efter næste hentning";
+/// When a source in back-off is tried again.
+pub fn watch_source_when_at(hhmm: &str) -> String {
+    format!("prøves igen tidligst {hhmm}")
+}
+/// Parking text: the item's source fails with `err`; `when` is one of the `WATCH_SOURCE_WHEN_*`
+/// texts (review6d W3).
+pub fn watch_source_wait_text(err: &str, when: &str) -> String {
+    format!("{WATCH_SOURCE_WAIT_PREFIX}: {err} ({when})")
+}
 /// Parking text: a cap of 0 in `project.json` or the workspace file (review6d N5: 0 = the watch
 /// starts nothing).
 pub const WATCH_WAIT_CAP_ZERO: &str = "loft 0: vagten starter intet";

@@ -6,7 +6,11 @@ import { NOTICE_KIND_LABEL, visibleNotices } from "../../../lib/watch";
 import { useStore } from "../../../state/store";
 import { useRun, useTicketActions } from "./actions";
 
-/** Opening the list marks everything read after this pause, so the badge is seen going away. */
+/**
+ * Opening the list marks the unread notices it shows read after this pause, so the badge is seen
+ * going away. Only those ids (review6d N15): notices hidden by `visibleNotices` or arriving while
+ * the list is open stay unread.
+ */
 const MARK_ALL_AFTER_MS = 1000;
 
 /**
@@ -22,24 +26,30 @@ export default function NoticesMenu() {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const items = visibleNotices(state.notices?.items ?? [], state.tickets, state.agents);
-  const unread = items.filter((n) => !n.seen).length;
-  const unreadRef = useRef(unread);
-  unreadRef.current = unread;
+  const unreadIds = items.filter((n) => !n.seen).map((n) => n.id);
+  const unread = unreadIds.length;
+  const unreadIdsRef = useRef(unreadIds);
+  unreadIdsRef.current = unreadIds;
   const now = Date.now();
 
-  const markAll = useCallback(
-    () =>
+  /** Marks exactly `ids` read (never `null` = every notice, review6d N15). */
+  const markSeen = useCallback(
+    (ids: string[]) =>
       run(async () => {
-        dispatch({ type: "notices/set", notices: await markNoticesSeen(null) });
+        if (ids.length === 0) return;
+        dispatch({ type: "notices/set", notices: await markNoticesSeen(ids) });
       }),
     [run, dispatch],
   );
 
   useEffect(() => {
-    if (!open || unreadRef.current === 0) return;
-    const t = setTimeout(() => void markAll(), MARK_ALL_AFTER_MS);
+    if (!open) return;
+    // The unread notices shown when the list opened.
+    const shown = unreadIdsRef.current;
+    if (shown.length === 0) return;
+    const t = setTimeout(() => void markSeen(shown), MARK_ALL_AFTER_MS);
     return () => clearTimeout(t);
-  }, [open, markAll]);
+  }, [open, markSeen]);
 
   // A click outside or Escape closes the list.
   useEffect(() => {
@@ -101,7 +111,7 @@ export default function NoticesMenu() {
             <span className="font-semibold">Beskeder</span>
             <button
               type="button"
-              onClick={() => void markAll()}
+              onClick={() => void markSeen(unreadIds)}
               disabled={unread === 0}
               className="ml-auto rounded-md border border-[var(--border)] px-2 py-0.5 text-[11px] hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
             >

@@ -88,6 +88,10 @@ eq(w.nextFreeText(at(2026, 10, 26, 7, 0), at(2026, 10, 25, 1, 30)), "i morgen 07
   eq(w.waitingBadge(waiting({ reason: "playbook", text: "playbook «x» findes ikke i workspace", nextAt: null }), NOW).text, "playbook «x» findes ikke i workspace");
   const f = w.waitingBadge(waiting({ reason: "failed", text: "vagt: start fejlede: gh: ingen forbindelse", nextAt: null }), NOW);
   eq([f.text, f.title, f.cls], ["vagt: start fejlede", "vagt: start fejlede: gh: ingen forbindelse", w.BADGE_FAILED]);
+  // review6d W3: the source is down — amber, the source's text in the title
+  const srcText = "vagt: venter på kilden: gh er ikke logget ind — kør gh auth login i en terminal (prøves igen efter Opdatér i indbakken)";
+  const s = w.waitingBadge(waiting({ reason: "failed", text: srcText, nextAt: null }), NOW);
+  eq([s.text, s.title, s.cls], ["vagt: venter på kilden", srcText, w.BADGE_WAIT]);
   for (const r of ["budget", "seat", "planner", "duplicate", "playbook"]) {
     eq(w.waitingBadge(waiting({ reason: r }), NOW).cls, w.BADGE_WAIT, r);
     eq(w.waitingBadge(waiting({ reason: r }), NOW).title.length > 0, true, r);
